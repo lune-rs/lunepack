@@ -17,9 +17,10 @@ use lunepack_core::state::{
 };
 use lunepack_core::trust::PublicKey;
 use lunepack_core::{
-    AppId, Channel, CurrentRef, DirEntryInfo, FileWrite, Floors, Fs, FsError, Hasher,
-    InstallCounters, InstallState, Loaded, LockGuard, MachineScope, Meta, PreviousRef, ReadAt,
-    RootParts, Scope, StagedRef, StateError, Target, UserScope, Version,
+    AppId, Channel, CurrentRef, DirEntryInfo, FileWrite, Floors, Fs, FsError, Hasher, Health,
+    InstallCounters, InstallState, Lifecycle, LifecycleEvent, Loaded, LockGuard, MachineScope,
+    Meta, PreviousRef, ReadAt, RootParts, Scope, StagedIssued, StagedRef, StateError, Target,
+    UserScope, Version,
 };
 use lunepack_testkit::{FakeHasher, MemFs, RecoverMode};
 use serde_json::{Map, Value, json};
@@ -59,12 +60,27 @@ fn sample(seq: u64) -> InstallState {
     r.previous = Some(PreviousRef {
         version: v("0.9.0"),
     });
-    r.staged = Some(StagedRef::new(
-        v("1.1.0"),
-        Target::LinuxX86_64,
-        H.sha256(b"the 1.1.0 manifest"),
-    ));
+    r = r.set_staged(Some((
+        StagedRef::new(
+            v("1.1.0"),
+            Target::LinuxX86_64,
+            H.sha256(b"the 1.1.0 manifest"),
+        ),
+        1_800_000_000,
+    )));
     r.bad = vec![v("1.0.1")];
+    // Applied from 0.9.0 and confirmed, but not yet started through `startup()`.
+    r.lifecycle = Some(Lifecycle {
+        events: vec![
+            LifecycleEvent::Updated {
+                from: v("0.9.0"),
+                to: v("1.0.0"),
+            },
+            LifecycleEvent::FirstRun {
+                version: v("1.0.0"),
+            },
+        ],
+    });
     r.floors = Floors {
         root: Some(RootParts {
             version: 2,
@@ -289,17 +305,15 @@ fn commit_refuses_a_record_its_reader_would_refuse() {
             "{what}: {got:?}"
         );
     };
-    let mut tree = base.set_staged(Some(StagedRef::new(
-        v("1.2.0"),
-        Target::LinuxX86_64,
-        H.sha256(b"m"),
+    let mut tree = base.set_staged(Some((
+        StagedRef::new(v("1.2.0"), Target::LinuxX86_64, H.sha256(b"m")),
+        1,
     )));
     tree.staged.as_mut().unwrap().tree = "1.2.1".into();
     refuse(tree, "tree is not the version text");
-    let mut nested = base.set_staged(Some(StagedRef::new(
-        v("1.2.0"),
-        Target::LinuxX86_64,
-        H.sha256(b"m"),
+    let mut nested = base.set_staged(Some((
+        StagedRef::new(v("1.2.0"), Target::LinuxX86_64, H.sha256(b"m")),
+        1,
     )));
     nested.staged.as_mut().unwrap().tree = "a/1.2.0".into();
     refuse(nested, "tree is two components");
@@ -683,7 +697,8 @@ fn newer_formats_stop_the_load() {
 #[test]
 fn unknown_top_level_fields_are_kept_through_transitions() {
     let x_future = json!({"a": [1, 2]});
-    let health = json!({"t": "token"});
+    let digest = H.sha256(b"token");
+    let health = json!({"token_sha256": digest.to_hex(), "version": "1.0.0"});
     let (fs, _) = newest_edited(|p| {
         p.insert("x_future".into(), x_future.clone());
         p.insert("health".into(), health.clone());
@@ -692,7 +707,14 @@ fn unknown_top_level_fields_are_kept_through_transitions() {
     let record = loaded.record.clone().unwrap();
     assert_eq!(record.seq, 3);
     assert_eq!(record.extra.get("x_future"), Some(&x_future));
-    assert_eq!(record.extra.get("health"), Some(&health));
+    assert_eq!(record.extra.get("health"), None, "health is typed");
+    assert_eq!(
+        record.health,
+        Some(Health {
+            version: v("1.0.0"),
+            token_sha256: digest
+        })
+    );
     let next = record.raise_floors(&floors(9, 9));
     let next = commit(&fs, &dir(), &loaded, &next, &H).unwrap();
     let written = payload(&bytes_of(&fs, 4));
@@ -702,11 +724,152 @@ fn unknown_top_level_fields_are_kept_through_transitions() {
 }
 
 #[test]
-fn a_new_record_writes_health_null() {
+fn a_new_record_writes_the_m5_members_null() {
     let fs = MemFs::new();
     let first = InstallState::new(1, app(), Scope::User, INSTALL_ID, Target::LinuxX86_64);
     commit(&fs, &dir(), &load_state(&fs).unwrap(), &first, &H).unwrap();
-    assert_eq!(payload(&bytes_of(&fs, 1)).get("health"), Some(&Value::Null));
+    let p = payload(&bytes_of(&fs, 1));
+    for key in ["health", "lifecycle", "staged_issued"] {
+        assert_eq!(p.get(key), Some(&Value::Null), "{key}");
+    }
+}
+
+#[test]
+fn a_record_without_the_m5_members_reads_them_as_null() {
+    // An M4 writer wrote `health` but neither of the others; a hand edit may drop `health` too.
+    let (fs, _) = newest_edited(|p| {
+        for key in ["health", "lifecycle", "staged_issued"] {
+            p.remove(key);
+        }
+    });
+    let record = load_state(&fs).unwrap().record.unwrap();
+    assert_eq!(record.seq, 3);
+    assert_eq!(
+        (&record.health, &record.lifecycle, &record.staged_issued),
+        (&None, &None, &None)
+    );
+}
+
+#[test]
+fn the_m5_members_refuse_unknown_inner_members_and_wrong_shapes() {
+    let digest = H.sha256(b"m").to_hex();
+    let cases: Vec<(&str, &str, Value)> = vec![
+        (
+            "health with an unknown member",
+            "health",
+            json!({"token_sha256": digest, "version": "1.0.0", "token": "raw"}),
+        ),
+        (
+            "health without its version",
+            "health",
+            json!({"token_sha256": digest}),
+        ),
+        ("health is a number", "health", json!(3)),
+        (
+            "lifecycle with an unknown member",
+            "lifecycle",
+            json!({"events": [], "x": 1}),
+        ),
+        (
+            "an event with an unknown member",
+            "lifecycle",
+            json!({"events": [{"kind": "installed", "version": "1.0.0", "x": 1}]}),
+        ),
+        (
+            "an event of an unknown kind",
+            "lifecycle",
+            json!({"events": [{"kind": "rolled_back", "version": "1.0.0"}]}),
+        ),
+        (
+            "an update event without its from",
+            "lifecycle",
+            json!({"events": [{"kind": "updated", "to": "1.0.0"}]}),
+        ),
+        (
+            "17 events",
+            "lifecycle",
+            json!({"events": vec![json!({"kind": "first_run", "version": "1.0.0"}); 17]}),
+        ),
+        (
+            "staged_issued with an unknown member",
+            "staged_issued",
+            json!({"version": "1.0.0", "manifest_sha256": digest, "issued": 1, "x": 1}),
+        ),
+        (
+            "staged_issued above 2^53 - 1",
+            "staged_issued",
+            json!({"version": "1.0.0", "manifest_sha256": digest, "issued": MAX_U53 + 1}),
+        ),
+    ];
+    for (what, key, value) in cases {
+        let (fs, _) = newest_edited(|p| {
+            p.insert(key.into(), value.clone());
+        });
+        let got = load_state(&fs);
+        assert!(
+            matches!(got, Err(StateError::Invalid(_))),
+            "{what}: {got:?}"
+        );
+    }
+    // 16 events is the cap, and is accepted.
+    let (fs, _) = newest_edited(|p| {
+        p.insert(
+            "lifecycle".into(),
+            json!({"events": vec![json!({"kind": "first_run", "version": "1.0.0"}); 16]}),
+        );
+    });
+    let events = load_state(&fs).unwrap().record.unwrap().lifecycle.unwrap();
+    assert_eq!(events.events.len(), 16);
+}
+
+#[test]
+fn set_staged_binds_staged_issued_and_clears_both() {
+    let r = sample(1);
+    let staged = StagedRef::new(v("1.2.0"), Target::LinuxX86_64, H.sha256(b"1.2.0"));
+    let set = r.set_staged(Some((staged.clone(), 1_850_000_000)));
+    assert_eq!(set.staged.as_ref(), Some(&staged));
+    assert_eq!(
+        set.staged_issued,
+        Some(StagedIssued {
+            version: v("1.2.0"),
+            manifest_sha256: H.sha256(b"1.2.0"),
+            issued: 1_850_000_000,
+        })
+    );
+    assert_eq!(set.staged_issued_bound(), Some(1_850_000_000));
+    let cleared = set.set_staged(None);
+    assert_eq!((&cleared.staged, &cleared.staged_issued), (&None, &None));
+    assert_eq!(cleared.staged_issued_bound(), None);
+}
+
+#[test]
+fn an_unbound_staged_issued_reads_and_is_dropped_by_the_next_transition() {
+    // An older writer replaced `staged` and kept `staged_issued` as it was.
+    let (fs, _) = store_with(&[&|r| {
+        r.set_staged(Some((
+            StagedRef::new(v("1.1.0"), Target::LinuxX86_64, H.sha256(b"1.1.0")),
+            1_800_000_000,
+        )))
+    }]);
+    let loaded = load_state(&fs).unwrap();
+    let mut other = loaded.record.clone().unwrap();
+    other.staged = Some(StagedRef::new(
+        v("1.2.0"),
+        Target::LinuxX86_64,
+        H.sha256(b"1.2.0"),
+    ));
+    let written = commit(&fs, &dir(), &loaded, &other, &H).unwrap();
+    let back = load_state(&fs).unwrap().record.unwrap();
+    assert_eq!(back, written, "an unbound value reads without error");
+    assert!(back.staged_issued.is_some());
+    assert_eq!(back.staged_issued_bound(), None);
+    for next in [
+        back.raise_floors(&floors(1, 1)),
+        back.mark_bad(v("0.1.0")),
+        back.install(v("1.0.0"), 1, Target::LinuxX86_64, INSTALL_ID),
+    ] {
+        assert_eq!(next.staged_issued, None, "an unbound value is dropped");
+    }
 }
 
 // ---- floors -------------------------------------------------------------------------------------
@@ -1073,4 +1236,52 @@ fn state_module_reads_no_clock() {
         assert!(!source.contains(needle), "state.rs mentions {needle}");
     }
     let _ = state::HEALTH_KEY;
+}
+
+// ---- the floor time over the lifecycle, with the clock far ahead ---------------------------------
+
+#[test]
+fn the_check_floor_time_holds_over_the_lifecycle_with_the_clock_400_days_ahead() {
+    use lunepack_core::{ClockReading, TokenCheck, apply, confirm, install_first, rollback};
+    use lunepack_testkit::FakeClock;
+
+    const DAY: u64 = 86_400;
+    // Every time is derived from the fake clock the check reads, never from the real one.
+    let clock = FakeClock::new(1_790_000_000);
+    let t0 = ClockReading::read(&clock, None).now();
+    let staged = |version: &str| {
+        StagedRef::new(
+            v(version),
+            Target::LinuxX86_64,
+            H.sha256(version.as_bytes()),
+        )
+    };
+    let token = H.sha256(b"token");
+    let start = InstallState::new(1, app(), Scope::User, INSTALL_ID, Target::LinuxX86_64)
+        .raise_floors(&floors(2, 5));
+    let installed = install_first(&start, v("1.0.0"), t0 - 20 * DAY, INSTALL_ID).unwrap();
+    let ready = installed.set_staged(Some((staged("1.1.0"), t0 - 10 * DAY)));
+    let applied = apply(&ready, &v("1.1.0"), token).unwrap();
+    let rolled = rollback(&applied, &v("1.1.0")).unwrap();
+    let ready2 = rolled.set_staged(Some((staged("1.2.0"), t0)));
+    let applied2 = apply(&ready2, &v("1.2.0"), token).unwrap();
+    let confirmed = confirm(&applied2, &v("1.2.0"), TokenCheck::Presented(token))
+        .unwrap()
+        .0;
+    let chain = [installed, applied, rolled, applied2, confirmed];
+    let times: Vec<u64> = chain
+        .iter()
+        .map(|s| s.current.as_ref().unwrap().issued)
+        .collect();
+    assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
+    for record in &chain {
+        assert_eq!(record.floors, start.floors, "a transition moved a floor");
+        let floor_time = record.current.as_ref().map(|c| c.issued);
+        for ahead in [0, 400 * DAY] {
+            clock.set(t0 + ahead);
+            assert!(ClockReading::read(&clock, floor_time).is_plausible());
+        }
+        clock.set(floor_time.unwrap() - 1);
+        assert!(!ClockReading::read(&clock, floor_time).is_plausible());
+    }
 }

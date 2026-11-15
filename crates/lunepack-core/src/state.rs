@@ -51,8 +51,15 @@ pub const KEEP_RECORDS: usize = 3;
 pub const MAX_BAD_VERSIONS: usize = 1000;
 /// Most channels in `floors.feed_seq`.
 pub const MAX_CHANNELS: usize = 64;
-/// The reserved top-level key owned by M5's health handshake (C4); kept in `extra`.
+/// The top-level key of M5's health handshake (C4, M5-D5): typed in an install-state record
+/// ([`InstallState::health`]); an install-counters record keeps it in `extra`.
 pub const HEALTH_KEY: &str = "health";
+/// The top-level key of the queued lifecycle events (M5-D6).
+pub const LIFECYCLE_KEY: &str = "lifecycle";
+/// The top-level key of the staged manifest's `issued` (P9).
+pub const STAGED_ISSUED_KEY: &str = "staged_issued";
+/// Most queued lifecycle events.
+pub const MAX_LIFECYCLE_EVENTS: usize = 16;
 
 /// Magic, format byte, payload length.
 const HEADER_LEN: usize = 4 + 1 + 4;
@@ -66,7 +73,7 @@ const KIND_COUNTERS: &str = "install-counters";
 
 /// Top-level keys every record kind has.
 const COMMON_KEYS: [&str; 5] = ["format", "kind", "critical", "seq", "app_id"];
-const STATE_KEYS: [&str; 9] = [
+const STATE_KEYS: [&str; 12] = [
     "scope",
     "install_id",
     "target",
@@ -76,6 +83,9 @@ const STATE_KEYS: [&str; 9] = [
     "staged",
     "bad",
     "floors",
+    HEALTH_KEY,
+    LIFECYCLE_KEY,
+    STAGED_ISSUED_KEY,
 ];
 const COUNTERS_KEYS: [&str; 2] = ["install_id", "floors"];
 
@@ -305,6 +315,83 @@ impl StagedRef {
     }
 }
 
+/// The supervised launch of a pending version (M5-D5): which version and the SHA-256 of the
+/// token it was given. The token itself is never recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Health {
+    /// The pending version the token belongs to.
+    pub version: Version,
+    /// SHA-256 of the raw token bytes.
+    pub token_sha256: Sha256Digest,
+}
+
+/// One lifecycle event queued for the version that must receive it (M5-D6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LifecycleEvent {
+    /// The app was installed at `version`.
+    Installed {
+        /// The installed version.
+        version: Version,
+    },
+    /// The app was updated from `from` to `to`.
+    Updated {
+        /// The version before.
+        from: Version,
+        /// The version after.
+        to: Version,
+    },
+    /// `version` runs for the first time.
+    FirstRun {
+        /// The version.
+        version: Version,
+    },
+}
+
+impl LifecycleEvent {
+    /// The version that receives the event: `version`, or `to` for an update.
+    pub fn recipient(&self) -> &Version {
+        match self {
+            LifecycleEvent::Installed { version } | LifecycleEvent::FirstRun { version } => version,
+            LifecycleEvent::Updated { to, .. } => to,
+        }
+    }
+}
+
+/// The queued lifecycle events, at most [`MAX_LIFECYCLE_EVENTS`], oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lifecycle {
+    /// The events.
+    pub events: Vec<LifecycleEvent>,
+}
+
+/// The `issued` of the staged manifest, naming the staged entry it belongs to (P9). It counts
+/// only when it is bound: its version and digest equal `staged`'s ([`StagedIssued::is_bound_to`]).
+/// An older writer keeps it verbatim while it changes `staged`, so an unbound value is read
+/// without error and ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedIssued {
+    /// The staged version.
+    pub version: Version,
+    /// SHA-256 of the staged manifest.
+    pub manifest_sha256: Sha256Digest,
+    /// That manifest's `issued`.
+    #[serde(deserialize_with = "de_u53")]
+    pub issued: u64,
+}
+
+impl StagedIssued {
+    /// Whether this names `staged`: the same version text and manifest digest.
+    pub fn is_bound_to(&self, staged: &StagedRef) -> bool {
+        self.version == staged.version
+            && self.version.to_string() == staged.version.to_string()
+            && self.manifest_sha256 == staged.manifest_sha256
+    }
+}
+
 /// An `install-state` record: the state of one install (M4-D6).
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstallState {
@@ -332,7 +419,13 @@ pub struct InstallState {
     pub floors: Floors,
     /// Critical features the record uses (v1: none).
     pub critical: Vec<String>,
-    /// Top-level keys this build does not define, kept verbatim (M4-D22 a); `health` included.
+    /// The supervised launch of the pending version (M5-D5); `None` when there is none.
+    pub health: Option<Health>,
+    /// Lifecycle events not yet delivered (M5-D6); `None` when there are none.
+    pub lifecycle: Option<Lifecycle>,
+    /// The staged manifest's `issued` (P9); counts only when bound to `staged`.
+    pub staged_issued: Option<StagedIssued>,
+    /// Top-level keys this build does not define, kept verbatim (M4-D22 a).
     pub extra: BTreeMap<String, Value>,
 }
 
@@ -355,7 +448,8 @@ pub struct InstallCounters {
 }
 
 impl InstallState {
-    /// A first record: nothing installed yet, no floors, `health: null`.
+    /// A first record: nothing installed yet, no floors, `health`, `lifecycle` and
+    /// `staged_issued` null.
     pub fn new(
         seq: u64,
         app_id: AppId,
@@ -376,7 +470,10 @@ impl InstallState {
             bad: Vec::new(),
             floors: Floors::default(),
             critical: Vec::new(),
-            extra: BTreeMap::from([(HEALTH_KEY.to_owned(), Value::Null)]),
+            health: None,
+            lifecycle: None,
+            staged_issued: None,
+            extra: BTreeMap::new(),
         }
     }
 
@@ -389,9 +486,28 @@ impl InstallState {
     }
 
     /// A copy for a transition. Its `seq` is the loaded record's and means nothing until a commit:
-    /// [`commit`] gives the written record the store's next seq.
-    fn next(&self) -> InstallState {
-        self.clone()
+    /// [`commit`] gives the written record the store's next seq. A `staged_issued` that is not
+    /// bound to `staged` is dropped, so after every transition it is null or bound (P9).
+    pub(crate) fn next(&self) -> InstallState {
+        let mut out = self.clone();
+        out.unbind_staged_issued();
+        out
+    }
+
+    /// Drops `staged_issued` unless it is bound to `staged`.
+    pub(crate) fn unbind_staged_issued(&mut self) {
+        if self.staged_issued_bound().is_none() {
+            self.staged_issued = None;
+        }
+    }
+
+    /// The staged manifest's `issued` when `staged_issued` is bound to `staged`; `None` when
+    /// nothing is staged or the value is missing or names another entry.
+    pub fn staged_issued_bound(&self) -> Option<u64> {
+        match (&self.staged, &self.staged_issued) {
+            (Some(staged), Some(issued)) if issued.is_bound_to(staged) => Some(issued.issued),
+            _ => None,
+        }
     }
 
     /// The next record with every floor raised to at least `floors` (never lowered).
@@ -401,10 +517,24 @@ impl InstallState {
         out
     }
 
-    /// The next record with `staged` replaced.
-    pub fn set_staged(&self, staged: Option<StagedRef>) -> InstallState {
+    /// The next record with `staged` replaced and `staged_issued` bound to it: `Some((entry,
+    /// issued))` writes both, `issued` being that manifest's `issued`; `None` clears both.
+    pub fn set_staged(&self, staged: Option<(StagedRef, u64)>) -> InstallState {
         let mut out = self.next();
-        out.staged = staged;
+        match staged {
+            Some((staged, issued)) => {
+                out.staged_issued = Some(StagedIssued {
+                    version: staged.version.clone(),
+                    manifest_sha256: staged.manifest_sha256,
+                    issued,
+                });
+                out.staged = Some(staged);
+            }
+            None => {
+                out.staged = None;
+                out.staged_issued = None;
+            }
+        }
         out
     }
 
@@ -543,6 +673,9 @@ impl Record for InstallState {
         put(&mut out, "staged", &self.staged)?;
         put(&mut out, "bad", &self.bad)?;
         put(&mut out, "floors", &self.floors)?;
+        put(&mut out, HEALTH_KEY, &self.health)?;
+        put(&mut out, LIFECYCLE_KEY, &self.lifecycle)?;
+        put(&mut out, STAGED_ISSUED_KEY, &self.staged_issued)?;
         Ok(out)
     }
 
@@ -565,6 +698,9 @@ impl Record for InstallState {
             bad: fields.take("bad")?,
             floors: fields.take("floors")?,
             critical,
+            health: fields.take_nullable(HEALTH_KEY)?,
+            lifecycle: fields.take_nullable(LIFECYCLE_KEY)?,
+            staged_issued: fields.take_nullable(STAGED_ISSUED_KEY)?,
             extra: fields.rest(),
         };
         record.check()?;
@@ -583,7 +719,13 @@ impl InstallState {
         if let Some(staged) = &self.staged {
             staged.check()?;
         }
-        check_health(&self.extra)?;
+        if self
+            .lifecycle
+            .as_ref()
+            .is_some_and(|l| l.events.len() > MAX_LIFECYCLE_EVENTS)
+        {
+            return Err(invalid("too many lifecycle events"));
+        }
         self.floors.check()
     }
 }
@@ -641,7 +783,7 @@ impl Record for InstallCounters {
     }
 }
 
-/// `health`, when present, is an object or `null` (M4-D6 amended).
+/// `health` in an install-counters record, when present, is an object or `null` (M4-D6 amended).
 fn check_health(extra: &BTreeMap<String, Value>) -> Result<(), StateError> {
     match extra.get(HEALTH_KEY) {
         None | Some(Value::Null | Value::Object(_)) => Ok(()),
@@ -695,6 +837,18 @@ impl Fields {
             .ok_or_else(|| StateError::Invalid(Untrusted::new(&format!("missing field {key}"))))?;
         serde_json::from_value(value)
             .map_err(|e| StateError::Invalid(Untrusted::new(&format!("{key}: {e}"))))
+    }
+
+    /// Removes and parses a member written from M5: a record written before it lacks the member,
+    /// which then reads as `null`.
+    fn take_nullable<T: DeserializeOwned>(
+        &mut self,
+        key: &'static str,
+    ) -> Result<Option<T>, StateError> {
+        if !self.0.contains_key(key) {
+            return Ok(None);
+        }
+        self.take(key)
     }
 
     fn install_id(&mut self) -> Result<[u8; INSTALL_ID_BYTES], StateError> {

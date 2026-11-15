@@ -48,13 +48,14 @@ pub struct Candidate {
 }
 
 /// Selects the update candidate (FORMAT.md 11.4): the release with the highest precedence that
-/// is strictly newer than `current` (equal precedence is not newer; never a downgrade), is not in
+/// is strictly newer than `current` (equal precedence is not newer; never a downgrade; `None`, a
+/// first install, admits any version), is not in
 /// `bad` (by precedence), lists `host` or else its first listed fallback, and whose rollout
 /// includes `install_id`. `None`: no update. A pre-release is a candidate only because this feed
 /// lists it; there is no channel logic here.
 pub fn select_candidate(
     feed: &VerifiedFeed,
-    current: &Version,
+    current: Option<&Version>,
     host: Target,
     bad: &[Version],
     install_id: &[u8; INSTALL_ID_BYTES],
@@ -69,7 +70,7 @@ pub fn select_candidate(
     });
     for index in order {
         let release = &feed.releases()[index];
-        if release.version() <= current {
+        if current.is_some_and(|c| release.version() <= c) {
             // Everything after is lower still.
             return None;
         }

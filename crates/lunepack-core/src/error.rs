@@ -421,6 +421,60 @@ pub enum StateError {
     FloorLowered,
 }
 
+/// A lifecycle transition (`lifecycle`, C4, M5-D5) refused; the record is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum LifecycleError {
+    /// The record is a machine install's, which only the privileged engine writes.
+    #[error("a machine install's state is not written here")]
+    MachineScope,
+    /// The record has no current version.
+    #[error("nothing is installed")]
+    NotInstalled,
+    /// The record already has a current version.
+    #[error("already installed")]
+    AlreadyInstalled,
+    /// No usable staged version (none, not newer, bad, or another target).
+    #[error("nothing usable is staged")]
+    NothingStaged,
+    /// The staged version is not the one asked for.
+    #[error("the staged version is not the requested one")]
+    StagedVersionMismatch,
+    /// `staged_issued` is missing or names another staged entry; the app stages again.
+    #[error("the staged entry has no bound issued time")]
+    StagedIssuedUnbound,
+    /// A version is already pending its health check.
+    #[error("a version is already pending")]
+    PendingExists,
+    /// The version is not the pending one.
+    #[error("the version is not pending")]
+    NotPending,
+    /// There is no previous version to roll back to.
+    #[error("no previous version")]
+    NoPrevious,
+    /// `bad` is full, so a rollback after this apply could not record its version.
+    #[error("too many bad versions")]
+    BadFull,
+    /// A presented health token does not match the recorded one.
+    #[error("the health token does not match")]
+    TokenMismatch,
+}
+
+/// A layout rule (`layout`, M5-D2, M5-D17) refused. Paths are never shown.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum LayoutError {
+    /// The executable does not lie in the entry's directory of the tree whose config was found.
+    #[error("the executable is not in its tree's entry directory")]
+    NotThisTree,
+    /// `current` under the install root is a file or a directory, not a link.
+    #[error("the current link is not a symlink")]
+    CurrentNotALink,
+    /// A filesystem operation failed.
+    #[error("{0}")]
+    Fs(#[from] FsError),
+}
+
 /// Why [`crate::stage::stage`] did not produce a tree (C3). Paths are never shown.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -779,4 +833,10 @@ pub enum Error {
     /// The operating-system integration (desktop entry, command link) failed.
     #[error("{0}")]
     Integration(#[from] IntegrationError),
+    /// A lifecycle transition refused.
+    #[error("lifecycle: {0}")]
+    Lifecycle(#[from] LifecycleError),
+    /// A layout rule refused.
+    #[error("layout: {0}")]
+    Layout(#[from] LayoutError),
 }
