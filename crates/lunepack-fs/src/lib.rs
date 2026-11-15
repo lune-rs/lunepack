@@ -55,6 +55,9 @@ impl StdFs {
 }
 
 /// Maps an `io::Error` of operation `op` on `path` to an [`FsError`] that names both.
+/// How often `read_link` looks again after an EINVAL that a concurrent replace caused.
+const READ_LINK_RETRIES: u32 = 16;
+
 fn err<'a>(op: &'static str, path: &'a Path) -> impl Fn(io::Error) -> FsError + 'a {
     move |e| FsError::from_io(path, e).during(op)
 }
@@ -311,16 +314,37 @@ impl Fs for StdFs {
     }
 
     fn read_link(&self, path: &Path) -> Result<String, FsError> {
-        match lstat(path)? {
-            None => Err(FsError::new(FsErrorKind::NotFound, path, None).during("read_link")),
-            Some(meta) if !meta.file_type().is_symlink() => {
-                Err(FsError::new(FsErrorKind::NotASymlink, path, None).during("read_link"))
+        // `lstat` then `readlink` is two lookups. When `replace_symlink` renames a new link over
+        // the one `readlink` found, macOS can answer EINVAL ("not a symlink") for the old,
+        // just-unlinked link (seen on the macOS CI runners). EINVAL after an `lstat` that saw a
+        // symlink means the entry changed under us: look again, a bounded number of times.
+        let mut attempts = 0;
+        loop {
+            match lstat(path)? {
+                None => {
+                    return Err(FsError::new(FsErrorKind::NotFound, path, None).during("read_link"));
+                }
+                Some(meta) if !meta.file_type().is_symlink() => {
+                    return Err(
+                        FsError::new(FsErrorKind::NotASymlink, path, None).during("read_link")
+                    );
+                }
+                Some(_) => {}
             }
-            Some(_) => fs::read_link(path)
-                .map_err(err("read_link", path))?
-                .into_os_string()
-                .into_string()
-                .map_err(|_| other(path, "link target is not UTF-8").during("read_link")),
+            match fs::read_link(path) {
+                Ok(target) => {
+                    return target
+                        .into_os_string()
+                        .into_string()
+                        .map_err(|_| other(path, "link target is not UTF-8").during("read_link"));
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::InvalidInput && attempts < READ_LINK_RETRIES =>
+                {
+                    attempts += 1;
+                }
+                Err(e) => return Err(FsError::from_io(path, e).during("read_link")),
+            }
         }
     }
 

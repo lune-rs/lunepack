@@ -318,8 +318,15 @@ mod unix {
             let reader = s.spawn(|| {
                 let mut seen = 0u32;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let target = fs::read_link(&link).expect("the link vanished mid-replace");
-                    assert!(target.to_string_lossy().starts_with('v'));
+                    // The rename is atomic: the name is never missing, not even for a moment.
+                    let meta = fs::symlink_metadata(&link).expect("the link vanished mid-replace");
+                    assert!(meta.file_type().is_symlink());
+                    // The adapter's reader always gets a target (macOS can answer EINVAL to a
+                    // raw `readlink` that races the rename; `StdFs::read_link` looks again).
+                    let target = StdFs
+                        .read_link(&link)
+                        .expect("read_link failed mid-replace");
+                    assert!(target.starts_with('v'));
                     seen += 1;
                 }
                 seen
