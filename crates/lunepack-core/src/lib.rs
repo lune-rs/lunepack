@@ -57,7 +57,9 @@ pub use fs::{
     DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, ReadAt,
 };
 pub use ident::{AppId, Channel};
-pub use integration::{IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration};
+pub use integration::{
+    IntegrationError, IntegrationItem, IntegrationReport, IntegrationRequest, OsIntegration,
+};
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use layout::{
     Discovery, UserLayout, discover, reconcile_current, tree_candidates, version_config_path,

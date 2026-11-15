@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lunepack_core::{
-    AppId, InstallMeta, IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration,
-    RelPath, Scope,
+    AppId, InstallMeta, IntegrationError, IntegrationItem, IntegrationReport, IntegrationRequest,
+    OsIntegration, RelPath, Scope,
 };
 
 /// Which operation a [`IntegrationCall`] was.
@@ -33,6 +33,8 @@ pub struct IntegrationCall {
     pub install_root: PathBuf,
     /// The metadata.
     pub meta: InstallMeta,
+    /// The stale command-link names the request carried.
+    pub stale_bins: Vec<String>,
 }
 
 #[derive(Default)]
@@ -99,6 +101,7 @@ impl FakeIntegration {
             app_id: req.app_id.as_str().to_owned(),
             install_root: req.install_root.clone(),
             meta: req.meta.clone(),
+            stale_bins: req.stale_bins.clone(),
         });
         if scope != Scope::User {
             return Err(IntegrationError::Unsupported);
@@ -116,7 +119,11 @@ impl OsIntegration for FakeIntegration {
         }
     }
 
-    fn apply(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+    fn apply(
+        &self,
+        scope: Scope,
+        req: &IntegrationRequest,
+    ) -> Result<IntegrationReport, IntegrationError> {
         let mut inner = self.enter(IntegrationOp::Apply, scope, req)?;
         if let Some(item) = inner.conflict {
             return Err(IntegrationError::Conflict(item));
@@ -127,13 +134,17 @@ impl OsIntegration for FakeIntegration {
         inner
             .applied
             .insert(req.app_id.as_str().to_owned(), req.meta.clone());
-        Ok(())
+        Ok(IntegrationReport::default())
     }
 
-    fn remove(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+    fn remove(
+        &self,
+        scope: Scope,
+        req: &IntegrationRequest,
+    ) -> Result<IntegrationReport, IntegrationError> {
         let mut inner = self.enter(IntegrationOp::Remove, scope, req)?;
         inner.applied.remove(req.app_id.as_str());
-        Ok(())
+        Ok(IntegrationReport::default())
     }
 }
 
@@ -185,6 +196,7 @@ fn suite_request(sandbox: &Path, id: &str, name: &str, bin: &str) -> Integration
             bin: Some(bin.to_owned()),
             terminal: false,
         },
+        stale_bins: Vec::new(),
     }
 }
 
@@ -199,7 +211,8 @@ fn suite_request(sandbox: &Path, id: &str, name: &str, bin: &str) -> Integration
 /// is `Unsupported` for all three operations and writes nothing; unsafe metadata (a newline or a
 /// separator in a text field, a path separator or `..` in `bin`, a quote or `%` in the install
 /// root) is refused by `check` and `apply`, writes nothing, and the error does not show the
-/// value. The install root of a request need not exist.
+/// value; `apply` and `remove` report nothing kept on a clean run. The install root of a request
+/// need not exist.
 pub fn run_integration_suite(integration: &dyn OsIntegration, sandbox: &Path) {
     let empty = snapshot(sandbox);
     assert!(empty.is_empty(), "the sandbox must start empty");
@@ -221,7 +234,11 @@ pub fn run_integration_suite(integration: &dyn OsIntegration, sandbox: &Path) {
     );
 
     // apply creates, and is idempotent.
-    integration.apply(Scope::User, &a).expect("apply");
+    let report = integration.apply(Scope::User, &a).expect("apply");
+    assert!(
+        report.kept.is_empty(),
+        "apply left something on a clean run"
+    );
     let applied = snapshot(sandbox);
     assert_ne!(applied, empty, "apply created nothing");
     integration.apply(Scope::User, &a).expect("apply again");
@@ -253,7 +270,8 @@ pub fn run_integration_suite(integration: &dyn OsIntegration, sandbox: &Path) {
     );
 
     // remove takes it all away.
-    integration.remove(Scope::User, &a).expect("remove");
+    let report = integration.remove(Scope::User, &a).expect("remove");
+    assert!(report.kept.is_empty(), "remove kept what it made");
     assert_eq!(snapshot(sandbox), empty, "remove left something behind");
     integration.remove(Scope::User, &a).expect("remove again");
     assert_eq!(
@@ -277,8 +295,8 @@ pub fn run_integration_suite(integration: &dyn OsIntegration, sandbox: &Path) {
     // Per-machine scope is unsupported, for every operation.
     for (what, result) in [
         ("check", integration.check(Scope::Machine, &a)),
-        ("apply", integration.apply(Scope::Machine, &a)),
-        ("remove", integration.remove(Scope::Machine, &a)),
+        ("apply", integration.apply(Scope::Machine, &a).map(|_| ())),
+        ("remove", integration.remove(Scope::Machine, &a).map(|_| ())),
     ] {
         assert!(
             matches!(result, Err(IntegrationError::Unsupported)),
@@ -330,7 +348,7 @@ fn unsafe_cases(
     for (what, req) in &cases {
         for (op, result) in [
             ("check", integration.check(Scope::User, req)),
-            ("apply", integration.apply(Scope::User, req)),
+            ("apply", integration.apply(Scope::User, req).map(|_| ())),
         ] {
             let err = result.expect_err(what);
             let shown = format!("{err} / {err:?}");
