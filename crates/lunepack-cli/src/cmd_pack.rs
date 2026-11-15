@@ -7,28 +7,32 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use lunepack_codec_lzma::LzmaCodec;
 use lunepack_core::digest::U53;
+use lunepack_core::error::UpdateConfigError;
 use lunepack_core::{
-    AppId, ArtifactRef, Channel, ClockReading, CodeSign, Hasher, PayloadKind, ReleaseDoc,
-    ReleaseLayout, RollbackFloor, Signer, Target, VerifiedEntry, VerifiedKeySet, Version,
-    decode_verified, next_feed, sign_envelope, verify_feed, verify_manifest,
+    AppId, ArtifactRef, Channel, ClockReading, CodeSign, Hasher, InstallMeta, PayloadKind,
+    ReleaseDoc, ReleaseLayout, RollbackFloor, Signer, Target, UpdateConfig, VerifiedEntry,
+    VerifiedKeySet, Version, check_runtime_image, decode_verified, next_feed, sign_envelope,
+    verify_feed, verify_manifest,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
 use crate::config::{Config, resolve_signer, writer_clock};
-use crate::pipeline::{self, Settings};
+use crate::pipeline::{self, Settings, UpdatePlan};
 use crate::place;
 use crate::release_dir;
 
 /// Prefix of the work dir under the system temp dir.
 pub const WORK_PREFIX: &str = "lunepack-pack-";
+/// Largest `--runtime` file read, in bytes.
+const MAX_RUNTIME_BYTES: u64 = 256 * 1024 * 1024;
 /// Default memory budget of the pack stage, in MiB.
 const DEFAULT_BUDGET_MIB: u64 = 2048;
 /// The channel of the throwaway feed the self-check signs; never written anywhere.
@@ -63,6 +67,10 @@ pub struct PackArgs {
     #[arg(long = "memory-budget-mib", default_value_t = DEFAULT_BUDGET_MIB,
           value_parser = clap::value_parser!(u64).range(1..=(1 << 40)))]
     memory_budget_mib: u64,
+    /// The static runtime to place beside the entry; required when the config has `[update]`, and
+    /// refused without it.
+    #[arg(long)]
+    runtime: Option<PathBuf>,
 }
 
 fn say(line: &str) -> Result<()> {
@@ -222,6 +230,87 @@ fn self_verify(
     Ok(frames)
 }
 
+/// What `[update]` adds to a pack, built before anything is read from the input tree.
+struct Prepared {
+    install: InstallMeta,
+    runtime: Vec<u8>,
+    config: Vec<u8>,
+}
+
+/// Names the config field a core refusal is about, never the value.
+fn config_error(e: UpdateConfigError) -> anyhow::Error {
+    match &e {
+        UpdateConfigError::Feed(rule) => anyhow!("[update] feed: {rule}"),
+        UpdateConfigError::Invalid { field, rule } => match field.strip_prefix("install.") {
+            Some(name) => anyhow!("[install] {name}: {rule}"),
+            None if ["feed", "channel", "health_timeout_secs"].contains(field) => {
+                anyhow!("[update] {field}: {rule}")
+            }
+            None => anyhow!("the update config is not valid: {e}"),
+        },
+        _ => anyhow!("the update config is not valid: {e}"),
+    }
+}
+
+fn read_runtime(path: &Path) -> Result<Vec<u8>> {
+    // Classified before opening: a FIFO blocks on open.
+    let meta = fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("--runtime {} is not a regular file", path.display());
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|f| f.take(MAX_RUNTIME_BYTES + 1).read_to_end(&mut bytes))
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_RUNTIME_BYTES {
+        bail!(
+            "--runtime {} is over {MAX_RUNTIME_BYTES} bytes",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+/// M5-D7: with `[update]` the runtime is required and the update config is written for this
+/// version and target; without it `--runtime` is refused. Every check that needs no tree runs here.
+fn prepare_update(
+    config: &Config,
+    runtime: Option<&Path>,
+    version: &Version,
+    target: Target,
+) -> Result<Option<Prepared>> {
+    let Some(settings) = &config.update else {
+        if runtime.is_some() {
+            bail!("--runtime needs [update] and [install] in the config");
+        }
+        return Ok(None);
+    };
+    let Some(runtime) = runtime else {
+        bail!("--runtime is required when the config has [update]");
+    };
+    let root = config.trusted_root(&Sha256Hasher, &Ed25519Verifier)?;
+    let document = UpdateConfig::new(
+        &root,
+        version.clone(),
+        target,
+        &settings.feed,
+        settings.channel.clone(),
+        settings.health_timeout_secs,
+        settings.install.clone(),
+    )
+    .map_err(config_error)?;
+    // The authoritative check, the one the facade runs before any request: the URL parser agrees.
+    lunepack::check_config_feed(&document.feed).map_err(config_error)?;
+    let bytes = read_runtime(runtime)?;
+    check_runtime_image(&bytes, target)
+        .map_err(|e| anyhow!("--runtime is not a runtime for {}: {e}", target.as_str()))?;
+    Ok(Some(Prepared {
+        install: document.install.clone(),
+        config: document.to_bytes().map_err(config_error)?,
+        runtime: bytes,
+    }))
+}
+
 /// `pack`: see the module documentation.
 pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Result<()> {
     let config = Config::load(config_path)?;
@@ -242,6 +331,8 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
             target.as_str()
         );
     }
+
+    let prepared = prepare_update(&config, args.runtime.as_deref(), &version, target)?;
 
     let clock = writer_clock()?;
     let now = clock.now_unix_secs();
@@ -285,6 +376,12 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         encoder: &LzmaCodec,
         codec: &LzmaCodec,
         hasher: &hasher,
+        update: prepared.as_ref().map(|p| UpdatePlan {
+            target,
+            install: &p.install,
+            runtime: &p.runtime,
+            config: &p.config,
+        }),
     };
     // Removed on drop: on success and on every error path.
     let work = tempfile::Builder::new()

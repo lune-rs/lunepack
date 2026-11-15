@@ -10,8 +10,9 @@ use lunepack_core::path::RelPath;
 use lunepack_core::{
     AppId, Channel, ClockReading, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream,
     Encoder, Error, FeedTargetEntry, FileClass, FrameView, Hasher, PackedFile, PayloadKind,
-    ReleaseLayout, RollbackFloor, Target, VerifiedEntry, VerifiedKeySet, candidates, classify,
-    decode_verified, pack_file, verify_feed, verify_manifest,
+    ReleaseLayout, RollbackFloor, RuntimeImageError, Target, VerifiedEntry, VerifiedKeySet,
+    candidates, check_runtime_image, classify, decode_verified, pack_file, verify_feed,
+    verify_manifest,
 };
 use lunepack_testkit::exe_headers::{self, arm64_like, x86_like};
 use lunepack_testkit::{
@@ -903,4 +904,147 @@ fn the_version_text_is_kept_verbatim() {
     assert_eq!(doc.version, "1.2.0-rc.1+build.5");
     assert_eq!(doc.pack.path, "1.2.0-rc.1+build.5/macos-universal.pack");
     assert!(doc.pack.check().is_ok());
+}
+
+// ---- the runtime image check (M5-D7) -------------------------------------------------------------
+
+/// A 64-bit little-endian ELF with a program header table holding `types`, as a real linker lays
+/// it out: `ET_DYN`, the table right after the 64-byte header.
+fn elf_with_phdrs(machine: u16, e_type: u16, types: &[u32]) -> Vec<u8> {
+    let mut h = exe_headers::elf(machine, false, 64 + 56 * types.len() + 128);
+    h[16..18].copy_from_slice(&e_type.to_le_bytes());
+    h[32..40].copy_from_slice(&64u64.to_le_bytes());
+    h[54..56].copy_from_slice(&56u16.to_le_bytes());
+    h[56..58].copy_from_slice(&(types.len() as u16).to_le_bytes());
+    for (i, t) in types.iter().enumerate() {
+        let at = 64 + 56 * i;
+        h[at..at + 4].copy_from_slice(&t.to_le_bytes());
+    }
+    h
+}
+
+#[test]
+fn runtime_image_check_for_linux() {
+    use RuntimeImageError as E;
+    const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
+    const PT_INTERP: u32 = 3;
+    let ok =
+        |m, t, types: &[u32], target| check_runtime_image(&elf_with_phdrs(m, t, types), target);
+    // Static: ET_EXEC and static-pie (ET_DYN without an interpreter) both pass.
+    assert_eq!(ok(62, 2, &[PT_LOAD], Target::LinuxX86_64), Ok(()));
+    assert_eq!(
+        ok(62, 3, &[PT_LOAD, PT_DYNAMIC], Target::LinuxX86_64),
+        Ok(())
+    );
+    assert_eq!(ok(183, 3, &[PT_LOAD], Target::LinuxAarch64), Ok(()));
+    // A PT_INTERP anywhere in the table is a dynamic executable.
+    assert_eq!(
+        ok(62, 3, &[PT_LOAD, PT_INTERP], Target::LinuxX86_64),
+        Err(E::Dynamic)
+    );
+    // The wrong machine, for both targets.
+    assert_eq!(ok(183, 3, &[PT_LOAD], Target::LinuxX86_64), Err(E::Machine));
+    assert_eq!(ok(62, 3, &[PT_LOAD], Target::LinuxAarch64), Err(E::Machine));
+    // A relocatable object or a core file, a table with no loadable segment, no table at all.
+    assert_eq!(ok(62, 1, &[PT_LOAD], Target::LinuxX86_64), Err(E::Format));
+    assert_eq!(
+        ok(62, 3, &[PT_DYNAMIC], Target::LinuxX86_64),
+        Err(E::Malformed)
+    );
+    assert_eq!(
+        check_runtime_image(&elf_with_phdrs(62, 3, &[]), Target::LinuxX86_64),
+        Err(E::Malformed)
+    );
+    // 32-bit and big-endian ELF, other formats, and bytes too short to hold a header.
+    let mut elf32 = elf_with_phdrs(62, 3, &[PT_LOAD]);
+    elf32[4] = 1;
+    assert_eq!(
+        check_runtime_image(&elf32, Target::LinuxX86_64),
+        Err(E::Format)
+    );
+    assert_eq!(
+        check_runtime_image(&exe_headers::elf(62, true, 4096), Target::LinuxX86_64),
+        Err(E::Format)
+    );
+    assert_eq!(
+        check_runtime_image(&exe_headers::pe(0x8664, 4096), Target::LinuxX86_64),
+        Err(E::Format)
+    );
+    assert_eq!(
+        check_runtime_image(b"", Target::LinuxX86_64),
+        Err(E::Format)
+    );
+    // A table that runs past the end of the file, and a count of 0xFFFF.
+    let mut cut = elf_with_phdrs(62, 3, &[PT_LOAD]);
+    cut.truncate(64 + 20);
+    assert_eq!(
+        check_runtime_image(&cut, Target::LinuxX86_64),
+        Err(E::Malformed)
+    );
+    let mut xnum = elf_with_phdrs(62, 3, &[PT_LOAD]);
+    xnum[56..58].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    assert_eq!(
+        check_runtime_image(&xnum, Target::LinuxX86_64),
+        Err(E::Malformed)
+    );
+    // No prefix of a valid image panics.
+    let full = elf_with_phdrs(62, 3, &[PT_LOAD, PT_INTERP]);
+    for n in 0..full.len() {
+        let _ = check_runtime_image(&full[..n], Target::LinuxX86_64);
+    }
+}
+
+#[test]
+fn runtime_image_check_for_windows_and_macos() {
+    use RuntimeImageError as E;
+    let pe = |m| exe_headers::pe(m, 4096);
+    assert_eq!(
+        check_runtime_image(&pe(0x8664), Target::WindowsX86_64),
+        Ok(())
+    );
+    assert_eq!(
+        check_runtime_image(&pe(0xAA64), Target::WindowsAarch64),
+        Ok(())
+    );
+    assert_eq!(
+        check_runtime_image(&pe(0xAA64), Target::WindowsX86_64),
+        Err(E::Machine)
+    );
+    assert_eq!(
+        check_runtime_image(&exe_headers::elf(62, false, 4096), Target::WindowsX86_64),
+        Err(E::Format)
+    );
+    let macho = |c| exe_headers::macho(c, false, 4096);
+    assert_eq!(
+        check_runtime_image(&macho(X86_64), Target::MacosX86_64),
+        Ok(())
+    );
+    assert_eq!(
+        check_runtime_image(&macho(ARM64), Target::MacosAarch64),
+        Ok(())
+    );
+    assert_eq!(
+        check_runtime_image(&macho(I386), Target::MacosX86_64),
+        Err(E::Machine)
+    );
+    assert_eq!(
+        check_runtime_image(&macho(ARM64), Target::MacosX86_64),
+        Err(E::Machine)
+    );
+    let both = exe_headers::fat(&[X86_64, ARM64], 4096);
+    assert_eq!(check_runtime_image(&both, Target::MacosUniversal), Ok(()));
+    let one = exe_headers::fat(&[ARM64], 4096);
+    assert_eq!(
+        check_runtime_image(&one, Target::MacosUniversal),
+        Err(E::Machine)
+    );
+    assert_eq!(
+        check_runtime_image(&macho(ARM64), Target::MacosUniversal),
+        Err(E::Format)
+    );
+    assert_eq!(
+        check_runtime_image(b"MZ", Target::WindowsX86_64),
+        Err(E::Format)
+    );
 }

@@ -188,6 +188,144 @@ pub fn classify(bytes: &[u8]) -> FileClass {
         .unwrap_or(FileClass::Data)
 }
 
+/// Why a file cannot be the runtime of a target (M5-D7). No byte of the file is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RuntimeImageError {
+    /// Not an executable of the format the target uses (ELF 64-bit little-endian for `linux-*`,
+    /// PE for `windows-*`, Mach-O for `macos-*`).
+    #[error("not an executable of the target's format")]
+    Format,
+    /// Built for another architecture than the target.
+    #[error("built for another architecture than the target")]
+    Machine,
+    /// A Linux executable with an interpreter (`PT_INTERP`): dynamically linked.
+    #[error("dynamically linked (it names an interpreter); the runtime must be static")]
+    Dynamic,
+    /// The ELF header or its program header table does not hold together.
+    #[error("the ELF program headers are malformed")]
+    Malformed,
+}
+
+const ELF_PHENTSIZE: usize = 56;
+const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
+
+fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
+    let raw: [u8; 8] = bytes.get(at..at.checked_add(8)?)?.try_into().ok()?;
+    Some(u64::from_le_bytes(raw))
+}
+
+fn check_elf_runtime(bytes: &[u8], machine: u16) -> Result<(), RuntimeImageError> {
+    use RuntimeImageError as E;
+    // ELFCLASS64 and little-endian: both Linux targets.
+    if !bytes.starts_with(&[0x7F, b'E', b'L', b'F']) || bytes.get(4) != Some(&2) {
+        return Err(E::Format);
+    }
+    if bytes.get(5) != Some(&1) {
+        return Err(E::Format);
+    }
+    // ET_EXEC, or ET_DYN (a static-pie executable is ET_DYN without an interpreter).
+    if !matches!(u16_at(bytes, 16, false).ok_or(E::Malformed)?, 2 | 3) {
+        return Err(E::Format);
+    }
+    if u16_at(bytes, 18, false).ok_or(E::Malformed)? != machine {
+        return Err(E::Machine);
+    }
+    let phoff =
+        usize::try_from(u64_at(bytes, 32).ok_or(E::Malformed)?).map_err(|_| E::Malformed)?;
+    let phentsize = usize::from(u16_at(bytes, 54, false).ok_or(E::Malformed)?);
+    let phnum = usize::from(u16_at(bytes, 56, false).ok_or(E::Malformed)?);
+    // 0xFFFF (PN_XNUM) moves the count into a section header; not read here, so refused.
+    if phentsize != ELF_PHENTSIZE || phnum == 0 || phnum == 0xFFFF {
+        return Err(E::Malformed);
+    }
+    let end = phnum
+        .checked_mul(ELF_PHENTSIZE)
+        .and_then(|n| n.checked_add(phoff))
+        .ok_or(E::Malformed)?;
+    if end > bytes.len() {
+        return Err(E::Malformed);
+    }
+    let mut loads = 0usize;
+    for i in 0..phnum {
+        match u32_at(bytes, phoff + i * ELF_PHENTSIZE, false).ok_or(E::Malformed)? {
+            PT_INTERP => return Err(E::Dynamic),
+            PT_LOAD => loads += 1,
+            _ => {}
+        }
+    }
+    if loads == 0 {
+        return Err(E::Malformed);
+    }
+    Ok(())
+}
+
+fn check_pe_runtime(bytes: &[u8], machine: u16) -> Result<(), RuntimeImageError> {
+    use RuntimeImageError as E;
+    if !bytes.starts_with(b"MZ") {
+        return Err(E::Format);
+    }
+    let lfanew = u32_at(bytes, 0x3C, false)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or(E::Format)?;
+    let sig_end = lfanew.checked_add(4).ok_or(E::Format)?;
+    if bytes.get(lfanew..sig_end) != Some(b"PE\0\0".as_slice()) {
+        return Err(E::Format);
+    }
+    if u16_at(bytes, sig_end, false).ok_or(E::Format)? == machine {
+        Ok(())
+    } else {
+        Err(E::Machine)
+    }
+}
+
+fn check_macho_runtime(bytes: &[u8], target: Target) -> Result<(), RuntimeImageError> {
+    use RuntimeImageError as E;
+    if target == Target::MacosUniversal {
+        return match fat(bytes) {
+            Some(FileClass::Fat {
+                x86: true,
+                arm64: true,
+            }) => Ok(()),
+            Some(_) => Err(E::Machine),
+            None => Err(E::Format),
+        };
+    }
+    let big = match bytes.get(..4) {
+        Some([0xFE, 0xED, 0xFA, 0xCE | 0xCF]) => true,
+        Some([0xCE | 0xCF, 0xFA, 0xED, 0xFE]) => false,
+        _ => return Err(E::Format),
+    };
+    let want = if target == Target::MacosX86_64 {
+        CPU_TYPE_X86_64
+    } else {
+        CPU_TYPE_ARM64
+    };
+    if u32_at(bytes, 4, big).ok_or(E::Format)? == want {
+        Ok(())
+    } else {
+        Err(E::Machine)
+    }
+}
+
+/// Checks that `bytes` can be the runtime of `target` (M5-D7), from the header alone. A `linux-*`
+/// runtime must be a 64-bit little-endian ELF of the target's machine with no `PT_INTERP` (static;
+/// a static-pie executable is `ET_DYN` and passes). A `windows-*` runtime must be a PE and a
+/// `macos-*` one a Mach-O of the target's architecture (a header-class check only, until the
+/// Windows and macOS runtimes exist). Bounds-checked; never panics.
+pub fn check_runtime_image(bytes: &[u8], target: Target) -> Result<(), RuntimeImageError> {
+    match target {
+        Target::LinuxX86_64 => check_elf_runtime(bytes, 62),
+        Target::LinuxAarch64 => check_elf_runtime(bytes, 183),
+        Target::WindowsX86_64 => check_pe_runtime(bytes, 0x8664),
+        Target::WindowsAarch64 => check_pe_runtime(bytes, 0xAA64),
+        Target::MacosX86_64 | Target::MacosAarch64 | Target::MacosUniversal => {
+            check_macho_runtime(bytes, target)
+        }
+    }
+}
+
 /// The codecs worth trying for `class`, in the fixed rank order `lzma2 < bcj-x86+lzma2 <
 /// bcj-arm64+lzma2 < bcj2`. `stored` is never listed: it is the baseline every candidate must beat,
 /// and the choice when none does. An empty list means "store" (or, for an empty file, no frame).
