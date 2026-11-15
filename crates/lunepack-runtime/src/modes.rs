@@ -5,7 +5,7 @@
 //! once and carries a value of a fixed form. It never echoes an argument: a refusal is the one
 //! fixed [`USAGE_LINE`] on stderr and exit code 2, before anything else happens.
 //!
-//! Step 8 has the internal `apply` mode; `install` and `uninstall` (step 9) and the app-facing
+//! The internal modes are `apply` (step 8), `install` and `uninstall` (step 9); the app-facing
 //! commands (step 12) extend [`Mode`] and the table here.
 
 use std::ffi::{OsStr, OsString};
@@ -71,8 +71,10 @@ pub enum Kind {
     /// The desktop integration failed or is in the way.
     Integration,
     /// A process still runs from the install.
-    #[allow(dead_code)] // uninstall's outcome (step 9)
     InUse,
+    /// The install this runtime stands in is not the one the environment derives, or is not a
+    /// real, canonical directory holding this app's record (`install`, `uninstall`; M5-D10).
+    InstallMismatch,
     /// Anything else (a worker panic, a facade error this build does not know).
     Internal,
 }
@@ -80,7 +82,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind, in code order (for the golden of step 12).
     #[allow(dead_code)]
-    pub const ALL: [Kind; 26] = [
+    pub const ALL: [Kind; 27] = [
         Kind::Ok,
         Kind::Usage,
         Kind::NotInstalled,
@@ -106,6 +108,7 @@ impl Kind {
         Kind::AlreadyInstalled,
         Kind::Integration,
         Kind::InUse,
+        Kind::InstallMismatch,
         Kind::Internal,
     ];
 
@@ -137,6 +140,7 @@ impl Kind {
             Kind::AlreadyInstalled => 23,
             Kind::Integration => 24,
             Kind::InUse => 25,
+            Kind::InstallMismatch => 26,
             Kind::Internal => 70,
         }
     }
@@ -169,6 +173,7 @@ impl Kind {
             Kind::AlreadyInstalled => "already_installed",
             Kind::Integration => "integration",
             Kind::InUse => "in_use",
+            Kind::InstallMismatch => "install_mismatch",
             Kind::Internal => "internal",
         }
     }
@@ -252,6 +257,10 @@ impl std::fmt::Debug for ApplyArgs {
 pub enum Mode {
     /// `apply --wait-pid <u32> --wait-start <u64> --version <ver> [-- <args>…]`.
     Apply(ApplyArgs),
+    /// `install`: the first install from the bootstrap tree this runtime belongs to.
+    Install,
+    /// `uninstall`: removes the install this runtime belongs to.
+    Uninstall,
 }
 
 /// The arguments do not follow the grammar. Carries nothing about them.
@@ -263,6 +272,9 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
     let (mode, rest) = args.split_first().ok_or(UsageError)?;
     match mode.to_str() {
         Some("apply") => parse_apply(rest).map(Mode::Apply),
+        // No options: everything they use is derived, nothing comes from argv (M5-D10).
+        Some("install") if rest.is_empty() => Ok(Mode::Install),
+        Some("uninstall") if rest.is_empty() => Ok(Mode::Uninstall),
         _ => Err(UsageError),
     }
 }
@@ -347,7 +359,9 @@ mod tests {
             "x",
         ]))
         .expect("parse");
-        let Mode::Apply(a) = got;
+        let Mode::Apply(a) = got else {
+            panic!("not apply");
+        };
         assert_eq!(
             a.wait,
             ProcessId {
@@ -372,7 +386,11 @@ mod tests {
         let bad: Vec<Vec<OsString>> = vec![
             os(&[]),
             os(&["Apply"]),
-            os(&["install"]),
+            os(&["install", "--root"]),
+            os(&["install", "/tmp/r"]),
+            os(&["uninstall", "--"]),
+            os(&["uninstall", "/tmp/r"]),
+            os(&["Uninstall"]),
             os(&["apply"]),
             ok(&["--wait-pid", "3"]),
             ok(&["--json"]),
@@ -457,6 +475,12 @@ mod tests {
     }
 
     #[test]
+    fn install_and_uninstall_take_no_arguments() {
+        assert_eq!(parse(&os(&["install"])), Ok(Mode::Install));
+        assert_eq!(parse(&os(&["uninstall"])), Ok(Mode::Uninstall));
+    }
+
+    #[test]
     fn codes_and_names_are_unique() {
         let mut codes: Vec<u8> = Kind::ALL.iter().map(|k| k.code()).collect();
         let mut names: Vec<&str> = Kind::ALL.iter().map(|k| k.name()).collect();
@@ -470,5 +494,7 @@ mod tests {
         assert_eq!(Kind::RolledBack.code(), 20);
         assert_eq!(Kind::WaitTimeout.code(), 21);
         assert_eq!(Kind::RollbackUnavailable.code(), 22);
+        assert_eq!(Kind::InUse.code(), 25);
+        assert_eq!(Kind::InstallMismatch.code(), 26);
     }
 }
