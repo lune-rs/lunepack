@@ -12,3 +12,6 @@ workspace = true
 
 [dependencies]
 lunepack-core.workspace = true
+# The facade (Installation, the lifecycle calls) and the Linux adapters; wired in main.rs (step 8).
+lunepack.workspace = true
+lunepack-os-linux.workspace = true

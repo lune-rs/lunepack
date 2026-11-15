@@ -3,7 +3,10 @@
 //! No variant's `Display` holds a URL query, a full user path or key bytes: core errors name only
 //! file names and origins, and the facade adds fixed text.
 
-use lunepack_core::{FsError, RangeError, RelPath, StateError, TransportError};
+use lunepack_core::{
+    FsError, IntegrationError, LayoutError, LifecycleError, ProcessError, ProcessErrorKind,
+    RangeError, RelPath, StateError, TransportError, UpdateConfigError,
+};
 
 /// Every way an [`Updater`](crate::Updater) operation fails.
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +62,39 @@ pub enum Error {
     /// The configuration is unusable (for example a feed URL with an unsupported scheme).
     #[error("configuration: {0}")]
     Config(&'static str),
+    /// This platform has no adapter for the call yet (processes and desktop integration outside
+    /// Linux in M5).
+    #[error("not supported on this platform")]
+    Unsupported,
+    /// No directory from the executable's own up holds an update config (a development run).
+    #[error("no update config was found for this executable")]
+    NoUpdateConfig,
+    /// The update config found for the executable is unusable: refused by the reader or the feed
+    /// rule, not a regular file, or the executable is not in its entry's directory.
+    #[error("update config: {0}")]
+    UpdateConfig(UpdateConfigError),
+    /// Nothing usable is staged (none, not newer, bad, its tree missing, or its `issued` not
+    /// bound to it); the app stages again.
+    #[error("nothing is staged")]
+    NothingStaged,
+    /// The staged version is not the one the app expected.
+    #[error("the staged version is not the expected one")]
+    UnexpectedVersion,
+    /// The install already has a current version.
+    #[error("already installed")]
+    AlreadyInstalled,
+    /// The health token does not match the supervised start's, or is malformed.
+    #[error("the health token does not match")]
+    TokenMismatch,
+    /// A process operation failed.
+    #[error("{0}")]
+    Process(ProcessError),
+    /// The desktop integration failed or is in the way.
+    #[error("{0}")]
+    Integration(IntegrationError),
+    /// There is no previous version to roll back to.
+    #[error("no previous version to roll back to")]
+    RollbackUnavailable,
 }
 
 /// Sorts a core error into the variant an app can act on: a disk failure is [`Error::Fs`] (so
@@ -71,7 +107,49 @@ impl From<lunepack_core::Error> for Error {
             lunepack_core::Error::Transport(e) => Error::Transport(e),
             lunepack_core::Error::Cancelled => Error::Cancelled,
             lunepack_core::Error::State(e) => Error::from(e),
+            lunepack_core::Error::Process(e) => Error::from(e),
+            lunepack_core::Error::Integration(e) => Error::from(e),
+            lunepack_core::Error::Lifecycle(e) => Error::from(e),
+            lunepack_core::Error::Layout(LayoutError::Fs(e)) => Error::Fs(e),
             other => Error::Verify(other),
+        }
+    }
+}
+
+impl From<ProcessError> for Error {
+    fn from(e: ProcessError) -> Self {
+        match e.kind {
+            ProcessErrorKind::Unsupported => Error::Unsupported,
+            _ => Error::Process(e),
+        }
+    }
+}
+
+impl From<IntegrationError> for Error {
+    fn from(e: IntegrationError) -> Self {
+        match e {
+            IntegrationError::Unsupported => Error::Unsupported,
+            IntegrationError::Fs(e) => Error::Fs(e),
+            other => Error::Integration(other),
+        }
+    }
+}
+
+/// A refused transition as the app sees it: a staged entry that cannot be applied is nothing
+/// staged (C9), and the rest keep the core's reason.
+impl From<LifecycleError> for Error {
+    fn from(e: LifecycleError) -> Self {
+        match e {
+            LifecycleError::MachineScope => Error::MachineScope,
+            LifecycleError::NotInstalled => Error::NotInstalled,
+            LifecycleError::AlreadyInstalled => Error::AlreadyInstalled,
+            LifecycleError::NothingStaged | LifecycleError::StagedIssuedUnbound => {
+                Error::NothingStaged
+            }
+            LifecycleError::StagedVersionMismatch => Error::UnexpectedVersion,
+            LifecycleError::NoPrevious => Error::RollbackUnavailable,
+            LifecycleError::TokenMismatch => Error::TokenMismatch,
+            other => Error::Verify(lunepack_core::Error::Lifecycle(other)),
         }
     }
 }

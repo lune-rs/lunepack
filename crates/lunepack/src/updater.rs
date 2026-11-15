@@ -21,16 +21,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lunepack_core::fetch::FetchPolicy;
+use lunepack_core::state::{CurrentRef, Scope};
 use lunepack_core::state::{
     Floors, InstallCounters, InstallState, Loaded, MachineScope as MachineStore, RootParts,
     StagedRef, UserScope,
 };
 use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, CancelToken, Channel, ClockReading, Codec,
-    FileKind, Fs, Hasher, Limits, Phase, Progress, Request, Sha256Digest, SourceFor, StageEnv,
-    StageError, StageInput, Target, Transport, TransportError, TrustedRoot, VerifiedEntry,
-    VerifiedManifest, Verifier, Version, advance_root, select_candidate, verify_feed,
-    verify_key_set, verify_manifest,
+    FileKind, Fs, Hasher, IntegrationRequest, Limits, OsIntegration, Phase, Progress, Request, Rng,
+    Sha256Digest, SourceFor, StageEnv, StageError, StageInput, Target, Transport, TransportError,
+    TrustedRoot, UPDATE_CONFIG_FILE, UpdateConfigError, VerifiedEntry, VerifiedManifest, Verifier,
+    Version, advance_root, select_candidate, verify_feed, verify_key_set, verify_manifest,
 };
 
 use crate::cache::{Cache, CacheKind};
@@ -187,6 +188,8 @@ pub struct UpdaterBuilder {
     hasher: Option<Arc<dyn Hasher>>,
     verifier: Option<Arc<dyn Verifier>>,
     clock: Option<Arc<dyn lunepack_core::Clock>>,
+    rng: Option<Arc<dyn Rng>>,
+    integration: Option<Arc<dyn OsIntegration>>,
     workers: Option<usize>,
     budget: u64,
     policy: FetchPolicy,
@@ -222,6 +225,8 @@ impl UpdaterBuilder {
             hasher: None,
             verifier: None,
             clock: None,
+            rng: None,
+            integration: None,
             workers: None,
             budget: DEFAULT_BUDGET,
             policy: FetchPolicy::default(),
@@ -268,6 +273,26 @@ impl UpdaterBuilder {
     /// The clock (default: [`SystemClock`]).
     pub fn clock(mut self, clock: Arc<dyn lunepack_core::Clock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// The channel to follow instead of the one given to [`UpdaterBuilder::new`] (a valid name,
+    /// FORMAT.md 10.5).
+    pub fn channel(mut self, channel: Channel) -> Self {
+        self.channel = channel;
+        self
+    }
+
+    /// The random source of [`Updater::install`]'s install id (default: the OS's).
+    pub fn rng(mut self, rng: Arc<dyn Rng>) -> Self {
+        self.rng = Some(rng);
+        self
+    }
+
+    /// The desktop integration [`Updater::install`] applies (default: XDG on Linux; elsewhere
+    /// [`Error::Unsupported`]).
+    pub fn integration(mut self, integration: Arc<dyn OsIntegration>) -> Self {
+        self.integration = Some(integration);
         self
     }
 
@@ -343,6 +368,10 @@ impl UpdaterBuilder {
                     .verifier
                     .unwrap_or_else(|| Arc::new(lunepack_crypto::Ed25519Verifier)),
                 clock: self.clock.unwrap_or_else(|| Arc::new(SystemClock)),
+                rng: self.rng.unwrap_or_else(|| Arc::new(lunepack_crypto::OsRng)),
+                integration: self
+                    .integration
+                    .unwrap_or_else(crate::installation::default_integration),
                 workers: workers.max(1),
                 budget: self.budget,
                 policy: self.policy,
@@ -640,6 +669,8 @@ struct Inner {
     hasher: Arc<dyn Hasher>,
     verifier: Arc<dyn Verifier>,
     clock: Arc<dyn lunepack_core::Clock>,
+    rng: Arc<dyn Rng>,
+    integration: Arc<dyn OsIntegration>,
     workers: usize,
     budget: u64,
     policy: FetchPolicy,
@@ -911,6 +942,29 @@ impl Updater {
         async move { stage(inner, downloaded).await }
     }
 
+    /// The first install (M5-D8), for an updater whose layout is a per-user install root's
+    /// ([`Layout::user`]) with the bootstrap tree it runs from as `current_tree`:
+    ///
+    /// 1. the bootstrap's update config must name this app; its desktop integration passes the
+    ///    preflight before anything is written;
+    /// 2. the install state is created when there is none (a fresh install id from the random
+    ///    source); a record with no current version resumes, one with a current version is
+    ///    [`Error::AlreadyInstalled`];
+    /// 3. the check runs with no current version (no floor time, any release of the channel), the
+    ///    newest candidate is downloaded and staged, reusing the bootstrap's files that match;
+    /// 4. under the lock the installed tree's own config is read, the integration preflight runs
+    ///    again on it, the record names the version as current (events `installed` and
+    ///    `first_run`), `current` is linked and the integration applied.
+    ///
+    /// A machine layout is [`Error::MachineScope`].
+    pub fn install(
+        &self,
+        options: DownloadOptions,
+    ) -> impl Future<Output = Result<InstalledVersion, Error>> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        async move { install(inner, options).await }
+    }
+
     /// The installed version; `Ok(None)` in a development run (no install state). Takes no lock.
     pub fn installed(&self) -> Result<Option<InstalledVersion>, Error> {
         let snap = match self.inner.load() {
@@ -966,13 +1020,41 @@ async fn check(inner: Arc<Inner>) -> Result<Option<UpdateInfo>, Error> {
         inner.load()
     })
     .await?;
+    let current = snap.record().current.clone().ok_or(Error::NotInstalled)?;
+    check_from(&inner, &lock, &cancel, snap, Some(current)).await
+}
+
+/// The check of [`Updater::install`]: the record exists and has no current version, so there is
+/// no floor time and any release of the channel is a candidate (M5-D8).
+async fn check_first(
+    inner: &Arc<Inner>,
+    cancel: &CancelToken,
+) -> Result<Option<UpdateInfo>, Error> {
+    let lock = take_lock(inner, cancel).await?;
+    let snap = on_job(inner, Some(&lock), cancel, "state-load", |inner, _| {
+        inner.load()
+    })
+    .await?;
+    if snap.record().current.is_some() {
+        return Err(Error::AlreadyInstalled);
+    }
+    check_from(inner, &lock, cancel, snap, None).await
+}
+
+/// The check proper, under `lock`, from the loaded `snap` whose current version is `current`.
+async fn check_from(
+    inner: &Arc<Inner>,
+    lock: &OpLock,
+    cancel: &CancelToken,
+    snap: Snapshot,
+    current: Option<CurrentRef>,
+) -> Result<Option<UpdateInfo>, Error> {
     let record = snap.record().clone();
-    let current = record.current.clone().ok_or(Error::NotInstalled)?;
     let floors = snap.floors();
-    let clock = ClockReading::read(&*inner.clock, Some(current.issued));
+    let clock = ClockReading::read(&*inner.clock, current.as_ref().map(|c| c.issued));
     let hasher = &*inner.hasher;
     let verifier = &*inner.verifier;
-    let transport_arc = inner.transport.for_op(&lock);
+    let transport_arc = inner.transport.for_op(lock);
     let transport = &*transport_arc;
 
     // Root walk (FORMAT.md 5.2) from the higher of the stored and the embedded root.
@@ -1009,7 +1091,7 @@ async fn check(inner: Arc<Inner>) -> Result<Option<UpdateInfo>, Error> {
     )?;
     let candidate = select_candidate(
         &feed,
-        Some(&current.version),
+        current.as_ref().map(|c| &c.version),
         record.target,
         &record.bad,
         &record.install_id,
@@ -1048,9 +1130,9 @@ async fn check(inner: Arc<Inner>) -> Result<Option<UpdateInfo>, Error> {
     };
     raised.feed_seq.insert(inner.channel.clone(), feed.seq());
     on_job(
-        &inner,
-        Some(&lock),
-        &cancel,
+        inner,
+        Some(lock),
+        cancel,
         "state-commit",
         move |inner, _| inner.commit_floors(&snap, &raised),
     )
@@ -1451,5 +1533,200 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
             tree: staged.tree,
         })
     })
+    .await
+}
+
+// ---- first install -------------------------------------------------------------------------------
+
+/// The install root `R` of a per-user layout made by [`Layout::user`]: `versions` and `state`
+/// directly under one directory.
+fn install_root_of(state_dir: &Path, versions_dir: &Path) -> Result<PathBuf, Error> {
+    let root = versions_dir
+        .parent()
+        .filter(|r| {
+            versions_dir == r.join(lunepack_core::layout::VERSIONS_DIR)
+                && state_dir == r.join(lunepack_core::layout::STATE_DIR)
+        })
+        .ok_or(Error::Config(
+            "install needs the per-user layout of an install root",
+        ))?;
+    Ok(root.to_path_buf())
+}
+
+/// The integration request for `meta` of the install at `root`.
+fn integration_request(
+    app_id: &AppId,
+    root: &Path,
+    meta: lunepack_core::InstallMeta,
+) -> IntegrationRequest {
+    IntegrationRequest {
+        app_id: app_id.clone(),
+        install_root: root.to_path_buf(),
+        meta,
+        stale_bins: Vec::new(),
+    }
+}
+
+/// The update config of the tree at `tree`, which must name `app_id`.
+fn tree_config(
+    fs: &dyn Fs,
+    app_id: &AppId,
+    tree: &Path,
+) -> Result<lunepack_core::UpdateConfig, Error> {
+    let config = crate::installation::read_config(fs, &tree.join(UPDATE_CONFIG_FILE))?
+        .ok_or(Error::NoUpdateConfig)?;
+    if &config.app_id != app_id {
+        return Err(Error::UpdateConfig(UpdateConfigError::RootMismatch(
+            "app_id",
+        )));
+    }
+    Ok(config)
+}
+
+async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<InstalledVersion, Error> {
+    let Layout::User {
+        state_dir,
+        versions_dir,
+        current_tree,
+        ..
+    } = &inner.layout
+    else {
+        return Err(Error::MachineScope);
+    };
+    let root = install_root_of(state_dir, versions_dir)?;
+    let bootstrap = current_tree.clone().ok_or(Error::Config(
+        "install needs the bootstrap tree as the current tree",
+    ))?;
+    let cancel = options.cancel.clone().unwrap_or_default();
+
+    // The bootstrap's config and the integration preflight, before the first write.
+    let boot_root = root.clone();
+    let target = on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
+        let config = tree_config(&*inner.fs, &inner.app_id, &bootstrap)?;
+        let request = integration_request(&inner.app_id, &boot_root, config.install.clone());
+        inner.integration.check(Scope::User, &request)?;
+        Ok(config.target)
+    })
+    .await?;
+
+    // The record: created when missing, resumed when it has no current version.
+    {
+        let lock = take_lock(&inner, &cancel).await?;
+        on_job(
+            &inner,
+            Some(&lock),
+            &cancel,
+            "state-create",
+            move |inner, _| {
+                let Layout::User { state_dir, .. } = &inner.layout else {
+                    return Err(Error::MachineScope);
+                };
+                let store = UserScope {
+                    dir: state_dir.clone(),
+                    app_id: inner.app_id.clone(),
+                };
+                let loaded = store.load(&*inner.fs, &*inner.hasher)?;
+                match &loaded.record {
+                    Some(record) if record.current.is_some() => Err(Error::AlreadyInstalled),
+                    Some(_) => Ok(()),
+                    None => {
+                        let mut install_id = [0u8; lunepack_core::policy::INSTALL_ID_BYTES];
+                        inner.rng.fill(&mut install_id)?;
+                        let record = InstallState::new(
+                            loaded.next_seq,
+                            inner.app_id.clone(),
+                            lunepack_core::Scope::User,
+                            install_id,
+                            target,
+                        );
+                        store.commit(&*inner.fs, &loaded, &record, &*inner.hasher)?;
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await?;
+    }
+
+    let info = check_first(&inner, &cancel).await?.ok_or(Error::Config(
+        "the channel offers no release for this install",
+    ))?;
+    // A run that staged this release before it was cut off goes straight to the commit.
+    let staged_info = info.clone();
+    let already = on_job(&inner, None, &cancel, "state-load", move |inner, _| {
+        let snap = inner.load()?;
+        let record = snap.record();
+        let bound = record.staged.as_ref().is_some_and(|s| {
+            crate::installation::same_version(&s.version, &staged_info.version)
+                && s.manifest_sha256 == staged_info.manifest_sha256
+        }) && record.staged_issued_bound().is_some();
+        let tree = inner
+            .layout
+            .versions_dir()
+            .map(|v| v.join(staged_info.version.to_string()));
+        Ok(bound && tree.is_some_and(|t| is_real_dir(&*inner.fs, &t).unwrap_or(false)))
+    })
+    .await?;
+    if !already {
+        let downloaded = download(Arc::clone(&inner), info.clone(), options).await?;
+        stage(Arc::clone(&inner), downloaded).await?;
+    }
+
+    let lock = take_lock(&inner, &cancel).await?;
+    on_job(
+        &inner,
+        Some(&lock),
+        &cancel,
+        "install-commit",
+        move |inner, _| {
+            let Layout::User {
+                state_dir,
+                versions_dir,
+                ..
+            } = &inner.layout
+            else {
+                return Err(Error::MachineScope);
+            };
+            let store = UserScope {
+                dir: state_dir.clone(),
+                app_id: inner.app_id.clone(),
+            };
+            let loaded = store.load(&*inner.fs, &*inner.hasher)?;
+            let record = loaded.record.clone().ok_or(Error::NotInstalled)?;
+            if record.current.is_some() {
+                return Err(Error::AlreadyInstalled);
+            }
+            let version = info.version.clone();
+            let staged_here = record
+                .staged
+                .as_ref()
+                .is_some_and(|s| crate::installation::same_version(&s.version, &version));
+            let issued = record
+                .staged_issued_bound()
+                .filter(|_| staged_here)
+                .ok_or(Error::NothingStaged)?;
+            let tree = versions_dir.join(version.to_string());
+            let config = tree_config(&*inner.fs, &inner.app_id, &tree)?;
+            if !crate::installation::same_version(&config.version, &version) {
+                return Err(Error::UpdateConfig(UpdateConfigError::Invalid {
+                    field: "version",
+                    rule: "is not the version of its directory",
+                }));
+            }
+            let request = integration_request(&inner.app_id, &root, config.install);
+            inner.integration.check(Scope::User, &request)?;
+            let next =
+                lunepack_core::install_first(&record, version.clone(), issued, record.install_id)?;
+            let committed = store.commit(&*inner.fs, &loaded, &next, &*inner.hasher)?;
+            lunepack_core::reconcile_current(&*inner.fs, &root, &committed)
+                .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))?;
+            inner.integration.apply(Scope::User, &request)?;
+            Ok(InstalledVersion {
+                version,
+                issued,
+                target: committed.target,
+            })
+        },
+    )
     .await
 }
