@@ -28,3 +28,9 @@ tempfile = { workspace = true }
 [[test]]
 name = "apply"
 harness = false
+
+# The end-to-end suite (M5-D13): own main, run by scripts/e2e.sh, a SKIP without its environment.
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+harness = false

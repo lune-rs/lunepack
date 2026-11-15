@@ -290,6 +290,85 @@ key, and a host that cannot say 404 would otherwise fail every check. It adds no
 capability: an attacker who controls responses (class 1) can already answer 404 and hide a rotation,
 which is the freeze already described there, bounded by the key set's and feed's expiry.
 
+## The Linux runtime (M5)
+
+The per-user Linux runtime (`lunepack-runtime`, `docs/FORMAT.md` 12 and 13) adds code that deletes
+files, writes outside the install root, starts processes and reads configuration from a tree. It
+defends against a hostile publisher or host only through the signed manifest (the configuration is
+a file of the tree, covered by its hashes), and it takes no side against the app's own user (class 4):
+a same-user process can already edit the tree, the records and the desktop entry. What each piece
+below adds is that lunepack never acts on a path or a name it was not given by a signed tree or
+derived itself, and fails toward keeping files.
+
+**The health token (M5-D5).** The runtime draws 32 bytes from the OS random source, puts them in
+`LUNEPACK_HEALTH_TOKEN` (64 lowercase hex digits) in the environment of the one child it supervises,
+and records only their SHA-256. The token is never in an argument list, an event, the log, a result
+line or an error, and a facade error never shows it (the apply tests search the log for a planted
+token; the command line's planted-secrets test checks every stream, M5 step 14). A malformed token is `TokenMismatch`; a matching one
+is compared in constant time. Same-user processes can read another process's environment, so the
+token is not a defence against class 4. It tells the record that this start was the supervised one:
+a per-user install also lets a start with no token confirm the pending version (M5-D5), so the token
+protects nothing a local process could not do anyway. Per-machine installs, which arrive later,
+always need it (C8).
+
+**The attempt counter (M5-D5).** An unsupervised start of the pending version counts one attempt in
+the record and the fourth rolls back, so an app that never confirms (a crash on start, or a program
+that never calls `confirm`) cannot stay current. A same-user process can edit the counter, as it
+can the rest of the record (class 4); a host or publisher cannot reach it. A supervised start counts
+nothing, and a rollback marks the version bad, so the next check does not offer it again.
+
+**The wait target and the processes it starts.** The applier only waits for the process the app
+named (by pid and start time, so a reused pid is not mistaken for it, and a zombie counts as
+exited); it never signals it. The one process it ever signals is its own child, by the handle it
+got at spawn. Programs start without a shell, with arguments as separate values. The restart
+arguments travel in the detached applier's argument list after `--` (M5-D14), so they are as
+readable to other processes of the user as the app's own command line; the token never does.
+
+**Deleting files (M5-D9, M5-D10).** Three paths remove files, each driven by state and each limited
+to what lunepack made.
+- Garbage collection removes only direct children of `R/versions` whose names are a version's
+  canonical text, that are real directories (checked with `lstat` right before the removal), that
+  the record does not keep (current, previous, pending, staged) and that no other process of the
+  user runs from or has open (`exe`, `cwd`, mappings, descriptors; a process that cannot be read
+  counts as using it). Any error keeps the tree. The scan misses a process that runs from a tree with
+  none of those open, such as a script its interpreter has read completely; GC keeps current and
+  previous, so only an older tree is exposed, and the cost is a process that loses its files.
+- Uninstall derives `R` from its own resolved path, never from an argument or the state, and refuses
+  unless `R` is exactly `<data home>/<app id>`, a real and canonical directory, holding a record of
+  this app id, with no other process running from it. It removes the desktop entry only when the file
+  holds the line `X-Lunepack-App-Id=<app id>` and the command link only when it is a symlink into
+  `<R>/current/`; other files are kept and reported. Then it removes `R` without following symlinks:
+  a link inside a tree is deleted, never what it points to. After an environment change (a different
+  `HOME` or `XDG_DATA_HOME` than at install) the derivation no longer matches and uninstall refuses;
+  a file outside `R` that lunepack made then stays.
+- The `current` link is derived from the record; a link or file at that name that is not a symlink
+  is refused, never replaced.
+
+**Desktop entries (M5-D4, FORMAT.md 13.4 and 13.5).** Name, comment, icon, categories and the command
+name come from the signed configuration and go into a file the desktop environment reads and
+executes. They are checked before anything is written and a value that does not pass is refused,
+never escaped: names and comments reject controls and line breaks, the command name has a closed
+character set, categories are freedesktop names, the icon must be a PNG or SVG file of the tree, and
+the paths put into `Exec` and `Icon` (the install root and the entry) must contain none of the
+characters that give them another meaning in the specification (quotes, backtick, `$`, backslash,
+`%`, the apostrophe, controls and invisible format characters). The entry's bytes are fixed in shape,
+so a hostile string cannot add a key or a line. An existing entry or link that is not ours is a
+conflict, found before the first write, and nothing is overwritten.
+
+**The update configuration's feed (M5-D16).** The configuration carries the feed the runtime
+fetches metadata from, so it is checked with one rule before the first request, by the packager and
+by the client: `https:`, `file:`, or `http:` only to a loopback IP literal (`127.x.y.z` or `[::1]`),
+in the canonical form of the URL parser the transport uses, with no user information, query,
+fragment or escape. An `http:` feed from the configuration is fetched without the environment's
+proxy and without following a redirect (either would carry a plain request off the machine). A
+hostname such as `localhost` is not accepted because the resolver, not the rule, decides where it
+goes. The library path is unchanged: an app that builds the updater itself may use any URL, as in
+M4, and the signatures and hashes protect the content on any transport.
+
+**What the runtime prints.** Its fixed error kinds and exit codes name a class, never a path, URL,
+argument value, key or the token; a refused command line prints one fixed line and exits 2 before
+anything else happens. The log under `R/logs` holds the same events.
+
 ## Denial-of-service bounds
 
 | Resource | Bound |
