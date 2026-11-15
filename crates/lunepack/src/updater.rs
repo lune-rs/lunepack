@@ -84,6 +84,18 @@ pub enum Layout {
 }
 
 impl Layout {
+    /// The layout of a per-user install rooted at `layout`'s root (M5-D2): its `state`, `cache`
+    /// and `versions` directories, and no separate live tree (the current tree is
+    /// `versions/<current>`, M4-D4).
+    pub fn user(layout: &lunepack_core::UserLayout) -> Layout {
+        Layout::User {
+            state_dir: layout.state_dir(),
+            cache_dir: layout.cache_dir(),
+            versions_dir: layout.versions_dir(),
+            current_tree: layout.current_tree(),
+        }
+    }
+
     fn lock_dir(&self) -> &Path {
         match self {
             Layout::User { state_dir, .. } => state_dir,
@@ -997,7 +1009,7 @@ async fn check(inner: Arc<Inner>) -> Result<Option<UpdateInfo>, Error> {
     )?;
     let candidate = select_candidate(
         &feed,
-        &current.version,
+        Some(&current.version),
         record.target,
         &record.bad,
         &record.install_id,
@@ -1401,6 +1413,8 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
         // Record the tree, then drop the version's cache entries (M4-D17).
         let staged_ref =
             StagedRef::new(staged.version.clone(), staged.target, info.manifest_sha256);
+        // The staged manifest's `issued` goes with it: an apply makes it the floor time (P9).
+        let staged_issued = info.issued();
         let drop_frames: Vec<Sha256Digest> = all_frames.iter().map(|(_, f)| f.sha256).collect();
         let pack_sha = info.pack.sha256;
         on_job(
@@ -1417,7 +1431,7 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
                 else {
                     return Err(Error::MachineScope);
                 };
-                let next = record.set_staged(Some(staged_ref));
+                let next = record.set_staged(Some((staged_ref, staged_issued)));
                 store.commit(&*inner.fs, loaded, &next, &*inner.hasher)?;
                 // The tree is in place and recorded: dropping the cache entries is housekeeping
                 // (M4-D17), so a failure here (a file held open by a scanner, a permission change)

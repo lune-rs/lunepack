@@ -14,7 +14,7 @@ use common::*;
 use lunepack::{DownloadOptions, Error, Layout, block_on};
 use lunepack_core::fetch::FetchPolicy;
 use lunepack_core::state::{
-    InstallCounters, InstallState, MachineScope, Record, Scope, StagedRef, commit,
+    Health, InstallCounters, InstallState, MachineScope, Record, Scope, StagedRef, commit,
     commit_raw_payload, load,
 };
 use lunepack_core::{
@@ -96,6 +96,9 @@ fn check_download_stage_builds_the_tree_and_records_it() {
         assert_eq!(w.read(&staged.tree().join(path)), bytes);
     }
     assert_eq!(u.staged().expect("staged"), Some(staged));
+    // The stage commit binds the staged manifest's `issued` to the entry (P9).
+    let record = w.user_state().record.expect("record");
+    assert_eq!(record.staged_issued_bound(), Some(SUITE_T0));
     // The version's cache entries are gone.
     assert!(names(&w.fs, &w.cache_dir.join("frames")).is_empty());
     assert!(names(&w.fs, &w.cache_dir.join("packs")).is_empty());
@@ -211,6 +214,47 @@ fn a_semantically_invalid_newest_record_stops_the_check() {
     workers_stopped();
 }
 
+#[test]
+fn an_m4_record_without_staged_issued_cannot_apply_until_the_stage_commit_binds_it() {
+    let _s = serial();
+    let w = World::new();
+    w.install("1.0.0", SUITE_T0 - 10 * DAY);
+    w.publish(1, "1.1.0");
+    let u = w.updater();
+    // Stage 1.1.0 through the facade, then rewrite the record the way an M4 writer leaves it:
+    // the same `staged` entry, and neither `staged_issued` nor `lifecycle`.
+    let info = block_on(u.check()).expect("check").expect("an update");
+    let downloaded = block_on(u.download(&info, DownloadOptions::default())).expect("download");
+    block_on(u.stage(downloaded)).expect("stage");
+    let loaded = w.user_state();
+    let staged = loaded.record.clone().expect("record");
+    let mut fields = staged
+        .clone()
+        .with_seq(loaded.next_seq)
+        .to_fields()
+        .expect("fields");
+    fields.remove("staged_issued");
+    fields.remove("lifecycle");
+    let payload = serde_json::to_vec(&fields).expect("json");
+    commit_raw_payload(&w.fs, &w.state_dir, loaded.next_seq, &payload, &FakeHasher).expect("raw");
+    let m4 = w.user_state().record.expect("record");
+    assert_eq!(m4.staged, staged.staged);
+    assert_eq!(m4.staged_issued, None);
+    assert_eq!(
+        lunepack_core::apply(&m4, &version("1.1.0"), sha(b"token")),
+        Err(lunepack_core::LifecycleError::StagedIssuedUnbound)
+    );
+    // The next stage commit binds it, and the apply then takes the manifest's `issued`.
+    let info = block_on(u.check()).expect("check").expect("an update");
+    let downloaded = block_on(u.download(&info, DownloadOptions::default())).expect("download");
+    block_on(u.stage(downloaded)).expect("stage");
+    let bound = w.user_state().record.expect("record");
+    assert_eq!(bound.staged_issued_bound(), Some(info.issued()));
+    let applied = lunepack_core::apply(&bound, &version("1.1.0"), sha(b"token")).expect("apply");
+    assert_eq!(applied.current.expect("current").issued, info.issued());
+    workers_stopped();
+}
+
 /// Writes record `seq` in the frame layout with format byte 2.
 fn write_format_2(w: &World, record: &InstallState, seq: u64) {
     let fields = record.clone().with_seq(seq).to_fields().expect("fields");
@@ -264,9 +308,10 @@ fn unknown_fields_and_health_survive_a_check_commit() {
         TARGET,
         INSTALL_ID,
     );
-    record
-        .extra
-        .insert("health".to_owned(), serde_json::json!({"token": "abc"}));
+    record.health = Some(Health {
+        version: version("1.0.0"),
+        token_sha256: sha(b"token"),
+    });
     record
         .extra
         .insert("x_future".to_owned(), serde_json::json!([1, 2, 3]));
@@ -276,6 +321,7 @@ fn unknown_fields_and_health_survive_a_check_commit() {
     let after = w.user_state().record.expect("record");
     assert!(after.seq > committed.seq, "the check did not commit");
     assert_eq!(after.extra, committed.extra);
+    assert_eq!(after.health, committed.health);
     assert_eq!(after.critical, committed.critical);
     workers_stopped();
 }
@@ -736,7 +782,10 @@ fn a_bad_publisher_frame_exhausts_the_ladder_naming_the_file() {
 
 fn with_staged(w: &World, staged: StagedRef, bad: &[&str]) {
     let loaded = w.user_state();
-    let mut next = loaded.record.expect("record").set_staged(Some(staged));
+    let mut next = loaded
+        .record
+        .expect("record")
+        .set_staged(Some((staged, SUITE_T0)));
     for b in bad {
         next = next.mark_bad(version(b));
     }
@@ -1449,4 +1498,19 @@ fn the_facade_names_the_api_types_and_builds_a_trusted_root_from_bytes() {
     let _phase = lunepack::Phase::Download;
     let _target: lunepack::Target = TARGET;
     let _core_error: Option<lunepack::CoreError> = None;
+}
+
+#[test]
+fn a_user_layout_gives_the_facade_layout_under_its_root() {
+    let root = PathBuf::from("/home/u/.local/share/org.example.hello");
+    let layout = Layout::user(&lunepack_core::UserLayout::from_root(root.clone()));
+    assert_eq!(
+        layout,
+        Layout::User {
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            versions_dir: root.join("versions"),
+            current_tree: None,
+        }
+    );
 }

@@ -15,6 +15,8 @@ pub mod ident;
 pub mod integration;
 pub mod json;
 pub mod keyset;
+pub mod layout;
+pub mod lifecycle;
 pub mod limits;
 pub mod manifest;
 pub mod pack;
@@ -37,7 +39,8 @@ pub use cancel::CancelToken;
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
 pub use error::{
-    DesktopPathError, Error, FeedRule, Result, StageError, StateError, UpdateConfigError,
+    DesktopPathError, Error, FeedRule, LayoutError, LifecycleError, Result, StageError, StateError,
+    UpdateConfigError,
 };
 pub use feed::{
     ArtifactRef, CheckedRef, FeedDocument, FeedTargetEntry, ReleaseDoc, Rollout, RolloutDoc,
@@ -56,6 +59,13 @@ pub use fs::{
 pub use ident::{AppId, Channel};
 pub use integration::{IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration};
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
+pub use layout::{
+    Discovery, UserLayout, discover, reconcile_current, tree_candidates, version_config_path,
+};
+pub use lifecycle::{
+    AttemptOutcome, ConfirmOutcome, TokenCheck, apply, confirm, count_attempt, deliver_events,
+    gc_keep, install_first, rollback,
+};
 pub use limits::Limits;
 pub use manifest::{EntryDoc, ManifestDocument, VerifiedEntry, VerifiedManifest, verify_manifest};
 pub use pack::{
@@ -71,8 +81,9 @@ pub use progress::{FileProgress, Phase, Progress, Source};
 pub use root::{RootDocument, TrustedRoot, advance_root};
 pub use stage::{SourceFor, StageEnv, StageInput, StagedVersion, scan, stage};
 pub use state::{
-    CurrentRef, Floors, InstallCounters, InstallState, Loaded, MachineScope, PendingRef,
-    PreviousRef, Record, RootParts, Scope, StagedRef, UserScope,
+    CurrentRef, Floors, Health, InstallCounters, InstallState, Lifecycle, LifecycleEvent, Loaded,
+    MachineScope, PendingRef, PreviousRef, Record, RootParts, Scope, StagedIssued, StagedRef,
+    UserScope,
 };
 pub use target::Target;
 pub use traits::{

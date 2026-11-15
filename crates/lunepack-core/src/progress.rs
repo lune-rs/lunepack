@@ -1,5 +1,5 @@
 //! Progress event types (M4-D19), shared by the client (C9), the apply engine (C4) and the runtime
-//! (C10). The JSON form of an event is M5's; this module only fixes the Rust shape.
+//! (C10). The JSON form of an event is the runtime's; this module only fixes the Rust shape.
 
 use crate::path::RelPath;
 
@@ -15,6 +15,20 @@ pub enum Phase {
     Download,
     /// Building and verifying the new version tree.
     Stage,
+    /// Installing the first version (C10).
+    Install,
+    /// Waiting for the app to exit before an apply.
+    Wait,
+    /// Committing the staged version and switching `current` to it.
+    Apply,
+    /// Launching the new version.
+    Launch,
+    /// Waiting for the new version to confirm its health.
+    Confirm,
+    /// Rolling a version that failed its health check back to the previous one.
+    Rollback,
+    /// Removing the install.
+    Uninstall,
 }
 
 /// Where the bytes of one file come from.

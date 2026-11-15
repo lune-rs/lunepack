@@ -798,11 +798,15 @@ fn sample_install_state(seq: u64) -> InstallState {
     record.previous = Some(PreviousRef {
         version: version("0.9.0"),
     });
-    record.staged = Some(StagedRef::new(
-        version("1.1.0"),
-        FUZZ_TARGET,
-        FakeHasher.sha256(b"the 1.1.0 manifest"),
-    ));
+    // `staged_issued` bound to the staged entry, as the stage commit writes it (P9).
+    let mut record = record.set_staged(Some((
+        StagedRef::new(
+            version("1.1.0"),
+            FUZZ_TARGET,
+            FakeHasher.sha256(b"the 1.1.0 manifest"),
+        ),
+        SUITE_T0 + 1,
+    )));
     record.bad = vec![version("1.0.1"), version("1.0.2-beta.1")];
     record.floors = Floors {
         root: Some(RootParts {
@@ -874,8 +878,73 @@ fn state_seeds(out: &mut Out) {
 
     let mut extra = payload_value(&valid);
     extra.insert("x_future".to_owned(), serde_json::json!({ "a": [1, 2] }));
-    extra.insert("health".to_owned(), serde_json::json!({ "t": "token" }));
     out.ok("state", "extra-fields", raw_record(&extra));
+
+    // The M5 members (FORMAT.md 12.9): a pending version with its health digest and events.
+    let mut pending = sample_install_state(STATE_NAME_SEQ);
+    let v = |t: &str| Version::parse(t).expect("version");
+    pending.pending = Some(lunepack_core::PendingRef {
+        version: v(FUZZ_VERSION),
+        attempts: 2,
+    });
+    pending.health = Some(lunepack_core::Health {
+        version: v(FUZZ_VERSION),
+        // A low-entropy digest: secret scanners flag a `token…` key with a random-looking value.
+        token_sha256: Sha256Digest::from_bytes([0xab; 32]),
+    });
+    pending.lifecycle = Some(lunepack_core::Lifecycle {
+        events: vec![
+            lunepack_core::LifecycleEvent::Updated {
+                from: v("0.9.0"),
+                to: v(FUZZ_VERSION),
+            },
+            lunepack_core::LifecycleEvent::FirstRun {
+                version: v(FUZZ_VERSION),
+            },
+        ],
+    });
+    let with_members = committed(&[pending]);
+    out.ok("state", "lifecycle-members", with_members.clone());
+    let mut m4 = payload_value(&valid);
+    m4.remove("lifecycle");
+    m4.remove("staged_issued");
+    out.ok("state", "m4-without-new-members", raw_record(&m4));
+    let mut unbound = payload_value(&valid);
+    if let Some(serde_json::Value::Object(issued)) = unbound.get_mut("staged_issued") {
+        issued.insert("version".to_owned(), serde_json::json!("1.2.0"));
+    }
+    out.ok("state", "staged-issued-unbound", raw_record(&unbound));
+    let members = payload_value(&with_members);
+    let inner = |key: &str, extra: (&str, serde_json::Value)| {
+        let mut edited = members.clone();
+        if let Some(serde_json::Value::Object(obj)) = edited.get_mut(key) {
+            obj.insert(extra.0.to_owned(), extra.1);
+        }
+        raw_record(&edited)
+    };
+    out.bad(
+        "state",
+        "unknown-key-in-health",
+        inner("health", ("token", serde_json::json!("raw"))),
+    );
+    out.bad(
+        "state",
+        "unknown-key-in-staged-issued",
+        inner("staged_issued", ("x_future", serde_json::json!(1))),
+    );
+    let mut kind = members.clone();
+    kind.insert(
+        "lifecycle".to_owned(),
+        serde_json::json!({ "events": [{ "kind": "rolled_back", "version": FUZZ_VERSION }] }),
+    );
+    out.bad("state", "unknown-event-kind", raw_record(&kind));
+    let mut many = members.clone();
+    let event = serde_json::json!({ "kind": "first_run", "version": FUZZ_VERSION });
+    many.insert(
+        "lifecycle".to_owned(),
+        serde_json::json!({ "events": vec![event; 17] }),
+    );
+    out.bad("state", "too-many-events", raw_record(&many));
 
     out.bad("state", "torn", valid[..valid.len() / 2].to_vec());
     out.bad("state", "empty", Vec::new());
