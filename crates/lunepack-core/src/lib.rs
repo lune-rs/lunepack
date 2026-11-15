@@ -27,13 +27,16 @@ pub mod target;
 pub mod traits;
 pub mod transport;
 pub mod trust;
+pub mod update_config;
 pub mod version;
 pub mod write;
 
 pub use cancel::CancelToken;
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
-pub use error::{Error, Result, StageError, StateError};
+pub use error::{
+    DesktopPathError, Error, FeedRule, Result, StageError, StateError, UpdateConfigError,
+};
 pub use feed::{
     ArtifactRef, CheckedRef, FeedDocument, FeedTargetEntry, ReleaseDoc, Rollout, RolloutDoc,
     VerifiedFeed, VerifiedRelease, verify_feed,
@@ -72,6 +75,9 @@ pub use transport::{
     Transport, TransportError, TransportErrorKind, Validator,
 };
 pub use trust::{ClockReading, KeyEntry, KeyRing, PublicKey, RollbackFloor};
+pub use update_config::{
+    FeedKind, InstallMeta, UPDATE_CONFIG_FILE, UpdateConfig, check_feed, desktop_safe_path,
+};
 pub use version::Version;
 pub use write::{
     DEFAULT_FEED_LIFETIME_SECS, next_feed, next_key_set, rollout_seed, rotate_root, sign_envelope,

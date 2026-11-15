@@ -90,6 +90,7 @@ pub const HARNESSES: &[(&str, Harness)] = &[
     ("frame", frame),
     ("http", http),
     ("state", state),
+    ("update_config", update_config),
 ];
 
 /// Runs the harness `name` and reports whether `data` got all the way through it (`None`: no such
@@ -108,6 +109,7 @@ pub fn accepts(name: &str, data: &[u8]) -> Option<bool> {
         "frame" => frame_run(data),
         "http" => http_run(data),
         "state" => state_run(data),
+        "update_config" => crate::update_config::fuzz_run(data),
         _ => return None,
     })
 }
@@ -202,6 +204,12 @@ pub fn http(data: &[u8]) {
 /// payload), and as a bare payload of either kind, for app id [`FUZZ_APP_ID`].
 pub fn state(data: &[u8]) {
     let _ = state_run(data);
+}
+
+/// `data` as an update-config document (FORMAT.md 13); an accepted one must round-trip through the
+/// writer.
+pub fn update_config(data: &[u8]) {
+    let _ = crate::update_config::fuzz_run(data);
 }
 
 // ---- scaffolding: fake hasher, fake signatures, clock, codec -------------------------------------

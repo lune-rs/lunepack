@@ -439,6 +439,109 @@ pub enum StageError {
     Other(#[from] Error),
 }
 
+/// Which rule of the update-config feed (FORMAT.md 13.3) a feed string broke. The string itself is
+/// never shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FeedRule {
+    /// Longer than 2048 bytes.
+    #[error("feed is longer than 2048 bytes")]
+    TooLong,
+    /// A byte outside ASCII 0x21-0x7E (space, tab, CR, LF, a control or a non-ASCII byte).
+    #[error("feed has a byte outside printable ASCII")]
+    Byte,
+    /// One of the characters `\ % ? # @ " < > ^ ` { | }`.
+    #[error("feed has a forbidden character")]
+    Forbidden,
+    /// Not exactly `https://`, `http://` or `file:///` (lowercase).
+    #[error("feed scheme is not https://, http:// or file:///")]
+    Scheme,
+    /// An `https` host that is not lowercase LDH labels or a canonical dotted-quad.
+    #[error("feed host is not a lowercase DNS name or a canonical IPv4 address")]
+    Host,
+    /// A bracketed IPv6 host on `https` (refused in v1).
+    #[error("feed host is an IPv6 address, which https feeds do not allow in v1")]
+    Ipv6Host,
+    /// An `http` host other than a canonical `127.x.y.z` or `[::1]`.
+    #[error("http feed host is not a loopback IP literal")]
+    HttpNotLoopback,
+    /// A port that is empty, has a leading zero, is out of 1-65535 or is the scheme's default.
+    #[error("feed port is not a canonical non-default port")]
+    Port,
+    /// A path that does not start and end with `/`, or a segment outside `[A-Za-z0-9._~-]+`, `.`
+    /// or `..`.
+    #[error("feed path is not a canonical directory path")]
+    Path,
+    /// The facade's URL parser refused the string.
+    #[error("feed is not a URL the transport accepts")]
+    Unparsable,
+    /// The facade's URL parser changed the string (it would connect somewhere else than it reads).
+    #[error("feed is not in the URL parser's canonical form")]
+    Normalised,
+    /// The parsed scheme differs from the one the core rule saw.
+    #[error("feed scheme differs after parsing")]
+    SchemeMismatch,
+    /// The parsed URL carries a user name or password.
+    #[error("feed carries user information")]
+    Userinfo,
+}
+
+/// Why a path string cannot go into a desktop entry's `Exec` or `Icon` (FORMAT.md 13.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum DesktopPathError {
+    /// The path is empty.
+    #[error("desktop entry path is empty")]
+    Empty,
+    /// A control or invisible character, or one of `" ` $ \ % '`. The character is not shown.
+    #[error("desktop entry path has a character the entry cannot carry")]
+    Char,
+}
+
+/// Why an update-config document (FORMAT.md 13) was refused, by the reader or the writer. Every
+/// variant names a field or a rule; no value from the document is ever shown.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum UpdateConfigError {
+    /// Over the 64 KiB cap.
+    #[error("update config is {size} bytes, over the {cap} byte cap")]
+    TooLarge {
+        /// The size.
+        size: u64,
+        /// The cap.
+        cap: u64,
+    },
+    /// The strict JSON pre-pass (FORMAT.md 3.1) refused the bytes.
+    #[error("update config: {0}")]
+    Json(#[from] JsonError),
+    /// `format` above 1, or a `critical` name this build does not implement.
+    #[error("update config is from a newer format")]
+    NewerFormat,
+    /// A required member is missing.
+    #[error("update config has no {0}")]
+    Missing(&'static str),
+    /// An object (`root` or `install`) has a member that is not defined.
+    #[error("update config {0} has an unknown member")]
+    Unknown(&'static str),
+    /// A member has the wrong JSON type.
+    #[error("update config {0} has the wrong type")]
+    WrongType(&'static str),
+    /// A member breaks its rule.
+    #[error("update config {field}: {rule}")]
+    Invalid {
+        /// The member, as a dotted path (`install.name`).
+        field: &'static str,
+        /// The rule it breaks.
+        rule: &'static str,
+    },
+    /// The feed breaks the feed rule.
+    #[error("update config feed: {0}")]
+    Feed(FeedRule),
+    /// The app id or root parts differ from the trusted root the writer was given.
+    #[error("update config {0} does not match the trusted root")]
+    RootMismatch(&'static str),
+}
+
 /// Every way the core rejects input or fails.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

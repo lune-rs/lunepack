@@ -100,6 +100,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod cache;
 mod error;
 mod executor;
+mod feed_rule;
 mod fetch;
 mod pipe;
 mod progress;
@@ -111,6 +112,7 @@ pub mod blocking;
 
 pub use error::Error;
 pub use executor::block_on;
+pub use feed_rule::check_config_feed;
 pub use updater::{
     DownloadOptions, Downloaded, InstalledVersion, Layout, ProgressCallback, StagedVersion,
     Timeouts, UpdateInfo, Updater, UpdaterBuilder,
@@ -125,10 +127,10 @@ pub use lunepack_core::Error as CoreError;
 pub use lunepack_core::fetch::FetchPolicy;
 pub use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, Body, BoxFuture, ByteRange, CancelToken, Channel,
-    Clock, Codec, DirEntryInfo, FileKind, FileProgress, FileWrite, Fs, FsError, FsErrorKind,
-    Hasher, Head, LockGuard, Meta, Phase, Progress, RangeError, ReadAt, RelPath, Request, Response,
-    Sha256Digest, Source, StateError, Target, Transport, TransportError, TransportErrorKind,
-    TrustedRoot, Validator, Verifier, Version,
+    Clock, Codec, DirEntryInfo, FeedKind, FeedRule, FileKind, FileProgress, FileWrite, Fs, FsError,
+    FsErrorKind, Hasher, Head, LockGuard, Meta, Phase, Progress, RangeError, ReadAt, RelPath,
+    Request, Response, Sha256Digest, Source, StateError, Target, Transport, TransportError,
+    TransportErrorKind, TrustedRoot, UpdateConfigError, Validator, Verifier, Version,
 };
 
 /// Plumbing that tests and sibling crates use; not part of the supported API and free to change in
@@ -136,6 +138,7 @@ pub use lunepack_core::{
 #[doc(hidden)]
 pub mod unstable_internals {
     pub use crate::cache::{Cache, CacheKind};
+    pub use crate::feed_rule::check_parsed_feed;
     pub use crate::fetch::{
         ABSENT_ROOT_STATUSES, FeedUrls, FetchCtx, FetchOutcome, Fetched, FrameNeed, PackTarget,
         acquire_op_lock, download, fetch_artifact_doc, fetch_document, fetch_pack, fetch_root_doc,

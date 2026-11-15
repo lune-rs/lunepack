@@ -27,7 +27,7 @@ pub use docs::{
 pub use hasher::FakeHasher;
 pub use http_server::LoopbackServer;
 pub use memfs::{MemFs, RecoverMode};
-pub use seeds::{Seed, fuzz_seeds};
+pub use seeds::{Seed, fuzz_seeds, sample_update_config};
 pub use signer::FakeSigner;
 pub use suites::{
     HashKat, SHA256_KATS, SignFixture, TransportCaps, VerifyKat, run_blocking_transport_suite,
