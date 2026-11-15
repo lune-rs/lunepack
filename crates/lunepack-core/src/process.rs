@@ -269,6 +269,8 @@ pub trait Process: Send + Sync {
 
     /// Whether any process other than those in `exclude` is running with the tree at `tree` in
     /// use (its executable, working directory, mapped files or open files lie under it). A process
-    /// that cannot be inspected counts as in use.
+    /// that cannot be inspected counts as in use, except one the system denies inspection of by
+    /// design (a non-dumpable process of the same user on Linux): that one is judged by its
+    /// command line alone (M5-D9).
     fn tree_in_use(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool>;
 }

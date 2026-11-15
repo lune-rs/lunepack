@@ -330,7 +330,14 @@ to what lunepack made.
   canonical text, that are real directories (checked with `lstat` right before the removal), that
   the record does not keep (current, previous, pending, staged) and that no other process of the
   user runs from or has open (`exe`, `cwd`, mappings, descriptors; a process that cannot be read
-  counts as using it). Any error keeps the tree. The scan misses a process that runs from a tree with
+  counts as using it). Any error keeps the tree. The one exception is a process the kernel denies
+  inspection of by design (`EACCES` or `EPERM` on those reads: a non-dumpable process of the user,
+  such as `(sd-pam)` or an ssh-agent, present on every desktop login and CI runner): counting it as
+  in use would keep every tree forever, so its command line decides instead, and it uses the tree
+  when `argv[0]` or an absolute argument, with symlinks resolved (a path through `R/current`
+  included), lies under it (M5-D9, amended by the user's decision Q40). This is a heuristic with
+  a gap: an app that is non-dumpable and was started by a relative path, or not from the tree's
+  path, is not seen. The scan also misses a process that runs from a tree with
   none of those open, such as a script its interpreter has read completely; GC keeps current and
   previous, so only an older tree is exposed, and the cost is a process that loses its files.
 - Uninstall derives `R` from its own resolved path, never from an argument or the state, and refuses
