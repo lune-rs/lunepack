@@ -2,6 +2,9 @@
 //! the protocol of `lunepack_testkit::run_process_suite` plus three modes of this crate's tests:
 //!
 //! - `hold <file> <ready> <secs>`: opens `file`, creates `ready`, then sleeps with `file` open.
+//! - `nodump <ready> <secs> [ignored...]`: sets `PR_SET_DUMPABLE` to 0 (so `/proc/<pid>/{exe,cwd,fd,
+//!   maps}` are denied to its own user without `CAP_SYS_PTRACE`, like `(sd-pam)` or ssh-agent),
+//!   creates `ready`, then sleeps. The extra arguments only appear in its command line.
 //! - `pid-sleep <file> <secs>`: creates `file` holding `<pid> <start ticks>`, then sleeps.
 //! - `detach-then <exit|sleep> <mode> <arg>...`: starts this binary with `<mode> <arg>...` through
 //!   `LinuxProcess::spawn_detached`, then exits 0 (`exit`) or sleeps for 600 s (`sleep`).
@@ -24,6 +27,7 @@ const MODES: &[&str] = &[
     "env",
     "probe",
     "hold",
+    "nodump",
     "pid-sleep",
     "detach-then",
 ];
@@ -78,6 +82,11 @@ pub fn run(args: &[String]) -> bool {
             let _file = std::fs::File::open(&rest[0]).expect("open the held file");
             create(Path::new(&rest[1]), "ready\n");
             sleep(&rest[2]);
+        }
+        "nodump" => {
+            set_not_dumpable();
+            create(Path::new(&rest[0]), "ready\n");
+            sleep(&rest[1]);
         }
         "pid-sleep" => {
             let me = LinuxProcess::new().current().expect("current");
@@ -142,4 +151,12 @@ fn ignore_sigterm() {
     // here (the helper starts no thread), and nothing else in it relies on SIGTERM's disposition.
     let previous = unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
     assert_ne!(previous, libc::SIG_ERR, "ignore SIGTERM");
+}
+
+#[allow(unsafe_code)]
+fn set_not_dumpable() {
+    // SAFETY: prctl(2) PR_SET_DUMPABLE takes two integers and touches no memory; the three
+    // unused arguments are zero as the call requires.
+    let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    assert_eq!(rc, 0, "prctl(PR_SET_DUMPABLE, 0)");
 }
