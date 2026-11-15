@@ -90,6 +90,10 @@ pub struct Release {
     pub moved_entry: bool,
     /// `[update] health_timeout_secs` of this release.
     pub health_timeout_secs: u64,
+    /// Bytes of incompressible filler in `share/blob.bin` (0: no file), so a download takes time.
+    pub blob_bytes: usize,
+    /// Small filler files under `share/many/` (4 KiB each), so staging takes time.
+    pub small_files: usize,
 }
 
 impl Release {
@@ -100,8 +104,51 @@ impl Release {
             flags: &[],
             moved_entry: false,
             health_timeout_secs: 20,
+            blob_bytes: 0,
+            small_files: 0,
         }
     }
+}
+
+/// How a lab differs from the plain one: names the planted-secrets tests choose.
+#[derive(Clone, Copy, Default)]
+pub struct LabOptions {
+    /// Prefix of the temporary directory's name, so the home's path holds a chosen component.
+    pub tmp_prefix: &'static str,
+    /// A path component the feed URL carries (`http://127.0.0.1:<port>/<component>/`).
+    pub feed_component: Option<&'static str>,
+}
+
+/// What a command printed, byte for byte.
+pub struct Captured {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl Captured {
+    /// The last non-empty stdout line.
+    pub fn last_line(&self) -> String {
+        String::from_utf8_lossy(&self.stdout)
+            .lines()
+            .rfind(|l| !l.is_empty())
+            .unwrap_or_default()
+            .to_owned()
+    }
+}
+
+/// Deterministic incompressible bytes (a xorshift stream), `seed` telling releases apart.
+fn filler(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(len);
+    out
 }
 
 /// The record, as far as the scenarios look at it.
@@ -132,6 +179,10 @@ pub struct Lab {
     bins: Binaries,
     app: App,
     feed: String,
+    /// The path under which the release directory is served (empty, or `<component>/`).
+    feed_prefix: String,
+    /// The feed the packed configs name instead of `feed` (the seed install still uses `feed`).
+    release_feed: Option<String>,
     kind: FeedKind,
     _server: Option<LoopbackServer>,
     origin: Option<FakeOrigin>,
@@ -248,8 +299,13 @@ impl Lab {
     /// A publisher with generated keys and a signed key set, a feed of the given kind, and an
     /// empty temporary home.
     pub fn new(bins: &Binaries, app: &App, kind: FeedKind) -> Lab {
+        Lab::with_options(bins, app, kind, LabOptions::default())
+    }
+
+    /// As [`Lab::new`], with the names of `options`.
+    pub fn with_options(bins: &Binaries, app: &App, kind: FeedKind, options: LabOptions) -> Lab {
         let tmp = tempfile::Builder::new()
-            .prefix("lunepack-e2e-")
+            .prefix(&format!("lunepack-e2e-{}", options.tmp_prefix))
             .tempdir()
             .expect("temporary directory");
         let work = std::fs::canonicalize(tmp.path()).expect("canonical");
@@ -260,11 +316,15 @@ impl Lab {
         for dir in [&home, &release_dir, &cfg_dir] {
             std::fs::create_dir_all(dir).expect("create dir");
         }
+        let feed_prefix = options
+            .feed_component
+            .map(|c| format!("{c}/"))
+            .unwrap_or_default();
         let (server, origin, feed) = match kind {
             FeedKind::Http => {
                 let origin = FakeOrigin::new();
                 let server = LoopbackServer::start(origin.clone()).expect("loopback server");
-                let feed = format!("{}/", server.base_url());
+                let feed = format!("{}/{feed_prefix}", server.base_url());
                 (Some(server), Some(origin), feed)
             }
             FeedKind::File => (None, None, format!("file://{}/", release_dir.display())),
@@ -282,6 +342,8 @@ impl Lab {
             bins: bins.clone(),
             app: app.clone(),
             feed,
+            feed_prefix,
+            release_feed: None,
             kind,
             _server: server,
             origin,
@@ -401,7 +463,7 @@ impl Lab {
              categories = [\"Utility\"]\n\
              bin = \"{BIN}\"\n\
              terminal = false\n",
-            feed = self.feed,
+            feed = self.release_feed.as_deref().unwrap_or(&self.feed),
             timeout = release.health_timeout_secs,
         );
         std::fs::write(path, text).expect("write config");
@@ -417,7 +479,7 @@ impl Lab {
     }
 
     /// Packs `release` with the real command line, adds it to the feed and serves it.
-    pub fn publish(&mut self, release: &Release) {
+    pub fn publish(&self, release: &Release) {
         let input = self.work.join(format!("in-{}", release.version));
         let entry = self.entry_rel(release);
         let bytes = std::fs::read(&self.app.binary).expect("read the app");
@@ -427,6 +489,21 @@ impl Lab {
             format!("{}\n", release.version).as_bytes(),
             false,
         );
+        if release.blob_bytes > 0 {
+            let seed = release.version.bytes().map(u64::from).sum::<u64>();
+            write_file(
+                &input.join("share/blob.bin"),
+                &filler(release.blob_bytes, seed),
+                false,
+            );
+        }
+        for n in 0..release.small_files {
+            write_file(
+                &input.join(format!("share/many/f{n:04}.bin")),
+                &filler(4096, n as u64 + 1),
+                false,
+            );
+        }
         if !release.flags.is_empty() {
             write_file(
                 &input.join("e2e-flags"),
@@ -488,20 +565,28 @@ impl Lab {
         let Some(origin) = &self.origin else {
             return;
         };
-        fn walk(origin: &FakeOrigin, base: &Path, dir: &Path) {
+        fn walk(origin: &FakeOrigin, prefix: &str, base: &Path, dir: &Path) {
             for entry in std::fs::read_dir(dir).expect("read dir") {
                 let entry = entry.expect("entry");
                 let path = entry.path();
                 if entry.file_type().expect("file type").is_dir() {
-                    walk(origin, base, &path);
+                    walk(origin, prefix, base, &path);
                 } else {
                     let rel = path.strip_prefix(base).expect("under base");
                     let url = rel.to_string_lossy().replace('\\', "/");
-                    origin.put(&url, std::fs::read(&path).expect("read file"));
+                    origin.put(
+                        &format!("{prefix}{url}"),
+                        std::fs::read(&path).expect("read file"),
+                    );
                 }
             }
         }
-        walk(origin, &self.release_dir, &self.release_dir);
+        walk(
+            origin,
+            &self.feed_prefix,
+            &self.release_dir,
+            &self.release_dir,
+        );
     }
 
     /// The URL requests the loopback server has seen (empty for a `file:` feed).
@@ -517,8 +602,22 @@ impl Lab {
     /// starts from a throwaway seed tree that carries only the update config (M5-D8).
     pub fn bootstrap(&self) -> PathBuf {
         let scratch = self.work.join("scratch");
-        let seed = scratch.join("seed");
-        let data = scratch.join("data");
+        let tree = self.facade_install(&scratch.join("seed"), &scratch.join("data"));
+        let boot = self.work.join("boot");
+        copy_tree(&tree, &boot);
+        boot
+    }
+
+    /// Installs the release the feed offers into this lab's own data home through the facade (a
+    /// fake desktop integration, so no desktop entry or command link): an installed tree and its
+    /// record without the runtime's install mode. Returns the installed version's tree.
+    pub fn install_in_place(&self) -> PathBuf {
+        self.facade_install(&self.work.join("seed"), &self.data)
+    }
+
+    /// The seed tree at `seed` (an update config for the feed, a stub entry), then the facade's
+    /// install of the newest release into `data`. Returns the installed tree.
+    fn facade_install(&self, seed: &Path, data: &Path) -> PathBuf {
         let root = TrustedRoot::from_parts(
             AppId::parse(APP_ID).expect("app id"),
             1,
@@ -554,7 +653,7 @@ impl Lab {
         write_file(&seed.join("bin").join(&name), b"seed", true);
 
         let platform = Platform::native()
-            .with_data_home(data.clone())
+            .with_data_home(data.to_path_buf())
             .with_integration(Arc::new(FakeIntegration::new()))
             .with_health_token(None);
         let inst = Installation::from_exe_with(&seed.join("bin").join(&name), platform)
@@ -567,14 +666,26 @@ impl Lab {
         );
         let installed = updater
             .install(DownloadOptions::default(), &CancelToken::new())
-            .expect("the scratch install");
-        let tree = data
-            .join(APP_ID)
+            .expect("the facade install");
+        data.join(APP_ID)
             .join("versions")
-            .join(installed.version().to_string());
-        let boot = self.work.join("boot");
-        copy_tree(&tree, &boot);
-        boot
+            .join(installed.version().to_string())
+    }
+
+    /// The published releases name `feed` in their configs from now on, while the seed install
+    /// keeps using the loopback feed (so a tree can be installed whose own feed is unreachable).
+    pub fn set_release_feed(&mut self, feed: &str) {
+        self.release_feed = Some(feed.to_owned());
+    }
+
+    /// The loopback origin (an `http:` lab).
+    pub fn origin(&self) -> &FakeOrigin {
+        self.origin.as_ref().expect("an http lab")
+    }
+
+    /// The app's file name in a tree.
+    pub fn app_name(&self) -> &str {
+        &self.app.name
     }
 
     /// A command for `program` with the lab's environment: its own `HOME`, the two outcome files,
@@ -600,6 +711,22 @@ impl Lab {
             output.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&output.stdout).into_owned(),
         )
+    }
+
+    /// Runs `program` with `args` to completion (no more than [`COMMAND_LIMIT`]) and returns what
+    /// it printed. `token` is put into `LUNEPACK_HEALTH_TOKEN` of its environment when given.
+    pub fn run_cmd(&self, program: &Path, args: &[&str], token: Option<&str>) -> Captured {
+        let mut cmd = self.command(program);
+        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(token) = token {
+            cmd.env("LUNEPACK_HEALTH_TOKEN", token);
+        }
+        let output = run_limited(cmd, COMMAND_LIMIT, "a runtime command");
+        Captured {
+            code: output.status.code().unwrap_or(-1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }
     }
 
     /// Runs an app (a path, usually the command link) with `args` and returns its status. Its
@@ -753,6 +880,35 @@ impl Lab {
     /// The runtime log's lines (empty before the install has one).
     pub fn runtime_log(&self) -> String {
         std::fs::read_to_string(self.root.join("logs/runtime.log")).unwrap_or_default()
+    }
+
+    /// Every file of the runtime's log (`runtime.log`, `runtime.log.1`), by name and bytes.
+    pub fn runtime_logs(&self) -> Vec<(String, Vec<u8>)> {
+        let mut logs = Vec::new();
+        for name in ["runtime.log", "runtime.log.1"] {
+            if let Ok(bytes) = std::fs::read(self.root.join("logs").join(name)) {
+                logs.push((name.to_owned(), bytes));
+            }
+        }
+        logs
+    }
+
+    /// The install id of the record, as the record writes it (hex), when there is a record.
+    pub fn install_id_hex(&self) -> Option<String> {
+        let loaded = UserScope {
+            dir: self.root.join("state"),
+            app_id: AppId::parse(APP_ID).expect("app id"),
+        }
+        .load(&StdFs::new(), &Sha256Hasher)
+        .ok()?;
+        let record = loaded.record?;
+        Some(
+            record
+                .install_id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        )
     }
 
     /// What a failure should show: the outcome and the log. Neither holds a secret (the token
