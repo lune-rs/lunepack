@@ -12,6 +12,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 mod apply;
+mod cli;
 mod events;
 mod gc;
 mod install;
@@ -34,7 +35,12 @@ fn main() -> ExitCode {
     let mode = match modes::parse(&args) {
         Ok(mode) => mode,
         Err(modes::UsageError) => {
-            eprintln!("{USAGE_LINE}");
+            // With `--json` before any `--`, even a refusal is an object on stdout (C4 Output).
+            if cli::args::wants_json(&args) {
+                println!("{}", cli::json::error_line(None, None, Kind::Usage));
+            } else {
+                eprintln!("{USAGE_LINE}");
+            }
             return ExitCode::from(Kind::Usage.code());
         }
     };
@@ -50,6 +56,7 @@ fn main() -> ExitCode {
             events.finish(SINK_DRAIN);
             kind
         }),
+        Mode::Command(parsed) => run(|ad| cli::execute(ad, &parsed)),
         // R is `<data home>/<app id>`, with the data home from this environment (M5-D2).
         Mode::Install => run(|ad| {
             let data_home = match data_home() {

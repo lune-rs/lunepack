@@ -198,7 +198,7 @@ fn source_name(source: Source) -> &'static str {
 }
 
 /// `text` as a JSON string.
-fn json_str(out: &mut String, text: &str) {
+pub(crate) fn json_str(out: &mut String, text: &str) {
     out.push('"');
     for c in text.chars() {
         match c {
@@ -216,14 +216,14 @@ fn json_str(out: &mut String, text: &str) {
     out.push('"');
 }
 
-fn json_version(out: &mut String, v: Option<&Version>) {
+pub(crate) fn json_version(out: &mut String, v: Option<&Version>) {
     match v {
         Some(v) => json_str(out, &v.to_string()),
         None => out.push_str("null"),
     }
 }
 
-fn head(out: &mut String, kind: &str) {
+pub(crate) fn head(out: &mut String, kind: &str) {
     let _ = write!(out, "{{\"schema\":{SCHEMA},\"type\":");
     json_str(out, kind);
 }
