@@ -58,6 +58,21 @@ public = "<64 lowercase hex characters>"   # the key the command signs for
 
 # Optional: where the publisher state file lives, relative to this file.
 # state = "lunepack-state.json"            # the default
+
+# Optional, together: an app that updates itself (see "Self-updating apps" below).
+[update]
+feed = "https://updates.example.com/hello/"   # the release directory, as a client reaches it
+channel = "stable"                            # default "stable"
+health_timeout_secs = 60                      # default 60, 5..=3600
+
+[install]
+entry = "bin/hello"          # the executable, relative to the tree (required, must be exec)
+name = "Hello"               # the display name (required)
+comment = "Says hello"       # optional
+icon = "assets/hello.svg"    # optional: a .png or .svg file of the tree
+categories = ["Utility"]     # optional: freedesktop category names
+bin = "hello"                # optional: the name of the command-line link
+terminal = false             # optional, default false
 ```
 
 ## The publisher state file (M3-R2-D1)
@@ -247,7 +262,7 @@ in the release directory.
 ```
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
-    [--config <CONFIG>]
+    [--runtime <RUNTIME>] [--config <CONFIG>]
 ```
 
 - `--version`: SemVer 2.0.0, used verbatim as the directory name. A directory of equal precedence with
@@ -258,6 +273,8 @@ lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-di
 - `--memory-budget-mib`: memory budget of the encoders (default 2048). A file that needs more than the
   whole budget is encoded alone.
 - `--app-id`: when given, it must equal the config's.
+- `--runtime`: the static runtime to place beside the entry. Required when the config has `[update]`,
+  refused without it (see "Self-updating apps").
 
 Pre-checks run before any encoding: `keys.json` verifies; every `--sign` key is in the key set and
 inside its window; the signers reach the threshold; the manifest and pack do not exist yet; the target
@@ -277,6 +294,51 @@ cannot know the bits, so it marks no file executable and refuses `linux-*` and `
 Special files (fifo, socket, device) are refused everywhere. Hard links are packed as files; symlinks
 are packed as links and must satisfy FORMAT 10.2 (symlinks exist only on `linux-*` and `macos-*`
 targets; a `windows-*` pack with a symlink is refused).
+
+### Self-updating apps: `[update]`, `[install]` and `--runtime` (M5-D7)
+
+An app that updates itself carries the runtime and a configuration in its tree. Both are written by
+`pack`, so the manifest's hashes cover them and the signed release vouches for them (FORMAT.md 13).
+Without `[update]` the tree is packed exactly as above, for apps that do not update themselves.
+
+With `[update]` (and then `[install]`, which is required; `[install]` without `[update]` is an error):
+
+- `--runtime <path>` is required. The file must match the target: for `linux-*`, a 64-bit ELF of the
+  target's machine (x86-64 or aarch64) with no `PT_INTERP`, meaning statically linked (a static-pie
+  executable passes); for `windows-*` a PE and for `macos-*` a Mach-O of the target's architecture
+  (a header check only, until those runtimes exist). Anything else is refused.
+- After the input is copied and before code signing and hashing, `pack` copies the runtime to
+  `<directory of install.entry>/lunepack-runtime` (`lunepack-runtime.exe` for `windows-*`), marked
+  executable, and writes the update configuration at the tree's root, `lunepack-update.json`
+  (`Contents/Resources/lunepack-update.json` for `macos-*`, assumed until M8). The configuration holds
+  the app id and root from `lunepack.toml`, the `--version` and `--target` of this pack, the feed, the
+  channel, the health timeout and the install metadata. It holds no timestamp. Stdout gets one
+  `update:` line.
+- The entry and the icon must be regular files of the input tree (not symlinks, nor behind one), and
+  on a non-Windows target the entry must carry the exec bit. An error names the field, `install.entry`
+  or `install.icon`, never its value.
+
+Reserved names, each an error before anything is written:
+
+- a file or directory named `lunepack-update.json` (any case) at any depth of the input, so nothing
+  can shadow the root configuration when an executable looks for the nearest one above itself;
+- a file named `lunepack-runtime` or `lunepack-runtime.exe` (any case) in the entry's directory.
+
+The feed (`[update] feed`) must pass the feed rule of FORMAT.md 13.3, which `pack` checks with the same
+function a client runs before its first request: `https://` with a lowercase DNS name or an IPv4
+address, `file:///`, or `http://` to a loopback IP literal (`127.x.y.z` or `[::1]`) only; no user
+information, query, fragment, percent-encoding, uppercase or non-canonical form; a trailing `/` is
+added when missing. `http://` to any other host, `localhost` included, is refused: the error names
+`[update] feed` and the rule that failed and never prints the feed.
+
+Determinism (C2) covers the runtime too: the same inputs, runtime bytes, keys and `SOURCE_DATE_EPOCH`
+give a byte-identical configuration, pack and manifest. `verify` accepts the result; `inspect` lists
+the two files like any others.
+
+Building the runtime: `scripts/build-runtime.sh <linux-x86_64|linux-aarch64>` runs the static musl
+build (the target must be installed with `rustup target add`; `--print-command` shows the command and
+runs nothing). `pack` does not build the runtime itself in M5; D19's build-from-source waits for a
+published crate (M13).
 
 ### `lunepack feed add`
 

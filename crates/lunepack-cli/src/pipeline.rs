@@ -9,17 +9,19 @@
 //! index order, so neither the worker count nor the scheduling reaches the output bytes.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 
 use anyhow::{Context, Result, anyhow, bail};
 use lunepack_core::path::MAX_PATH_DEPTH;
+use lunepack_core::update_config::{RUNTIME_FILE, RUNTIME_FILE_WINDOWS, config_path, runtime_file};
 use lunepack_core::{
-    CodeSign, Codec, CodecId, Encoder, EntryKind, Hasher, ManifestDocument, PackedFile, RelPath,
-    ReleaseLayout, Sha256Digest, Target, pack_file, validate_tree,
+    CodeSign, Codec, CodecId, Encoder, EntryKind, Hasher, InstallMeta, ManifestDocument,
+    PackedFile, RelPath, ReleaseLayout, Sha256Digest, Target, UPDATE_CONFIG_FILE, pack_file,
+    validate_tree,
 };
 
 /// Fixed per-job allowance on top of the input, output and encoder estimates: 16 MiB of slack for
@@ -125,6 +127,133 @@ fn make_symlink(_text: &str, at: &Path) -> Result<()> {
         "{} is a symlink; symlinks are packed only on Unix hosts",
         at.display()
     )
+}
+
+/// What a pack with `[update]` adds to the tree (M5-D7): the runtime beside the entry and the
+/// update configuration at its fixed place (FORMAT.md 13.1).
+pub struct UpdatePlan<'a> {
+    /// The target of the pack.
+    pub target: Target,
+    /// The install metadata, which names the entry and the icon.
+    pub install: &'a InstallMeta,
+    /// The runtime's bytes, already checked against the target.
+    pub runtime: &'a [u8],
+    /// The update configuration's canonical bytes.
+    pub config: &'a [u8],
+}
+
+/// The directory part of a tree path (`""` for a path at the root).
+fn parent_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// Fails when the input holds a name the update setup reserves (M5-D17): the configuration's file
+/// name at any depth, so nothing can shadow the root's in the nearest-ancestor discovery, or the
+/// runtime's name (either form) in the entry's directory. Names compare ignoring ASCII case, as a
+/// case-insensitive file system would.
+pub fn check_reserved(input: &Path, entry: &RelPath) -> Result<()> {
+    let entry_dir = parent_of(entry.as_str());
+    for (path, ..) in walk(input)? {
+        let text = path.as_str();
+        let name = text.rsplit_once('/').map_or(text, |(_, name)| name);
+        if name.eq_ignore_ascii_case(UPDATE_CONFIG_FILE) {
+            bail!(
+                "the input tree holds {text:?}; the name {UPDATE_CONFIG_FILE} is reserved for the update configuration at any depth"
+            );
+        }
+        if parent_of(text) == entry_dir
+            && [RUNTIME_FILE, RUNTIME_FILE_WINDOWS]
+                .iter()
+                .any(|r| name.eq_ignore_ascii_case(r))
+        {
+            bail!(
+                "the input tree holds {text:?}; the name {RUNTIME_FILE} is reserved for the runtime beside the entry"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Fails unless `rel` names a regular file in `tree`, reached through real directories only (a
+/// symlink on the way would make the last `lstat` say nothing about the path).
+fn regular_file_in(tree: &Path, rel: &RelPath, field: &str) -> Result<fs::Metadata> {
+    let count = rel.components().count();
+    let mut at = tree.to_path_buf();
+    for (i, component) in rel.components().enumerate() {
+        at.push(component);
+        let meta = fs::symlink_metadata(&at)
+            .map_err(|_| anyhow!("{field} is not a file of the input tree"))?;
+        let last = i + 1 == count;
+        let ok = if last {
+            meta.file_type().is_file()
+        } else {
+            meta.file_type().is_dir()
+        };
+        if !ok {
+            bail!(
+                "{field} is not a regular file of the input tree, or is reached through a symlink"
+            );
+        }
+        if last {
+            return Ok(meta);
+        }
+    }
+    bail!("{field} is empty")
+}
+
+#[cfg(unix)]
+fn write_new(path: &Path, bytes: &[u8], exec: bool) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(if exec { 0o755 } else { 0o644 })
+        .open(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("cannot write {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_new(path: &Path, bytes: &[u8], _exec: bool) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// Checks the entry and icon in the assembled tree at `tree`, then places the runtime beside the
+/// entry and the update configuration at its fixed path (M5-D7). Runs after `assemble` and before
+/// code signing, so both files are signed, hashed and packed like the app's own.
+pub fn place_update(tree: &Path, plan: &UpdatePlan<'_>) -> Result<()> {
+    let install = plan.install;
+    let meta = regular_file_in(tree, &install.entry, "install.entry")?;
+    // The exec bit of a Windows target means nothing; elsewhere the entry must carry it.
+    #[cfg(unix)]
+    if !plan.target.is_windows() && !is_exec(&meta) {
+        bail!("install.entry is not marked executable in the input tree");
+    }
+    #[cfg(not(unix))]
+    let _ = meta;
+    if let Some(icon) = &install.icon {
+        regular_file_in(tree, icon, "install.icon")?;
+    }
+    let dir = parent_of(install.entry.as_str());
+    let mut runtime = tree.to_path_buf();
+    if !dir.is_empty() {
+        runtime.push(dir);
+    }
+    runtime.push(runtime_file(plan.target));
+    write_new(&runtime, plan.runtime, true)?;
+    let config = tree.join(config_path(plan.target));
+    if let Some(parent) = config.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    write_new(&config, plan.config, false)
 }
 
 /// Stage 1: copies the tree at `input` into `dest` (which must not exist): files (with their
@@ -449,6 +578,8 @@ pub struct Settings<'a> {
     pub codec: &'a dyn Codec,
     /// SHA-256.
     pub hasher: &'a dyn Hasher,
+    /// The runtime and update configuration to place after assemble, when `[update]` is set.
+    pub update: Option<UpdatePlan<'a>>,
 }
 
 /// The unsigned result of stages 1 to 5.
@@ -474,8 +605,17 @@ pub fn build(
     say: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<Built> {
     let tree = work.join("tree");
+    if let Some(plan) = &set.update
+        && input.is_dir()
+    {
+        check_reserved(input, &plan.install.entry)?;
+    }
     assemble(input, &tree)?;
     say(&format!("assemble: copied {}", input.display()))?;
+    if let Some(plan) = &set.update {
+        place_update(&tree, plan)?;
+        say("update: placed the runtime and the update config")?;
+    }
 
     let order = sign_order(&tree)?;
     set.code_sign
@@ -641,6 +781,7 @@ mod tests {
             encoder: &LzmaCodec,
             codec: &LzmaCodec,
             hasher: &Sha256Hasher,
+            update: None,
         };
         let layout = ReleaseLayout::new(
             AppId::parse("org.example.app").unwrap(),

@@ -55,7 +55,10 @@ pub use ident::{AppId, Channel};
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use limits::Limits;
 pub use manifest::{EntryDoc, ManifestDocument, VerifiedEntry, VerifiedManifest, verify_manifest};
-pub use pack::{FileClass, PackedFile, ReleaseLayout, candidates, classify, pack_file};
+pub use pack::{
+    FileClass, PackedFile, ReleaseLayout, RuntimeImageError, candidates, check_runtime_image,
+    classify, pack_file,
+};
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
 pub use progress::{FileProgress, Phase, Progress, Source};

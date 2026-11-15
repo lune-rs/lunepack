@@ -212,6 +212,16 @@ impl World {
         )
     }
 
+    /// Appends `text` to the config (the `[update]` and `[install]` tables).
+    fn append_config(&self, text: &str) {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&self.config)
+            .unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
     fn work_dirs(&self) -> usize {
         fs::read_dir(&self.tmp)
             .unwrap()
@@ -734,4 +744,562 @@ fn non_rust_app_layout() {
         assert_ok(&linux, "pack linux-aarch64");
         check(Target::LinuxAarch64);
     }
+}
+
+// ---- `[update]`, `[install]` and `--runtime` (M5 step 2) -----------------------------------------
+
+/// A 64-bit little-endian ELF as a linker lays out a static executable (`ET_DYN`, one `PT_LOAD`,
+/// plus a `PT_INTERP` when `dynamic`), then filler.
+#[cfg(unix)]
+fn runtime_elf(machine: u16, dynamic: bool) -> Vec<u8> {
+    let types: &[u32] = if dynamic { &[1, 3] } else { &[1] };
+    let mut h = exe_headers::elf(machine, false, 64 + 56 * types.len() + 4096);
+    h[16..18].copy_from_slice(&3u16.to_le_bytes());
+    h[32..40].copy_from_slice(&64u64.to_le_bytes());
+    h[54..56].copy_from_slice(&56u16.to_le_bytes());
+    h[56..58].copy_from_slice(&(types.len() as u16).to_le_bytes());
+    for (i, t) in types.iter().enumerate() {
+        let at = 64 + 56 * i;
+        h[at..at + 4].copy_from_slice(&t.to_le_bytes());
+    }
+    h
+}
+
+#[cfg(unix)]
+const UPDATE_TOML: &str = r#"
+[update]
+feed = "https://updates.example.com/hello"
+channel = "stable"
+health_timeout_secs = 30
+
+[install]
+entry = "bin/app"
+name = "Hello"
+comment = "Says hello"
+icon = "assets/icon.svg"
+categories = ["Utility"]
+bin = "hello"
+"#;
+
+/// An app tree with `entry` marked exec and an SVG icon.
+#[cfg(unix)]
+fn app_tree(root: &Path, entry: &str) {
+    write(root, entry, &exe_headers::elf(62, false, 20_000));
+    set_mode(&root.join(entry), 0o755);
+    write(
+        root,
+        "assets/icon.svg",
+        b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+    );
+    write(root, "data/readme.txt", &text(3_000));
+}
+
+#[cfg(unix)]
+fn pack_update(
+    w: &World,
+    input: &Path,
+    dir: &Path,
+    runtime: Option<&Path>,
+    version: &'static str,
+    target: &'static str,
+) -> Output {
+    let mut extra = Vec::new();
+    if let Some(r) = runtime {
+        extra.extend_from_slice(&["--runtime", s(r)]);
+    }
+    w.pack(&Pack {
+        input,
+        version,
+        target,
+        release_dir: dir,
+        signers: w.all_signers(),
+        epoch: T0,
+        extra,
+    })
+}
+
+#[cfg(unix)]
+fn sha_of(m: &VerifiedManifest, path: &str) -> lunepack_core::Sha256Digest {
+    match file_entry(m, path) {
+        VerifiedEntry::File { sha256, .. } => *sha256,
+        _ => panic!("{path} is not a file"),
+    }
+}
+
+/// The runtime is placed beside the entry, the config at the root, both hashed into the manifest;
+/// the config decodes to the document the config file describes; `verify` accepts the release.
+#[cfg(unix)]
+#[test]
+fn update_pack_places_runtime_and_config() {
+    for (entry, runtime_at) in [
+        ("bin/app", "bin/lunepack-runtime"),
+        ("app", "lunepack-runtime"),
+    ] {
+        let w = World::new(1, 1);
+        let toml = UPDATE_TOML.replace("bin/app", entry);
+        w.append_config(&toml);
+        let dir = w.release_dir("rel", &[]);
+        let input = tempfile::tempdir().unwrap();
+        app_tree(input.path(), entry);
+        let runtime = w.dir.path().join("runtime");
+        let runtime_bytes = runtime_elf(62, false);
+        fs::write(&runtime, &runtime_bytes).unwrap();
+
+        let out = pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&runtime),
+            "1.2.3",
+            "linux-x86_64",
+        );
+        assert_ok(&out, "pack with [update]");
+        assert!(stdout(&out).contains("update: placed"), "{}", stdout(&out));
+        // The input is never touched.
+        assert!(!input.path().join(runtime_at).exists());
+        assert!(!input.path().join("lunepack-update.json").exists());
+
+        let (m, files) = w.verify(&dir, "1.2.3", Target::LinuxX86_64);
+        assert_eq!(files[runtime_at], runtime_bytes, "{entry}: the runtime");
+        assert!(exec_of(&m, runtime_at), "{entry}: the runtime is exec");
+        assert!(exec_of(&m, entry));
+        let config_bytes = &files["lunepack-update.json"];
+        assert_eq!(
+            sha_of(&m, "lunepack-update.json"),
+            Sha256Hasher.sha256(config_bytes),
+            "{entry}: the manifest's hash is the written bytes'"
+        );
+        assert!(!files.contains_key("assets/lunepack-update.json"));
+        let doc = lunepack_core::UpdateConfig::parse(config_bytes).unwrap();
+        assert_eq!(doc.app_id.as_str(), APP);
+        assert_eq!(doc.version.to_string(), "1.2.3");
+        assert_eq!(doc.target, Target::LinuxX86_64);
+        assert_eq!(doc.feed, "https://updates.example.com/hello/");
+        assert_eq!(doc.channel.as_str(), "stable");
+        assert_eq!(doc.health_timeout_secs, 30);
+        assert_eq!(doc.root.threshold, 1);
+        assert_eq!(doc.root.keys.len(), 1);
+        assert_eq!(doc.install.entry.as_str(), entry);
+        assert_eq!(doc.install.name, "Hello");
+        assert_eq!(doc.install.comment.as_deref(), Some("Says hello"));
+        assert_eq!(
+            doc.install.icon.as_ref().map(|i| i.as_str()),
+            Some("assets/icon.svg")
+        );
+        assert_eq!(doc.install.categories, ["Utility"]);
+        assert_eq!(doc.install.bin.as_deref(), Some("hello"));
+        assert!(!doc.install.terminal);
+
+        // `verify` accepts the release once a feed lists it, and `inspect` shows nothing new.
+        let signer = spec(&w.release[0]);
+        let epoch = T0.to_string();
+        let publisher = w.dir.path().join("rel.publisher/lunepack.toml");
+        let added = w.cmd(
+            &[
+                "--config",
+                s(&publisher),
+                "feed",
+                "add",
+                "--release-dir",
+                s(&dir),
+                "--channel",
+                "stable",
+                "--version",
+                "1.2.3",
+                "--sign",
+                &signer,
+            ],
+            &[("SOURCE_DATE_EPOCH", &epoch)],
+        );
+        assert_ok(&added, "feed add");
+        let at = (T0 + 60).to_string();
+        let verified = w.run(&["verify", s(&dir), "--at", &at], &[]);
+        assert_ok(&verified, "verify");
+        let inspected = w.run(&["inspect", s(&dir), "--at", &at], &[]);
+        assert_ok(&inspected, "inspect");
+        assert!(!stdout(&inspected).contains("lunepack-runtime"));
+    }
+}
+
+/// C2: the same inputs (the runtime's bytes included), keys and clock give identical bytes; a
+/// different runtime gives a different pack.
+#[cfg(unix)]
+#[test]
+fn update_pack_is_deterministic() {
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let (a, b) = (w.release_dir("a", &[]), w.release_dir("b", &[]));
+    for dir in [&a, &b] {
+        assert_ok(
+            &pack_update(
+                &w,
+                input.path(),
+                dir,
+                Some(&runtime),
+                "1.0.0",
+                "linux-x86_64",
+            ),
+            "pack",
+        );
+    }
+    for name in [
+        "1.0.0/linux-x86_64.pack",
+        "1.0.0/linux-x86_64.manifest.json",
+    ] {
+        assert_eq!(
+            fs::read(a.join(name)).unwrap(),
+            fs::read(b.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+    let other = w.dir.path().join("runtime2");
+    let mut changed = runtime_elf(62, false);
+    *changed.last_mut().unwrap() ^= 0xFF;
+    fs::write(&other, &changed).unwrap();
+    let c = w.release_dir("c", &[]);
+    assert_ok(
+        &pack_update(&w, input.path(), &c, Some(&other), "1.0.0", "linux-x86_64"),
+        "pack with another runtime",
+    );
+    assert_ne!(
+        fs::read(a.join("1.0.0/linux-x86_64.manifest.json")).unwrap(),
+        fs::read(c.join("1.0.0/linux-x86_64.manifest.json")).unwrap()
+    );
+}
+
+/// Every refusal exits 1, names the field or flag and not its value, writes nothing and leaves no
+/// work dir.
+#[cfg(unix)]
+#[test]
+fn update_pack_refusals() {
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    let dir = w.release_dir("rel", &[]);
+    let good = tempfile::tempdir().unwrap();
+    app_tree(good.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let refused = |input: &Path, rt: Option<&Path>, target: &'static str, needle: &str| {
+        let out = pack_update(&w, input, &dir, rt, "1.0.0", target);
+        let err = assert_fails(&out, 1, needle);
+        assert!(err.contains(needle), "{err:?} lacks {needle:?}");
+        assert!(
+            !dir.join("1.0.0")
+                .join(format!("{target}.manifest.json"))
+                .exists()
+        );
+        assert!(!dir.join("1.0.0").join(format!("{target}.pack")).exists());
+        assert_eq!(w.work_dirs(), 0, "{needle}: no work dir is left");
+        err
+    };
+
+    refused(good.path(), None, "linux-x86_64", "--runtime is required");
+
+    // A dynamic ELF, and an arm64 ELF for linux-x86_64.
+    let dynamic = w.dir.path().join("dynamic");
+    fs::write(&dynamic, runtime_elf(62, true)).unwrap();
+    refused(
+        good.path(),
+        Some(&dynamic),
+        "linux-x86_64",
+        "must be static",
+    );
+    let arm = w.dir.path().join("arm");
+    fs::write(&arm, runtime_elf(183, false)).unwrap();
+    refused(
+        good.path(),
+        Some(&arm),
+        "linux-x86_64",
+        "another architecture",
+    );
+    let junk = w.dir.path().join("junk");
+    fs::write(&junk, b"not an executable").unwrap();
+    refused(
+        good.path(),
+        Some(&junk),
+        "linux-x86_64",
+        "not an executable",
+    );
+
+    // Reserved names: the root config, one deeper, a directory of that name, and the runtime
+    // beside the entry (either form, any case).
+    for (rel, is_dir) in [
+        ("lunepack-update.json", false),
+        ("assets/lunepack-update.json", false),
+        ("data/deep/Lunepack-Update.JSON", false),
+        ("data/lunepack-update.json", true),
+        ("bin/lunepack-runtime", false),
+        ("bin/lunepack-runtime.exe", false),
+        ("bin/LUNEPACK-RUNTIME", false),
+    ] {
+        let input = tempfile::tempdir().unwrap();
+        app_tree(input.path(), "bin/app");
+        if is_dir {
+            fs::create_dir_all(input.path().join(rel)).unwrap();
+        } else {
+            write(input.path(), rel, b"x");
+        }
+        refused(input.path(), Some(&runtime), "linux-x86_64", "reserved");
+    }
+    // The runtime's name away from the entry's directory is an ordinary file.
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    write(input.path(), "tools/lunepack-runtime", b"x");
+    assert_ok(
+        &pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&runtime),
+            "2.0.0",
+            "linux-x86_64",
+        ),
+        "a runtime-named file elsewhere",
+    );
+
+    // An entry that is missing, not exec, a directory or a symlink; an icon that is missing.
+    let input = tempfile::tempdir().unwrap();
+    write(input.path(), "assets/icon.svg", b"<svg/>");
+    let err = refused(
+        input.path(),
+        Some(&runtime),
+        "linux-x86_64",
+        "install.entry",
+    );
+    assert!(!err.contains("bin/app"), "the value is not echoed: {err:?}");
+    write(input.path(), "bin/app", b"#!/bin/sh\n");
+    refused(
+        input.path(),
+        Some(&runtime),
+        "linux-x86_64",
+        "not marked executable",
+    );
+    fs::remove_file(input.path().join("bin/app")).unwrap();
+    fs::create_dir(input.path().join("bin/app")).unwrap();
+    refused(
+        input.path(),
+        Some(&runtime),
+        "linux-x86_64",
+        "install.entry",
+    );
+    fs::remove_dir(input.path().join("bin/app")).unwrap();
+    write(input.path(), "bin/real", b"#!/bin/sh\n");
+    set_mode(&input.path().join("bin/real"), 0o755);
+    std::os::unix::fs::symlink("real", input.path().join("bin/app")).unwrap();
+    refused(
+        input.path(),
+        Some(&runtime),
+        "linux-x86_64",
+        "install.entry",
+    );
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    fs::remove_file(input.path().join("assets/icon.svg")).unwrap();
+    refused(input.path(), Some(&runtime), "linux-x86_64", "install.icon");
+}
+
+/// The feed rule at pack time: a plain-http non-loopback feed is refused, naming the field and the
+/// rule and not the value; a loopback literal packs.
+#[cfg(unix)]
+#[test]
+fn update_pack_feed_rule() {
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    for (feed, ok) in [
+        ("http://example.com/", false),
+        ("http://localhost:8080/", false),
+        ("https://user@example.com/", false),
+        ("https://example.com/a?x=1", false),
+        ("http://127.0.0.1:8080/", true),
+        ("file:///srv/releases/", true),
+    ] {
+        let w = World::new(1, 1);
+        let toml = UPDATE_TOML.replace("https://updates.example.com/hello", feed);
+        w.append_config(&toml);
+        let dir = w.release_dir("rel", &[]);
+        let runtime = w.dir.path().join("runtime");
+        fs::write(&runtime, runtime_elf(62, false)).unwrap();
+        let out = pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&runtime),
+            "1.0.0",
+            "linux-x86_64",
+        );
+        if ok {
+            assert_ok(&out, feed);
+            let (_, files) = w.verify(&dir, "1.0.0", Target::LinuxX86_64);
+            let doc = lunepack_core::UpdateConfig::parse(&files["lunepack-update.json"]).unwrap();
+            assert_eq!(doc.feed, feed);
+        } else {
+            let err = assert_fails(&out, 1, feed);
+            assert!(err.contains("[update] feed"), "{feed}: {err:?}");
+            assert!(
+                !err.contains("example.com") && !err.contains("localhost"),
+                "{err:?}"
+            );
+            assert!(!dir.join("1.0.0").exists());
+            assert_eq!(w.work_dirs(), 0);
+        }
+    }
+}
+
+/// The config tables: `--runtime` without `[update]`, `[update]` without `[install]`, and the
+/// other way round, are errors; an app with neither packs as before; bad `[install]` values name
+/// their field.
+#[cfg(unix)]
+#[test]
+fn update_config_tables() {
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+
+    // No [update]: --runtime is refused, and the tree is packed as in M3.
+    let w = World::new(1, 1);
+    let dir = w.release_dir("rel", &[]);
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let out = pack_update(
+        &w,
+        input.path(),
+        &dir,
+        Some(&runtime),
+        "1.0.0",
+        "linux-x86_64",
+    );
+    let err = assert_fails(&out, 1, "--runtime without [update]");
+    assert!(err.contains("--runtime needs [update]"), "{err:?}");
+    assert!(!dir.join("1.0.0").exists());
+    assert_ok(
+        &pack_update(&w, input.path(), &dir, None, "1.0.0", "linux-x86_64"),
+        "pack without [update]",
+    );
+    let (_, files) = w.verify(&dir, "1.0.0", Target::LinuxX86_64);
+    assert!(!files.contains_key("lunepack-update.json"));
+    assert!(!files.contains_key("bin/lunepack-runtime"));
+
+    let broken = |toml: &str, needle: &str| {
+        let w = World::new(1, 1);
+        w.append_config(toml);
+        let out = w.run(&["verify", s(w.dir.path())], &[]);
+        let err = assert_fails(&out, 1, needle);
+        assert!(err.contains(needle), "{err:?} lacks {needle:?}");
+    };
+    broken(
+        "[update]\nfeed = \"https://example.com/\"\n",
+        "[update] needs [install]",
+    );
+    broken(
+        "[install]\nentry = \"app\"\nname = \"A\"\n",
+        "[install] needs [update]",
+    );
+    broken(
+        "[update]\nfeed = \"https://example.com/\"\nhealth_timeout_secs = 4\n[install]\nentry = \"app\"\nname = \"A\"\n",
+        "health_timeout_secs",
+    );
+    broken(
+        "[update]\nfeed = \"https://example.com/\"\n[install]\nentry = \"/abs\"\nname = \"A\"\n",
+        "install.entry",
+    );
+    broken(
+        "[update]\nfeed = \"https://example.com/\"\nbogus = 1\n[install]\nentry = \"app\"\nname = \"A\"\n",
+        "unknown field",
+    );
+    // A value the core refuses is named by its field at pack time.
+    let w = World::new(1, 1);
+    w.append_config(&UPDATE_TOML.replace("name = \"Hello\"", "name = \"Hel\\\\lo\""));
+    let dir = w.release_dir("rel", &[]);
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let out = pack_update(
+        &w,
+        input.path(),
+        &dir,
+        Some(&runtime),
+        "1.0.0",
+        "linux-x86_64",
+    );
+    let err = assert_fails(&out, 1, "a name with a backslash");
+    assert!(err.contains("[install] name"), "{err:?}");
+}
+
+/// Windows and macOS targets: the runtime's name and the config's place follow the target (the
+/// header-class check only), and the exec bit of a Windows entry is not required.
+#[cfg(unix)]
+#[test]
+fn update_pack_other_targets() {
+    let w = World::new(1, 1);
+    w.append_config(&UPDATE_TOML.replace("bin/app", "bin/app.exe"));
+    let dir = w.release_dir("rel", &[]);
+    let input = tempfile::tempdir().unwrap();
+    write(input.path(), "bin/app.exe", &exe_headers::pe(0x8664, 8_000));
+    write(input.path(), "assets/icon.svg", b"<svg/>");
+
+    let pe = w.dir.path().join("runtime.exe");
+    fs::write(&pe, exe_headers::pe(0x8664, 4_096)).unwrap();
+    assert_ok(
+        &pack_update(&w, input.path(), &dir, Some(&pe), "1.0.0", "windows-x86_64"),
+        "windows-x86_64",
+    );
+    let (_, files) = w.verify(&dir, "1.0.0", Target::WindowsX86_64);
+    assert!(files.contains_key("bin/lunepack-runtime.exe"));
+    assert!(files.contains_key("lunepack-update.json"));
+
+    // A Linux runtime for a Windows target, and an arm64 PE for x86-64, are refused.
+    let elf = w.dir.path().join("runtime.elf");
+    fs::write(&elf, runtime_elf(62, false)).unwrap();
+    let out = pack_update(
+        &w,
+        input.path(),
+        &dir,
+        Some(&elf),
+        "1.0.1",
+        "windows-x86_64",
+    );
+    assert_fails(&out, 1, "an ELF for a Windows target");
+    let arm = w.dir.path().join("arm.exe");
+    fs::write(&arm, exe_headers::pe(0xAA64, 4_096)).unwrap();
+    let out = pack_update(
+        &w,
+        input.path(),
+        &dir,
+        Some(&arm),
+        "1.0.1",
+        "windows-x86_64",
+    );
+    let err = assert_fails(&out, 1, "an arm64 PE for windows-x86_64");
+    assert!(err.contains("another architecture"), "{err:?}");
+
+    // macOS: the config sits under Contents/Resources (assumed until M8).
+    let w = World::new(1, 1);
+    w.append_config(&UPDATE_TOML.replace("bin/app", "App.app/Contents/MacOS/app"));
+    let dir = w.release_dir("rel", &[]);
+    let input = tempfile::tempdir().unwrap();
+    write(
+        input.path(),
+        "App.app/Contents/MacOS/app",
+        &exe_headers::macho(0x0100_000C, false, 8_000),
+    );
+    set_mode(&input.path().join("App.app/Contents/MacOS/app"), 0o755);
+    write(input.path(), "assets/icon.svg", b"<svg/>");
+    let macho = w.dir.path().join("runtime.macho");
+    fs::write(&macho, exe_headers::macho(0x0100_000C, false, 4_096)).unwrap();
+    assert_ok(
+        &pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&macho),
+            "1.0.0",
+            "macos-aarch64",
+        ),
+        "macos-aarch64",
+    );
+    let (_, files) = w.verify(&dir, "1.0.0", Target::MacosAarch64);
+    assert!(files.contains_key("App.app/Contents/MacOS/lunepack-runtime"));
+    assert!(files.contains_key("Contents/Resources/lunepack-update.json"));
 }
