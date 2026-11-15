@@ -212,7 +212,9 @@ impl World {
         )
     }
 
-    /// Appends `text` to the config (the `[update]` and `[install]` tables).
+    /// Appends `text` to the config (the `[update]` and `[install]` tables). Every user is a
+    /// unix-only test.
+    #[cfg(unix)]
     fn append_config(&self, text: &str) {
         use std::io::Write as _;
         let mut file = fs::OpenOptions::new()
