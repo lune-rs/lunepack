@@ -158,7 +158,7 @@ fn write_loop(
     let mut last_emit: Option<Instant> = None;
     loop {
         enum Step {
-            Progress(Progress, bool),
+            Progress(Progress),
             Final(FinalLine),
             Wait(Duration),
         }
@@ -168,13 +168,13 @@ fn write_loop(
                 let due = last_emit.is_none_or(|t| t.elapsed() >= interval);
                 // JSON shows every phase; human output keeps to its rate.
                 if json && let Some(p) = state.ended.pop_front() {
-                    break Step::Progress(p, true);
+                    break Step::Progress(p);
                 }
                 if !json {
                     state.ended.clear();
                 }
                 if due && let Some(p) = state.latest.take() {
-                    break Step::Progress(p, false);
+                    break Step::Progress(p);
                 }
                 if state.latest.is_none() && state.ended.is_empty() {
                     if let Some(last) = state.final_line.take() {
@@ -193,7 +193,7 @@ fn write_loop(
         };
         match step {
             Step::Wait(wait) => std::thread::sleep(wait),
-            Step::Progress(p, _) => {
+            Step::Progress(p) => {
                 last_emit = Some(Instant::now());
                 let text = progress_text(&p, json);
                 if json {
