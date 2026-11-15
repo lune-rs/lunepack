@@ -61,6 +61,10 @@ pub enum IntegrationError {
     /// value is not shown.
     #[error("field {0} cannot go into a desktop entry")]
     UnsafeField(&'static str),
+    /// The environment names no usable home directory (`HOME` is unset, not absolute or not
+    /// UTF-8).
+    #[error("the environment names no usable home directory")]
+    Home,
     /// A filesystem operation failed.
     #[error("{0}")]
     Fs(#[from] FsError),
@@ -78,6 +82,21 @@ pub struct IntegrationRequest {
     pub install_root: PathBuf,
     /// The metadata from the version's update config.
     pub meta: InstallMeta,
+    /// Command-link names from the outgoing version's config that the new `meta.bin` no longer
+    /// uses. `apply` removes each of them that lunepack made and leaves any other. Empty for a
+    /// first install and for `remove`.
+    pub stale_bins: Vec<String>,
+}
+
+/// What `apply` and `remove` report: the items they found and left alone because they are not
+/// lunepack's for this app (a foreign file at the entry's path, a link that points elsewhere).
+/// Empty when everything was handled.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IntegrationReport {
+    /// The items left in place, in the order met. An item can be named twice (the command link
+    /// and a stale command link).
+    pub kept: Vec<IntegrationItem>,
 }
 
 /// Creates, refreshes and removes an app's desktop integration. Object-safe and `Send + Sync`.
@@ -89,11 +108,20 @@ pub trait OsIntegration: Send + Sync {
     fn check(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError>;
 
     /// Creates the integration, or refreshes it from `req` when it exists; running it again with
-    /// the same request changes nothing. On an error nothing foreign is overwritten.
-    fn apply(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError>;
+    /// the same request changes nothing. On an error nothing foreign is overwritten. A stale
+    /// command link (`req.stale_bins`) that is not lunepack's is left and reported in `kept`.
+    fn apply(
+        &self,
+        scope: Scope,
+        req: &IntegrationRequest,
+    ) -> Result<IntegrationReport, IntegrationError>;
 
     /// Removes what [`OsIntegration::apply`] created for `req.app_id`, and only that: an entry
-    /// without lunepack's marker for this app id is left alone. Removing what is not there is
-    /// not an error.
-    fn remove(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError>;
+    /// without lunepack's marker for this app id is left alone and reported in `kept`. Removing
+    /// what is not there is not an error.
+    fn remove(
+        &self,
+        scope: Scope,
+        req: &IntegrationRequest,
+    ) -> Result<IntegrationReport, IntegrationError>;
 }

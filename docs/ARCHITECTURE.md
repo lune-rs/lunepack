@@ -77,15 +77,19 @@ Owned by the core, implemented by adapters, faked in the testkit. Defined today:
   in-use answers); suite: `run_process_suite`, which needs a helper executable the adapter's tests
   build. Errors name no path beyond a file name and no argument or environment value;
 - `OsIntegration` (`check`, `apply`, `remove` of an app's desktop entry and command link, built
-  from the update config's `InstallMeta`; removal checks a marker; machine scope is `Unsupported`
-  in M5), implemented by `lunepack-os-linux` (M5 step 6). Fake: `FakeIntegration` (records calls,
+  from the update config's `InstallMeta` and the `stale_bins` of the outgoing version; `apply` and
+  `remove` return an `IntegrationReport` naming what they left because it is not lunepack's;
+  removal checks a marker; machine scope is `Unsupported` in M5), implemented by
+  `lunepack-os-linux` as `XdgIntegration` (M5 step 6): the desktop entry is ours when it carries
+  `X-Lunepack-App-Id=<app id>`, the command link when its target lies under `<root>/current/`,
+  and an unsafe path is refused, never escaped. Fake: `FakeIntegration` (records calls,
   scripted conflicts); suite: `run_integration_suite`, run on a sandbox directory.
 
 `Clock` is implemented by `lunepack::SystemClock` and by the testkit's fake; the CLI adds a fixed
 clock for `SOURCE_DATE_EPOCH`. Each trait has a contract suite in the testkit that the real
 implementation's `tests/` runs, and a fake in the testkit. `Process` and `OsIntegration` have no
-implementation until M5 steps 5 and 6; their suites are written and checked against the fakes (and
-a small file-backed probe for the integration suite) in step 3.
+implementation before M5 steps 5 and 6 (`LinuxProcess`, `XdgIntegration`); their suites were written
+and checked against the fakes (and a small file-backed probe for the integration suite) in step 3.
 
 ## Layouts and the current tree
 

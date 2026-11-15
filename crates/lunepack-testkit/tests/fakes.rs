@@ -14,10 +14,10 @@ use lunepack_core::fetch::classify;
 use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId,
     DecodeReport, Encoder, Error, ExitKind, FileKind, FrameView, Fs, FsErrorKind, Hasher, Head,
-    InstallMeta, IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration, Process,
-    ProcessError, ProcessErrorKind, ProcessId, RangeError, RelPath, Request, ResponseInfo, Rng,
-    Scope, Sha256Digest, SignatureAlg, Signer, SpawnSpec, StreamView, Transport, TransportError,
-    TransportErrorKind, Validator, Verifier, WaitOutcome,
+    InstallMeta, IntegrationError, IntegrationItem, IntegrationReport, IntegrationRequest,
+    OsIntegration, Process, ProcessError, ProcessErrorKind, ProcessId, RangeError, RelPath,
+    Request, ResponseInfo, Rng, Scope, Sha256Digest, SignatureAlg, Signer, SpawnSpec, StreamView,
+    Transport, TransportError, TransportErrorKind, Validator, Verifier, WaitOutcome,
 };
 use lunepack_testkit::*;
 
@@ -1806,6 +1806,7 @@ fn integration_request(id: &str, root: &str) -> IntegrationRequest {
             bin: None,
             terminal: false,
         },
+        stale_bins: vec![],
     }
 }
 
@@ -1835,8 +1836,8 @@ fn fake_integration_records_calls_and_scripts_conflicts() {
     fake.script_failure(None);
     for result in [
         fake.check(Scope::Machine, &a),
-        fake.apply(Scope::Machine, &a),
-        fake.remove(Scope::Machine, &a),
+        fake.apply(Scope::Machine, &a).map(|_| ()),
+        fake.remove(Scope::Machine, &a).map(|_| ()),
     ] {
         assert!(matches!(result, Err(IntegrationError::Unsupported)));
     }
@@ -1910,7 +1911,11 @@ mod suite_probe {
             self.validate(req)
         }
 
-        fn apply(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+        fn apply(
+            &self,
+            scope: Scope,
+            req: &IntegrationRequest,
+        ) -> Result<IntegrationReport, IntegrationError> {
             self.check(scope, req)?;
             fs::create_dir_all(self.home.join("applications")).unwrap();
             fs::create_dir_all(self.home.join("bin")).unwrap();
@@ -1930,10 +1935,14 @@ mod suite_probe {
                 let _ = fs::remove_file(&path);
                 std::os::unix::fs::symlink(req.install_root.join("current/bin/app"), path).unwrap();
             }
-            Ok(())
+            Ok(IntegrationReport::default())
         }
 
-        fn remove(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+        fn remove(
+            &self,
+            scope: Scope,
+            req: &IntegrationRequest,
+        ) -> Result<IntegrationReport, IntegrationError> {
             if scope != Scope::User {
                 return Err(IntegrationError::Unsupported);
             }
@@ -1943,7 +1952,7 @@ mod suite_probe {
             {
                 let _ = fs::remove_file(self.home.join("bin").join(bin));
             }
-            Ok(())
+            Ok(IntegrationReport::default())
         }
     }
 }
