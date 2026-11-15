@@ -261,6 +261,8 @@ pub enum Mode {
     Install,
     /// `uninstall`: removes the install this runtime belongs to.
     Uninstall,
+    /// An app-facing command (`check`, `download`, `startup`, `confirm`).
+    Command(crate::cli::args::Parsed),
 }
 
 /// The arguments do not follow the grammar. Carries nothing about them.
@@ -275,12 +277,16 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
         // No options: everything they use is derived, nothing comes from argv (M5-D10).
         Some("install") if rest.is_empty() => Ok(Mode::Install),
         Some("uninstall") if rest.is_empty() => Ok(Mode::Uninstall),
-        _ => Err(UsageError),
+        Some(word) => match crate::cli::args::Command::named(word) {
+            Some(command) => crate::cli::args::parse(command, rest).map(Mode::Command),
+            None => Err(UsageError),
+        },
+        None => Err(UsageError),
     }
 }
 
 /// A decimal number: ASCII digits only (no sign, no space, no leading zero but `0` itself).
-fn decimal<T: std::str::FromStr>(value: &OsStr) -> Result<T, UsageError> {
+pub(crate) fn decimal<T: std::str::FromStr>(value: &OsStr) -> Result<T, UsageError> {
     let text = value.to_str().ok_or(UsageError)?;
     let plain = !text.is_empty()
         && text.bytes().all(|b| b.is_ascii_digit())
