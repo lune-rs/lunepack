@@ -17,7 +17,8 @@ the committed seeds and random and mutated inputs on stable:
     cargo install cargo-fuzz --locked
     cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
 
-Targets: `envelope`, `root`, `keys`, `feed`, `manifest`, `path`, `tree`, `rules`, `json`, `frame`, `http`.
+Targets: `envelope`, `root`, `keys`, `feed`, `manifest`, `path`, `tree`, `rules`, `json`, `frame`, `http`,
+`state`, `update_config`.
 If AddressSanitizer does not work on your host, add `-s none`. `corpus/` and `artifacts/` are
 local and gitignored; a crash lands in `artifacts/<target>/`.
 
@@ -49,3 +50,5 @@ regression case and fix the parser.
   first, last, signed pack size and expected body length; u16 BE status), then one `name: value`
   header line per newline. The harness runs the response header rules, the `Content-Range` and
   `Content-Length` checks and the document check.
+- `update_config`: the bytes are an update-config document (FORMAT.md 13); an accepted one must
+  round-trip through the writer to the same value and canonical bytes.

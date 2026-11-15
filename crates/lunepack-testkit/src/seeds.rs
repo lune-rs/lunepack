@@ -19,6 +19,7 @@ use lunepack_core::{
     FrameDesc, Fs, Hasher, InstallCounters, InstallState, Loaded, PayloadKind, PreviousRef,
     RootParts, Scope, StagedRef, StreamDesc, Target, Validator, Version, write_envelope,
 };
+use lunepack_core::{InstallMeta, RelPath, UpdateConfig};
 
 use crate::docs::{ChainFixture, PackBuilder, SUITE_T0};
 use crate::hasher::FakeHasher;
@@ -82,6 +83,7 @@ pub fn fuzz_seeds() -> Vec<Seed> {
     frame_seeds(&mut out);
     http_seeds(&mut out);
     state_seeds(&mut out);
+    update_config_seeds(&mut out);
     out.0
 }
 
@@ -910,4 +912,146 @@ fn state_seeds(out: &mut Out) {
     let mut unsorted = payload_value(&valid);
     unsorted.insert("bad".to_owned(), serde_json::json!(["1.0.2", "1.0.1"]));
     out.bad("state", "bad-not-sorted", raw_record(&unsorted));
+}
+
+// ---- update config --------------------------------------------------------------------------------
+
+/// An update config (FORMAT.md 13) with every member set, for app id [`FUZZ_APP_ID`]: the `update_config`
+/// seeds and the FORMAT.md 13 golden start from it. The root keys come from the fake hasher.
+pub fn sample_update_config() -> UpdateConfig {
+    let key = |label: &str| PublicKey::from_bytes(*FakeHasher.sha256(label.as_bytes()).as_bytes());
+    UpdateConfig {
+        app_id: AppId::parse(FUZZ_APP_ID).expect("fuzz app id"),
+        version: Version::parse(FUZZ_VERSION).expect("version"),
+        target: FUZZ_TARGET,
+        root: RootParts {
+            version: 2,
+            threshold: 1,
+            keys: vec![key("root key 1"), key("root key 2")],
+        },
+        feed: "https://updates.example.org/hello/".to_owned(),
+        channel: Channel::parse("stable").expect("channel"),
+        health_timeout_secs: 60,
+        install: InstallMeta {
+            entry: RelPath::parse("bin/hello").expect("entry"),
+            name: "Hello".to_owned(),
+            comment: Some("Says hello".to_owned()),
+            icon: Some(RelPath::parse("share/hello.png").expect("icon")),
+            categories: vec!["Utility".to_owned(), "Development".to_owned()],
+            bin: Some("hello".to_owned()),
+            terminal: false,
+        },
+        extra: Default::default(),
+    }
+}
+
+fn config_value(config: &UpdateConfig) -> serde_json::Map<String, serde_json::Value> {
+    let bytes = config.to_bytes().expect("sample config writes");
+    serde_json::from_slice(&bytes).expect("written config is JSON")
+}
+
+fn config_with(edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) -> Vec<u8> {
+    let mut map = config_value(&sample_update_config());
+    edit(&mut map);
+    serde_json::to_vec(&map).expect("edited config")
+}
+
+fn install_with(key: &str, value: serde_json::Value) -> Vec<u8> {
+    config_with(|m| {
+        if let Some(serde_json::Value::Object(install)) = m.get_mut("install") {
+            install.insert(key.to_owned(), value);
+        }
+    })
+}
+
+fn update_config_seeds(out: &mut Out) {
+    use serde_json::json;
+    let full = sample_update_config();
+    out.ok("update_config", "full", full.to_bytes().expect("full"));
+    let mut minimal = full.clone();
+    minimal.feed = "http://127.0.0.1:8080/r/".to_owned();
+    minimal.install = InstallMeta {
+        entry: RelPath::parse("hello").expect("entry"),
+        name: "H".to_owned(),
+        comment: None,
+        icon: None,
+        categories: Vec::new(),
+        bin: None,
+        terminal: true,
+    };
+    out.ok(
+        "update_config",
+        "minimal",
+        minimal.to_bytes().expect("minimal"),
+    );
+    out.ok(
+        "update_config",
+        "unknown-top-level",
+        config_with(|m| {
+            m.insert("x_future".to_owned(), json!({ "a": [1, 2] }));
+        }),
+    );
+    out.ok(
+        "update_config",
+        "file-feed",
+        config_with(|m| {
+            m.insert("feed".to_owned(), json!("file:///C:/releases/"));
+        }),
+    );
+
+    out.bad("update_config", "empty", Vec::new());
+    out.bad(
+        "update_config",
+        "critical",
+        config_with(|m| {
+            m.insert("critical".to_owned(), json!(["x_future"]));
+        }),
+    );
+    out.bad(
+        "update_config",
+        "format-2",
+        config_with(|m| {
+            m.insert("format".to_owned(), json!(2));
+        }),
+    );
+    out.bad(
+        "update_config",
+        "unknown-install-member",
+        install_with("x_future", json!(true)),
+    );
+    out.bad(
+        "update_config",
+        "name-newline",
+        install_with("name", json!("Hello\nExec=evil")),
+    );
+    out.bad(
+        "update_config",
+        "entry-is-runtime",
+        install_with("entry", json!("bin/lunepack-runtime")),
+    );
+    out.bad(
+        "update_config",
+        "feed-http-not-loopback",
+        config_with(|m| {
+            m.insert("feed".to_owned(), json!("http://10.0.0.1/"));
+        }),
+    );
+    out.bad(
+        "update_config",
+        "feed-userinfo",
+        config_with(|m| {
+            m.insert("feed".to_owned(), json!("http://127.0.0.1@evil.example/"));
+        }),
+    );
+    out.bad(
+        "update_config",
+        "missing-root",
+        config_with(|m| {
+            m.remove("root");
+        }),
+    );
+    let mut dup = full.to_bytes().expect("full");
+    let tail = dup.iter().rposition(|&b| b == b'}').expect("closing brace");
+    dup.splice(tail..tail, b",\"kind\":\"update-config\"\n".iter().copied());
+    out.bad("update_config", "duplicate-key", dup);
 }
