@@ -1,8 +1,9 @@
 //! The testkit's own tests: the fakes pass the contract suites, and each fake rejects what it must.
 
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
@@ -11,10 +12,12 @@ use std::time::{Duration, Instant};
 use lunepack_core::error::{CodecError, SignatureError};
 use lunepack_core::fetch::classify;
 use lunepack_core::{
-    BlockingResponse, BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId,
-    DecodeReport, Encoder, Error, FileKind, FrameView, Fs, FsErrorKind, Hasher, Head, RangeError,
-    Request, ResponseInfo, Sha256Digest, SignatureAlg, Signer, StreamView, Transport,
-    TransportError, TransportErrorKind, Validator, Verifier,
+    AppId, BlockingResponse, BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId,
+    DecodeReport, Encoder, Error, ExitKind, FileKind, FrameView, Fs, FsErrorKind, Hasher, Head,
+    InstallMeta, IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration, Process,
+    ProcessError, ProcessErrorKind, ProcessId, RangeError, RelPath, Request, ResponseInfo, Rng,
+    Scope, Sha256Digest, SignatureAlg, Signer, SpawnSpec, StreamView, Transport, TransportError,
+    TransportErrorKind, Validator, Verifier, WaitOutcome,
 };
 use lunepack_testkit::*;
 
@@ -1225,6 +1228,12 @@ fn the_fs_suite_catches_a_fs_that_follows_symlinks_on_create() {
         fn symlink(&self, t: &str, l: &Path) -> Result<(), lunepack_core::FsError> {
             self.0.symlink(t, l)
         }
+        fn read_link(&self, p: &Path) -> Result<String, lunepack_core::FsError> {
+            self.0.read_link(p)
+        }
+        fn replace_symlink(&self, t: &str, l: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.replace_symlink(t, l)
+        }
         fn try_lock(
             &self,
             p: &Path,
@@ -1525,4 +1534,449 @@ fn memfs_errors_name_only_the_file() {
     );
     let err = fs.read_capped(&root.join("only-name.txt"), 1).unwrap_err();
     assert!(format!("{err}").contains("only-name.txt"));
+}
+
+// ---- Rng, symlink replacement, Process and OsIntegration (M5 step 3) -----------------------------------
+
+#[test]
+fn fake_rng_passes_the_rng_suite_and_is_deterministic() {
+    run_rng_suite(&FakeRng::new(7));
+    let draw = |seed| {
+        let mut buf = [0u8; 48];
+        FakeRng::new(seed).fill(&mut buf).unwrap();
+        buf
+    };
+    assert_eq!(draw(7), draw(7));
+    assert_ne!(draw(7), draw(8));
+    assert_ne!(
+        draw(0),
+        [0u8; 48],
+        "seed 0 must not give an all-zero stream"
+    );
+    // The same source continues, it does not restart.
+    let rng = FakeRng::new(7);
+    let mut a = [0u8; 16];
+    let mut b = [0u8; 16];
+    rng.fill(&mut a).unwrap();
+    rng.fill(&mut b).unwrap();
+    assert_ne!(a, b);
+}
+
+#[test]
+fn a_failing_fake_rng_reports_random() {
+    let mut buf = [0u8; 4];
+    assert!(matches!(
+        FakeRng::failing().fill(&mut buf),
+        Err(Error::Random)
+    ));
+}
+
+#[test]
+fn the_rng_suite_catches_a_constant_source_and_a_zero_source() {
+    struct Zeros;
+    impl Rng for Zeros {
+        fn fill(&self, buf: &mut [u8]) -> Result<(), Error> {
+            buf.fill(0);
+            Ok(())
+        }
+    }
+    struct Constant;
+    impl Rng for Constant {
+        fn fill(&self, buf: &mut [u8]) -> Result<(), Error> {
+            buf.fill(0x42);
+            Ok(())
+        }
+    }
+    assert!(std::panic::catch_unwind(|| run_rng_suite(&Zeros)).is_err());
+    assert!(std::panic::catch_unwind(|| run_rng_suite(&Constant)).is_err());
+}
+
+fn link(fs: &MemFs, dir: &Path, name: &str) -> Option<String> {
+    fs.read_link(&dir.join(name)).ok()
+}
+
+#[test]
+fn memfs_replace_symlink_counts_two_ops_and_read_link_reads_it() {
+    let (fs, root) = mem();
+    fs.symlink("v1", &root.join("current")).unwrap();
+    assert_eq!(fs.read_link(&root.join("current")).unwrap(), "v1");
+    let before = fs.op_count();
+    fs.replace_symlink("v2", &root.join("current")).unwrap();
+    assert_eq!(fs.op_count() - before, 2, "the temp link, then the rename");
+    assert_eq!(link(&fs, root, "current").as_deref(), Some("v2"));
+    let names: Vec<_> = fs
+        .list_dir(root)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names.len(), 1, "a temporary link is left: {names:?}");
+    // A refusal costs no op and changes nothing.
+    put(&fs, &root.join("file"), b"x", true);
+    let before = fs.op_count();
+    assert_eq!(
+        fs.replace_symlink("v3", &root.join("file"))
+            .unwrap_err()
+            .kind,
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(fs.op_count(), before);
+    assert_eq!(
+        fs.read_link(&root.join("file")).unwrap_err().kind,
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(
+        fs.read_link(&root.join("none")).unwrap_err().kind,
+        FsErrorKind::NotFound
+    );
+}
+
+#[test]
+fn memfs_replace_symlink_is_atomic_at_every_crash_point_and_volatile_until_sync_dir() {
+    // Crash at op 0 (before the temp link) and op 1 (before the rename): the old link survives
+    // whatever the recovery mode; after op 1 the temp link is the only trace of the attempt.
+    for n in 0..2u64 {
+        let (fs, root) = mem();
+        fs.symlink("v1", &root.join("current")).unwrap();
+        fs.sync_dir(root).unwrap();
+        fs.crash_after(fs.op_count() + n);
+        assert_eq!(
+            fs.replace_symlink("v2", &root.join("current"))
+                .unwrap_err()
+                .kind,
+            FsErrorKind::Crashed,
+            "crash at op {n}"
+        );
+        for mode in [
+            RecoverMode::DropVolatile,
+            RecoverMode::KeepVolatile,
+            RecoverMode::TornVolatile(1),
+        ] {
+            let image = fs.recover(mode);
+            assert_eq!(
+                link(&image, root, "current").as_deref(),
+                Some("v1"),
+                "crash at op {n}, {mode:?}"
+            );
+        }
+        let kept = fs.recover(RecoverMode::KeepVolatile);
+        let entries = kept.list_dir(root).unwrap().len();
+        assert_eq!(entries, 1 + n as usize, "crash at op {n}");
+        let dropped = fs.recover(RecoverMode::DropVolatile);
+        assert_eq!(dropped.list_dir(root).unwrap().len(), 1, "crash at op {n}");
+    }
+    // A completed replace is volatile until the parent is synced.
+    let (fs, root) = mem();
+    fs.symlink("v1", &root.join("current")).unwrap();
+    fs.sync_dir(root).unwrap();
+    fs.replace_symlink("v2", &root.join("current")).unwrap();
+    let image = fs.recover(RecoverMode::DropVolatile);
+    assert_eq!(link(&image, root, "current").as_deref(), Some("v1"));
+    fs.sync_dir(root).unwrap();
+    let image = fs.recover(RecoverMode::DropVolatile);
+    assert_eq!(link(&image, root, "current").as_deref(), Some("v2"));
+    assert_eq!(image.list_dir(root).unwrap().len(), 1);
+}
+
+#[test]
+fn spawn_spec_and_process_errors_show_no_argument_or_environment_value() {
+    let mut spec = SpawnSpec::new("/opt/app/bin/the-app");
+    spec.args = vec![OsString::from("ARG-SECRET")];
+    spec.env_set = vec![(
+        OsString::from("LUNEPACK_HEALTH_TOKEN"),
+        OsString::from("ENV-SECRET"),
+    )];
+    spec.env_remove = vec![OsString::from("OLD")];
+    let shown = format!("{spec:?}");
+    assert!(
+        shown.contains("the-app") && shown.contains("LUNEPACK_HEALTH_TOKEN"),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("SECRET") && !shown.contains("/opt/app"),
+        "{shown}"
+    );
+    let err = ProcessError::new(ProcessErrorKind::SpawnFailed, "spawn")
+        .about(&spec.program)
+        .caused_by(io::Error::other("failed at /home/someone/private"));
+    let shown = format!("{err} / {err:?}");
+    assert!(
+        shown.contains("the-app") && !shown.contains("/opt/app"),
+        "{shown}"
+    );
+    assert!(!shown.contains("/home/someone"), "{shown}");
+    assert!(
+        std::error::Error::source(&err).is_some(),
+        "the cause is kept"
+    );
+}
+
+#[test]
+fn fake_process_records_spawns_and_scripts_children() {
+    let fake = FakeProcess::new("/opt/app/versions/1.0.0/bin/app");
+    assert_eq!(fake.current().unwrap().pid, 100);
+    assert!(fake.parent().unwrap().is_some());
+    fake.set_parent(None);
+    assert_eq!(fake.parent().unwrap(), None);
+
+    let mut spec = SpawnSpec::new("/opt/app/bin/app");
+    spec.args = vec![OsString::from("--x")];
+    spec.env_set = vec![(OsString::from("K"), OsString::from("V"))];
+    fake.script_child(ChildScript::exits(2, ExitKind::Failure(3)));
+    let mut child = fake.spawn_child(&spec).unwrap();
+    let id = child.id();
+    // While scripted to run, wait_exit times out; the child answers None twice, then the exit.
+    assert_eq!(
+        fake.wait_exit(&id, Duration::from_secs(1)).unwrap(),
+        WaitOutcome::TimedOut
+    );
+    assert_eq!(child.try_wait().unwrap(), None);
+    assert_eq!(child.try_wait().unwrap(), None);
+    assert_eq!(child.try_wait().unwrap(), Some(ExitKind::Failure(3)));
+    assert_eq!(child.try_wait().unwrap(), Some(ExitKind::Failure(3)));
+    assert_eq!(
+        fake.wait_exit(&id, Duration::from_secs(1)).unwrap(),
+        WaitOutcome::Exited
+    );
+    // An unscripted child runs until terminated.
+    let mut other = fake.spawn_child(&spec).unwrap();
+    assert_ne!(other.id(), id);
+    assert_eq!(other.try_wait().unwrap(), None);
+    other.terminate(Duration::from_millis(1)).unwrap();
+    assert_eq!(other.try_wait().unwrap(), Some(ExitKind::Signal(15)));
+    assert_eq!(fake.terminated(), vec![other.id()]);
+    // Detached spawns are recorded with their arguments and environment.
+    fake.spawn_detached(&spec).unwrap();
+    let spawns = fake.spawns();
+    assert_eq!(spawns.len(), 3);
+    assert!(!spawns[0].detached && spawns[2].detached);
+    assert_eq!(spawns[2].args, vec![OsString::from("--x")]);
+    assert_eq!(spawns[2].child, None);
+    // Scripted waits and in-use answers come out in order, and are logged.
+    fake.script_wait(WaitOutcome::TimedOut);
+    fake.script_wait(WaitOutcome::Exited);
+    let target = ProcessId {
+        pid: 9,
+        start_ticks: 9,
+    };
+    assert_eq!(
+        fake.wait_exit(&target, Duration::from_secs(5)).unwrap(),
+        WaitOutcome::TimedOut
+    );
+    assert_eq!(
+        fake.wait_exit(&target, Duration::from_secs(5)).unwrap(),
+        WaitOutcome::Exited
+    );
+    assert_eq!(
+        fake.waits().last().unwrap(),
+        &(target, Duration::from_secs(5))
+    );
+    fake.script_in_use(true);
+    assert!(
+        fake.tree_in_use(Path::new("/opt/app/versions/1.0.0"), &[id])
+            .unwrap()
+    );
+    assert!(
+        !fake
+            .tree_in_use(Path::new("/opt/app/versions/1.0.0"), &[])
+            .unwrap()
+    );
+    assert_eq!(fake.in_use_calls()[0].1, vec![id]);
+    // Spawn failures, and a relative program, are refused with a typed error.
+    fake.fail_spawns(Some(ProcessErrorKind::NotFound));
+    let err = fake.spawn_child(&spec).err().unwrap();
+    assert!(matches!(&err, Error::Process(e) if e.kind == ProcessErrorKind::NotFound));
+    fake.fail_spawns(None);
+    let err = fake
+        .spawn_detached(&SpawnSpec::new("relative/app"))
+        .unwrap_err();
+    assert!(matches!(&err, Error::Process(e) if e.kind == ProcessErrorKind::InvalidRequest));
+}
+
+fn integration_request(id: &str, root: &str) -> IntegrationRequest {
+    IntegrationRequest {
+        app_id: AppId::parse(id).unwrap(),
+        install_root: PathBuf::from(root),
+        meta: InstallMeta {
+            entry: RelPath::parse("bin/app").unwrap(),
+            name: "App".to_owned(),
+            comment: None,
+            icon: None,
+            categories: vec![],
+            bin: None,
+            terminal: false,
+        },
+    }
+}
+
+#[test]
+fn fake_integration_records_calls_and_scripts_conflicts() {
+    let fake = FakeIntegration::new();
+    let a = integration_request("app.a", "/data/app.a");
+    fake.check(Scope::User, &a).unwrap();
+    fake.apply(Scope::User, &a).unwrap();
+    assert_eq!(fake.applied().into_iter().collect::<Vec<_>>(), ["app.a"]);
+    assert_eq!(fake.applied_meta("app.a").unwrap().name, "App");
+    fake.script_conflict(Some(IntegrationItem::BinLink));
+    assert!(matches!(
+        fake.check(Scope::User, &a),
+        Err(IntegrationError::Conflict(IntegrationItem::BinLink))
+    ));
+    assert!(matches!(
+        fake.apply(Scope::User, &a),
+        Err(IntegrationError::Conflict(_))
+    ));
+    fake.script_conflict(None);
+    fake.script_failure(Some("disk on fire"));
+    assert!(matches!(
+        fake.apply(Scope::User, &a),
+        Err(IntegrationError::Failed("disk on fire"))
+    ));
+    fake.script_failure(None);
+    for result in [
+        fake.check(Scope::Machine, &a),
+        fake.apply(Scope::Machine, &a),
+        fake.remove(Scope::Machine, &a),
+    ] {
+        assert!(matches!(result, Err(IntegrationError::Unsupported)));
+    }
+    assert_eq!(fake.applied().len(), 1, "machine scope applied something");
+    fake.remove(Scope::User, &a).unwrap();
+    assert!(fake.applied().is_empty());
+    let ops: Vec<_> = fake.calls().iter().map(|c| c.op).collect();
+    assert_eq!(ops[..2], [IntegrationOp::Check, IntegrationOp::Apply]);
+    assert_eq!(*ops.last().unwrap(), IntegrationOp::Remove);
+    assert_eq!(fake.calls()[0].install_root, PathBuf::from("/data/app.a"));
+}
+
+/// A small real-file implementation, only to prove the suite passes a correct integration and
+/// fails a broken one. (The Linux adapter runs the suite in `lunepack-os-linux`.)
+#[cfg(unix)]
+mod suite_probe {
+    use super::*;
+    use std::fs;
+
+    pub struct Probe {
+        pub home: PathBuf,
+        pub leave_bin_on_remove: bool,
+        pub ignore_checks: bool,
+    }
+
+    impl Probe {
+        fn unsafe_text(text: &str) -> bool {
+            text.chars()
+                .any(|c| c.is_control() || c == ';' || c == '\\')
+        }
+
+        fn validate(&self, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+            if self.ignore_checks {
+                return Ok(());
+            }
+            let m = &req.meta;
+            if Self::unsafe_text(&m.name) {
+                return Err(IntegrationError::UnsafeField("name"));
+            }
+            if m.comment.as_deref().is_some_and(Self::unsafe_text) {
+                return Err(IntegrationError::UnsafeField("comment"));
+            }
+            if m.categories.iter().any(|c| Self::unsafe_text(c)) {
+                return Err(IntegrationError::UnsafeField("categories"));
+            }
+            if m.bin
+                .as_deref()
+                .is_some_and(|b| b.contains('/') || b.contains(".."))
+            {
+                return Err(IntegrationError::UnsafeField("bin"));
+            }
+            lunepack_core::desktop_safe_path(&req.install_root.to_string_lossy()).map_err(
+                |reason| IntegrationError::UnsafePath {
+                    what: "install root",
+                    reason,
+                },
+            )
+        }
+
+        fn entry(&self, req: &IntegrationRequest) -> PathBuf {
+            self.home
+                .join(format!("applications/{}.desktop", req.app_id.as_str()))
+        }
+    }
+
+    impl OsIntegration for Probe {
+        fn check(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+            if scope != Scope::User {
+                return Err(IntegrationError::Unsupported);
+            }
+            self.validate(req)
+        }
+
+        fn apply(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+            self.check(scope, req)?;
+            fs::create_dir_all(self.home.join("applications")).unwrap();
+            fs::create_dir_all(self.home.join("bin")).unwrap();
+            fs::write(
+                self.entry(req),
+                format!(
+                    "[Desktop Entry]\nName={}\nExec={}/current/{}\nX-Lunepack-App-Id={}\n",
+                    req.meta.name,
+                    req.install_root.display(),
+                    req.meta.entry,
+                    req.app_id.as_str()
+                ),
+            )
+            .unwrap();
+            if let Some(bin) = &req.meta.bin {
+                let path = self.home.join("bin").join(bin);
+                let _ = fs::remove_file(&path);
+                std::os::unix::fs::symlink(req.install_root.join("current/bin/app"), path).unwrap();
+            }
+            Ok(())
+        }
+
+        fn remove(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+            if scope != Scope::User {
+                return Err(IntegrationError::Unsupported);
+            }
+            let _ = fs::remove_file(self.entry(req));
+            if !self.leave_bin_on_remove
+                && let Some(bin) = &req.meta.bin
+            {
+                let _ = fs::remove_file(self.home.join("bin").join(bin));
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_integration_suite_passes_a_correct_integration_and_catches_broken_ones() {
+    use suite_probe::Probe;
+    let run = |leave_bin_on_remove, ignore_checks| {
+        let dir = std::env::temp_dir().join(format!(
+            "lunepack-integration-probe-{}-{}-{}",
+            std::process::id(),
+            leave_bin_on_remove,
+            ignore_checks
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = std::fs::canonicalize(&dir).unwrap();
+        let probe = Probe {
+            home: home.clone(),
+            leave_bin_on_remove,
+            ignore_checks,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_integration_suite(&probe, &home)
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        result.is_ok()
+    };
+    assert!(run(false, false), "a correct integration must pass");
+    assert!(!run(true, false), "a remove that leaves the link must fail");
+    assert!(
+        !run(false, true),
+        "an integration that accepts unsafe input must fail"
+    );
 }

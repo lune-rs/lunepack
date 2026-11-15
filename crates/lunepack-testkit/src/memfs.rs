@@ -11,7 +11,8 @@
 //!
 //! Crashes: every mutating call is a numbered op (`create_new`, each `write`, `sync`, `truncate`,
 //! `rename`, `remove_file`, `remove_dir_all_nofollow`, `create_dir_all`, `sync_dir`, `copy_file`,
-//! `set_exec`, `symlink`; `open_append` and the reads are not). [`MemFs::crash_after`]`(n)` makes op
+//! `set_exec`, `symlink`, and two for `replace_symlink` (the temporary link, then the rename over
+//! the old one); `open_append` and the reads are not). [`MemFs::crash_after`]`(n)` makes op
 //! number `n` (zero-based) and everything after it, reads and locks included, fail with
 //! [`FsErrorKind::Crashed`]; op `n` has no effect. [`MemFs::op_count`] says how many ops ran, so a
 //! test runs an operation once to learn its op count `k` and then once per crash point `0..k`.
@@ -706,6 +707,44 @@ impl Fs for MemFs {
         let (dir, name) = st.new_entry(link_path)?;
         let id = st.add(Node::Symlink(target.to_owned()));
         st.dir_live_mut(dir, link_path)?.insert(name, id);
+        Ok(())
+    }
+
+    fn read_link(&self, path: &Path) -> Result<String, FsError> {
+        let st = lock(&self.state);
+        st.alive(path)?;
+        let walk = st.walk(path, false)?;
+        match walk.node.and_then(|id| st.nodes.get(&id)) {
+            None => Err(FsError::new(FsErrorKind::NotFound, path, None)),
+            Some(Node::Symlink(target)) => Ok(target.clone()),
+            Some(_) => Err(FsError::new(FsErrorKind::NotASymlink, path, None)),
+        }
+    }
+
+    fn replace_symlink(&self, target: &str, link: &Path) -> Result<(), FsError> {
+        let mut st = lock(&self.state);
+        st.alive(link)?;
+        // Validate first: a refusal changes nothing and costs no op.
+        let walk = st.walk(link, false)?;
+        let Some((dir, name)) = walk.entry else {
+            return Err(FsError::new(FsErrorKind::NotFound, link, None));
+        };
+        if let Some(id) = walk.node
+            && !matches!(st.nodes.get(&id), Some(Node::Symlink(_)))
+        {
+            return Err(FsError::new(FsErrorKind::NotASymlink, link, None));
+        }
+        // Op one: the temporary link, in the link's own directory.
+        st.begin_op(link)?;
+        let temp_id = st.add(Node::Symlink(target.to_owned()));
+        let temp_name = OsString::from(format!(".lunepack-link-{temp_id}"));
+        st.dir_live_mut(dir, link)?
+            .insert(temp_name.clone(), temp_id);
+        // Op two: the rename over the old link. A crash here leaves the temporary link behind.
+        st.begin_op(link)?;
+        let live = st.dir_live_mut(dir, link)?;
+        live.remove(&temp_name);
+        live.insert(name, temp_id);
         Ok(())
     }
 

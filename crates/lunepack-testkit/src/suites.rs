@@ -1179,6 +1179,40 @@ pub fn run_transport_suite(
 
 // ---- filesystem suite (M4 step 3) ---------------------------------------------------------------------
 
+/// Random source contract: every length from 0 to 64 is filled, exactly (nothing past the end of
+/// the slice is touched, which the slice type already guarantees, and the bytes written are not
+/// left as the zeros they started as once the slice is long enough to tell), and two draws of
+/// 32 bytes differ. A source that is deterministic by design (the fake) still passes: it differs
+/// from draw to draw.
+pub fn run_rng_suite(rng: &dyn lunepack_core::Rng) {
+    let mut tail_guard = [0xA5u8; 80];
+    for len in 0..=64usize {
+        let mut buf = vec![0u8; len];
+        rng.fill(&mut buf)
+            .unwrap_or_else(|e| panic!("fill({len}): {e}"));
+        assert_eq!(buf.len(), len);
+        if len >= 8 {
+            assert!(
+                buf.iter().any(|b| *b != 0),
+                "fill({len}) left all {len} bytes zero"
+            );
+        }
+        // A prefix of a larger buffer: the bytes after it stay as they were.
+        tail_guard.fill(0xA5);
+        rng.fill(&mut tail_guard[..len])
+            .unwrap_or_else(|e| panic!("fill(prefix {len}): {e}"));
+        assert!(
+            tail_guard[len..].iter().all(|b| *b == 0xA5),
+            "fill({len}) wrote past the slice"
+        );
+    }
+    let mut first = [0u8; 32];
+    let mut second = [0u8; 32];
+    rng.fill(&mut first).expect("first draw");
+    rng.fill(&mut second).expect("second draw");
+    assert_ne!(first, second, "two 32-byte draws were equal");
+}
+
 fn fs_kind<T>(result: Result<T, FsError>, what: &str) -> FsErrorKind {
     match result {
         Ok(_) => panic!("{what}: succeeded, expected an error"),
@@ -1535,4 +1569,113 @@ fn fs_symlink_cases(fs: &dyn Fs, base: &Path) {
             .map(|m| m.kind),
         Some(FileKind::Symlink)
     );
+
+    fs_link_cases(fs, base);
+}
+
+/// `read_link` and `replace_symlink`, in a directory of their own so the entries can be counted.
+fn fs_link_cases(fs: &dyn Fs, base: &Path) {
+    let dir = base.join("links");
+    fs.create_dir_all(&dir).unwrap();
+    let names = |fs: &dyn Fs| {
+        let mut names: Vec<String> = fs
+            .list_dir(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    write_file(fs, &dir.join("file"), b"payload");
+    fs.create_dir_all(&dir.join("sub")).unwrap();
+    fs.symlink("versions/1.0.0", &dir.join("old")).unwrap();
+
+    // read_link: the target text as stored; a file, a directory and a missing path are errors.
+    assert_eq!(fs.read_link(&dir.join("old")).unwrap(), "versions/1.0.0");
+    assert_eq!(
+        fs_kind(fs.read_link(&dir.join("file")), "read_link of a file"),
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(
+        fs_kind(fs.read_link(&dir.join("sub")), "read_link of a directory"),
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(
+        fs_kind(fs.read_link(&dir.join("missing")), "read_link of nothing"),
+        FsErrorKind::NotFound
+    );
+    let before = names(fs);
+
+    // Over an existing link: the target changes, no temporary entry is left, the old target
+    // (here a directory that does not exist) is untouched.
+    fs.replace_symlink("versions/1.1.0", &dir.join("old"))
+        .expect("replace over a link");
+    assert_eq!(fs.read_link(&dir.join("old")).unwrap(), "versions/1.1.0");
+    assert_eq!(names(fs), before, "a temporary link was left behind");
+    fs.sync_dir(&dir).unwrap();
+
+    // Over an absent path: a new link, a dangling target is fine.
+    fs.replace_symlink("nowhere/at/all", &dir.join("fresh"))
+        .expect("replace over nothing");
+    assert_eq!(fs.read_link(&dir.join("fresh")).unwrap(), "nowhere/at/all");
+    assert_eq!(
+        fs.symlink_metadata(&dir.join("fresh"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Symlink)
+    );
+    assert_eq!(
+        fs.symlink_metadata(&dir.join("nowhere")).unwrap(),
+        None,
+        "created through the link"
+    );
+
+    // Over a link to a directory: the link is replaced, not the directory behind it.
+    fs.symlink("sub", &dir.join("to-dir")).unwrap();
+    fs.replace_symlink("file", &dir.join("to-dir"))
+        .expect("replace a link to a directory");
+    assert_eq!(fs.read_link(&dir.join("to-dir")).unwrap(), "file");
+    assert_eq!(
+        fs.symlink_metadata(&dir.join("sub"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Dir)
+    );
+
+    // Refusals: a file or a directory at the link; nothing changes, nothing is left behind.
+    let before = names(fs);
+    assert_eq!(
+        fs_kind(
+            fs.replace_symlink("x", &dir.join("file")),
+            "replace_symlink over a file"
+        ),
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(
+        fs_kind(
+            fs.replace_symlink("x", &dir.join("sub")),
+            "replace_symlink over a directory"
+        ),
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(fs.read_capped(&dir.join("file"), 100).unwrap(), b"payload");
+    assert_eq!(
+        fs.symlink_metadata(&dir.join("sub"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Dir)
+    );
+    assert_eq!(names(fs), before, "a refusal left an entry behind");
+
+    // A missing parent directory is an error, and creates nothing.
+    assert_eq!(
+        fs_kind(
+            fs.replace_symlink("x", &dir.join("no-such-dir/link")),
+            "replace_symlink in a missing directory"
+        ),
+        FsErrorKind::NotFound
+    );
+    assert_eq!(names(fs), before);
+    fs.remove_dir_all_nofollow(&dir).unwrap();
 }

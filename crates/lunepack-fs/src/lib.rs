@@ -12,6 +12,9 @@
 //!   canonicalised first);
 //! - `remove_dir_all_nofollow` removes a symlink itself and never reaches through one;
 //! - `copy_file` never overwrites;
+//! - `replace_symlink` makes a temporary link in the link's own directory and renames it over the
+//!   old one, so a reader sees the old target or the new one; it refuses a file or directory at
+//!   the link;
 //! - errors name only the file name of the path (`lunepack_core::FsError`).
 //!
 //! Durability: [`Fs::sync_dir`] is `fsync` on the directory on Unix. On Windows it calls
@@ -24,6 +27,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lunepack_core::{
     DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, ReadAt,
@@ -35,6 +39,9 @@ const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 /// `ERROR_ACCESS_DENIED` and `ERROR_INVALID_FUNCTION`.
 #[cfg(windows)]
 const WINDOWS_DIR_FLUSH_REFUSED: [i32; 2] = [5, 1];
+
+/// Makes temporary link names unique within one process.
+static TEMP_LINK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The filesystem of the host, through `std`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -301,6 +308,59 @@ impl Fs for StdFs {
 
     fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
         symlink(target, link_path).map_err(err("symlink", link_path))
+    }
+
+    fn read_link(&self, path: &Path) -> Result<String, FsError> {
+        match lstat(path)? {
+            None => Err(FsError::new(FsErrorKind::NotFound, path, None).during("read_link")),
+            Some(meta) if !meta.file_type().is_symlink() => {
+                Err(FsError::new(FsErrorKind::NotASymlink, path, None).during("read_link"))
+            }
+            Some(_) => fs::read_link(path)
+                .map_err(err("read_link", path))?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| other(path, "link target is not UTF-8").during("read_link")),
+        }
+    }
+
+    fn replace_symlink(&self, target: &str, link: &Path) -> Result<(), FsError> {
+        // Refuse a file or directory before anything is created. A symlink (dangling or not) or
+        // nothing at all is fine. The gap before the rename is not a race this crate can close:
+        // the install root is the user's own directory under the state lock.
+        if let Some(meta) = lstat(link)?
+            && !meta.file_type().is_symlink()
+        {
+            return Err(
+                FsError::new(FsErrorKind::NotASymlink, link, None).during("replace_symlink")
+            );
+        }
+        let parent = link.parent().ok_or_else(|| {
+            FsError::new(FsErrorKind::NotFound, link, None).during("replace_symlink")
+        })?;
+        // A fresh temporary name in the same directory, so the rename is atomic and never crosses
+        // a file system. Names do not depend on the link's own name (which may be long).
+        let mut temp = None;
+        for _ in 0..16 {
+            let n = TEMP_LINK_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(".lunepack-link-{}-{n}", std::process::id()));
+            match symlink(target, &candidate) {
+                Ok(()) => {
+                    temp = Some(candidate);
+                    break;
+                }
+                // A leftover of an earlier crash with a recycled pid: try the next name.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(FsError::from_io(link, e).during("symlink")),
+            }
+        }
+        let temp = temp.ok_or_else(|| {
+            FsError::new(FsErrorKind::AlreadyExists, link, None).during("replace_symlink")
+        })?;
+        fs::rename(&temp, link).map_err(|e| {
+            let _ = fs::remove_file(&temp);
+            FsError::from_io(link, e).during("rename")
+        })
     }
 
     fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {

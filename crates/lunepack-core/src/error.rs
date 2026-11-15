@@ -7,7 +7,9 @@ use std::fmt;
 
 use crate::fetch::RangeError;
 use crate::fs::FsError;
+use crate::integration::IntegrationError;
 use crate::path::{PathError, TreeError};
+use crate::process::ProcessError;
 use crate::target::TargetError;
 use crate::traits::CodecId;
 use crate::transport::TransportError;
@@ -768,4 +770,13 @@ pub enum Error {
     /// The install-state store failed.
     #[error("install state: {0}")]
     State(#[from] StateError),
+    /// The operating system gave no randomness.
+    #[error("the operating system gave no randomness")]
+    Random,
+    /// A process operation failed.
+    #[error("{0}")]
+    Process(#[from] ProcessError),
+    /// The operating-system integration (desktop entry, command link) failed.
+    #[error("{0}")]
+    Integration(#[from] IntegrationError),
 }

@@ -1,7 +1,7 @@
 # Architecture
 
 How the workspace is split and how the split is enforced. Crate roles and the boundary rules
-are the current design; ten traits are defined (below) and the rest stay provisional. The wire
+are the current design; thirteen traits are defined (below). The wire
 format is `docs/FORMAT.md` and its threat model `docs/THREAT-MODEL.md`. Decisions behind this are in
 `docs/DECISIONS.md` (D1, D6, D14, D17, D23, D26, D28, D30, D31, D33, M2-D1 to M2-D9, M3-D1 to M3-D13,
 M4-D1 to M4-D23).
@@ -11,7 +11,7 @@ M4-D1 to M4-D23).
 | Crate | Role | May depend on |
 |---|---|---|
 | `lunepack-core` | Types, rules, verification policy, planning, state machine, apply engine; owns every trait and the error enum. No I/O, clock, randomness or network of its own. Today: strict JSON, DSSE envelopes, root rotation, key sets, feeds, manifests, frame descriptors, the path, version and target rules, update policy, and the hidden `fuzz` harness module. Since M4 also the sans-IO client logic: the transport traits and the pure HTTP response rules (`Content-Range`, validators, encoding, fetch planning), the `Fs` trait, the install-state store (records, commit and load, scopes, transitions; FORMAT.md 12), the stage engine (scan for unchanged files, bounded parallel decode within a memory budget, resume, `NeedFetch`), the `CancelToken` and the progress event types. The one use of threads in the core is `std::thread::scope` (and `std::thread::panicking`) in the stage engine, because the worker count comes from the caller, so the output never depends on the machine; it uses no clock, environment, filesystem or network, the purity test allows exactly those two paths in `stage.rs`, and any other thread use in the core stays forbidden (M4-D12, user decision Q30, 2026-11-14). | nothing external beyond an explicit allowlist: `serde`, `serde_json`, `base64`, `semver`, `unicode-normalization`, `thiserror` (M2-D1) |
-| `lunepack-testkit` | In-memory fakes and the contract suites. Today: a fake clock, hasher, signature scheme and codec (with fault knobs), the contract suites for the traits below, document builders over the core's real writer, and the fuzz seed writer; `MemFs`, an in-memory `Fs` that injects a crash at any operation and recovers under a chosen durability mode; `FakeTransport` and `FakeBlockingTransport` over a `FakeOrigin` (Range, `If-Range`, validators, redirects, a request log and fault knobs such as an ignored Range, a wrong `Content-Range`, a truncated, endless or one-byte-chunk body); and `LoopbackServer`, the same origin over a real `127.0.0.1` socket. `publish = false`. | core |
+| `lunepack-testkit` | In-memory fakes and the contract suites. Today: a fake clock, hasher, signature scheme and codec (with fault knobs), the contract suites for the traits below, document builders over the core's real writer, and the fuzz seed writer; `MemFs`, an in-memory `Fs` that injects a crash at any operation and recovers under a chosen durability mode; `FakeTransport` and `FakeBlockingTransport` over a `FakeOrigin` (Range, `If-Range`, validators, redirects, a request log and fault knobs such as an ignored Range, a wrong `Content-Range`, a truncated, endless or one-byte-chunk body); and `LoopbackServer`, the same origin over a real `127.0.0.1` socket; and, since M5 step 3, `FakeRng`, `FakeProcess` and `FakeIntegration` with their suites. `publish = false`. | core |
 | `lunepack-crypto` | Hashing and signature verification adapters: SHA-256 and Ed25519 with strict verification; and the signers (M3): `Ed25519Signer` over PKCS#8 PEM from a file or an environment variable, `generate_key_file`, and `CommandSigner` (an external command whose signature is verified before use). Nothing it prints or returns in an error holds key material. | core |
 | `lunepack-codec-lzma` | Compression adapter over `lzma-rust2` (confined to this crate, M3-D11): the `Codec` decoder with limits from the signed descriptor, and the `Encoder` at the 9e settings for all five codec ids (stored, LZMA2, BCJ x86 and ARM64 + LZMA2, BCJ2). Delta coding comes later. | core |
 | `lunepack-fs` | Filesystem adapter: `StdFs`, the `Fs` implementation over `std::fs` (it refuses symlink components when it creates directories, and syncs files and directories), and the OS lock behind `Fs::try_lock` through `fs4` (released by the OS when its holder dies). May lift `unsafe_code`; documents that Windows directory durability is an unverified assumption. | core |
@@ -61,14 +61,31 @@ Owned by the core, implemented by adapters, faked in the testkit. Defined today:
   (validators, duplicate headers, the request log, and the redirect off Unix), each named where it is
   switched off;
 - `Fs` (capped reads, positional reads, create-new and append writes with sync, truncate, rename,
-  removal, directory creation, listing and sync, copy, `set_exec`, `symlink` and `symlink_metadata`,
-  and `try_lock` returning a `LockGuard`), implemented by
-  `lunepack-fs`. Fake: `MemFs` with crash injection; suite: `run_fs_suite`, run by `StdFs` and `MemFs`.
+  removal, directory creation, listing and sync, copy, `set_exec`, `symlink`, `read_link`,
+  `replace_symlink` and `symlink_metadata`, and `try_lock` returning a `LockGuard`), implemented by
+  `lunepack-fs`. `replace_symlink` is the atomic flip of an install's `current` link: it makes a
+  temporary link in the link's directory and renames it over the old one (two crash ops in
+  `MemFs`), and refuses a file or directory at the link (M5 step 3). Fake: `MemFs` with crash
+  injection; suite: `run_fs_suite`, run by `StdFs` and `MemFs`;
+- `Rng` (`fill`, the only source of random bytes; a failure is `Error::Random`, never a weaker
+  fallback), implemented by `lunepack-crypto`'s `OsRng` over `getrandom`. Fake: `FakeRng`, a seeded
+  deterministic sequence; suite: `run_rng_suite`, run by `OsRng` and the fake;
+- `Process` (the running executable and process id, the parent, `spawn_detached` and `spawn_child`
+  without a shell, `wait_exit` by pid and start time so a reused pid is not mistaken for the
+  original, and `tree_in_use`; a `Child` is polled and terminated, only itself), implemented by
+  `lunepack-os-linux` (M5 step 5). Fake: `FakeProcess` (records spawns, scripted exits, waits and
+  in-use answers); suite: `run_process_suite`, which needs a helper executable the adapter's tests
+  build. Errors name no path beyond a file name and no argument or environment value;
+- `OsIntegration` (`check`, `apply`, `remove` of an app's desktop entry and command link, built
+  from the update config's `InstallMeta`; removal checks a marker; machine scope is `Unsupported`
+  in M5), implemented by `lunepack-os-linux` (M5 step 6). Fake: `FakeIntegration` (records calls,
+  scripted conflicts); suite: `run_integration_suite`, run on a sandbox directory.
 
 `Clock` is implemented by `lunepack::SystemClock` and by the testkit's fake; the CLI adds a fixed
 clock for `SOURCE_DATE_EPOCH`. Each trait has a contract suite in the testkit that the real
-implementation's `tests/` runs, and a fake in the testkit. The others are provisional and arrive with
-their milestones: `Rng`, `OsIntegration`, `Process`.
+implementation's `tests/` runs, and a fake in the testkit. `Process` and `OsIntegration` have no
+implementation until M5 steps 5 and 6; their suites are written and checked against the fakes (and
+a small file-backed probe for the integration suite) in step 3.
 
 ## Layouts and the current tree
 

@@ -888,6 +888,12 @@ impl Fs for GatedFs {
     fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
         self.inner.symlink(target, link_path)
     }
+    fn read_link(&self, path: &Path) -> Result<String, FsError> {
+        self.inner.read_link(path)
+    }
+    fn replace_symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
+        self.inner.replace_symlink(target, link_path)
+    }
     fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {
         self.inner.try_lock(path)
     }
@@ -1208,6 +1214,12 @@ impl Fs for CancelOnRead {
     }
     fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
         self.inner.symlink(target, link_path)
+    }
+    fn read_link(&self, path: &Path) -> Result<String, FsError> {
+        self.inner.read_link(path)
+    }
+    fn replace_symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
+        self.inner.replace_symlink(target, link_path)
     }
     fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {
         self.inner.try_lock(path)

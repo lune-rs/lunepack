@@ -241,6 +241,99 @@ mod unix {
     }
 
     #[test]
+    fn read_link_and_replace_symlink_on_the_real_filesystem() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let (_guard, root) = temp_root();
+        let link = root.join("current");
+        symlink("versions/1", &link).unwrap();
+        assert_eq!(StdFs.read_link(&link).unwrap(), "versions/1");
+        // A target that is not UTF-8 is an error, not a lossy string.
+        let raw = root.join("raw");
+        symlink(OsString::from_vec(vec![b'a', 0xFF, b'b']), &raw).unwrap();
+        let err = StdFs.read_link(&raw).unwrap_err();
+        assert_eq!(err.kind, FsErrorKind::Other);
+        assert_eq!(
+            StdFs.read_link(&root.join("none")).unwrap_err().kind,
+            FsErrorKind::NotFound
+        );
+        fs::write(root.join("file"), b"x").unwrap();
+        assert_eq!(
+            StdFs.read_link(&root.join("file")).unwrap_err().kind,
+            FsErrorKind::NotASymlink
+        );
+        // Replacement is a rename: the link keeps one inode name, no temporary is left, and a
+        // refusal at a file or a directory changes nothing.
+        StdFs.replace_symlink("versions/2", &link).unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("versions/2"));
+        fs::create_dir(root.join("dir")).unwrap();
+        for target in ["file", "dir"] {
+            assert_eq!(
+                StdFs
+                    .replace_symlink("x", &root.join(target))
+                    .unwrap_err()
+                    .kind,
+                FsErrorKind::NotASymlink
+            );
+        }
+        assert_eq!(fs::read(root.join("file")).unwrap(), b"x");
+        assert!(root.join("dir").is_dir() && !root.join("dir").is_symlink());
+        let mut names: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["current", "dir", "file", "raw"]);
+        // A dangling target is fine, and a missing parent is an error that creates nothing.
+        StdFs
+            .replace_symlink("../gone", &root.join("dangling"))
+            .unwrap();
+        assert_eq!(
+            fs::read_link(root.join("dangling")).unwrap(),
+            Path::new("../gone")
+        );
+        assert_eq!(
+            StdFs
+                .replace_symlink("x", &root.join("nodir/link"))
+                .unwrap_err()
+                .kind,
+            FsErrorKind::NotFound
+        );
+        // A stale temporary name from an earlier crash does not block the replacement.
+        let pid = std::process::id();
+        for n in 0..8 {
+            let _ = symlink("stale", root.join(format!(".lunepack-link-{pid}-{n}")));
+        }
+        StdFs.replace_symlink("versions/3", &link).unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("versions/3"));
+    }
+
+    #[test]
+    fn a_reader_never_sees_a_missing_link_while_it_is_replaced() {
+        let (_guard, root) = temp_root();
+        let link = root.join("current");
+        symlink("v0", &link).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut seen = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let target = fs::read_link(&link).expect("the link vanished mid-replace");
+                    assert!(target.to_string_lossy().starts_with('v'));
+                    seen += 1;
+                }
+                seen
+            });
+            for i in 1..=300 {
+                StdFs.replace_symlink(&format!("v{i}"), &link).unwrap();
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(reader.join().unwrap() > 0);
+        });
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("v300"));
+    }
+
+    #[test]
     fn positional_reads_work_from_many_threads() {
         let (_guard, root) = temp_root();
         let bytes: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();

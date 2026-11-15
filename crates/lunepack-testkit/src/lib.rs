@@ -11,7 +11,10 @@ mod docs;
 pub mod exe_headers;
 mod hasher;
 mod http_server;
+mod integration;
 mod memfs;
+mod process;
+mod rng;
 mod seeds;
 mod signer;
 mod suites;
@@ -26,13 +29,17 @@ pub use docs::{
 };
 pub use hasher::FakeHasher;
 pub use http_server::LoopbackServer;
+pub use integration::{FakeIntegration, IntegrationCall, IntegrationOp, run_integration_suite};
 pub use memfs::{MemFs, RecoverMode};
+pub use process::{ChildScript, FakeProcess, SpawnRecord, run_process_suite};
+pub use rng::FakeRng;
 pub use seeds::{Seed, fuzz_seeds, sample_update_config};
 pub use signer::FakeSigner;
 pub use suites::{
     HashKat, SHA256_KATS, SignFixture, TransportCaps, VerifyKat, run_blocking_transport_suite,
     run_blocking_transport_suite_with, run_clock_suite, run_codec_suite, run_fs_suite,
-    run_fs_suite_with, run_hasher_suite, run_signer_suite, run_transport_suite, run_verifier_suite,
+    run_fs_suite_with, run_hasher_suite, run_rng_suite, run_signer_suite, run_transport_suite,
+    run_verifier_suite,
 };
 pub use transport::{
     FAKE_BASE_URL, FakeBlockingTransport, FakeOrigin, FakeTransport, SeenRequest, TransportFault,

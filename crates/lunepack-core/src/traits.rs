@@ -1,5 +1,5 @@
 //! The traits behind everything external the core needs (hard rule 3): hashing, signature
-//! verification, the clock and frame decoding on the reading side; frame encoding, signing and the
+//! verification, the clock, randomness and frame decoding on the reading side; frame encoding, signing and the
 //! code-signing hook on the producing side. Core code never reaches for a digest, a signature
 //! algorithm, the time, a codec or a private key any other way. Each trait is object-safe and
 //! `Send + Sync`; implementations live in adapter crates, fakes in `lunepack-testkit`.
@@ -78,6 +78,15 @@ pub trait Verifier: Send + Sync {
 pub trait Clock: Send + Sync {
     /// Seconds since the Unix epoch (UTC).
     fn now_unix_secs(&self) -> u64;
+}
+
+/// The source of randomness: the only way the core or a caller of the core obtains random bytes
+/// (hard rule 3). The real one reads the operating system's generator; the testkit's fake is a
+/// seeded, deterministic sequence.
+pub trait Rng: Send + Sync {
+    /// Fills all of `buf` with random bytes. On failure `buf` must be treated as unfilled; an
+    /// implementation never falls back to a weaker source.
+    fn fill(&self, buf: &mut [u8]) -> Result<(), Error>;
 }
 
 /// Codec ids of format v1 (FORMAT.md 9.0); the set is closed.
