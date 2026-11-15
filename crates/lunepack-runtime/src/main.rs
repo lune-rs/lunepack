@@ -31,6 +31,9 @@ use modes::{Kind, Mode, USAGE_LINE};
 const SINK_DRAIN: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
+    // `apply-and-restart` waits for its parent by default (C4): named now, before anything else,
+    // so the parent cannot have exited and had its pid reused by the time the target is read.
+    let parent = initial_parent();
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let mode = match modes::parse(&args) {
         Ok(mode) => mode,
@@ -56,7 +59,12 @@ fn main() -> ExitCode {
             events.finish(SINK_DRAIN);
             kind
         }),
-        Mode::Command(parsed) => run(|ad| cli::execute(ad, &parsed)),
+        Mode::Command(parsed) => {
+            // A pid given on the command line is named (with its start time) at once, too.
+            let wait = (parsed.command == cli::args::Command::ApplyAndRestart)
+                .then(|| wait_target(parsed.wait_pid, parent));
+            run(|ad| cli::execute(ad, &parsed, wait))
+        }
         // R is `<data home>/<app id>`, with the data home from this environment (M5-D2).
         Mode::Install => run(|ad| {
             let data_home = match data_home() {
@@ -133,6 +141,40 @@ fn data_home() -> Result<PathBuf, Kind> {
 #[cfg(not(target_os = "linux"))]
 fn data_home() -> Result<PathBuf, Kind> {
     Err(Kind::Unsupported)
+}
+
+/// The parent process as this process started: its id, or why it cannot be waited for (pid 1,
+/// gone, a zombie, unreadable: `process`).
+#[cfg(target_os = "linux")]
+fn initial_parent() -> cli::WaitTarget {
+    use lunepack::Process as _;
+    match lunepack_os_linux::LinuxProcess::new().parent() {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) | Err(_) => Err(Kind::Process),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn initial_parent() -> cli::WaitTarget {
+    Err(Kind::Unsupported)
+}
+
+/// The wait target of `apply-and-restart`: the process `--wait-pid` names, with its start time
+/// read now (a pid with no running process is `process`), else the parent read at start.
+#[cfg(target_os = "linux")]
+fn wait_target(wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarget {
+    let Some(pid) = wait_pid else {
+        return parent;
+    };
+    match lunepack_os_linux::LinuxProcess::new().process_id(pid) {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) | Err(_) => Err(Kind::Process),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wait_target(_wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarget {
+    parent
 }
 
 /// The events of a mode: to `R/logs/runtime.log` when the tree is installed, else to stderr

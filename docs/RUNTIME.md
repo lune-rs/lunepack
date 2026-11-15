@@ -3,14 +3,11 @@
 Every version tree of an app that updates itself carries `lunepack-runtime`, placed beside the
 app's entry executable by `lunepack pack --runtime` (`docs/CLI.md`). Besides the internal modes it
 runs for the installer and the applier, it is a command line that an app in any language runs as a
-child process to check for an update, download it, learn what happened since its last start and
-confirm that it works. Each command is a thin layer over the library calls a Rust app makes
-(`Updater::check`, `download` and `stage`, `startup`, `confirm_healthy`), so both get the same
-behaviour and the same errors (D42). The decisions are M5-D11 and M5-D12 in `docs/DECISIONS.md`;
+child process to check for an update, download it, learn what happened since its last start,
+confirm that it works and hand a staged update over to be applied. Each command is a thin layer over
+the library calls a Rust app makes (`Updater::check`, `download` and `stage`, `startup`,
+`confirm_healthy`, `apply_and_restart`), so both get the same behaviour and the same errors (D42). The decisions are M5-D11 and M5-D12 in `docs/DECISIONS.md`;
 what the output must never hold is in `docs/THREAT-MODEL.md` ("The Linux runtime").
-
-This page covers `check`, `download`, `startup` and `confirm`. `apply-and-restart` is documented with
-its step of the milestone.
 
 ## Locating the runtime
 
@@ -38,6 +35,7 @@ lunepack-runtime <command> [options] [-- <args>]
 | `download` | `--channel <name>`, `--expect-version <version>` | Runs `check`, then downloads and stages the update it found. |
 | `startup` | `-- <args>` | Delivers the lifecycle events queued for this version and says whether to go on. |
 | `confirm` | none | Confirms that this version works. |
+| `apply-and-restart` | `--wait-pid <pid>`, `--expect-version <version>`, `-- <args>` | Starts the applier for the staged version, which applies it and starts the new version with `<args>` once the waited-for process has exited. |
 
 Global options, accepted by every command: `--json` (output JSON Lines instead of text) and
 `--expect-schema <N>` (the schema the caller understands; anything but `1` is the error
@@ -46,7 +44,7 @@ Global options, accepted by every command: `--json` (output JSON Lines instead o
 The grammar is closed. Every option may appear once. An unknown option, a repeated one, an option
 that does not belong to the command, a value that does not parse (a channel name outside the rule of
 `docs/FORMAT.md` 10.5, a version that is not in its canonical text, a number with a sign or leading
-zeros), a missing value, the `--option=value` form and any stray word are a usage error: exit code 2,
+zeros, a `--wait-pid` of 0 or 1), a missing value, the `--option=value` form and any stray word are a usage error: exit code 2,
 before any action (no lock, no state read, no network). The refusal names nothing of the arguments:
 one fixed line on stderr, or, when `--json` stands before any `--`, the `error` object below with
 `command` and `tree_version` null. `download` never takes an update description from its caller:
@@ -55,6 +53,8 @@ one fixed line on stderr, or, when `--json` stands before any `--`, the `error` 
 
 `startup` takes everything after `--` as the arguments the app was started with. They matter only
 when the start rolls back, because the previous version is then started with them.
+`apply-and-restart` takes everything after `--` as the arguments the new version is started with
+(and, if it rolls back, the previous one).
 
 ## Output
 
@@ -83,6 +83,7 @@ line a second on stderr and the final line is one human line on stdout (an error
 | `download` | `version` and `staged`: the staged version and `true`; or `null` and `false` when the channel offers nothing new |
 | `startup` | `events`: `[{kind: "installed", version}, {kind: "updated", from, to}, {kind: "first_run", version}, ...]`, oldest first; `action`: `"continue"` or `"exit"`; `pending` |
 | `confirm` | `outcome`: `"confirmed"` or `"nothing_pending"` |
+| `apply-and-restart` | `version`: the staged version the applier will apply; `scheduled`: `true` |
 
 `error`: `{"schema":1,"type":"error","command":…,"tree_version":…,"kind":…,"exit_code":N}`, with
 `command` and `tree_version` null when not known. The strings in any object come only from signed
@@ -127,6 +128,35 @@ One code per error class, the same number as in the object's `kind`. They are st
 The table lives in one place in the runtime (`crates/lunepack-runtime/src/modes.rs`) and is pinned
 by `crates/lunepack-runtime/tests/golden/objects.jsonl`, one error object per kind.
 
+## Apply and restart
+
+`apply-and-restart` reads the staged version again, refuses with `nothing_staged` when nothing
+usable is staged and with `unexpected_version` when `--expect-version` names another one, and then
+starts the applier: this tree's own runtime in its internal `apply` mode, detached (a new session,
+standard streams on `/dev/null`, no health token in its environment). It prints its result and
+exits; the app exits next. The applier waits for the process it was given, then applies the update,
+starts the new tree's entry (from that tree's own update configuration, without a shell, with the
+arguments after `--` and a fresh health token) and supervises its health check (above); its events
+go to the runtime's log, `logs/runtime.log` under the install. Because the applier holds none of the
+caller's streams, a shell capture (`x=$(lunepack-runtime apply-and-restart --json)`) returns as soon
+as the command exits.
+
+The process the applier waits for is named by its pid and start time, so a pid that the system
+reuses for another process is never mistaken for it, and it is only ever waited on, never signalled.
+By default it is the command's parent process, read when the command starts. `--wait-pid <pid>`
+names another one, whose start time is read at once. Either way, a target that is pid 1, gone or a
+zombie is the error `process` (19), and nothing is started.
+
+The parent is the app only when the app runs the command itself. A shell runs a lone command in
+`x=$(cmd)` directly, so the parent is the shell; but in `x=$(cmd; true)`, or any capture or pipeline
+with more than one command, the parent is a subshell that exits at once, and the update would be
+applied while the app still runs. So:
+
+- a shell script always passes its own pid: `x=$(lunepack-runtime apply-and-restart --json
+  --wait-pid $$)`;
+- any caller that runs the command through a wrapper (a shell, `env`, a launcher library) passes
+  its own pid with `--wait-pid`.
+
 ## Cancel
 
 End the child process (SIGTERM). A download keeps its partial file and resumes on the next run.
@@ -154,4 +184,5 @@ badly or does not confirm within the health timeout (`[update] health_timeout_se
 This is the one meaning of "healthy" for every app, Rust or not.
 
 An app that captures output in a shell must run the command directly (`x=$(lunepack-runtime check
---json)`); `apply-and-restart` has its own rule for the process it waits for.
+--json)`); `apply-and-restart` has its own rule for the process it waits for (above): pass
+`--wait-pid $$`.

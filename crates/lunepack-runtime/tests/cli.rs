@@ -1,6 +1,7 @@
-//! The app-facing command line with the real binary (M5 step 12, C4, M5-D11, M5-D12): the grammar
-//! and its refusals, schema 1 objects against goldens, the exit codes, output hygiene, and a
-//! closed stdout.
+//! The app-facing command line with the real binary (M5 steps 12 and 13, C4, M5-D11, M5-D12): the
+//! grammar and its refusals, schema 1 objects against goldens, the exit codes, output hygiene, a
+//! closed stdout, and the hand-off of `apply-and-restart` to the detached applier (its wait
+//! target, and a shell capture that returns at once).
 //!
 //! Each case publishes releases into a `file:` feed under a temporary directory: documents signed
 //! with Ed25519 keys generated at test time, every frame stored, the config of each tree written
@@ -29,6 +30,14 @@ const BIN: &str = "lp-cli-test";
 const DAY: u64 = 86_400;
 const LIMIT: Duration = Duration::from_secs(120);
 const USAGE_STDERR: &str = "lunepack-runtime: usage error\n";
+/// The file (in the lab's home) where the launched app writes its arguments.
+const APP_ARGS: &str = "app-args";
+/// How long the launched app runs before it confirms.
+const APP_SLEEP_SECS: u64 = 3;
+/// The golden lines of `apply-and-restart`: its result, `nothing_staged`, `unexpected_version`.
+const GOLDEN_SCHEDULED: usize = 37;
+const GOLDEN_NOTHING_STAGED: usize = 38;
+const GOLDEN_UNEXPECTED: usize = 39;
 
 #[cfg(target_arch = "aarch64")]
 const TARGET: Target = Target::LinuxAarch64;
@@ -187,9 +196,15 @@ impl Lab {
             .to_bytes()
             .expect("config bytes");
             let files: Vec<(&str, Vec<u8>, bool)> = vec![
+                // Started by the applier, the app records its arguments, stays up a while (so an
+                // applier that kept a caller's stdio would hold a capture open), then confirms its
+                // health through its own runtime.
                 (
                     "bin/app",
-                    format!("#!/bin/sh\n# {version}\n").into_bytes(),
+                    format!(
+                        "#!/bin/sh\n# {version}\nprintf '%s\\n' \"$@\" > \"$HOME/{APP_ARGS}\"\nsleep {APP_SLEEP_SECS}\nexec \"${{0%/*}}/lunepack-runtime\" confirm\n"
+                    )
+                    .into_bytes(),
                     true,
                 ),
                 (
@@ -421,6 +436,17 @@ const BAD_LINES: &[&[&str]] = &[
     &["confirm", "--expect-schema"],
     &["confirm", "--expect-schema", "x"],
     &["confirm", "--expect-schema", "1", "--expect-schema", "1"],
+    &["confirm", "--wait-pid", "42"],
+    &["apply-and-restart", "--wait-pid"],
+    &["apply-and-restart", "--wait-pid", "0"],
+    &["apply-and-restart", "--wait-pid", "1"],
+    &["apply-and-restart", "--wait-pid", "x"],
+    &["apply-and-restart", "--wait-pid", "042"],
+    &["apply-and-restart", "--wait-pid", "4294967296"],
+    &["apply-and-restart", "--wait-pid", "42", "--wait-pid", "42"],
+    &["apply-and-restart", "--expect-version", "v1.1.0"],
+    &["apply-and-restart", "--channel", "stable"],
+    &["apply-and-restart", "stray"],
 ];
 
 /// A refusal is an object on stdout when `--json` stands before any `--`, else one fixed line on
@@ -763,6 +789,338 @@ fn a_closed_stdout_cancels_and_the_next_run_goes_on() {
     let run = lab.cmd(&["download", "--json"]);
     assert_eq!(run.code, 0, "{run:?}");
     assert_eq!(run.last_line(), golden(3));
+    assert_eq!(
+        lab.record()
+            .expect("record")
+            .staged
+            .expect("staged")
+            .version
+            .to_string(),
+        "1.1.0"
+    );
+}
+
+// ---- apply-and-restart --------------------------------------------------------------------------
+
+fn now_ms() -> u64 {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_millis();
+    u64::try_from(ms).expect("ms")
+}
+
+impl Lab {
+    /// 1.0.0 installed, 1.1.0 published, downloaded and staged.
+    fn staged() -> Lab {
+        let mut lab = Lab::installed();
+        lab.publish(&["1.0.0", "1.1.0"]);
+        let run = lab.cmd(&["download", "--json"]);
+        assert_eq!(run.code, 0, "download: {run:?}");
+        lab
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.root.join("logs/runtime.log")).unwrap_or_default()
+    }
+
+    /// Waits for the applier's final event in the log; returns the whole log.
+    fn applier_end(&self) -> String {
+        let start = Instant::now();
+        loop {
+            let log = self.log();
+            let ended = log.lines().any(|l| {
+                l.contains("\"command\":\"apply\"")
+                    && (l.contains("\"type\":\"result\"") || l.contains("\"type\":\"error\""))
+            });
+            if ended {
+                return log;
+            }
+            assert!(start.elapsed() < LIMIT, "the applier did not finish: {log}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The applier confirmed 1.1.0, which was started with `args`; nothing it logged holds a
+    /// path of the case.
+    fn assert_applied(&self, log: &str, args: &[&str]) {
+        assert!(
+            log.lines().any(|l| l.contains("\"command\":\"apply\"")
+                && l.contains("\"outcome\":\"confirmed\"")
+                && l.contains("\"version\":\"1.1.0\"")),
+            "{log}"
+        );
+        assert!(!log.contains(&self.base.display().to_string()), "{log}");
+        let record = self.record().expect("record");
+        assert_eq!(
+            record.current.expect("current").version.to_string(),
+            "1.1.0"
+        );
+        assert!(record.pending.is_none());
+        let mut want: String = args.iter().map(|a| format!("{a}\n")).collect();
+        if args.is_empty() {
+            want.push('\n');
+        }
+        let got = std::fs::read_to_string(self.home.join(APP_ARGS)).expect("app args");
+        assert_eq!(got, want);
+    }
+
+    /// Nothing was started: after a while there is still no applier log, and 1.1.0 is still the
+    /// staged version.
+    fn assert_nothing_started(&self) {
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(self.log(), "", "an applier ran");
+        let record = self.record().expect("record");
+        assert_eq!(
+            record.current.expect("current").version.to_string(),
+            "1.0.0"
+        );
+        assert!(record.pending.is_none());
+    }
+}
+
+/// The `time_ms` of the first log line of `phase`.
+fn phase_time(log: &str, phase: &str) -> u64 {
+    let needle = format!("\"phase\":\"{phase}\"");
+    let line = log
+        .lines()
+        .find(|l| l.contains(&needle))
+        .unwrap_or_else(|| panic!("no {phase} line: {log}"));
+    let (_, rest) = line.split_once("\"time_ms\":").expect("time_ms");
+    rest.trim_end_matches('}').parse().expect("time_ms")
+}
+
+/// The start time (`/proc/<pid>/stat` field 22) of a running process.
+fn start_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
+    let (_, rest) = stat.rsplit_once(')').expect("comm");
+    rest.split_whitespace()
+        .nth(19)
+        .expect("starttime")
+        .parse()
+        .expect("ticks")
+}
+
+/// The state letter (`/proc/<pid>/stat` field 3) of a process.
+fn state_of(pid: u32) -> char {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
+    let (_, rest) = stat.rsplit_once(')').expect("comm");
+    rest.trim_start().chars().next().expect("state")
+}
+
+/// The error object of `apply-and-restart` for `kind` (the golden's line for `check`, renamed).
+fn golden_error(kind: &str) -> String {
+    GOLDEN_OBJECTS
+        .lines()
+        .find(|l| {
+            l.contains("\"command\":\"check\"") && l.contains(&format!("\"kind\":\"{kind}\""))
+        })
+        .expect("golden error")
+        .replace("\"command\":\"check\"", "\"command\":\"apply-and-restart\"")
+}
+
+#[test]
+fn a_shell_capture_returns_at_once_while_the_applier_goes_on() {
+    let lab = Lab::staged();
+    // `x=$(cmd)`: the shell runs the command directly, so its parent is the shell.
+    let mut cmd = lab.command(Path::new("sh"));
+    cmd.args([
+        "-c",
+        r#"x=$("$0" apply-and-restart --json -- --restarted "two words"); printf '%s\n' "$x""#,
+    ])
+    .arg(lab.runtime_of("1.0.0"));
+    let started = Instant::now();
+    let run = Run::of(finish(cmd.spawn().expect("spawn")));
+    let took = started.elapsed();
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.line(), golden(GOLDEN_SCHEDULED));
+    assert_eq!(run.stderr, "");
+    run.assert_clean(&lab, &[]);
+    // The app the applier starts runs for APP_SLEEP_SECS: an applier holding the caller's stdio
+    // would keep the capture (and this pipe) open that long.
+    assert!(took < Duration::from_secs(2), "the capture took {took:?}");
+    let log = lab.applier_end();
+    lab.assert_applied(&log, &["--restarted", "two words"]);
+}
+
+#[test]
+fn the_applier_waits_for_the_parent_recorded_at_start() {
+    let lab = Lab::staged();
+    let out = lab.base.join("out");
+    // The shell is the runtime's parent; it outlives the runtime by two seconds.
+    let mut cmd = lab.command(Path::new("sh"));
+    cmd.args(["-c", r#""$0" apply-and-restart --json > "$1"; sleep 2"#])
+        .arg(lab.runtime_of("1.0.0"))
+        .arg(&out);
+    let spawned = now_ms();
+    let run = Run::of(finish(cmd.spawn().expect("spawn")));
+    assert_eq!(run.code, 0, "{run:?}");
+    let printed = std::fs::read_to_string(&out).expect("out");
+    assert_eq!(printed.trim_end(), golden(GOLDEN_SCHEDULED));
+    let log = lab.applier_end();
+    let (wait, apply) = (phase_time(&log, "wait"), phase_time(&log, "apply"));
+    assert!(wait <= apply, "{log}");
+    assert!(
+        apply >= spawned + 2000,
+        "the applier went on before its parent exited: {log}"
+    );
+    lab.assert_applied(&log, &[]);
+}
+
+#[test]
+fn a_shell_caller_passes_its_own_pid_and_is_waited_for() {
+    let lab = Lab::staged();
+    let out = lab.base.join("out");
+    // `x=$(cmd; true)`: the runtime's parent is a subshell that exits at once; `--wait-pid $$`
+    // names the shell itself, which lives two more seconds.
+    let mut cmd = lab.command(Path::new("sh"));
+    cmd.args([
+        "-c",
+        r#"x=$("$0" apply-and-restart --json --wait-pid $$; true); printf '%s\n' "$x" > "$1"; sleep 2"#,
+    ])
+    .arg(lab.runtime_of("1.0.0"))
+    .arg(&out);
+    let spawned = now_ms();
+    let started = Instant::now();
+    let child = cmd.spawn().expect("spawn");
+    // The capture returns at once.
+    loop {
+        let printed = std::fs::read_to_string(&out).unwrap_or_default();
+        if printed.ends_with('\n') {
+            assert_eq!(printed.trim_end(), golden(GOLDEN_SCHEDULED));
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the capture did not return"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let run = Run::of(finish(child));
+    assert_eq!(run.code, 0, "{run:?}");
+    let log = lab.applier_end();
+    assert!(
+        phase_time(&log, "apply") >= spawned + 2000,
+        "the applier went on when the subshell exited: {log}"
+    );
+    lab.assert_applied(&log, &[]);
+}
+
+#[test]
+fn a_wait_pid_is_named_with_its_start_time_and_a_reused_pid_is_not_waited_for() {
+    let lab = Lab::staged();
+    let mut target = Command::new("sleep").arg("60").spawn().expect("sleep");
+    let pid = target.id();
+    let run = lab.cmd(&[
+        "apply-and-restart",
+        "--json",
+        "--wait-pid",
+        &pid.to_string(),
+    ]);
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.line(), golden(GOLDEN_SCHEDULED));
+    // The applier waits for the live target (the start time it was handed is the target's).
+    std::thread::sleep(Duration::from_millis(1500));
+    let log = lab.log();
+    assert!(log.contains("\"phase\":\"wait\""), "{log}");
+    assert!(
+        !log.contains("\"phase\":\"apply\""),
+        "it did not wait: {log}"
+    );
+    let ended = now_ms();
+    target.kill().expect("kill");
+    target.wait().expect("reap");
+    let log = lab.applier_end();
+    assert!(phase_time(&log, "apply") >= ended, "{log}");
+    lab.assert_applied(&log, &[]);
+
+    // The pid now names another process (another start time): the hand-off's target counts as
+    // exited, and the applier does not wait for the newcomer.
+    let mut lab = lab;
+    lab.publish(&["1.0.0", "1.1.0", "1.2.0"]);
+    let run = lab.run(&lab.runtime_of("1.1.0"), &["download", "--json"], &[]);
+    assert_eq!(run.code, 0, "{run:?}");
+    let mut other = Command::new("sleep").arg("60").spawn().expect("sleep");
+    let other_pid = other.id();
+    let stale_start = start_ticks(other_pid) + 1;
+    let started = Instant::now();
+    let run = lab.run(
+        &lab.runtime_of("1.1.0"),
+        &[
+            "apply",
+            "--wait-pid",
+            &other_pid.to_string(),
+            "--wait-start",
+            &stale_start.to_string(),
+            "--version",
+            "1.2.0",
+        ],
+        &[],
+    );
+    assert_eq!(run.code, 0, "{run:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "it waited for the newcomer"
+    );
+    assert!(other.try_wait().expect("try_wait").is_none(), "still alive");
+    let _ = other.kill();
+    let _ = other.wait();
+    let record = lab.record().expect("record");
+    assert_eq!(
+        record.current.expect("current").version.to_string(),
+        "1.2.0"
+    );
+}
+
+#[test]
+fn a_wait_target_that_is_not_running_starts_nothing() {
+    let lab = Lab::staged();
+    // No such process (above any pid_max).
+    let run = lab.cmd(&["apply-and-restart", "--json", "--wait-pid", "4294967295"]);
+    assert_eq!(run.code, 19, "{run:?}");
+    assert_eq!(run.line(), golden_error("process"));
+    // A zombie: it has exited, so there is nothing to wait for.
+    let mut zombie = Command::new("true").spawn().expect("true");
+    let pid = zombie.id();
+    let start = Instant::now();
+    while state_of(pid) != 'Z' {
+        assert!(start.elapsed() < LIMIT, "no zombie");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let run = lab.cmd(&[
+        "apply-and-restart",
+        "--json",
+        "--wait-pid",
+        &pid.to_string(),
+    ]);
+    zombie.wait().expect("reap");
+    assert_eq!(run.code, 19, "{run:?}");
+    assert_eq!(run.line(), golden_error("process"));
+    run.assert_clean(&lab, &[]);
+    lab.assert_nothing_started();
+}
+
+#[test]
+fn apply_and_restart_with_nothing_staged_or_another_version_starts_nothing() {
+    let lab = Lab::installed();
+    let run = lab.cmd(&["apply-and-restart", "--json"]);
+    assert_eq!(run.code, 12, "{run:?}");
+    assert_eq!(run.line(), golden(GOLDEN_NOTHING_STAGED));
+    let run = lab.cmd(&["apply-and-restart"]);
+    assert_eq!(run.code, 12, "{run:?}");
+    assert_eq!(run.stdout, "");
+    assert_eq!(
+        run.stderr,
+        "apply-and-restart: error: nothing_staged (exit 12)\n"
+    );
+    assert_eq!(lab.log(), "");
+
+    let lab = Lab::staged();
+    let run = lab.cmd(&["apply-and-restart", "--json", "--expect-version", "1.2.0"]);
+    assert_eq!(run.code, 15, "{run:?}");
+    assert_eq!(run.line(), golden(GOLDEN_UNEXPECTED));
+    run.assert_clean(&lab, &[]);
+    lab.assert_nothing_started();
     assert_eq!(
         lab.record()
             .expect("record")
