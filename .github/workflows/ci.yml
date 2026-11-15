@@ -105,3 +105,37 @@ jobs:
         timeout-minutes: 20
         shell: pwsh
         run: ./scripts/ci/os-trust.ps1
+
+  runtime-musl:
+    # the static musl runtime (M5-D7), built by scripts/build-runtime.sh, which also checks that it
+    # is static and prints its size. The binary is an artifact for the E2E job. The job uses no credentials.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x86_64, triple: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: linux-aarch64, triple: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install musl-tools (the C compiler for the musl target) and the Rust target
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add "${{ matrix.triple }}"
+      - name: Build the runtime and check that it is static
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/runtime"
+          ./scripts/build-runtime.sh "${{ matrix.target }}" --out "$RUNNER_TEMP/runtime/lunepack-runtime"
+      # actions/upload-artifact v7.0.2 (lightweight tag, resolves directly to the commit)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: lunepack-runtime-${{ matrix.target }}
+          path: ${{ runner.temp }}/runtime/lunepack-runtime
+          if-no-files-found: error
+          retention-days: 7
