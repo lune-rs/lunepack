@@ -2,7 +2,9 @@
 //! [-- <args>]`, hand-written and closed.
 //!
 //! Global options: `--json` (a flag) and `--expect-schema <N>`. `check` and `download` take
-//! `--channel <name>`; `download` takes `--expect-version <version>`; `startup` takes `-- <args>`.
+//! `--channel <name>`; `download` and `apply-and-restart` take `--expect-version <version>`;
+//! `apply-and-restart` takes `--wait-pid <pid>` (a pid above 1); `startup` and `apply-and-restart`
+//! take `-- <args>`.
 //! Each option is allowed once, and anything else (an unknown name, a repeat, a value that does not
 //! parse, a missing value, `=` forms, a stray word) is a [`UsageError`] that names nothing of
 //! the arguments. Nothing happens before the whole line has been parsed.
@@ -24,6 +26,9 @@ pub enum Command {
     Startup,
     /// The app confirms its health.
     Confirm,
+    /// Hands the staged version to a detached applier, which applies it and restarts the app once
+    /// the waited-for process has exited.
+    ApplyAndRestart,
 }
 
 impl Command {
@@ -34,6 +39,7 @@ impl Command {
             Command::Download => "download",
             Command::Startup => "startup",
             Command::Confirm => "confirm",
+            Command::ApplyAndRestart => "apply-and-restart",
         }
     }
 
@@ -44,6 +50,7 @@ impl Command {
             "download" => Some(Command::Download),
             "startup" => Some(Command::Startup),
             "confirm" => Some(Command::Confirm),
+            "apply-and-restart" => Some(Command::ApplyAndRestart),
             _ => None,
         }
     }
@@ -60,10 +67,13 @@ pub struct Parsed {
     pub expect_schema: Option<u64>,
     /// The channel to follow instead of the config's.
     pub channel: Option<Channel>,
-    /// The version the app expects `download` to fetch.
+    /// The version the app expects `download` to fetch, or `apply-and-restart` to apply.
     pub expect_version: Option<Version>,
-    /// The arguments after `--` (`startup`), which a rolled-back start passes on.
-    pub startup_args: Vec<OsString>,
+    /// The process `apply-and-restart` waits for instead of its parent: a pid above 1.
+    pub wait_pid: Option<u32>,
+    /// The arguments after `--`: the app's own arguments (`startup`, which a rolled-back start
+    /// passes on), or the arguments the new version is started with (`apply-and-restart`).
+    pub passed_args: Vec<OsString>,
 }
 
 impl std::fmt::Debug for Parsed {
@@ -78,7 +88,8 @@ impl std::fmt::Debug for Parsed {
                 "expect_version",
                 &self.expect_version.as_ref().map(ToString::to_string),
             )
-            .field("startup_args", &self.startup_args.len())
+            .field("wait_pid", &self.wait_pid)
+            .field("passed_args", &self.passed_args.len())
             .finish()
     }
 }
@@ -98,16 +109,17 @@ pub fn parse(command: Command, rest: &[OsString]) -> Result<Parsed, UsageError> 
         expect_schema: None,
         channel: None,
         expect_version: None,
-        startup_args: Vec::new(),
+        wait_pid: None,
+        passed_args: Vec::new(),
     };
     let mut i = 0;
     while i < rest.len() {
         let name = rest[i].to_str().ok_or(UsageError)?;
         if name == "--" {
-            if command != Command::Startup {
+            if !matches!(command, Command::Startup | Command::ApplyAndRestart) {
                 return Err(UsageError);
             }
-            parsed.startup_args = rest[i + 1..].to_vec();
+            parsed.passed_args = rest[i + 1..].to_vec();
             break;
         }
         if name == "--json" {
@@ -131,7 +143,8 @@ pub fn parse(command: Command, rest: &[OsString]) -> Result<Parsed, UsageError> 
                 parsed.channel = Some(Channel::parse(text).map_err(|_| UsageError)?);
             }
             "--expect-version"
-                if parsed.expect_version.is_none() && command == Command::Download =>
+                if parsed.expect_version.is_none()
+                    && matches!(command, Command::Download | Command::ApplyAndRestart) =>
             {
                 let text = value.to_str().ok_or(UsageError)?;
                 let v = Version::parse(text).map_err(|_| UsageError)?;
@@ -140,6 +153,14 @@ pub fn parse(command: Command, rest: &[OsString]) -> Result<Parsed, UsageError> 
                     return Err(UsageError);
                 }
                 parsed.expect_version = Some(v);
+            }
+            "--wait-pid" if parsed.wait_pid.is_none() && command == Command::ApplyAndRestart => {
+                let pid: u32 = decimal(value)?;
+                // 0 is no process, and 1 (init) never exits: neither can be waited for.
+                if pid <= 1 {
+                    return Err(UsageError);
+                }
+                parsed.wait_pid = Some(pid);
             }
             _ => return Err(UsageError),
         }
@@ -185,7 +206,32 @@ mod tests {
         )
         .expect("parse");
         assert!(p.json);
-        assert_eq!(p.startup_args, os(&["--json", "x", "--"]));
+        assert_eq!(p.passed_args, os(&["--json", "x", "--"]));
+    }
+
+    #[test]
+    fn apply_and_restart_takes_a_wait_pid_a_version_and_restart_args() {
+        let p = parse(
+            Command::ApplyAndRestart,
+            &os(&[
+                "--wait-pid",
+                "4242",
+                "--json",
+                "--expect-version",
+                "1.2.3",
+                "--",
+                "--wait-pid",
+                "x",
+            ]),
+        )
+        .expect("parse");
+        assert!(p.json);
+        assert_eq!(p.wait_pid, Some(4242));
+        assert_eq!(p.expect_version.expect("version").to_string(), "1.2.3");
+        assert_eq!(p.passed_args, os(&["--wait-pid", "x"]));
+        let p = parse(Command::ApplyAndRestart, &[]).expect("parse");
+        assert_eq!(p.wait_pid, None);
+        assert!(p.passed_args.is_empty());
     }
 
     #[test]
@@ -223,6 +269,24 @@ mod tests {
             (Command::Confirm, &["--"]),
             (Command::Confirm, &["--channel", "stable"]),
             (Command::Confirm, &["--expect-version", "1.0.0"]),
+            (Command::Confirm, &["--wait-pid", "42"]),
+            (Command::Download, &["--wait-pid", "42"]),
+            (Command::ApplyAndRestart, &["--wait-pid"]),
+            (Command::ApplyAndRestart, &["--wait-pid", "0"]),
+            (Command::ApplyAndRestart, &["--wait-pid", "1"]),
+            (Command::ApplyAndRestart, &["--wait-pid", "-5"]),
+            (Command::ApplyAndRestart, &["--wait-pid", "+5"]),
+            (Command::ApplyAndRestart, &["--wait-pid", "05"]),
+            (Command::ApplyAndRestart, &["--wait-pid", "4294967296"]),
+            (Command::ApplyAndRestart, &["--wait-pid", "x"]),
+            (Command::ApplyAndRestart, &["--wait-pid=5"]),
+            (
+                Command::ApplyAndRestart,
+                &["--wait-pid", "5", "--wait-pid", "5"],
+            ),
+            (Command::ApplyAndRestart, &["--expect-version", "v1.0.0"]),
+            (Command::ApplyAndRestart, &["--channel", "stable"]),
+            (Command::ApplyAndRestart, &["stray"]),
         ];
         for (command, args) in bad {
             assert_eq!(parse(*command, &os(args)), Err(UsageError), "{args:?}");

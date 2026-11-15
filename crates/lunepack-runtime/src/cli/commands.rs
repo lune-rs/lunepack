@@ -3,8 +3,11 @@
 //! here: the facade's results are mapped to the closed objects of [`super::json`], and its errors
 //! to a [`Kind`].
 
-use lunepack::{CancelToken, DownloadOptions, HEALTH_TOKEN_VAR, Installation, Platform, blocking};
+use lunepack::{
+    ApplyOptions, CancelToken, DownloadOptions, HEALTH_TOKEN_VAR, Installation, Platform, blocking,
+};
 
+use super::WaitTarget;
 use super::args::{Command, Parsed};
 use super::json::{Body, UpdateSummary};
 use super::progress::Output;
@@ -18,18 +21,21 @@ pub fn platform(base: &Platform) -> Platform {
         .with_health_token(std::env::var_os(HEALTH_TOKEN_VAR))
 }
 
-/// Runs `parsed` for the tree `inst`. Progress goes to `output`; `cancel` ends a long operation.
+/// Runs `parsed` for the tree `inst`. Progress goes to `output`; `cancel` ends a long operation;
+/// `wait` is the process `apply-and-restart` waits for (`None` for the other commands).
 pub fn run(
     inst: &Installation,
     parsed: &Parsed,
     output: &Output,
     cancel: &CancelToken,
+    wait: Option<WaitTarget>,
 ) -> Result<Body, Kind> {
     match parsed.command {
         Command::Check => check(inst, parsed, cancel),
         Command::Download => download(inst, parsed, output, cancel),
         Command::Startup => startup(inst, parsed),
         Command::Confirm => confirm(inst),
+        Command::ApplyAndRestart => apply_and_restart(inst, parsed, wait),
     }
 }
 
@@ -89,7 +95,7 @@ fn download(
 
 fn startup(inst: &Installation, parsed: &Parsed) -> Result<Body, Kind> {
     let started =
-        lunepack::startup_for(inst, parsed.startup_args.clone()).map_err(|e| Kind::of(&e))?;
+        lunepack::startup_for(inst, parsed.passed_args.clone()).map_err(|e| Kind::of(&e))?;
     Ok(Body::Startup {
         events: started.events,
         exit: started.action == lunepack::StartupAction::Exit,
@@ -103,4 +109,28 @@ fn confirm(inst: &Installation) -> Result<Body, Kind> {
         lunepack::ConfirmOutcome::Confirmed => "confirmed",
         lunepack::ConfirmOutcome::NothingPending => "nothing_pending",
     }))
+}
+
+/// `apply-and-restart`: the facade starts this tree's runtime detached (`apply`, standard streams
+/// null, a new session), which waits for `wait`, applies the staged version and starts the new
+/// tree's entry with the arguments after `--`. Nothing is started when the wait target is not a
+/// running process, when nothing usable is staged, or when the staged version is not the one
+/// `--expect-version` names. The target is only ever waited on.
+fn apply_and_restart(
+    inst: &Installation,
+    parsed: &Parsed,
+    wait: Option<WaitTarget>,
+) -> Result<Body, Kind> {
+    // Read at the start of the process (main.rs); a command without one is a wiring fault.
+    let wait = wait.ok_or(Kind::Internal)??;
+    let scheduled = lunepack::apply_and_restart_for(
+        inst,
+        ApplyOptions {
+            expect_version: parsed.expect_version.clone(),
+            wait_for: Some(wait),
+            restart_args: parsed.passed_args.clone(),
+        },
+    )
+    .map_err(|e| Kind::of(&e))?;
+    Ok(Body::ApplyAndRestart(scheduled.version().clone()))
 }

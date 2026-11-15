@@ -42,6 +42,8 @@ pub enum Body {
     },
     /// `confirm`: `confirmed` or `nothing_pending`.
     Confirm(&'static str),
+    /// `apply-and-restart`: the version the detached applier was started to apply.
+    ApplyAndRestart(Version),
 }
 
 fn event(out: &mut String, e: &LifecycleEvent) {
@@ -108,6 +110,11 @@ pub fn result_line(command: &str, tree_version: &Version, body: &Body) -> String
             out.push_str(",\"outcome\":");
             json_str(&mut out, outcome);
         }
+        Body::ApplyAndRestart(version) => {
+            out.push_str(",\"version\":");
+            json_str(&mut out, &version.to_string());
+            out.push_str(",\"scheduled\":true");
+        }
     }
     out.push('}');
     out
@@ -150,6 +157,7 @@ pub fn human_result(command: &str, body: &Body) -> String {
             if *pending { ", pending" } else { "" }
         ),
         Body::Confirm(outcome) => format!("{command}: {outcome}"),
+        Body::ApplyAndRestart(v) => format!("{command}: scheduled {v}"),
     }
 }
 
@@ -241,6 +249,22 @@ mod tests {
         for kind in Kind::ALL.into_iter().filter(|k| *k != Kind::Ok) {
             lines.push(error_line(Some("check"), Some(&tree), kind));
         }
+        // apply-and-restart (step 13): its result and the two errors a caller acts on.
+        lines.push(result_line(
+            "apply-and-restart",
+            &tree,
+            &Body::ApplyAndRestart(v("1.1.0")),
+        ));
+        lines.push(error_line(
+            Some("apply-and-restart"),
+            Some(&tree),
+            Kind::NothingStaged,
+        ));
+        lines.push(error_line(
+            Some("apply-and-restart"),
+            Some(&tree),
+            Kind::UnexpectedVersion,
+        ));
         let mut text = lines.join("\n");
         text.push('\n');
         text
