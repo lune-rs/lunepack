@@ -149,7 +149,15 @@ pub(crate) fn has_exited(id: &ProcessId) -> io::Result<bool> {
 
 /// The in-use scan of [`Process::tree_in_use`](lunepack_core::Process::tree_in_use); `tree`
 /// is canonical. Errors only when `/proc` itself cannot be listed or this process's own entry
-/// cannot be read; a process that cannot be inspected answers `true`.
+/// cannot be read.
+///
+/// A same-uid process whose `exe`, `cwd`, `fd` or `maps` cannot be read because the kernel denies
+/// it (`EACCES`/`EPERM`: a non-dumpable process, such as a systemd `(sd-pam)` or an ssh-agent,
+/// which every desktop login and CI runner has) does not count as in use by that failure. What is
+/// still readable, its command line, decides: in use when `argv[0]` or an absolute argument,
+/// canonicalised, lies under the tree (M5-D9, user decision Q40). Any other read error answers
+/// `true` (fail closed). Gap: a non-dumpable process started by a relative path, or not from the
+/// tree's path, is not seen.
 pub(crate) fn tree_in_use(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool> {
     let my_uid = fs::metadata("/proc/self")?.uid();
     for entry in fs::read_dir("/proc")? {
@@ -187,15 +195,56 @@ pub(crate) fn tree_in_use(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool
         match uses_tree(pid, tree) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
-            Err(_) => {
-                // Unreadable: fine only if the process ended (or the pid was reused) meanwhile.
-                if !has_exited(&id).unwrap_or(false) {
-                    return Ok(true);
+            Err(e) => {
+                let used = if permission_denied(&e) {
+                    cmdline_uses_tree(pid, tree)
+                } else {
+                    Err(e)
+                };
+                match used {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {}
+                    // Unreadable: fine only if the process ended (or the pid was reused)
+                    // meanwhile.
+                    Err(_) => {
+                        if !has_exited(&id).unwrap_or(false) {
+                            return Ok(true);
+                        }
+                    }
                 }
             }
         }
     }
     Ok(false)
+}
+
+/// The kernel refused the read (`EACCES` or `EPERM`), as opposed to a process that vanished or
+/// any other failure.
+fn permission_denied(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+}
+
+/// For a process whose files cannot be inspected: whether `argv[0]` or an absolute argument of
+/// `/proc/<pid>/cmdline` lies under `tree`, as written or after resolving symlinks (so a path
+/// through `R/current` resolves into the version tree). A relative argument cannot be resolved
+/// without the process's working directory and is not counted.
+fn cmdline_uses_tree(pid: u32, tree: &Path) -> io::Result<bool> {
+    let cmdline = fs::read(proc_path(pid, "cmdline"))?;
+    Ok(cmdline
+        .split(|&b| b == 0)
+        .filter(|arg| arg.first() == Some(&b'/'))
+        .map(|arg| Path::new(OsStr::from_bytes(arg)))
+        .any(|arg| under(arg, tree) || resolve(arg).is_some_and(|p| under(&p, tree))))
+}
+
+/// `path` with symlinks resolved; when it does not exist (any more), its parent resolved with the
+/// last component re-appended.
+fn resolve(path: &Path) -> Option<PathBuf> {
+    fs::canonicalize(path).ok().or_else(|| {
+        let parent = fs::canonicalize(path.parent()?).ok()?;
+        Some(parent.join(path.file_name()?))
+    })
 }
 
 /// Whether `pid`'s executable, working directory, an open file or a mapped file lies under

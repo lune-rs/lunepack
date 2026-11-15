@@ -60,6 +60,14 @@ mod linux {
         ("a_process_with_an_open_file_in_the_tree_uses_it", in_use_fd),
         ("a_shell_script_from_the_tree_uses_it", in_use_scripts),
         (
+            "a_non_dumpable_process_unrelated_to_the_tree_does_not_use_it",
+            nodump_unrelated,
+        ),
+        (
+            "a_non_dumpable_process_with_the_tree_in_its_command_line_uses_it",
+            nodump_cmdline,
+        ),
+        (
             "terminate_kills_a_child_that_ignores_sigterm",
             terminate_stubborn,
         ),
@@ -438,6 +446,103 @@ mod linux {
                 "{name}: after the exit"
             );
         }
+    }
+
+    /// Starts `<program> nodump <ready> 600 <extra>...` and waits until it is non-dumpable.
+    /// Without `CAP_SYS_PTRACE` its `exe` is then denied to this process (the gate's container
+    /// and an unprivileged user); with it (root outside the gate) the case still holds, through
+    /// the files, and says so.
+    fn start_nodump(program: &Path, ready: &Path, extra: &[&Path], cwd: &Path) -> Reap {
+        let mut command = Command::new(program);
+        command.arg("nodump").arg(ready).arg("600");
+        command.args(extra);
+        let child = Reap(command.current_dir(cwd).spawn().expect("spawn nodump"));
+        wait_for_file(ready);
+        let exe = std::fs::read_link(format!("/proc/{}/exe", child.0.id()));
+        match exe {
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "the exe of a non-dumpable process: {e}"
+            ),
+            Ok(_) => println!("note: exe of a non-dumpable process is readable (CAP_SYS_PTRACE)"),
+        }
+        child
+    }
+
+    fn nodump_unrelated(scratch: &Path) {
+        let tree = scratch.join("tree");
+        let other = scratch.join("other");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let _nodump = start_nodump(&helper(), &scratch.join("ready"), &[&other], &other);
+        assert!(
+            !os().tree_in_use(&tree, &[]).unwrap(),
+            "a non-dumpable process that has nothing to do with the tree"
+        );
+    }
+
+    fn nodump_cmdline(scratch: &Path) {
+        let tree = scratch.join("tree");
+        let other = scratch.join("other");
+        std::fs::create_dir_all(tree.join("bin")).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let app = tree.join("bin").join("app");
+        std::fs::copy(helper(), &app).unwrap();
+        let data = tree.join("data");
+        std::fs::write(&data, b"x").unwrap();
+        // `current` is a link to the tree, as in an install.
+        let current = scratch.join("current");
+        std::os::unix::fs::symlink(&tree, &current).unwrap();
+
+        // (a) argv[0] under the tree.
+        let ready = scratch.join("ready-a");
+        let mut child = start_nodump(&app, &ready, &[], &other);
+        assert!(os().tree_in_use(&tree, &[]).unwrap(), "argv[0] in the tree");
+        let id = ProcessId {
+            pid: child.0.id(),
+            start_ticks: start_ticks(child.0.id()),
+        };
+        assert!(!os().tree_in_use(&tree, &[id]).unwrap(), "excluded");
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(!os().tree_in_use(&tree, &[]).unwrap(), "a: after the exit");
+
+        // (b) argv[0] through the `current` link.
+        let ready = scratch.join("ready-b");
+        let mut child = start_nodump(&current.join("bin").join("app"), &ready, &[], &other);
+        assert!(
+            os().tree_in_use(&tree, &[]).unwrap(),
+            "argv[0] through the current link"
+        );
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(!os().tree_in_use(&tree, &[]).unwrap(), "b: after the exit");
+
+        // (c) an absolute argument in the tree, and (d) one through the link.
+        for (name, arg) in [("c", data.clone()), ("d", current.join("data"))] {
+            let ready = scratch.join(format!("ready-{name}"));
+            let mut child = start_nodump(&helper(), &ready, &[&arg], &other);
+            assert!(
+                os().tree_in_use(&tree, &[]).unwrap(),
+                "{name}: an absolute argument"
+            );
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            assert!(
+                !os().tree_in_use(&tree, &[]).unwrap(),
+                "{name}: after the exit"
+            );
+        }
+
+        // (e) an argument that is not there (any more) but lies in the tree.
+        let ready = scratch.join("ready-e");
+        let gone = current.join("deleted-file");
+        let _child = start_nodump(&helper(), &ready, &[&gone], &other);
+        assert!(
+            os().tree_in_use(&tree, &[]).unwrap(),
+            "e: an absolute argument naming a missing file in the tree"
+        );
     }
 
     fn terminate_stubborn(scratch: &Path) {
