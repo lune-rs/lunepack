@@ -12,6 +12,7 @@ pub mod fs;
 #[doc(hidden)]
 pub mod fuzz;
 pub mod ident;
+pub mod integration;
 pub mod json;
 pub mod keyset;
 pub mod limits;
@@ -19,6 +20,7 @@ pub mod manifest;
 pub mod pack;
 pub mod path;
 pub mod policy;
+pub mod process;
 pub mod progress;
 pub mod root;
 pub mod stage;
@@ -52,6 +54,7 @@ pub use fs::{
     DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, ReadAt,
 };
 pub use ident::{AppId, Channel};
+pub use integration::{IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration};
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use limits::Limits;
 pub use manifest::{EntryDoc, ManifestDocument, VerifiedEntry, VerifiedManifest, verify_manifest};
@@ -61,6 +64,9 @@ pub use pack::{
 };
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
+pub use process::{
+    Child, ExitKind, Process, ProcessError, ProcessErrorKind, ProcessId, SpawnSpec, WaitOutcome,
+};
 pub use progress::{FileProgress, Phase, Progress, Source};
 pub use root::{RootDocument, TrustedRoot, advance_root};
 pub use stage::{SourceFor, StageEnv, StageInput, StagedVersion, scan, stage};
@@ -71,7 +77,7 @@ pub use state::{
 pub use target::Target;
 pub use traits::{
     Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,
-    HashState, Hasher, SignatureAlg, Signer, StreamView, Verifier,
+    HashState, Hasher, Rng, SignatureAlg, Signer, StreamView, Verifier,
 };
 pub use transport::{
     BlockingResponse, BlockingTransport, Body, BoxFuture, ByteRange, Head, Request, Response,

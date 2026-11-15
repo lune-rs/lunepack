@@ -1,7 +1,8 @@
 //! Hashing, signature-verification and signing adapters implementing the core traits:
 //! [`Sha256Hasher`] (SHA-256), [`Ed25519Verifier`] (Ed25519 with strict verification) and the
 //! signers of [`signer`] ([`Ed25519Signer`] over a PKCS#8 PEM key, [`CommandSigner`] over an
-//! external command, [`generate_key_file`]). Pure Rust.
+//! external command, [`generate_key_file`]) and [`OsRng`] (the operating system's random source).
+//! Pure Rust.
 
 pub mod signer;
 
@@ -9,7 +10,7 @@ pub use signer::{CommandSigner, Ed25519Signer, GeneratedKey, generate_key_file};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use lunepack_core::error::SignatureError;
-use lunepack_core::{Error, HashState, Hasher, Sha256Digest, SignatureAlg, Verifier};
+use lunepack_core::{Error, HashState, Hasher, Rng, Sha256Digest, SignatureAlg, Verifier};
 use sha2::Digest;
 
 /// SHA-256, backed by the `sha2` crate.
@@ -31,6 +32,17 @@ impl HashState for Sha256State {
 impl Hasher for Sha256Hasher {
     fn sha256_start(&self) -> Box<dyn HashState> {
         Box::new(Sha256State(sha2::Sha256::new()))
+    }
+}
+
+/// The operating system's random source (`getrandom`): the real [`Rng`]. A failure is reported as
+/// [`Error::Random`]; there is no fallback to a weaker source.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OsRng;
+
+impl Rng for OsRng {
+    fn fill(&self, buf: &mut [u8]) -> Result<(), Error> {
+        getrandom::fill(buf).map_err(|_| Error::Random)
     }
 }
 

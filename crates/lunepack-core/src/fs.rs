@@ -7,6 +7,9 @@
 //! through [`crate::RelPath`] joined onto a trusted base. An [`FsError`] names only the file name
 //! of the path, never the directories above it (they can hold a user name).
 //!
+//! A symlink's target is text (`&str`); the `current` link of an install is flipped with
+//! [`Fs::replace_symlink`] and read with [`Fs::read_link`].
+//!
 //! Durability: bytes written to a [`FileWrite`] are volatile until [`FileWrite::sync`]; a directory
 //! entry created, removed or renamed is volatile until [`Fs::sync_dir`] on its parent. Callers that
 //! need a change to survive a crash sync the file, then its directory.
@@ -33,6 +36,8 @@ pub enum FsErrorKind {
     NotADirectory,
     /// A symlink where the operation refuses one.
     IsSymlink,
+    /// A path that must be a symlink is not one.
+    NotASymlink,
     /// A lock is held elsewhere.
     Locked,
     /// The (simulated) process crashed; nothing more can be done through this handle.
@@ -50,6 +55,7 @@ impl FsErrorKind {
             FsErrorKind::TooLarge => "too large",
             FsErrorKind::NotADirectory => "not a directory",
             FsErrorKind::IsSymlink => "is a symlink",
+            FsErrorKind::NotASymlink => "not a symlink",
             FsErrorKind::Locked => "locked",
             FsErrorKind::Crashed => "crashed",
             FsErrorKind::Other => "I/O failed",
@@ -275,6 +281,20 @@ pub trait Fs: Send + Sync {
 
     /// Creates a symlink at `link_path` holding the text `target`; `link_path` must not exist.
     fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError>;
+
+    /// The target text of the symlink at `path`. A path that is not a symlink is
+    /// [`FsErrorKind::NotASymlink`], a missing one [`FsErrorKind::NotFound`], and a target that is
+    /// not UTF-8 is an error of kind [`FsErrorKind::Other`] (the core handles link targets as
+    /// text).
+    fn read_link(&self, path: &Path) -> Result<String, FsError>;
+
+    /// Atomically makes `link` a symlink holding the text `target`, replacing a symlink that is
+    /// already there. `link` must be absent or a symlink: a file or a directory at `link` is
+    /// [`FsErrorKind::NotASymlink`] and nothing is changed. A reader of `link` sees the old target
+    /// or the new one, never neither; a dangling `target` is allowed. The adapter creates a
+    /// temporary link in the same directory and renames it over `link` (two crash ops in the
+    /// testkit's `MemFs`). The change is volatile until [`Fs::sync_dir`] on the parent of `link`.
+    fn replace_symlink(&self, target: &str, link: &Path) -> Result<(), FsError>;
 
     /// Takes the exclusive advisory lock on the file at `path`, creating it when the adapter needs
     /// one. `Ok(None)` means another holder has it; the lock is released when the guard drops.

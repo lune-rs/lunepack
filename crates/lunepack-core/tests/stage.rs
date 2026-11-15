@@ -354,6 +354,12 @@ impl Fs for Spy<'_> {
         self.record(Op::Symlink(target.to_owned(), link_path.to_path_buf()));
         self.inner.symlink(target, link_path)
     }
+    fn read_link(&self, path: &Path) -> Result<String, FsError> {
+        self.inner.read_link(path)
+    }
+    fn replace_symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
+        self.inner.replace_symlink(target, link_path)
+    }
     fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {
         self.inner.try_lock(path)
     }
@@ -1124,6 +1130,14 @@ mod real {
         }
         fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
             std::os::unix::fs::symlink(target, link_path).map_err(|e| err(link_path, e))
+        }
+        fn read_link(&self, path: &Path) -> Result<String, FsError> {
+            std::fs::read_link(path)
+                .map_err(|e| err(path, e))
+                .map(|p| p.to_string_lossy().into_owned())
+        }
+        fn replace_symlink(&self, _target: &str, link_path: &Path) -> Result<(), FsError> {
+            Err(FsError::new(FsErrorKind::Other, link_path, None))
         }
         fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {
             Err(FsError::new(FsErrorKind::Other, path, None))
