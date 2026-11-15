@@ -1071,9 +1071,12 @@ fn discovery_and_startup_work_on_a_real_directory() {
     let dir = std::fs::canonicalize(tmp.path()).expect("canonical");
     let exe = real_install(&dir, FEED);
     // The native filesystem; the exe reached through a symlink resolves to its tree.
-    let link = dir.join("app-link");
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&exe, &link).expect("symlink");
+    let link = {
+        let link = dir.join("app-link");
+        std::os::unix::fs::symlink(&exe, &link).expect("symlink");
+        link
+    };
     #[cfg(not(unix))]
     let link = exe.clone();
     let platform = Platform::native()
