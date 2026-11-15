@@ -4,15 +4,17 @@
 //! re-runs this binary as a child process whose environment is set on the `Command`; the parent's
 //! environment is never touched. This test has its own `main` (see Cargo.toml).
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::panic::catch_unwind;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lunepack_core::{BlockingTransport, CancelToken, Request};
-use lunepack_http::{UreqTransport, proxy_for_url};
+use lunepack_http::{UreqOptions, UreqTransport, proxy_for_url};
 
 const PROXY_VARS: &[&str] = &[
     "ALL_PROXY",
@@ -36,13 +38,26 @@ fn main() {
             );
             return;
         }
-        Some("--fetch") => {
+        Some(mode @ ("--fetch" | "--fetch-with")) => {
+            // `--fetch <url>` with the default options; `--fetch-with <direct 0|1>
+            // <max_redirects> <url>` with those.
+            let (transport, url) = if mode == "--fetch" {
+                (UreqTransport::new(), args[1].clone())
+            } else {
+                let options = UreqOptions {
+                    direct: args[1] == "1",
+                    max_redirects: args[2].parse().expect("max redirects"),
+                    connect_timeout: Duration::from_secs(5),
+                    read_timeout: Duration::from_secs(5),
+                };
+                (UreqTransport::with_options(&options), args[3].clone())
+            };
             let request = Request {
-                url: args[1].clone(),
+                url,
                 range: None,
                 if_range: None,
             };
-            match UreqTransport::new().get(&request, &CancelToken::new()) {
+            match transport.get(&request, &CancelToken::new()) {
                 Ok(mut response) => {
                     let mut body = String::new();
                     response.body.read_to_string(&mut body).expect("body");
@@ -64,6 +79,14 @@ fn main() {
             request_goes_through_proxy,
         ),
         ("without_env_there_is_no_proxy_on_linux", no_env_no_proxy),
+        (
+            "a_direct_transport_ignores_every_env_proxy",
+            direct_ignores_env_proxies,
+        ),
+        (
+            "with_no_redirects_a_302_is_returned_and_not_followed",
+            no_redirects_returns_the_302,
+        ),
     ];
     let mut failed = 0;
     for (name, test) in tests {
@@ -194,4 +217,93 @@ fn no_env_no_proxy() {
         return;
     }
     assert_eq!(child(&[], &["--proxy-for", URL]), "none");
+}
+
+/// A loopback port nothing listens on.
+fn closed_port() -> u16 {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    listener.local_addr().expect("addr").port()
+}
+
+/// A loopback HTTP server that answers every request with `response` until `stop` is set, and
+/// returns how many requests it saw.
+fn serve(response: String) -> (u16, Arc<AtomicBool>, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut seen = 0;
+        while !flag.load(Ordering::SeqCst) && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).expect("blocking");
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .expect("timeout");
+                    read_head(&mut stream);
+                    seen += 1;
+                    stream.write_all(response.as_bytes()).expect("write");
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        }
+        seen
+    });
+    (port, stop, handle)
+}
+
+const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+/// `direct` reaches a loopback server although every proxy variable names a closed port; the
+/// control without `direct` goes to that proxy and fails.
+fn direct_ignores_env_proxies() {
+    let dead = format!("http://127.0.0.1:{}", closed_port());
+    let env: Vec<(&str, &str)> = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
+        .iter()
+        .map(|v| (*v, dead.as_str()))
+        .collect();
+
+    let (port, stop, server) = serve(OK.to_owned());
+    let url = format!("http://127.0.0.1:{port}/feed-stable.json");
+    let got = child(&env, &["--fetch-with", "1", "0", &url]);
+    assert_eq!(got, "status=200 body=ok", "direct");
+
+    let control = child(&env, &["--fetch-with", "0", "0", &url]);
+    stop.store(true, Ordering::SeqCst);
+    assert!(control.starts_with("error="), "control reached: {control}");
+    assert_eq!(
+        server.join().expect("server"),
+        1,
+        "only the direct fetch reaches the server"
+    );
+}
+
+/// With `max_redirects` 0 a 302 comes back as the answer: the redirect target sees no request.
+/// The control with redirects on shows the target is reachable.
+fn no_redirects_returns_the_302() {
+    let (target, stop_target, target_server) = serve(OK.to_owned());
+    let redirect = format!(
+        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target}/x\r\nContent-Length: 0\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (port, stop, server) = serve(redirect);
+    let url = format!("http://127.0.0.1:{port}/feed-stable.json");
+    let got = child(&[], &["--fetch-with", "1", "0", &url]);
+    assert_eq!(got, "status=302 body=", "the 302 is the answer");
+    let control = child(&[], &["--fetch-with", "1", "5", &url]);
+    stop.store(true, Ordering::SeqCst);
+    stop_target.store(true, Ordering::SeqCst);
+    assert_eq!(control, "status=200 body=ok", "control follows");
+    assert_eq!(server.join().expect("server"), 2);
+    assert_eq!(
+        target_server.join().expect("target"),
+        1,
+        "only the control reaches the redirect target"
+    );
 }

@@ -17,6 +17,8 @@ lunepack-codec-lzma.workspace = true
 lunepack-crypto.workspace = true
 lunepack-fs.workspace = true
 lunepack-http.workspace = true
+# Processes and the XDG desktop integration (the crate is empty outside Linux).
+lunepack-os-linux.workspace = true
 thiserror.workspace = true
 # The cache's part sidecars (strict JSON on read through the core) and feed URL resolution.
 serde = { workspace = true }

@@ -13,8 +13,13 @@
 //!   worker, and sees coalesced counters, so a slow callback does not stall a download.
 //! - **Lock.** Every operation takes `<state dir>/lock`; another holder gives [`Error::Busy`]. The
 //!   OS releases it when a holder dies.
-//! - **Locations.** A [`Layout`] names the state, cache and versions directories; per-OS discovery
-//!   comes later. The app compiles its trusted root key in ([`trusted_root`]).
+//! - **Locations.** A [`Layout`] names the state, cache and versions directories. An installed
+//!   app finds its own from its executable with [`Installation`] (per user, Linux in M5), whose
+//!   update config also gives the root, feed and channel ([`Installation::updater_builder`]).
+//!   An app that builds the updater itself compiles its trusted root key in ([`trusted_root`]).
+//! - **Lifecycle.** At every start the app calls [`startup`], once it works [`confirm_healthy`],
+//!   and to restart into a staged version [`apply_and_restart`] (then it exits). These are plain
+//!   calls that block the calling thread (a held install lock is retried for up to 2 s).
 //! - **One dependency.** Every type the API takes or returns is re-exported here (the ones the
 //!   adapter traits need included), so an app depends on `lunepack` alone.
 //!
@@ -102,6 +107,8 @@ mod error;
 mod executor;
 mod feed_rule;
 mod fetch;
+mod installation;
+mod lifecycle;
 mod pipe;
 mod progress;
 mod task;
@@ -113,6 +120,11 @@ pub mod blocking;
 pub use error::Error;
 pub use executor::block_on;
 pub use feed_rule::check_config_feed;
+pub use installation::{HEALTH_TOKEN_VAR, Installation, Platform};
+pub use lifecycle::{
+    ApplyOptions, ApplyScheduled, Startup, StartupAction, apply_and_restart, apply_and_restart_for,
+    confirm_for, confirm_healthy, startup, startup_for,
+};
 pub use updater::{
     DownloadOptions, Downloaded, InstalledVersion, Layout, ProgressCallback, StagedVersion,
     Timeouts, UpdateInfo, Updater, UpdaterBuilder,
@@ -127,10 +139,13 @@ pub use lunepack_core::Error as CoreError;
 pub use lunepack_core::fetch::FetchPolicy;
 pub use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, Body, BoxFuture, ByteRange, CancelToken, Channel,
-    Clock, Codec, DirEntryInfo, FeedKind, FeedRule, FileKind, FileProgress, FileWrite, Fs, FsError,
-    FsErrorKind, Hasher, Head, LockGuard, Meta, Phase, Progress, RangeError, ReadAt, RelPath,
-    Request, Response, Sha256Digest, Source, StateError, Target, Transport, TransportError,
-    TransportErrorKind, TrustedRoot, UpdateConfigError, Validator, Verifier, Version,
+    Child, Clock, Codec, ConfirmOutcome, DirEntryInfo, ExitKind, FeedKind, FeedRule, FileKind,
+    FileProgress, FileWrite, Fs, FsError, FsErrorKind, Hasher, Head, InstallMeta, IntegrationError,
+    IntegrationItem, IntegrationReport, IntegrationRequest, LifecycleEvent, LockGuard, Meta,
+    OsIntegration, Phase, Process, ProcessError, ProcessErrorKind, ProcessId, Progress, RangeError,
+    ReadAt, RelPath, Request, Response, Rng, Sha256Digest, Source, SpawnSpec, StateError, Target,
+    Transport, TransportError, TransportErrorKind, TrustedRoot, UpdateConfig, UpdateConfigError,
+    UserLayout, Validator, Verifier, Version, WaitOutcome,
 };
 
 /// Plumbing that tests and sibling crates use; not part of the supported API and free to change in

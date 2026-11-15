@@ -72,6 +72,16 @@ impl Updater {
         run(cancel, self.inner.stage(downloaded))
     }
 
+    /// [`crate::Updater::install`], blocking; `cancel` replaces the options' token.
+    pub fn install(
+        &self,
+        mut options: DownloadOptions,
+        cancel: &CancelToken,
+    ) -> Result<InstalledVersion, Error> {
+        options.cancel = Some(cancel.clone());
+        run(cancel, self.inner.install(options))
+    }
+
     /// [`crate::Updater::installed`].
     pub fn installed(&self) -> Result<Option<InstalledVersion>, Error> {
         self.inner.installed()

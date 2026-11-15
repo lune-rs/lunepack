@@ -25,6 +25,10 @@ pub struct UreqOptions {
     pub read_timeout: Duration,
     /// Redirects followed before the request fails. Default 5.
     pub max_redirects: u32,
+    /// Connect directly, ignoring every proxy source (the environment, WinINET and the macOS
+    /// system settings). Default `false`. The facade sets it for an update config's `http:` feed,
+    /// which may only reach a loopback address (M5-D16).
+    pub direct: bool,
 }
 
 impl Default for UreqOptions {
@@ -33,6 +37,7 @@ impl Default for UreqOptions {
             connect_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(30),
             max_redirects: 5,
+            direct: false,
         }
     }
 }
@@ -61,12 +66,14 @@ pub(crate) fn agent_config(options: &UreqOptions) -> Config {
 }
 
 /// The default transport for `http` and `https` URLs: ureq with rustls and the platform
-/// verifier, redirects followed, system proxies per M4-D14, no content decoding.
+/// verifier, redirects followed, system proxies per M4-D14 (none with [`UreqOptions::direct`]), no
+/// content decoding.
 ///
 /// A blocked read ends at the per-read timeout, not at cancellation (the socket cannot be woken;
 /// documented risk). Cancellation is checked before connecting and before every body read.
 pub struct UreqTransport {
     agent: Agent,
+    direct: bool,
 }
 
 impl UreqTransport {
@@ -79,6 +86,7 @@ impl UreqTransport {
     pub fn with_options(options: &UreqOptions) -> Self {
         UreqTransport {
             agent: Agent::new_with_config(agent_config(options)),
+            direct: options.direct,
         }
     }
 }
@@ -124,7 +132,12 @@ impl BlockingTransport for UreqTransport {
                 builder = builder.header("If-Range", validator.header_value());
             }
         }
-        let result = match proxy::select(&request.url) {
+        let selection = if self.direct {
+            Selection::Override(None)
+        } else {
+            proxy::select(&request.url)
+        };
+        let result = match selection {
             Selection::AgentDefault => builder.call(),
             Selection::Override(chosen) => builder.config().proxy(chosen).build().call(),
         };
@@ -283,6 +296,7 @@ mod tests {
         );
         assert!(!config.http_status_as_error());
         assert_eq!(config.max_redirects(), 5);
+        assert!(!UreqOptions::default().direct, "proxies apply unless asked");
     }
 
     #[test]
@@ -291,6 +305,7 @@ mod tests {
             connect_timeout: Duration::from_secs(7),
             read_timeout: Duration::from_secs(9),
             max_redirects: 2,
+            direct: true,
         });
         assert_eq!(config.max_redirects(), 2);
         assert_eq!(config.timeout_per_read(), Some(Duration::from_secs(9)));

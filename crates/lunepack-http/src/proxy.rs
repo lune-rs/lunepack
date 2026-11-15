@@ -15,7 +15,6 @@ pub(crate) enum Selection {
     /// Use the agent's own proxy setting (the environment, or the WinINET proxy on Windows).
     AgentDefault,
     /// Use exactly this proxy for the request; `None` connects directly.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Override(Option<ureq::Proxy>),
 }
 
