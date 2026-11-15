@@ -14,10 +14,10 @@ use lunepack_core::fetch::classify;
 use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId,
     DecodeReport, Encoder, Error, ExitKind, FileKind, FrameView, Fs, FsErrorKind, Hasher, Head,
-    InstallMeta, IntegrationError, IntegrationItem, IntegrationReport, IntegrationRequest,
-    OsIntegration, Process, ProcessError, ProcessErrorKind, ProcessId, RangeError, RelPath,
-    Request, ResponseInfo, Rng, Scope, Sha256Digest, SignatureAlg, Signer, SpawnSpec, StreamView,
-    Transport, TransportError, TransportErrorKind, Validator, Verifier, WaitOutcome,
+    InstallMeta, IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration, Process,
+    ProcessError, ProcessErrorKind, ProcessId, RangeError, RelPath, Request, ResponseInfo, Rng,
+    Scope, Sha256Digest, SignatureAlg, Signer, SpawnSpec, StreamView, Transport, TransportError,
+    TransportErrorKind, Validator, Verifier, WaitOutcome,
 };
 use lunepack_testkit::*;
 
@@ -1855,6 +1855,7 @@ fn fake_integration_records_calls_and_scripts_conflicts() {
 #[cfg(unix)]
 mod suite_probe {
     use super::*;
+    use lunepack_core::IntegrationReport;
     use std::fs;
 
     pub struct Probe {
