@@ -1209,7 +1209,11 @@ version = "0.0.0"
 dependencies = [
  "lunepack",
  "lunepack-core",
+ "lunepack-crypto",
+ "lunepack-fs",
  "lunepack-os-linux",
+ "lunepack-testkit",
+ "tempfile",
 ]
 
 [[package]]

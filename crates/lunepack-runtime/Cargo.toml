@@ -15,3 +15,16 @@ lunepack-core.workspace = true
 # The facade (Installation, the lifecycle calls) and the Linux adapters; wired in main.rs (step 8).
 lunepack.workspace = true
 lunepack-os-linux.workspace = true
+# The filesystem and crypto adapters (wired in main.rs, the composition root).
+lunepack-fs.workspace = true
+lunepack-crypto.workspace = true
+
+[dev-dependencies]
+lunepack-testkit.workspace = true
+tempfile = { workspace = true }
+
+# Own main: the test binary is also the helper app the applier launches (its first argument
+# names the helper mode), and the cases run one after another.
+[[test]]
+name = "apply"
+harness = false
