@@ -1183,7 +1183,9 @@ dependencies = [
 name = "lunepack-os-linux"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "lunepack-core",
+ "lunepack-testkit",
 ]
 
 [[package]]

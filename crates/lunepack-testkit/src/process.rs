@@ -579,7 +579,8 @@ fn detached_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
     let want: String = odd.iter().map(|a| format!("{a}\n")).collect();
     assert_eq!(got, want, "arguments did not arrive verbatim");
 
-    // env_set replaces, env_remove removes, the rest is inherited.
+    // env_remove is applied before env_set: a removed inherited variable is gone, a variable in
+    // both lists ends up set, env_set replaces, and the rest is inherited.
     let env_file = scratch.join("env");
     let mut spec = helper_spec(
         helper,
@@ -587,7 +588,8 @@ fn detached_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
             "env",
             &env_file.to_string_lossy(),
             "LUNEPACK_SUITE_TOKEN",
-            "LUNEPACK_SUITE_GONE",
+            "LUNEPACK_SUITE_BOTH",
+            "PATH",
             "HOME",
         ],
     );
@@ -597,11 +599,14 @@ fn detached_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
             OsString::from("tok en=1"),
         ),
         (
-            OsString::from("LUNEPACK_SUITE_GONE"),
-            OsString::from("set then removed"),
+            OsString::from("LUNEPACK_SUITE_BOTH"),
+            OsString::from("removed then set"),
         ),
     ];
-    spec.env_remove = vec![OsString::from("LUNEPACK_SUITE_GONE")];
+    spec.env_remove = vec![
+        OsString::from("LUNEPACK_SUITE_BOTH"),
+        OsString::from("PATH"),
+    ];
     process.spawn_detached(&spec).expect("spawn_detached env");
     let got = wait_for_file(&env_file, "env");
     let home = match std::env::var_os("HOME") {
@@ -610,7 +615,9 @@ fn detached_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
     };
     assert_eq!(
         got,
-        format!("LUNEPACK_SUITE_TOKEN=tok en=1\nLUNEPACK_SUITE_GONE unset\n{home}\n"),
+        format!(
+            "LUNEPACK_SUITE_TOKEN=tok en=1\nLUNEPACK_SUITE_BOTH=removed then set\nPATH unset\n{home}\n"
+        ),
         "environment of a spawned program"
     );
 

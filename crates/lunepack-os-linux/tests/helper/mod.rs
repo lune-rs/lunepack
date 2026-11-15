@@ -1,0 +1,145 @@
+//! The helper program: this test binary run with a helper mode as its first argument. It speaks
+//! the protocol of `lunepack_testkit::run_process_suite` plus three modes of this crate's tests:
+//!
+//! - `hold <file> <ready> <secs>`: opens `file`, creates `ready`, then sleeps with `file` open.
+//! - `pid-sleep <file> <secs>`: creates `file` holding `<pid> <start ticks>`, then sleeps.
+//! - `detach-then <exit|sleep> <mode> <arg>...`: starts this binary with `<mode> <arg>...` through
+//!   `LinuxProcess::spawn_detached`, then exits 0 (`exit`) or sleeps for 600 s (`sleep`).
+//!
+//! Every file is created atomically (`<file>.tmp`, then a rename).
+
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::Path;
+use std::time::Duration;
+
+use lunepack_core::{Process, SpawnSpec};
+use lunepack_os_linux::LinuxProcess;
+
+const MODES: &[&str] = &[
+    "exit",
+    "sleep",
+    "sleep-ignore-term",
+    "write",
+    "args",
+    "env",
+    "probe",
+    "hold",
+    "pid-sleep",
+    "detach-then",
+];
+
+/// Runs the helper mode named by `args[0]` and never returns; `false` when `args` names no mode.
+pub fn run(args: &[String]) -> bool {
+    let Some(mode) = args.first() else {
+        return false;
+    };
+    if !MODES.contains(&mode.as_str()) {
+        return false;
+    }
+    let rest = &args[1..];
+    match mode.as_str() {
+        "exit" => std::process::exit(rest[0].parse().expect("exit code")),
+        "sleep" => sleep(&rest[0]),
+        "sleep-ignore-term" => {
+            ignore_sigterm();
+            create(Path::new(&rest[1]), "ready\n");
+            sleep(&rest[0]);
+        }
+        "write" => create(Path::new(&rest[0]), &rest[1]),
+        "args" => {
+            let text: String = rest[1..].iter().map(|a| format!("{a}\n")).collect();
+            create(Path::new(&rest[0]), &text);
+        }
+        "env" => {
+            let text: String = rest[1..]
+                .iter()
+                .map(|name| match std::env::var_os(name) {
+                    Some(v) => format!("{name}={}\n", v.to_string_lossy()),
+                    None => format!("{name} unset\n"),
+                })
+                .collect();
+            create(Path::new(&rest[0]), &text);
+        }
+        "probe" => {
+            let fields = stat_fields(None);
+            let leader = fields[6 - 3] == std::process::id().to_string();
+            let mut text = String::from(if leader {
+                "session leader\n"
+            } else {
+                "session member\n"
+            });
+            for (fd, name) in [(0, "stdin"), (1, "stdout"), (2, "stderr")] {
+                let null = is_dev_null(&format!("/proc/self/fd/{fd}"));
+                text.push_str(&format!("{name} {}\n", if null { "null" } else { "other" }));
+            }
+            create(Path::new(&rest[0]), &text);
+        }
+        "hold" => {
+            let _file = std::fs::File::open(&rest[0]).expect("open the held file");
+            create(Path::new(&rest[1]), "ready\n");
+            sleep(&rest[2]);
+        }
+        "pid-sleep" => {
+            let me = LinuxProcess::new().current().expect("current");
+            create(
+                Path::new(&rest[0]),
+                &format!("{} {}\n", me.pid, me.start_ticks),
+            );
+            sleep(&rest[1]);
+        }
+        "detach-then" => {
+            let mut spec = SpawnSpec::new(std::env::current_exe().expect("current_exe"));
+            spec.args = rest[1..].iter().map(Into::into).collect();
+            LinuxProcess::new()
+                .spawn_detached(&spec)
+                .expect("spawn_detached");
+            if rest[0] == "sleep" {
+                sleep("600");
+            }
+        }
+        _ => unreachable!(),
+    }
+    std::process::exit(0);
+}
+
+fn sleep(secs: &str) {
+    std::thread::sleep(Duration::from_secs(secs.parse().expect("seconds")));
+}
+
+fn create(path: &Path, text: &str) {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, text).expect("write the helper's file");
+    std::fs::rename(&tmp, path).expect("rename the helper's file");
+}
+
+fn is_dev_null(path: &str) -> bool {
+    let (Ok(fd), Ok(null)) = (std::fs::metadata(path), std::fs::metadata("/dev/null")) else {
+        return false;
+    };
+    fd.file_type().is_char_device() && fd.rdev() == null.rdev()
+}
+
+/// The fields of `/proc/<pid>/stat` (of this process for `None`) from field 3 on, counted after
+/// the last `)`: index `n - 3` is field `n`.
+pub fn stat_fields(pid: Option<u32>) -> Vec<String> {
+    let path = match pid {
+        Some(pid) => format!("/proc/{pid}/stat"),
+        None => "/proc/self/stat".to_owned(),
+    };
+    let text = std::fs::read(path).expect("read stat");
+    let close = text.iter().rposition(|&b| b == b')').expect("comm");
+    String::from_utf8_lossy(&text[close + 2..])
+        .trim_end()
+        .split(' ')
+        .map(str::to_owned)
+        .collect()
+}
+
+#[allow(unsafe_code)]
+fn ignore_sigterm() {
+    // SAFETY: signal(2) with SIG_IGN installs no handler code; this process is single-threaded
+    // here (the helper starts no thread), and nothing else in it relies on SIGTERM's disposition.
+    let previous = unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+    assert_ne!(previous, libc::SIG_ERR, "ignore SIGTERM");
+}
