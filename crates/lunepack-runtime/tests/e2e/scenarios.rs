@@ -327,7 +327,7 @@ fn row_moved_entry(lab: &mut Lab) -> Vec<String> {
     assert_current_link(lab, "4.0.0");
     // The command link and the desktop entry follow the entry to the tree's root.
     let entry = lab.entry_rel(&V4);
-    assert_eq!(entry, "e2e_app");
+    assert_eq!(entry, lab.app_name());
     assert_integration(lab, &entry);
     // The relaunch ran the new tree's entry.
     let ran = format!("4.0.0 exe {}/versions/4.0.0/{entry}", lab.root.display());

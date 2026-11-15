@@ -9,8 +9,10 @@
 #
 # Inside, it builds the static musl runtime (scripts/build-runtime.sh; or takes --runtime), the
 # `lunepack` command line and the Rust example app, then runs the test binary
-# crates/lunepack-runtime/tests/e2e with them. LUNEPACK_E2E_REQUIRE=1 is set, so a missing piece
-# fails instead of skipping.
+# crates/lunepack-runtime/tests/e2e with them and with the shell app (tests/e2e/shell-app/app.sh,
+# checked with shellcheck when that is installed). The scenario table runs once per app and the two
+# outcome logs must be equal; the command-line extras run after. LUNEPACK_E2E_REQUIRE=1 is set, so
+# a missing piece fails instead of skipping.
 #
 # The Docker mode builds the image `lunepack-rs-e2e:<hash>` from scripts/e2e.Dockerfile (once per
 # Dockerfile change), runs `docker run --rm --init` (a reaping PID 1, as on a desktop) with the
@@ -127,8 +129,15 @@ cargo build --locked --release -p lunepack --example e2e_app
 # A stripped copy: the app is packed once per release, and its size is the pack's.
 strip -o "$work/e2e_app" "$tdir/release/examples/e2e_app"
 
+shell_app=$top/crates/lunepack-runtime/tests/e2e/shell-app/app.sh
+[ -f "$shell_app" ] || die "the shell app is missing"
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck -s sh "$shell_app"
+fi
+
 LUNEPACK_E2E_RUNTIME=$runtime \
   LUNEPACK_E2E_CLI=$tdir/release/lunepack \
   LUNEPACK_E2E_APP=$work/e2e_app \
+  LUNEPACK_E2E_SHELL_APP=$shell_app \
   LUNEPACK_E2E_REQUIRE=1 \
   cargo test --locked -p lunepack-runtime --test e2e
