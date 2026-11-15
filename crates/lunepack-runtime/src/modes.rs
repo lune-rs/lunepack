@@ -503,4 +503,81 @@ mod tests {
         assert_eq!(Kind::InUse.code(), 25);
         assert_eq!(Kind::InstallMismatch.code(), 26);
     }
+
+    /// The rows `| <code> | `<kind>` | ... |` of the exit-code table in `docs/RUNTIME.md`.
+    fn documented_codes() -> Vec<(u8, String)> {
+        let doc = include_str!("../../../docs/RUNTIME.md");
+        let table = doc
+            .split("## Exit codes")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("the exit-code section");
+        table
+            .lines()
+            .filter_map(|line| {
+                let mut cells = line.split('|').skip(1).map(str::trim);
+                let code: u8 = cells.next()?.parse().ok()?;
+                let kind = cells.next()?.trim_matches('`').to_owned();
+                Some((code, kind))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_documented_exit_codes_are_the_code_table() {
+        let documented = documented_codes();
+        // Success is the one row with no kind name.
+        let mut table: Vec<(u8, String)> = Kind::ALL
+            .iter()
+            .map(|k| {
+                let name = if *k == Kind::Ok { "" } else { k.name() };
+                (k.code(), name.to_owned())
+            })
+            .collect();
+        table.sort();
+        let mut doc = documented;
+        doc.sort();
+        assert_eq!(doc, table, "docs/RUNTIME.md and the code table differ");
+    }
+
+    #[test]
+    fn every_kind_has_a_golden_error_object() {
+        let golden = include_str!("../tests/golden/objects.jsonl");
+        for kind in Kind::ALL.iter().filter(|k| **k != Kind::Ok) {
+            let want = format!(
+                "\"kind\":\"{}\",\"exit_code\":{}}}",
+                kind.name(),
+                kind.code()
+            );
+            assert!(
+                golden.lines().any(|l| l.ends_with(&want)),
+                "no golden error object for kind {}",
+                kind.name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_documented_commands_are_the_parsed_ones() {
+        let doc = include_str!("../../../docs/RUNTIME.md");
+        for name in [
+            "check",
+            "download",
+            "startup",
+            "confirm",
+            "apply-and-restart",
+        ] {
+            assert!(crate::cli::args::Command::named(name).is_some(), "{name}");
+            assert!(
+                doc.contains(&format!("| `{name}` |")),
+                "{name} is not in the command table of docs/RUNTIME.md"
+            );
+        }
+        for name in ["apply", "install", "uninstall"] {
+            assert!(
+                doc.contains(&format!("`{name}")),
+                "{name} is not in docs/RUNTIME.md"
+            );
+        }
+    }
 }
