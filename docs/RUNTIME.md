@@ -157,6 +157,29 @@ applied while the app still runs. So:
 - any caller that runs the command through a wrapper (a shell, `env`, a launcher library) passes
   its own pid with `--wait-pid`.
 
+## Internal modes
+
+The runtime also has three modes for lunepack's own use: `apply`, `install` and `uninstall`. They
+are not part of the app-facing command line and carry no promise to callers: they are **same build
+only** (D28). Only the build that started a mode may rely on its arguments, its output or its exit
+codes, and a different version's runtime may run them differently. An app does not call them; it
+calls `apply-and-restart`, which starts `apply` itself.
+
+| Mode | Started by | What it does |
+|---|---|---|
+| `apply --wait-pid <pid> --wait-start <ticks> --version <version> [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. Exit codes 20 to 22 are its own. |
+| `install` | the first-install flow, from a bootstrap tree | Installs the newest release the tree's own channel offers (M5-D8): the root, feed and channel come only from that tree's update configuration. Exit codes 23, 24 and 26 are its own. |
+| `uninstall` | the uninstall flow, from a tree of the install | Removes the install this runtime stands in and the desktop integration lunepack made (M5-D10). Exit codes 24, 25 and 26 are its own. |
+
+`install` and `uninstall` take no options at all: the install root is derived from the runtime's own
+resolved path and the environment, never from an argument or the state. Every mode follows the
+closed grammar above (a refusal is exit code 2 and one fixed line). `apply` logs schema-1 events to
+`logs/runtime.log` under the install root (rotated at 1 MiB to `runtime.log.1`). `install` and
+`uninstall` log them to stderr, because the first has no install yet and the second removes the
+log's directory, and each ends by printing one final `result` or `error` object on stdout. The
+`result`'s `outcome` is `installed`, `uninstalled`, or `uninstalled_with_leftovers` (an
+integration item that is not lunepack's was kept and reported).
+
 ## Cancel
 
 End the child process (SIGTERM). A download keeps its partial file and resumes on the next run.

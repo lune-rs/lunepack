@@ -365,9 +365,45 @@ hostname such as `localhost` is not accepted because the resolver, not the rule,
 goes. The library path is unchanged: an app that builds the updater itself may use any URL, as in
 M4, and the signatures and hashes protect the content on any transport.
 
-**What the runtime prints.** Its fixed error kinds and exit codes name a class, never a path, URL,
-argument value, key or the token; a refused command line prints one fixed line and exits 2 before
-anything else happens. The log under `R/logs` holds the same events.
+**The command line as an input surface (D42, M5-D11).** The app-facing commands (`check`, `download`,
+`startup`, `confirm`, `apply-and-restart`; `docs/RUNTIME.md`) take their argv from whatever starts
+the runtime, and any process of the same user can start it with any arguments. That is no new power
+over the app (class 4 can already edit the tree and the records), but the runtime must not turn an
+argument into an action no signed tree allows. So:
+- The parser is hand-written and closed: every option is named, may appear once and has a value of a
+  fixed form; an unknown option, a repeat, an option of another command, the `--option=value` form
+  or a stray word is a usage error (exit 2), decided before any lock, state read or network access.
+  A framework parser is not used because its error text echoes the argument values.
+- No argument supplies trust material or a location: not the trusted root, the feed, the install
+  root or the tree to act on. Those come from the tree's own update configuration (`docs/FORMAT.md`
+  13), which the manifest's hashes cover, and from the runtime's own resolved path. `--channel` only
+  picks a channel name that passes the channel rule, from the feed the configuration names;
+  `--expect-version` only names the version the caller expects, and any other one is refused, never
+  taken as a downgrade; `--expect-schema` only refuses.
+- `--wait-pid` names a process that the applier waits for and never signals, identified by its pid
+  and start time, so a pid the system reuses is not mistaken for it. A caller that names a wrong or
+  exited process can delay or hasten its own update and nothing else.
+- The arguments after `--` are passed to the program the runtime starts (the new tree's entry, or
+  the previous one on rollback), as separate values with no shell. They travel in the detached
+  applier's argument list, as readable to the user's other processes as the app's own (M5-D14).
+
+**Output hygiene (C4).** What a caller reads (stdout, stderr, the exit code) and what the runtime
+logs must not carry what a same-user observer or a captured log could misuse, or what a hostile feed
+could place there. The rule is by construction, not by redaction: the only strings in any object
+come from signed documents (versions, channel names, signed relative paths), from the closed sets of
+`docs/RUNTIME.md` (kinds, phases, outcomes, reasons) and from the build. No path, URL, host name,
+header, argument value, install id, key, health token, file content or operating-system or network
+error text reaches a stream; an error is its closed kind and its exit code, and the facade's own
+error `Display` is never printed. A refused command line prints one fixed line, or, with `--json`
+before any `--`, the one `error` object with no command or tree version, and exits 2 before
+anything else happens. Progress is bounded (at most ten lines a second as JSON, one a second as
+text), a reader that stops reading cancels the operation and cannot stall it, and the log under
+`R/logs` holds the same events as the stream. Two tests hold the rule: a golden for every error
+kind and event, and a planted-secrets test that runs every command, with and without `--json`, in
+success and in each reachable error, and fails if a planted token, install id, feed host label or
+unique path component appears in plain, JSON-escaped or hex form in stdout, stderr or the log (it
+first plants one in a known output to prove the check can see it, and its failure message names the
+stream and the item, never the value).
 
 ## Denial-of-service bounds
 
