@@ -129,6 +129,14 @@ mod linux {
             a_record_that_moved_on_starts_nothing_more,
         ),
         (
+            "an_unconfirmed_version_that_exits_to_apply_starts_again",
+            an_unconfirmed_version_that_exits_to_apply_starts_again,
+        ),
+        (
+            "a_supervised_version_that_exits_to_apply_is_not_rolled_back",
+            a_supervised_version_that_exits_to_apply_is_not_rolled_back,
+        ),
+        (
             "a_missing_previous_config_leaves_it_pending",
             a_missing_previous_config_leaves_it_pending,
         ),
@@ -428,6 +436,19 @@ mod linux {
 
         /// Starts `from`'s runtime: `apply --wait-pid … --wait-start … --version v -- helper-app`.
         fn start_apply(&self, from: &str, entry_dir: &str, wait: ProcessId, v: &str) -> Child {
+            self.start_apply_with(from, entry_dir, wait, v, &[HELPER_ARG])
+        }
+
+        /// [`Lab::start_apply`] with `restart` after `--` (`helper-app <mode>` overrides the
+        /// started tree's marker).
+        fn start_apply_with(
+            &self,
+            from: &str,
+            entry_dir: &str,
+            wait: ProcessId,
+            v: &str,
+            restart: &[&str],
+        ) -> Child {
             let runtime = self.tree_dir(from).join(entry_dir).join("lunepack-runtime");
             self.command(&runtime)
                 .args([
@@ -439,8 +460,8 @@ mod linux {
                     "--version",
                     v,
                     "--",
-                    HELPER_ARG,
                 ])
+                .args(restart)
                 .spawn()
                 .expect("runtime")
         }
@@ -930,6 +951,124 @@ mod linux {
             "an app was started: {}",
             lab.notes()
         );
+    }
+
+    /// `staged` staged (bound) in `record`, with the core's real writer.
+    fn staging(record: &InstallState, staged: &str) -> InstallState {
+        record.set_staged(Some((
+            StagedRef::new(version(staged), TARGET, sha(staged.as_bytes())),
+            30,
+        )))
+    }
+
+    /// 0.9.0 installed and `staged` staged (bound).
+    fn installed_090(staged: &str) -> InstallState {
+        let app = sample_update_config().app_id;
+        let record = InstallState::new(1, app, Scope::User, INSTALL_ID, TARGET).install(
+            version(V090),
+            10,
+            TARGET,
+            INSTALL_ID,
+        );
+        staging(&record, staged)
+    }
+
+    /// F19: the version that exited is itself pending its health check (it asked for the update
+    /// before it confirmed, and no supervisor is left). The core refuses the apply while a version
+    /// is pending; the record did not move on, so that version starts again without the token,
+    /// and the start counts as an unconfirmed one.
+    fn an_unconfirmed_version_that_exits_to_apply_starts_again(lab: &Lab) {
+        lab.tree(V090, "bin/app", "exit0", 30);
+        lab.tree(V100, "bin/app", "exit0", 30);
+        lab.tree(V110, "bin/app", "confirm", 30);
+        let gone = sha(b"a supervisor that is gone");
+        lab.commit(|_| {
+            let pending =
+                lunepack_core::apply(&installed_090(V100), &version(V100), gone).expect("apply");
+            staging(&pending, V110)
+        });
+        let (code, _) = lab.apply(V100, target("0.1"), V110);
+        // The core's refusal (a version is pending) is the facade's `Verify` error.
+        assert_eq!(code, 7);
+        assert!(log_has(lab, "\"kind\":\"verify\""));
+        assert!(
+            lab.wait_note("1.0.0 startup continue", Duration::from_secs(10)),
+            "1.0.0 was not relaunched: {}",
+            lab.notes()
+        );
+        let notes = lab.notes();
+        assert!(notes.contains("1.0.0 start token=no"), "{notes}");
+        assert!(!notes.contains("token=yes"), "{notes}");
+        assert!(!notes.contains("1.1.0 start"), "1.1.0 was started: {notes}");
+        // Nothing was applied; the relaunch counted one unconfirmed start of 1.0.0.
+        let r = lab.record();
+        assert_eq!(r.current.as_ref().expect("current").version, version(V100));
+        assert_eq!(
+            r.pending.as_ref().map(|p| (p.version.clone(), p.attempts)),
+            Some((version(V100), 1))
+        );
+        assert_eq!(r.health.as_ref().map(|h| h.token_sha256), Some(gone));
+        assert_eq!(
+            r.staged.as_ref().map(|s| s.version.clone()),
+            Some(version(V110))
+        );
+        assert!(r.bad.is_empty(), "marked bad");
+        assert_eq!(lab.current_link(), Path::new("versions/1.0.0"));
+    }
+
+    /// F19 with the pending version's supervisor still running: started with its token, 1.0.0
+    /// exits 0 for an apply before it confirms, and the apply is refused. Started again without
+    /// the token, it confirms, so its supervisor ends confirmed instead of rolling a healthy
+    /// version back at its timeout.
+    fn a_supervised_version_that_exits_to_apply_is_not_rolled_back(lab: &Lab) {
+        lab.tree(V090, "bin/app", "exit0", 30);
+        lab.tree(V100, "bin/app", "exit0", 30);
+        lab.tree(V110, "bin/app", "confirm", 30);
+        lab.commit(|_| installed_090(V100));
+        let supervisor = lab.start_apply(V090, "bin", target("0.1"), V100);
+        assert!(
+            lab.wait_note("1.0.0 startup continue", Duration::from_secs(10)),
+            "1.0.0 did not start: {}",
+            lab.notes()
+        );
+        assert!(lab.notes().contains("1.0.0 start token=yes"));
+        // 1.1.0 is staged meanwhile, and 1.0.0 asks for it before it confirms.
+        lab.commit(|r| staging(r.expect("record"), V110));
+        let applier =
+            lab.start_apply_with(V100, "bin", target("0.1"), V110, &[HELPER_ARG, "confirm"]);
+        let (code, _) = finish(applier);
+        assert_eq!(code, 7);
+        let (code, _) = finish(supervisor);
+        assert_eq!(
+            code,
+            0,
+            "the supervisor did not end confirmed: {}",
+            lab.notes()
+        );
+        let notes = lab.notes();
+        assert!(notes.contains("1.0.0 start token=no"), "{notes}");
+        assert!(notes.contains("1.0.0 confirm confirmed"), "{notes}");
+        assert!(!notes.contains("1.1.0 start"), "1.1.0 was started: {notes}");
+        assert!(
+            !notes.contains("0.9.0 start"),
+            "0.9.0 was relaunched: {notes}"
+        );
+        assert!(log_has(lab, "\"outcome\":\"confirmed\""));
+        assert!(!log_has(lab, "\"phase\":\"rollback\""));
+        let r = lab.record();
+        assert_eq!(r.current.as_ref().expect("current").version, version(V100));
+        assert_eq!(
+            r.previous.as_ref().expect("previous").version,
+            version(V090)
+        );
+        assert!(r.pending.is_none(), "still pending");
+        assert!(r.health.is_none(), "health left");
+        assert!(r.bad.is_empty(), "marked bad");
+        assert_eq!(
+            r.staged.as_ref().map(|s| s.version.clone()),
+            Some(version(V110))
+        );
+        assert_eq!(lab.current_link(), Path::new("versions/1.0.0"));
     }
 
     fn a_missing_previous_config_leaves_it_pending(lab: &Lab) {
