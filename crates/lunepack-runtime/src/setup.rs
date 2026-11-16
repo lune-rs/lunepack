@@ -126,16 +126,6 @@ impl Prepared {
         &self.found.trailer.version
     }
 
-    /// The install root `R`.
-    pub fn install_root(&self) -> &Path {
-        &self.install_root
-    }
-
-    /// The release's install metadata, verified.
-    pub fn verified(&self) -> &VerifiedSetup {
-        &self.verified
-    }
-
     /// The UI's directory, when the UI was extracted.
     pub fn ui_dir(&self) -> Option<&Path> {
         self.ui_dir.as_deref()
