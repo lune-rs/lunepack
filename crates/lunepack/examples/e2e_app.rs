@@ -10,7 +10,8 @@
 //!
 //! Then it confirms its health. With `--update` it checks the feed, downloads and stages what it
 //! finds and hands it to the runtime with [`lunepack::apply_and_restart`], passing
-//! `--after-update` as the restart argument.
+//! `--after-update` as the restart argument; with `--no-ui` as well, the applier shows no
+//! window ([`lunepack::UiChoice::Never`]).
 //!
 //! The harness names two files in the environment. `LUNEPACK_E2E_OUT` gets one line per outcome,
 //! `<tree version> <outcome>`: versions and outcomes only, so the suite can compare runs of
@@ -136,7 +137,8 @@ fn main() -> ExitCode {
     }
 
     if args.iter().any(|a| a == "--update") {
-        return match update(&inst) {
+        let no_ui = args.iter().any(|a| a == "--no-ui");
+        return match update(&inst, no_ui) {
             Ok(line) => {
                 out(&line);
                 ExitCode::SUCCESS
@@ -152,7 +154,7 @@ fn main() -> ExitCode {
 
 /// Check, download, stage and hand over. Returns the last outcome line; the earlier ones are
 /// written on the way.
-fn update(inst: &Installation) -> Result<String, &'static str> {
+fn update(inst: &Installation, no_ui: bool) -> Result<String, &'static str> {
     let version = inst.tree_version().to_string();
     let out = |line: &str| note(OUT_VAR, &format!("{version} {line}"));
     let builder = inst.updater_builder().map_err(|_| "builder")?;
@@ -171,7 +173,11 @@ fn update(inst: &Installation) -> Result<String, &'static str> {
         expect_version: Some(staged.version().clone()),
         wait_for: None,
         restart_args: vec![OsString::from(AFTER_UPDATE)],
-        ui: lunepack::UiChoice::Auto,
+        ui: if no_ui {
+            lunepack::UiChoice::Never
+        } else {
+            lunepack::UiChoice::Auto
+        },
     })
     .map_err(|_| "apply")?;
     Ok("apply-scheduled".to_owned())

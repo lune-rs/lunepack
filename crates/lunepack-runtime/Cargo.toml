@@ -46,3 +46,9 @@ harness = false
 name = "e2e"
 path = "tests/e2e/main.rs"
 harness = false
+
+# The stand-in UI of the end-to-end suite (M6 step 11): a small executable that speaks the frame
+# protocol with no window, packed beside the runtime by `pack --ui`.
+[[example]]
+name = "e2e_fake_ui"
+path = "tests/e2e/fake-ui/main.rs"

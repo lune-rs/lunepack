@@ -142,11 +142,14 @@ jobs:
 
   e2e-linux:
     # the end-to-end suite of the Linux runtime (M5-D13) on the hosted x86_64 runner: install,
-    # updates, rollbacks and uninstall through the static runtime built by `runtime-musl`. It is
-    # not part of the gate; a skip here is a failure (LUNEPACK_E2E_REQUIRE).
+    # updates, rollbacks and uninstall through the static runtime built by `runtime-musl`, and
+    # (M6 step 11) setup files and a UI that is absent, killed or cannot start. The script builds
+    # the stand-in UI and the real `lunepack-ui` itself; nothing needs a GPU or a display (the real
+    # UI is started once with a DISPLAY that no server answers, to see it exit with its typed
+    # code). It is not part of the gate; a skip here is a failure (LUNEPACK_E2E_REQUIRE).
     needs: runtime-musl
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
