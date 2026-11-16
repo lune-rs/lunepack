@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use lunepack_core::layout::{MAX_TREE_DEPTH, current_target};
 use lunepack_core::{
-    AppId, CurrentRef, Discovery, Fs, FsErrorKind, InstallState, LayoutError, RelPath, Scope,
-    Target, UpdateConfig, UserLayout, Version, discover, reconcile_current, tree_candidates,
-    version_config_path,
+    AppId, CurrentRef, Discovery, FileKind, Fs, FsErrorKind, InstallState, LayoutError, RelPath,
+    Scope, Target, UpdateConfig, UserLayout, Version, discover, is_tombstone_of, reconcile_current,
+    remove_tombstones, tombstone_name, tree_candidates, version_config_path,
 };
 use lunepack_testkit::{MemFs, abs_path, sample_update_config};
 
@@ -310,4 +310,104 @@ fn reconcile_refuses_a_file_or_directory_and_deletes_nothing() {
         fs.read_link(&link).unwrap_err().kind,
         FsErrorKind::NotASymlink
     );
+}
+
+// ---- tombstones (F18) ------------------------------------------------------------------------
+
+const DATA_HOME: &str = "/home/u/.local/share";
+
+fn app() -> AppId {
+    AppId::parse("org.example.hello").unwrap()
+}
+
+#[test]
+fn a_tombstone_name_is_the_app_id_and_16_hex_digits() {
+    let name = tombstone_name(&app(), &[0x00, 0x01, 0x2a, 0x7f, 0x80, 0xab, 0xcd, 0xff]);
+    assert_eq!(name, ".org.example.hello.removing-00012a7f80abcdff");
+    assert!(is_tombstone_of(&app(), name.as_ref()));
+    // R's own name never is one: an app id begins with [a-z0-9].
+    assert_eq!(Path::new(R).file_name().unwrap(), "org.example.hello");
+    assert!(!is_tombstone_of(&app(), Path::new(R).file_name().unwrap()));
+}
+
+#[test]
+fn only_the_exact_tombstone_form_of_this_app_id_matches() {
+    let other = AppId::parse("org.example").unwrap();
+    for name in [
+        "org.example.hello",
+        ".org.example.hello",
+        ".org.example.hello.removing-",
+        ".org.example.hello.removing-00012a7f80abcdf",
+        ".org.example.hello.removing-00012a7f80abcdff0",
+        ".org.example.hello.removing-00012A7F80ABCDFF",
+        ".org.example.hello.removing-00012a7f80abcdfg",
+        ".org.example.hello.removing-00012a7f80abcdff/x",
+        "org.example.hello.removing-00012a7f80abcdff",
+        "..org.example.hello.removing-00012a7f80abcdff",
+        ".org.example.hello.removing-00012a7f80abcdff.removing-00012a7f80abcdff",
+    ] {
+        assert!(!is_tombstone_of(&app(), name.as_ref()), "{name}");
+    }
+    // Another app's tombstone, even one whose id is a prefix of this one's.
+    let theirs = tombstone_name(&other, &[1; 8]);
+    assert!(!is_tombstone_of(&app(), theirs.as_ref()));
+    assert!(!is_tombstone_of(
+        &other,
+        tombstone_name(&app(), &[1; 8]).as_ref()
+    ));
+}
+
+#[test]
+fn remove_tombstones_removes_only_real_tombstone_directories_without_following_links() {
+    let fs = MemFs::new();
+    let home = PathBuf::from(DATA_HOME);
+    let outside = PathBuf::from("/home/u/keep");
+    fs.create_dir_all(&outside).unwrap();
+    let mut f = fs.create_new(&outside.join("precious")).unwrap();
+    f.write_all(b"mine").unwrap();
+    f.sync().unwrap();
+    drop(f);
+
+    // A cut-off uninstall's tombstone: part of a tree, with a link pointing outside.
+    let t1 = home.join(tombstone_name(&app(), &[1; 8]));
+    fs.create_dir_all(&t1.join("versions/1.0.0/bin")).unwrap();
+    fs.symlink("/home/u/keep", &t1.join("versions/1.0.0/bin/out"))
+        .unwrap();
+    // An empty one.
+    let t2 = home.join(tombstone_name(&app(), &[2; 8]));
+    fs.create_dir_all(&t2).unwrap();
+    // What is not ours to remove: R, another app's tombstone, a near miss, a file and a symlink
+    // at tombstone names.
+    fs.create_dir_all(&PathBuf::from(R).join("state")).unwrap();
+    let theirs = home.join(tombstone_name(&AppId::parse("org.other").unwrap(), &[3; 8]));
+    fs.create_dir_all(&theirs).unwrap();
+    let near = home.join(".org.example.hello.removing-0101");
+    fs.create_dir_all(&near).unwrap();
+    let file = home.join(tombstone_name(&app(), &[4; 8]));
+    let mut f = fs.create_new(&file).unwrap();
+    f.write_all(b"x").unwrap();
+    f.sync().unwrap();
+    drop(f);
+    let link = home.join(tombstone_name(&app(), &[5; 8]));
+    fs.symlink("/home/u/keep", &link).unwrap();
+
+    remove_tombstones(&fs, &home, &app()).unwrap();
+
+    assert_eq!(fs.symlink_metadata(&t1).unwrap(), None);
+    assert_eq!(fs.symlink_metadata(&t2).unwrap(), None);
+    assert_eq!(
+        fs.read_capped(&outside.join("precious"), 100).unwrap(),
+        b"mine"
+    );
+    let kind = |p: &Path| fs.symlink_metadata(p).unwrap().map(|m| m.kind);
+    assert_eq!(kind(&PathBuf::from(R).join("state")), Some(FileKind::Dir));
+    assert_eq!(kind(&theirs), Some(FileKind::Dir));
+    assert_eq!(kind(&near), Some(FileKind::Dir));
+    assert_eq!(kind(&file), Some(FileKind::File));
+    assert_eq!(kind(&link), Some(FileKind::Symlink));
+
+    // A second run finds nothing to remove; a missing data home has nothing to remove.
+    remove_tombstones(&fs, &home, &app()).unwrap();
+    assert_eq!(kind(&theirs), Some(FileKind::Dir));
+    remove_tombstones(&fs, Path::new("/nowhere"), &app()).unwrap();
 }

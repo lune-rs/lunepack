@@ -350,8 +350,19 @@ to what lunepack made.
   unless `R` is exactly `<data home>/<app id>`, a real and canonical directory, holding a record of
   this app id, with no other process running from it. It removes the desktop entry only when the file
   holds the line `X-Lunepack-App-Id=<app id>` and the command link only when it is a symlink into
-  `<R>/current/`; other files are kept and reported. Then it removes `R` without following symlinks:
-  a link inside a tree is deleted, never what it points to. After an environment change (a different
+  `<R>/current/`; other files are kept and reported. Then, still under the lock, it renames `R` to a
+  tombstone beside it in the data home, `.<app id>.removing-<16 random lowercase hex>`, and removes
+  the tombstone without following symlinks: a link inside a tree is deleted, never what it points
+  to. A cut-off uninstall so leaves `R` whole (the uninstall can run again) or gone (a reinstall
+  works), never half removed (review finding F18). The tombstone's name comes from the app id only,
+  never from the state, and is never an install root, since an app id begins with `[a-z0-9]`.
+  Install, when its root is `<parent>/<app id>`, and uninstall, once `R` is validated, first remove
+  what cut-off runs left: only real directories in the data home whose name is exactly that form
+  for this app id, checked with `lstat` right before removal and removed with the same no-follow
+  rule; a file or symlink at such a name, another app's tombstone or a near miss is left alone.
+  This cleanup runs outside the install lock (the lock lives inside `R`); two runs removing one
+  tombstone at once is harmless, and an uninstall whose own removal fails reports the failure only
+  while its tombstone is still there. After an environment change (a different
   `HOME` or `XDG_DATA_HOME` than at install) the derivation no longer matches and uninstall refuses;
   a file outside `R` that lunepack made then stays. Because uninstall removes `R` whole, the first
   install takes over an existing `R` only when it is a real directory that is empty, holds a record

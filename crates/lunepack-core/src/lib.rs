@@ -62,7 +62,8 @@ pub use integration::{
 };
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use layout::{
-    Discovery, UserLayout, discover, reconcile_current, tree_candidates, version_config_path,
+    Discovery, UserLayout, discover, is_tombstone_of, reconcile_current, remove_tombstones,
+    tombstone_name, tree_candidates, version_config_path,
 };
 pub use lifecycle::{
     AttemptOutcome, ConfirmOutcome, TokenCheck, apply, confirm, count_attempt, deliver_events,

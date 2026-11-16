@@ -6,14 +6,21 @@
 //! `versions/<current>` that is derived from the install record and never read as truth.
 //!
 //! Every rule here works on path components, never on path strings, so the same code serves
-//! Windows paths (`C:\…`, `\\?\C:\…`). Only [`reconcile_current`] touches the filesystem, and only
-//! through [`Fs`].
+//! Windows paths (`C:\…`, `\\?\C:\…`). Only [`reconcile_current`] and [`remove_tombstones`] touch
+//! the filesystem, and only through [`Fs`].
+//!
+//! Uninstall removes `R` = `<data home>/<app id>` by renaming it to a tombstone beside it,
+//! `.<app id>.removing-<16 lowercase hex>`, and then removing the tombstone (review finding F18):
+//! from install's point of view `R` is whole or gone, never half removed. The name is derived from
+//! the app id alone, never from state; an app id begins with `[a-z0-9]`, so a tombstone is never
+//! an install root.
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::LayoutError;
-use crate::fs::{FileKind, Fs};
+use crate::fs::{FileKind, Fs, FsError, FsErrorKind};
+use crate::ident::AppId;
 use crate::state::InstallState;
 use crate::update_config::{UPDATE_CONFIG_FILE, UpdateConfig};
 use crate::version::Version;
@@ -30,6 +37,74 @@ pub const CACHE_DIR: &str = "cache";
 pub const LOGS_DIR: &str = "logs";
 /// The derived link to the current tree under the install root.
 pub const CURRENT_LINK: &str = "current";
+
+/// What follows `.<app id>` in a tombstone's name, before its random part.
+pub const TOMBSTONE_TAG: &str = ".removing-";
+/// The random bytes in a tombstone's name, written as lowercase hex.
+pub const TOMBSTONE_RANDOM_BYTES: usize = 8;
+
+/// The name uninstall renames `R` to, in `R`'s parent: `.<app id>.removing-<random as 16
+/// lowercase hex>`.
+pub fn tombstone_name(app_id: &AppId, random: &[u8; TOMBSTONE_RANDOM_BYTES]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut name = format!(".{}{TOMBSTONE_TAG}", app_id.as_str());
+    for b in random {
+        name.push(char::from(DIGITS[usize::from(b >> 4)]));
+        name.push(char::from(DIGITS[usize::from(b & 0xf)]));
+    }
+    name
+}
+
+/// Whether `name` is exactly a [`tombstone_name`] of `app_id`: `.<app id>.removing-` followed by
+/// 16 lowercase hex digits and nothing else.
+pub fn is_tombstone_of(app_id: &AppId, name: &OsStr) -> bool {
+    name.to_str()
+        .and_then(|n| n.strip_prefix('.'))
+        .and_then(|n| n.strip_prefix(app_id.as_str()))
+        .and_then(|n| n.strip_prefix(TOMBSTONE_TAG))
+        .is_some_and(|hex| {
+            hex.len() == 2 * TOMBSTONE_RANDOM_BYTES
+                && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
+/// Removes what uninstalls of `app_id` cut off before the end left in `dir` (`R`'s parent, the
+/// data home): every entry whose name [`is_tombstone_of`] `app_id` and that is a real directory
+/// (checked with `symlink_metadata` right before its removal), with
+/// [`Fs::remove_dir_all_nofollow`], so a symlink inside one is removed itself and never followed.
+/// Anything else at such a name (a file, a symlink) is left alone. An entry that vanishes on the
+/// way (another run removing it) is not an error; a missing `dir` has nothing to remove. Every
+/// tombstone is tried; the first error is returned.
+pub fn remove_tombstones(fs: &dyn Fs, dir: &Path, app_id: &AppId) -> Result<(), FsError> {
+    let entries = match fs.list_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind == FsErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut first = None;
+    for entry in entries {
+        if entry.kind != FileKind::Dir || !is_tombstone_of(app_id, &entry.name) {
+            continue;
+        }
+        let path = dir.join(&entry.name);
+        let removed = match fs.symlink_metadata(&path) {
+            Ok(Some(meta)) if meta.kind == FileKind::Dir => fs.remove_dir_all_nofollow(&path),
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        };
+        match removed {
+            Ok(()) => {}
+            Err(e) if e.kind == FsErrorKind::NotFound => {}
+            Err(e) => {
+                first.get_or_insert(e);
+            }
+        }
+    }
+    match first {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
 
 /// The directories of a per-user install rooted at `R` (M5-D2).
 #[derive(Debug, Clone, PartialEq, Eq)]
