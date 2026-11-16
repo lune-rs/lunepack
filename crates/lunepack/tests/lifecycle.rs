@@ -1123,7 +1123,10 @@ fn a_file_feed_from_the_config_is_served_by_the_directory_source() {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         std::fs::write(&path, world.served(&name)).expect("write");
     }
-    let feed = format!("file://{}/", release.display());
+    // The feed URL of the directory (on Windows `file:///C:/…/rel/`, never the path's own text).
+    let feed = url::Url::from_directory_path(&release)
+        .expect("file url")
+        .to_string();
     let exe = real_install(&dir.join("install"), &feed);
     let platform = Platform::native()
         .with_hasher(Arc::new(FakeHasher))
