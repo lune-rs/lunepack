@@ -415,12 +415,12 @@ pub fn uninstall_failed(os: Os, proceed_ms: u64, fail_ms: u64, code: u32) -> Vec
     s
 }
 
-/// `n` demo leftover paths under the install location of `os`; the last is over 200 characters.
+/// `n` demo leftover paths under the install location of `os`; the first is over 200 characters.
 pub fn leftovers(os: Os, n: usize) -> Vec<String> {
     let base = location(os);
     (0..n)
         .map(|i| {
-            if i + 1 == n && n > 1 {
+            if i == 0 && n > 1 {
                 format!("{base}/app-1.4.0/{}", "very-long-folder-name/".repeat(10))
             } else {
                 format!("{base}/app-1.4.{i}")

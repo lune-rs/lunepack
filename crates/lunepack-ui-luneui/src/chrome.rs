@@ -17,7 +17,7 @@ use lunepack_core::ui::Flow;
 use crate::anim;
 use crate::icon::ICON_IMAGE;
 use crate::look::{self, CAPTION_W, ERR, OK, TITLE_H, WARN, white};
-use crate::model::{GLOW_MS, GlowKind, Material, RAIL_MS, UiModel};
+use crate::model::{ENTER_MS, GLOW_MS, GlowKind, LEAVE_MS, Material, RAIL_MS, UiModel};
 use crate::strings::{INSTALL_STEPS, UNINSTALL_STEPS};
 use crate::widgets;
 
@@ -160,14 +160,27 @@ pub(crate) fn rail(ui: &mut Ui<'_>, m: &UiModel, t: Duration, tier: MotionTier) 
         look::style(14.0, 18.0, 500, white(0.9)),
         Some(inner_w),
     );
-    // "Version 1.4.0" cross-fades to "Removed" once an uninstall is done.
+    // "Version 1.4.0" gives way to "Removed" once an uninstall is done: the old text fades out
+    // with the old content (180 ms), the new one fades in with the new content (250 ms later).
     let version_style = look::caption();
-    let removed = m.dim_since.is_some();
+    let (old_alpha, new_alpha) = match m.dim_since {
+        None => (1.0, 0.0),
+        Some(since) if anim::animates(tier) => (
+            1.0 - anim::eased(Easing::QuadIn, t, since, LEAVE_MS),
+            anim::eased(
+                Easing::QuadOut,
+                t,
+                since + Duration::from_millis(LEAVE_MS),
+                ENTER_MS,
+            ),
+        ),
+        Some(_) => (0.0, 1.0),
+    };
     for (text, alpha, key) in [
-        (format!("Version {}", m.version), 1.0 - dim, "rail-version"),
-        ("Removed".to_owned(), dim, "rail-removed"),
+        (format!("Version {}", m.version), old_alpha, "rail-version"),
+        ("Removed".to_owned(), new_alpha, "rail-removed"),
     ] {
-        if alpha <= 0.0 || (key == "rail-removed" && !removed) {
+        if alpha <= 0.0 {
             continue;
         }
         ui.painter().push_xform(Xform {
@@ -225,7 +238,13 @@ pub(crate) fn rail(ui: &mut Ui<'_>, m: &UiModel, t: Duration, tier: MotionTier) 
         if finished.is_some() {
             widgets::check_mark(ui, cx - 5.0, cy - 5.0, 10.0, OK, finished, t, tier);
         } else if current {
-            let color = match m.glow_to {
+            // The outcome colour arrives with the highlight, not before.
+            let kind = if t > m.glow_since {
+                m.glow_to
+            } else {
+                m.glow_from
+            };
+            let color = match kind {
                 GlowKind::Err => ERR,
                 GlowKind::Ok => OK,
                 GlowKind::Warn => WARN,
