@@ -363,6 +363,7 @@ mod linux {
                 categories: Vec::new(),
                 bin: Some("lp-apply-test".to_owned()),
                 terminal: false,
+                publisher: None,
             };
             cfg
         }

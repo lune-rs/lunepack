@@ -636,6 +636,7 @@ impl Lab {
             categories: Vec::new(),
             bin: None,
             terminal: false,
+            publisher: None,
         };
         let config = UpdateConfig::new(
             &root,

@@ -182,6 +182,7 @@ impl Lab {
                 categories: Vec::new(),
                 bin: Some(BIN.to_owned()),
                 terminal: false,
+                publisher: None,
             };
             let config = UpdateConfig::new(
                 &root,

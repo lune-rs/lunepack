@@ -1101,8 +1101,10 @@ only a feed read from an update configuration.
 
 ### 13.4 Install metadata
 
-`install` is `{entry, name, comment, icon, categories, bin, terminal}` (M5-D4), with exactly these
-members; an unknown member makes the document invalid (13.7).
+`install` is `{entry, name, comment, icon, categories, bin, terminal}` (M5-D4) and the optional
+`publisher` (M6-D3), with exactly these members; an unknown member makes the document invalid (13.7).
+A format-1 reader from before `publisher` was added refuses a document that holds it; nothing was
+released with that reader.
 
 | Member | Type | Rule |
 |---|---|---|
@@ -1113,8 +1115,9 @@ members; an unknown member makes the document invalid (13.7).
 | `categories` | array of strings | freedesktop main and additional category names: at most 16, each `[A-Za-z0-9-]{1,64}`, no name twice |
 | `bin` | string or null | the name of the command-line link (`~/.local/bin/<bin>` on Linux): `[A-Za-z0-9._-]{1,64}`, not starting with `-` or `.` |
 | `terminal` | boolean | whether the app runs in a terminal |
+| `publisher` | string, optional | the publisher's display name, shown by the installer beside "verified": 1 to 128 Unicode scalar values. The member is left out when there is no publisher (never `null`), so the bytes of a document without one are the same as before the member existed |
 
-`name` and `comment` hold no C0 or C1 control character, no DEL, no U+2028 or U+2029, no `\`, and
+`name`, `comment` and `publisher` hold no C0 or C1 control character, no DEL, no U+2028 or U+2029, no `\`, and
 no leading or trailing whitespace, so neither can break a line of a desktop entry or start an escape.
 File associations, URL schemes and autostart are not in format 1's first revision; they arrive as new
 optional members under 13.7.
