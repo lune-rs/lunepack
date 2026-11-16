@@ -1076,6 +1076,76 @@ fn install_over_an_installed_record_is_already_installed() {
     common::workers_stopped();
 }
 
+/// F15: a run that committed the install and ended before `current` was linked (killed, or its
+/// reconcile failed) is repaired by the rerun, which still reports `AlreadyInstalled`.
+#[test]
+fn a_rerun_after_the_install_commit_links_current_and_is_already_installed() {
+    let _serial = common::serial();
+    let lab = Lab::new();
+    publish_with_config(&lab, 1, V100);
+    let boot = bootstrap(&lab, V100);
+    install(&lab, &boot).expect("first");
+    // The state a run leaves when it ends between the commit and the link.
+    lab.fs
+        .remove_file(&root_dir().join("current"))
+        .expect("remove current");
+    let before = lab.record();
+    let got = install(&lab, &boot);
+    assert!(matches!(got, Err(Error::AlreadyInstalled)), "{got:?}");
+    assert_eq!(lab.current_link(), "versions/1.0.0");
+    assert_eq!(lab.record(), before, "the record changed");
+    common::workers_stopped();
+}
+
+/// F15: a kill at each write of the end of the install (the commit, the link and the syncs), then
+/// a rerun: the record and `current` agree afterwards, whatever the rerun reports.
+#[test]
+fn a_kill_around_the_install_commit_never_leaves_current_missing() {
+    let _serial = common::serial();
+    let setup = || {
+        let lab = Lab::new();
+        publish_with_config(&lab, 1, V100);
+        let boot = bootstrap(&lab, V100);
+        (lab, boot)
+    };
+    let (reference, boot) = setup();
+    let start = reference.fs.op_count();
+    install(&reference, &boot).expect("reference install");
+    let end = reference.fs.op_count();
+    assert!(end > start + 12, "too few writes to sweep: {start}..{end}");
+
+    for n in end - 12..end {
+        let (lab, boot) = setup();
+        assert_eq!(lab.fs.op_count(), start, "setup is not deterministic");
+        lab.fs.crash_after(n);
+        let got = install(&lab, &boot);
+        assert!(got.is_err(), "op {n}: the crash did not stop the install");
+        let after = Lab {
+            fs: lab.fs.recover(lunepack_testkit::RecoverMode::KeepVolatile),
+            world: lab.world,
+            process: lab.process,
+            integration: lab.integration,
+        };
+        let boot = Installation::from_exe_with(
+            &abs_path(&format!("/media/boot/{V100}")).join("bin/app"),
+            after.platform(None),
+        )
+        .expect("bootstrap after the crash");
+        let rerun = install(&after, &boot);
+        assert!(
+            matches!(rerun, Ok(_) | Err(Error::AlreadyInstalled)),
+            "op {n}: {rerun:?}"
+        );
+        assert_eq!(
+            after.record().current.expect("current").version,
+            version(V100),
+            "op {n}"
+        );
+        assert_eq!(after.current_link(), "versions/1.0.0", "op {n}");
+    }
+    common::workers_stopped();
+}
+
 #[test]
 fn an_integration_conflict_stops_install_before_anything_is_written() {
     let _serial = common::serial();
