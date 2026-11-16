@@ -35,9 +35,9 @@ const APP_ARGS: &str = "app-args";
 /// How long the launched app runs before it confirms.
 const APP_SLEEP_SECS: u64 = 3;
 /// The golden lines of `apply-and-restart`: its result, `nothing_staged`, `unexpected_version`.
-const GOLDEN_SCHEDULED: usize = 37;
-const GOLDEN_NOTHING_STAGED: usize = 38;
-const GOLDEN_UNEXPECTED: usize = 39;
+const GOLDEN_SCHEDULED: usize = 38;
+const GOLDEN_NOTHING_STAGED: usize = 39;
+const GOLDEN_UNEXPECTED: usize = 40;
 
 #[cfg(target_arch = "aarch64")]
 const TARGET: Target = Target::LinuxAarch64;
