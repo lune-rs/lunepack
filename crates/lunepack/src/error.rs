@@ -83,8 +83,9 @@ pub enum Error {
     /// The install already has a current version.
     #[error("already installed")]
     AlreadyInstalled,
-    /// The first install found no release for this install: the channel offers none, or none
-    /// whose rollout admits this install yet. Nothing was installed; a later try may succeed.
+    /// The first install found no release for this install: the channel offers none, none whose
+    /// rollout admits this install yet, or none at or above the bootstrap tree's own version.
+    /// Nothing was installed; a later try may succeed.
     #[error("no release is available for this install")]
     NoRelease,
     /// The health token does not match the supervised start's, or is malformed.

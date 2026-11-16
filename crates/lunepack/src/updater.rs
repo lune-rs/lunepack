@@ -952,7 +952,8 @@ impl Updater {
     ///    [`Error::AlreadyInstalled`];
     /// 3. the check runs with no current version (no floor time, any release of the channel), the
     ///    newest candidate is downloaded and staged, reusing the bootstrap's files that match; no
-    ///    candidate at all is [`Error::NoRelease`];
+    ///    candidate at all, or a newest candidate older than the bootstrap's own version (never a
+    ///    downgrade from the tree the user ran), is [`Error::NoRelease`];
     /// 4. under the lock the installed tree's own config is read, the integration preflight runs
     ///    again on it, the integration is applied, the record names the version as current (events
     ///    `installed` and `first_run`) and `current` is linked. A failure before that commit
@@ -1603,11 +1604,11 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
 
     // The bootstrap's config and the integration preflight, before the first write.
     let boot_root = root.clone();
-    let target = on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
+    let (target, boot_version) = on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
         let config = tree_config(&*inner.fs, &inner.app_id, &bootstrap)?;
         let request = integration_request(&inner.app_id, &boot_root, config.install.clone());
         inner.integration.check(Scope::User, &request)?;
-        Ok(config.target)
+        Ok((config.target, config.version))
     })
     .await?;
 
@@ -1650,8 +1651,11 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
         .await?;
     }
 
+    // The bootstrap's own version is the floor (S1, D25): a replayed, still unexpired feed whose
+    // newest release is older than the tree the user ran installs nothing.
     let info = check_first(&inner, &cancel)
         .await?
+        .filter(|info| info.version >= boot_version)
         .ok_or(Error::NoRelease)?;
     // A run that staged this release before it was cut off goes straight to the commit.
     let staged_info = info.clone();
