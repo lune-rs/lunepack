@@ -7,13 +7,15 @@
 //! release tree holds the update config, a shell-script entry that notes when it runs, and the
 //! built `lunepack-runtime` beside it. A bootstrap copy of the same tree sits outside the install,
 //! and its runtime runs `install` with `HOME` set to an empty temporary home. Linux only.
+//!
+//! The cases run in parallel on purpose: `uninstall`'s in-use scan must not count another case's
+//! process caught while it exits as using the tree (F9).
 
 #![cfg(target_os = "linux")]
 
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lunepack::{InstallMeta, RelPath, Target, TrustedRoot, UpdateConfig, Version};
@@ -47,15 +49,6 @@ const EXIT_ALREADY_INSTALLED: i32 = 23;
 const EXIT_INTEGRATION: i32 = 24;
 const EXIT_IN_USE: i32 = 25;
 const EXIT_INSTALL_MISMATCH: i32 = 26;
-
-/// The cases run one at a time. The in-use scan of `uninstall` fails closed: a process of this
-/// user that cannot be inspected while it exits (another case's runtime, say) counts as using
-/// the tree, so a case running beside another can see a spurious `in_use` (M5-D9).
-static SERIAL: Mutex<()> = Mutex::new(());
-
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 fn app_id() -> AppId {
     AppId::parse(SUITE_APP_ID).expect("app id")
@@ -401,7 +394,6 @@ fn listing(dir: &Path) -> Vec<String> {
 
 #[test]
 fn install_into_an_empty_home_installs_and_integrates_without_launching() {
-    let _serial = serial();
     let lab = Lab::new();
     let run = lab.installed();
     assert_eq!(
@@ -439,7 +431,6 @@ fn install_into_an_empty_home_installs_and_integrates_without_launching() {
 
 #[test]
 fn install_from_the_installed_tree_is_refused() {
-    let _serial = serial();
     let lab = Lab::new();
     lab.installed();
     let before = (lab.record(), listing(&lab.root));
@@ -450,7 +441,6 @@ fn install_from_the_installed_tree_is_refused() {
 
 #[test]
 fn a_rerun_after_a_kill_mid_install_resumes() {
-    let _serial = serial();
     let lab = Lab::new();
     let mut child = lab
         .command(&lab.boot_runtime(), "install")
@@ -492,7 +482,6 @@ fn a_rerun_after_a_kill_mid_install_resumes() {
 
 #[test]
 fn a_conflicting_command_link_stops_install_with_nothing_written() {
-    let _serial = serial();
     let lab = Lab::new();
     let foreign = lab.bin_link();
     write_file(&foreign, b"someone else's tool\n", true);
@@ -510,7 +499,6 @@ fn a_conflicting_command_link_stops_install_with_nothing_written() {
 
 #[test]
 fn install_and_uninstall_take_no_arguments() {
-    let _serial = serial();
     let lab = Lab::new();
     for mode in ["install", "uninstall"] {
         let child = lab
@@ -530,7 +518,6 @@ fn install_and_uninstall_take_no_arguments() {
 
 #[test]
 fn uninstall_removes_what_it_wrote_and_keeps_a_foreign_desktop_file() {
-    let _serial = serial();
     let lab = Lab::new();
     lab.installed();
     let applications = lab.data.join("applications");
@@ -556,7 +543,6 @@ fn uninstall_removes_what_it_wrote_and_keeps_a_foreign_desktop_file() {
 
 #[test]
 fn uninstall_keeps_a_foreign_file_at_its_entry_name_and_reports_it() {
-    let _serial = serial();
     let lab = Lab::new();
     lab.installed();
     let foreign = b"[Desktop Entry]\nName=Not lunepack's\n";
@@ -581,7 +567,6 @@ fn uninstall_keeps_a_foreign_file_at_its_entry_name_and_reports_it() {
 
 #[test]
 fn uninstall_from_a_copy_of_the_tree_outside_r_is_refused() {
-    let _serial = serial();
     let lab = Lab::new();
     lab.installed();
     let before = listing(&lab.root);
@@ -625,7 +610,6 @@ fn uninstall_from_a_copy_of_the_tree_outside_r_is_refused() {
 
 #[test]
 fn uninstall_through_a_symlinked_root_is_refused_and_the_target_is_untouched() {
-    let _serial = serial();
     let lab = Lab::new();
     lab.installed();
     // R moves elsewhere and a symlink takes its place.
@@ -656,7 +640,6 @@ fn uninstall_through_a_symlinked_root_is_refused_and_the_target_is_untouched() {
 
 #[test]
 fn uninstall_while_a_process_runs_from_r_is_refused() {
-    let _serial = serial();
     let lab = Lab::new();
     lab.installed();
     let sleeper = lab.tree().join("helper-sleep");
@@ -688,7 +671,6 @@ fn uninstall_while_a_process_runs_from_r_is_refused() {
 
 #[test]
 fn a_symlink_inside_a_tree_pointing_outside_r_is_removed_not_followed() {
-    let _serial = serial();
     let lab = Lab::new();
     lab.installed();
     let outside = lab.base.join("outside");

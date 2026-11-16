@@ -12,11 +12,18 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use lunepack_core::ProcessId;
 
 /// `PF_KTHREAD` in the `flags` field: a kernel thread, which has no executable and no files.
 const PF_KTHREAD: u64 = 0x0020_0000;
+
+/// How long a same-uid process whose files vanished during the in-use read is re-probed before
+/// it counts as in use (fail closed), and the step between probes. The kernel drops a task's mm,
+/// then its files and working directory, before it becomes a zombie; this covers that window.
+const VANISH_BOUND: Duration = Duration::from_millis(200);
+const VANISH_STEP: Duration = Duration::from_millis(10);
 
 /// The fields of `/proc/<pid>/stat` this crate uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +107,12 @@ pub(crate) fn read_stat(pid: Option<u32>) -> io::Result<Option<Stat>> {
         Some(pid) => proc_path(pid, "stat"),
         None => PathBuf::from("/proc/self/stat"),
     };
-    match fs::read(&path) {
+    read_stat_at(&path)
+}
+
+/// Reads and parses the `stat` file at `path`; `None` when it has vanished.
+fn read_stat_at(path: &Path) -> io::Result<Option<Stat>> {
+    match fs::read(path) {
         Ok(text) => parse_stat(&text).map(Some).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "unexpected /proc stat line")
         }),
@@ -155,9 +167,15 @@ pub(crate) fn has_exited(id: &ProcessId) -> io::Result<bool> {
 /// it (`EACCES`/`EPERM`: a non-dumpable process, such as a systemd `(sd-pam)` or an ssh-agent,
 /// which every desktop login and CI runner has) does not count as in use by that failure. What is
 /// still readable, its command line, decides: in use when `argv[0]` or an absolute argument,
-/// canonicalised, lies under the tree (M5-D9, user decision Q40). Any other read error answers
-/// `true` (fail closed). Gap: a non-dumpable process started by a relative path, or not from the
-/// tree's path, is not seen.
+/// canonicalised, lies under the tree (M5-D9, user decision Q40).
+///
+/// A read that fails because the files vanished (`ENOENT`/`ESRCH`) means the process is exiting,
+/// or its thread-group leader has ended while other threads run. Then the process's live threads
+/// are read instead (`/proc/<pid>/task/<tid>/`), and the pid is re-probed for at most
+/// [`VANISH_BOUND`]: it is skipped once it counts as exited, decided by its live threads when all
+/// of them read cleanly, and otherwise counts as in use. Any other read error answers `true`
+/// (fail closed). Gap: a non-dumpable process started by a relative path, or not from the tree's
+/// path, is not seen.
 pub(crate) fn tree_in_use(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool> {
     let my_uid = fs::metadata("/proc/self")?.uid();
     for entry in fs::read_dir("/proc")? {
@@ -192,7 +210,7 @@ pub(crate) fn tree_in_use(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool
         if exclude.contains(&id) {
             continue;
         }
-        match uses_tree(pid, tree) {
+        match process_uses_tree(&id, tree) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(e) => {
@@ -247,16 +265,73 @@ fn resolve(path: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Whether `pid`'s executable, working directory, an open file or a mapped file lies under
-/// `tree`. Any read error is returned (the caller decides); a descriptor closed between the
-/// listing and its read is skipped.
-fn uses_tree(pid: u32, tree: &Path) -> io::Result<bool> {
+/// Whether the process `id` uses `tree` ([`uses_tree`] over `/proc/<pid>`), riding out files that
+/// vanish under the read. On a vanished-kind error the process is either exiting or a zombie
+/// leader with live threads: within [`VANISH_BOUND`], it is `false` once `id` counts as exited,
+/// and the answer of its live threads once every one of them reads cleanly; past the bound the
+/// vanished error is returned, which the caller counts as in use. Any other error is returned at
+/// once.
+fn process_uses_tree(id: &ProcessId, tree: &Path) -> io::Result<bool> {
+    let deadline = Instant::now() + VANISH_BOUND;
+    loop {
+        let err = match uses_tree(&PathBuf::from(format!("/proc/{}", id.pid)), tree) {
+            Ok(used) => return Ok(used),
+            Err(e) if vanished(&e) => e,
+            Err(e) => return Err(e),
+        };
+        if has_exited(id)? {
+            return Ok(false);
+        }
+        match threads_use_tree(id.pid, tree) {
+            Ok(Some(used)) => return Ok(used),
+            Ok(None) => {}
+            Err(e) if vanished(&e) => {}
+            Err(e) => return Err(e),
+        }
+        if Instant::now() >= deadline {
+            return Err(err);
+        }
+        std::thread::sleep(VANISH_STEP);
+    }
+}
+
+/// [`uses_tree`] over each live thread of `pid` (`/proc/<pid>/task/<tid>/`; threads may have
+/// unshared their working directory or descriptor table, so each is read). A thread that is a
+/// zombie or gone holds nothing and is skipped. `Some(true)` as soon as one thread uses the tree;
+/// `Some(false)` when at least one live thread was read and every live thread read cleanly;
+/// `None` when a thread's files vanished too (it is exiting) or no live thread was found, so the
+/// caller re-probes. Any other error is returned.
+fn threads_use_tree(pid: u32, tree: &Path) -> io::Result<Option<bool>> {
+    let mut settled = false;
+    let mut unsettled = false;
+    for task in fs::read_dir(proc_path(pid, "task"))? {
+        let task = task?;
+        let dir = task.path();
+        match read_stat_at(&dir.join("stat"))? {
+            None => continue,
+            Some(stat) if matches!(stat.state, b'Z' | b'X' | b'x') => continue,
+            Some(_) => {}
+        }
+        match uses_tree(&dir, tree) {
+            Ok(true) => return Ok(Some(true)),
+            Ok(false) => settled = true,
+            Err(e) if vanished(&e) => unsettled = true,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((settled && !unsettled).then_some(false))
+}
+
+/// Whether the process or thread whose `/proc` directory is `dir` has its executable, working
+/// directory, an open file or a mapped file under `tree`. Any read error is returned (the caller
+/// decides); a descriptor closed between the listing and its read is skipped.
+fn uses_tree(dir: &Path, tree: &Path) -> io::Result<bool> {
     for leaf in ["exe", "cwd"] {
-        if under(&fs::read_link(proc_path(pid, leaf))?, tree) {
+        if under(&fs::read_link(dir.join(leaf))?, tree) {
             return Ok(true);
         }
     }
-    for fd in fs::read_dir(proc_path(pid, "fd"))? {
+    for fd in fs::read_dir(dir.join("fd"))? {
         let fd = fd?;
         match fs::read_link(fd.path()) {
             Ok(target) => {
@@ -268,7 +343,7 @@ fn uses_tree(pid: u32, tree: &Path) -> io::Result<bool> {
             Err(e) => return Err(e),
         }
     }
-    let maps = fs::read(proc_path(pid, "maps"))?;
+    let maps = fs::read(dir.join("maps"))?;
     Ok(maps
         .split(|&b| b == b'\n')
         .filter_map(maps_path)
