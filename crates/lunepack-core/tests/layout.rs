@@ -22,12 +22,20 @@ fn config(entry: &str, version: &str) -> UpdateConfig {
 }
 
 /// `discover` the way the facade drives it: the first candidate of `exe` holding a config is
-/// `tree` (given here), at the walk depth `tree_candidates` gives it. Both are POSIX-form
-/// absolute paths, made absolute on this platform with `abs_path` (on Windows `/a` has no drive
-/// and is not absolute; the Windows forms have their own test below).
+/// `tree` (given here), at the walk depth `tree_candidates` gives it. A POSIX-form path (`/a`) is
+/// made absolute on this platform with `abs_path` (on Windows `/a` has no drive and is not
+/// absolute); a Windows form (`C:\a`, `\\?\C:\a`, used by the Windows-only test below) is taken
+/// as written.
 fn find(exe: &str, tree: &str, config: &UpdateConfig) -> Result<Discovery, LayoutError> {
-    let exe = abs_path(exe);
-    let want = abs_path(tree);
+    let native = |p: &str| {
+        if p.starts_with('/') {
+            abs_path(p)
+        } else {
+            PathBuf::from(p)
+        }
+    };
+    let exe = native(exe);
+    let want = native(tree);
     let (tree, k) = tree_candidates(&exe)
         .into_iter()
         .find(|(t, _)| *t == want)
