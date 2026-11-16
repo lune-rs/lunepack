@@ -73,10 +73,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install Rust 1.88.0 (minimal)
-        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Install Rust 1.90.0 (minimal)
+        run: rustup toolchain install 1.90.0 --profile minimal
       - name: Check at the MSRV
-        run: cargo +1.88.0 check --workspace --all-targets --locked
+        run: cargo +1.90.0 check --workspace --all-targets --locked
 
   os-trust:
     # the production transport honours the OS trust store and the system proxy (a regression check,
