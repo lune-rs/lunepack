@@ -417,6 +417,33 @@ targets, rollout) and each manifest (entry counts, input and pack bytes, files p
 `--channel`, `--version` and `--target` narrow the output. `--entries` lists every entry: path, type,
 size, exec, codec and frame length. It reads the config for the root only and never resolves a signer.
 
+### `lunepack setup`
+
+```
+lunepack setup <DIR> --version <VERSION> --target <TARGET> [--out <FILE>] [--at <AT>]
+    [--config <CONFIG>]
+```
+
+Builds a Linux setup file (FORMAT.md 14): the release's own runtime, then `keys.json`, the manifest
+and the pack of `<VERSION>` for `<TARGET>`, then the trailer naming them and the root the release's
+update configuration trusts. Run, the file installs exactly that version with no network, with the
+window or `--silent` (RUNTIME.md, "Setup files").
+
+Before anything is written it checks the release the way the runtime will: the root walk and
+`keys.json` from the config's root, the manifest with no feed (release keys valid at the reader's
+time), the pack against the manifest, then the update configuration and the runtime read out of the
+pack through their signed frames. The release must have been packed with `[update]` and `--runtime`
+(and `--ui` for a window). The written bytes are then parsed back and verified as the runtime
+parses them, so `keys.json` must be signed under the root the update configuration names.
+
+`<VERSION>` is the text as written in the release (canonical). Only `linux-x86_64` and
+`linux-aarch64` are accepted in this release. The file goes to `--out`, or to
+`<app_id>-<VERSION>-<TARGET>-setup` in the current directory; an existing file is not replaced.
+It is made executable (mode 0755). The output depends on the release directory only: two runs give
+the same bytes. `--at` verifies at that Unix time instead of the system clock. A setup file stops
+installing when its key set expires or its release keys' windows end: build it from a current
+release.
+
 ## The release directory
 
 ```

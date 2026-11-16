@@ -1134,8 +1134,8 @@ value never needs quoting beyond the double quotes of the specification and neve
 
 M5 reads the configuration only from a tree on disk: `install` runs from a bootstrap tree that
 already holds the file, and the applier reads the new version's configuration from its staged tree.
-A client that needs `name` or `icon` before any tree exists (M6's installer) reads them through the
-verified manifest, and implements this path then:
+A client that needs `name` or `icon` before any tree exists (the setup file's runtime, section 14)
+reads them through the verified manifest:
 
 1. Verify the chain to the manifest (11.1). The configuration is the manifest's file entry at its
    fixed path (13.1).
@@ -1155,3 +1155,78 @@ verified manifest, and implements this path then:
   finds any name in `critical` stops with "newer format"; v1 implements no critical name.
 - `format` above 1 is a newer format: the reader stops and nothing is written. `format` 0 is invalid.
 - Every refusal names the member or rule; no value from the document is shown in an error.
+
+## 14. Setup file (Linux)
+
+A setup file installs one release of one target with no network. It is the release's own runtime
+(the `lunepack-runtime` file entry beside the entry, 13.1, taken from the pack through its signed
+frame), then the payload, then a trailer:
+
+```
+runtime ‖ keys.json ‖ <ver>/<target>.manifest.json ‖ <ver>/<target>.pack ‖ trailer
+```
+
+Each payload part starts at an offset that is a multiple of 8 (zero bytes fill the gaps) and holds
+the release directory's file byte for byte. The writer is `lunepack setup` and its output is a
+function of the release directory alone; it is named `<app_id>-<ver>-<target>-setup`. Only Linux
+targets have setup files in this revision.
+
+### 14.1 Trailer
+
+The trailer is the last 4096 bytes of the file: a body area (4016 bytes), then an 80-byte footer.
+Integers are unsigned little-endian.
+
+| Offset in the footer | Size | Field |
+|---|---|---|
+| 0 | 4 | `format`: 1 |
+| 4 | 4 | body length, 1 to 4016 |
+| 8 | 8 | reserved, zero |
+| 16 | 16 | key set: offset, length (8 each) |
+| 32 | 16 | manifest: offset, length |
+| 48 | 16 | pack: offset, length |
+| 64 | 16 | magic: `89 4c 55 4e 45 50 41 43 4b 53 45 54 55 50 0d 0a` (`\x89LUNEPACKSETUP\r\n`) |
+
+The body is canonical compact JSON (no whitespace, members in byte order) with exactly these
+members, followed by zero bytes to the end of the body area:
+
+```
+{"app_id":"org.example.hello","root":{"keys":["<64 hex>"],"threshold":1,"version":1},"target":"linux-x86_64","version":"1.2.0"}
+```
+
+`root` is the trusted root the release's update configuration names (13.2: `keys`, `threshold`,
+`version`), `app_id` its app id, and `version` and `target` the release the payload installs.
+
+### 14.2 Reading
+
+A reader looks only at the last 4096 bytes of its own resolved executable. Without the magic there
+the file is not a setup file. With the magic, everything else MUST hold or the file is refused
+(the runtime's exit 7 `verify`; it never falls back to another mode):
+
+1. `format` is 1 (another is a newer format); the reserved bytes are zero; the body length is in
+   range and every byte after the body in the body area is zero.
+2. The body is strict JSON (3.1) with exactly the four members; re-encoding it gives the same bytes;
+   `root` is a valid root (5) of `app_id`; `version` is a version (10.3) and `target` a target id
+   (10.4).
+3. Every part is non-empty, starts at a multiple of 8 and ends at or before the trailer's first
+   byte; the key set and the manifest are within their caps (4); no two parts overlap.
+
+The trailer itself is not signed. Its root is the trust anchor of the install, as the root compiled
+into an installed tree is (13.2); the payload is then verified under it with first-install floors
+(11.2: none), in 11.1 order and without a feed:
+
+1. The key set under the trailer's root, its expiry included (6, 11.3).
+2. The manifest under the key set, counting only release keys whose window holds the reader's
+   `now`, with the key set's release threshold; then as section 8: its `app_id` is the key set's,
+   its `version` byte-equal to the trailer's, its `target` equal to the trailer's. With no feed,
+   the signatures take the place of the feed's hash binding, so the release keys' windows apply.
+3. The pack part is the manifest's pack size and SHA-256 (7.1).
+4. The update configuration is read from the pack before staging (13.6) and names the trailer's
+   `app_id`, `version`, `target` and exactly the trailer's `root`.
+
+The install then stages from the pack's frames, each checked against its signed SHA-256 (9.2), and
+the staged tree's configuration again names exactly the trailer's root. The installed app trusts
+the root that verified it, and its later updates come from the feed as usual.
+
+A setup file stops installing when its key set's `expires` passes or its release keys' windows end.
+A publisher builds setup files from a current release; nothing re-signs old ones.
+
