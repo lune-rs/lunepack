@@ -60,6 +60,21 @@ pub struct Binaries {
     pub runtime: PathBuf,
     /// The `lunepack` command line.
     pub cli: PathBuf,
+    /// The stand-in UI that `pack --ui` places ([`Ui::Fake`]); it needs no display.
+    pub fake_ui: PathBuf,
+    /// The real `lunepack-ui` ([`Ui::Real`]).
+    pub real_ui: PathBuf,
+}
+
+/// The UI a release carries beside its runtime (`pack --ui`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ui {
+    /// None: the release has no UI, as every release of the M5 rows.
+    None,
+    /// The stand-in of `tests/e2e/fake-ui`.
+    Fake,
+    /// The real `lunepack-ui`.
+    Real,
 }
 
 /// The app under test: its built file and the file name it has in a tree.
@@ -94,6 +109,8 @@ pub struct Release {
     pub blob_bytes: usize,
     /// Small filler files under `share/many/` (4 KiB each), so staging takes time.
     pub small_files: usize,
+    /// The UI packed beside the runtime.
+    pub ui: Ui,
 }
 
 impl Release {
@@ -106,6 +123,7 @@ impl Release {
             health_timeout_secs: 20,
             blob_bytes: 0,
             small_files: 0,
+            ui: Ui::None,
         }
     }
 }
@@ -189,6 +207,8 @@ pub struct Lab {
     root_key: [u8; 32],
     /// The first release, whose config the writers share.
     first: Option<Release>,
+    /// Variables the lab's commands get besides the fixed ones (the UI's, M6 step 11).
+    extra_vars: Vec<(String, String)>,
 }
 
 fn hex_decode(text: &str) -> [u8; 32] {
@@ -349,6 +369,7 @@ impl Lab {
             origin,
             root_key: [0; 32],
             first: None,
+            extra_vars: Vec::new(),
         };
         lab.setup_publisher();
         lab
@@ -521,7 +542,7 @@ impl Lab {
             cfg.to_string_lossy().into_owned(),
             self.bins.runtime.to_string_lossy().into_owned(),
         );
-        self.cli_str(&[
+        let mut pack = vec![
             "pack",
             "--input",
             &input_s,
@@ -537,7 +558,16 @@ impl Lab {
             &runtime,
             "--config",
             &cfg_s,
-        ]);
+        ];
+        let ui = match release.ui {
+            Ui::None => None,
+            Ui::Fake => Some(self.bins.fake_ui.to_string_lossy().into_owned()),
+            Ui::Real => Some(self.bins.real_ui.to_string_lossy().into_owned()),
+        };
+        if let Some(ui) = &ui {
+            pack.extend(["--ui", ui.as_str()]);
+        }
+        self.cli_str(&pack);
         let base = self
             .cfg_dir
             .join("lunepack.toml")
@@ -700,7 +730,80 @@ impl Lab {
             .env(DETAIL_VAR, &self.detail)
             .current_dir(&self.work)
             .stdin(Stdio::null());
+        for (name, value) in &self.extra_vars {
+            cmd.env(name, value);
+        }
         cmd
+    }
+
+    /// Sets a variable of every command of the lab from now on (replacing an earlier value).
+    pub fn set_var(&mut self, name: &str, value: &str) {
+        self.unset_var(name);
+        self.extra_vars.push((name.to_owned(), value.to_owned()));
+    }
+
+    /// Drops a variable set by [`Lab::set_var`].
+    pub fn unset_var(&mut self, name: &str) {
+        self.extra_vars.retain(|(n, _)| n != name);
+    }
+
+    /// Makes the stand-in UI behave as `mode` says (`proceed` or `die`, see `tests/e2e/fake-ui`)
+    /// and note its life in the lab's own `ui-notes` directory. `display` sets `DISPLAY` to a
+    /// name nothing serves (the stand-in never connects to it), so the runtime wants a UI; without
+    /// it neither `DISPLAY` nor `WAYLAND_DISPLAY` is set.
+    pub fn fake_ui_env(&mut self, mode: &str, display: bool) {
+        let dir = self.work.join("ui-notes");
+        std::fs::create_dir_all(&dir).expect("notes directory");
+        // Each call starts a scenario: what an earlier one noted is not this one's.
+        for name in ["ui-spawns", "ui-hello", "ui-prompts"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        self.set_var("LUNEPACK_E2E_UI_DIR", &dir.to_string_lossy());
+        self.set_var("LUNEPACK_E2E_UI_MODE", mode);
+        if display {
+            self.set_var("DISPLAY", ":99");
+        } else {
+            self.unset_var("DISPLAY");
+        }
+    }
+
+    /// What the stand-in UI noted under `name` since the last call or the last
+    /// [`Lab::fake_ui_env`], one string per line (the file starts empty again).
+    pub fn ui_notes(&self, name: &str) -> Vec<String> {
+        let path = self.work.join("ui-notes").join(name);
+        let lines = std::fs::read_to_string(&path)
+            .map(|t| t.lines().map(str::to_owned).collect())
+            .unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        lines
+    }
+
+    /// Builds the Linux setup file of the published `version` with `lunepack setup`, from the
+    /// lab's release directory, and returns its path.
+    pub fn build_setup(&self, version: &str) -> PathBuf {
+        let out = self.work.join(format!("{APP_ID}-{version}-{TARGET}-setup"));
+        let (rd, out_s) = (
+            self.release_dir.to_string_lossy().into_owned(),
+            out.to_string_lossy().into_owned(),
+        );
+        let cfg = self
+            .cfg_dir
+            .join("lunepack.toml")
+            .to_string_lossy()
+            .into_owned();
+        self.cli_str(&[
+            "setup",
+            &rd,
+            "--version",
+            version,
+            "--target",
+            TARGET,
+            "--out",
+            &out_s,
+            "--config",
+            &cfg,
+        ]);
+        out
     }
 
     /// Runs a runtime mode (`install`, `uninstall`) and returns its exit code and stdout.

@@ -102,38 +102,45 @@ pub fn run_table(bins: &Binaries, app: &App) -> Result<Vec<String>, String> {
     let mut log = Vec::new();
     for (kind, rows) in [(FeedKind::Http, HTTP_ROWS), (FeedKind::File, FILE_ROWS)] {
         let mut lab = Lab::new(bins, app, kind);
-        for row in rows {
-            eprintln!("e2e: row {}: {}", row.id, row.name);
-            let started = Instant::now();
-            match catch_unwind(AssertUnwindSafe(|| (row.run)(&mut lab))) {
-                Ok(lines) => {
-                    log.push(format!("# row {}", row.id));
-                    log.extend(lines);
-                    eprintln!(
-                        "e2e: row {} ok ({:.1}s)",
-                        row.id,
-                        started.elapsed().as_secs_f32()
-                    );
-                }
-                Err(payload) => {
-                    let why = payload
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                        .unwrap_or_else(|| "a panic".to_owned());
-                    return Err(format!(
-                        "row {} failed: {why}\n{}",
-                        row.id,
-                        lab.diagnostics()
-                    ));
-                }
-            }
-        }
+        run_rows(&mut lab, rows, &mut log)?;
     }
     Ok(log)
 }
 
-fn record(current: &str, previous: Option<&str>, bad: &[&str], events: usize) -> RecordView {
+/// Runs `rows` in order on `lab`, appending each row's outcome lines (under a `# row N` line) to
+/// `log`; stops at the first row that panics, naming it and the lab's state.
+pub fn run_rows(lab: &mut Lab, rows: &[Row], log: &mut Vec<String>) -> Result<(), String> {
+    for row in rows {
+        eprintln!("e2e: row {}: {}", row.id, row.name);
+        let started = Instant::now();
+        match catch_unwind(AssertUnwindSafe(|| (row.run)(lab))) {
+            Ok(lines) => {
+                log.push(format!("# row {}", row.id));
+                log.extend(lines);
+                eprintln!(
+                    "e2e: row {} ok ({:.1}s)",
+                    row.id,
+                    started.elapsed().as_secs_f32()
+                );
+            }
+            Err(payload) => {
+                let why = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_else(|| "a panic".to_owned());
+                return Err(format!(
+                    "row {} failed: {why}\n{}",
+                    row.id,
+                    lab.diagnostics()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn record(current: &str, previous: Option<&str>, bad: &[&str], events: usize) -> RecordView {
     RecordView {
         current: Some(current.to_owned()),
         previous: previous.map(str::to_owned),
@@ -145,7 +152,7 @@ fn record(current: &str, previous: Option<&str>, bad: &[&str], events: usize) ->
 }
 
 /// The desktop entry and the command link match an entry at `entry` (M5-D2, M5-D10).
-fn assert_integration(lab: &Lab, entry: &str) {
+pub fn assert_integration(lab: &Lab, entry: &str) {
     let desktop = lab.desktop_file();
     assert_eq!(
         std::fs::read_to_string(&desktop).expect("the desktop entry"),
@@ -163,7 +170,7 @@ fn assert_integration(lab: &Lab, entry: &str) {
     );
 }
 
-fn assert_current_link(lab: &Lab, version: &str) {
+pub fn assert_current_link(lab: &Lab, version: &str) {
     assert_eq!(
         lab.current_link().as_deref(),
         Some(format!("versions/{version}").as_str()),
@@ -172,7 +179,7 @@ fn assert_current_link(lab: &Lab, version: &str) {
 }
 
 /// Every line of the runtime log is a schema-1 object.
-fn assert_log_is_schema_1(lab: &Lab) {
+pub fn assert_log_is_schema_1(lab: &Lab) {
     let log = lab.runtime_log();
     assert!(!log.is_empty(), "the runtime wrote no log");
     for line in log.lines() {
@@ -184,13 +191,13 @@ fn assert_log_is_schema_1(lab: &Lab) {
 }
 
 /// Runs the app through the command link with `--update` and expects it to hand over.
-fn update_from_link(lab: &Lab) {
+pub fn update_from_link(lab: &Lab) {
     let status = lab.run_app(&lab.bin_link(), &["--update"]);
     assert!(status.success(), "the --update run failed: {status}");
 }
 
 /// Runs the app through the command link with no arguments.
-fn start_from_link(lab: &Lab) {
+pub fn start_from_link(lab: &Lab) {
     let status = lab.run_app(&lab.bin_link(), &[]);
     assert!(status.success(), "the app failed: {status}");
 }
@@ -204,19 +211,25 @@ fn row_install(lab: &mut Lab) -> Vec<String> {
         stdout.contains("\"outcome\":\"installed\""),
         "the install result line"
     );
-
-    let mut want = record("1.0.0", None, &[], 2);
-    want.staged = None;
-    assert_eq!(lab.record(), Some(want), "the record after the install");
-    assert_eq!(lab.versions(), ["1.0.0"]);
-    assert_current_link(lab, "1.0.0");
-    assert_integration(lab, &lab.entry_rel(&V1));
     if lab.feed_kind() == FeedKind::Http {
         assert!(
             !lab.requests().is_empty(),
             "the loopback server saw no request"
         );
     }
+    check_installed(lab, &V1)
+}
+
+/// What a first install of `release` (1.0.0) leaves behind, however it was made (the runtime's
+/// install mode, or a setup file): the record, the trees, the links, the integration, and the
+/// app's own lines over two starts through the command link. Returns those lines.
+pub fn check_installed(lab: &Lab, release: &Release) -> Vec<String> {
+    let mut want = record("1.0.0", None, &[], 2);
+    want.staged = None;
+    assert_eq!(lab.record(), Some(want), "the record after the install");
+    assert_eq!(lab.versions(), ["1.0.0"]);
+    assert_current_link(lab, "1.0.0");
+    assert_integration(lab, &lab.entry_rel(release));
 
     // Two starts through the command link: the events come once.
     start_from_link(lab);
@@ -240,28 +253,45 @@ fn row_install(lab: &mut Lab) -> Vec<String> {
 fn row_update_confirmed(lab: &mut Lab) -> Vec<String> {
     lab.publish(&V2);
     update_from_link(lab);
-    let lines = lab.expect_lines(&[
-        "1.0.0 start",
-        "1.0.0 nothing-pending",
-        "1.0.0 check 2.0.0",
-        "1.0.0 staged 2.0.0",
-        "1.0.0 apply-scheduled",
-        "2.0.0 start",
-        "2.0.0 arg after-update",
-        "2.0.0 event updated 1.0.0",
-        "2.0.0 event first_run",
-        "2.0.0 confirmed",
-    ]);
+    expect_confirmed_update(lab, &V2, "1.0.0")
+}
+
+/// The outcome lines of an update from `from` to `to` that the new version confirms, in the
+/// order the apps write them.
+fn confirmed_update_lines(from: &str, to: &str) -> Vec<String> {
+    vec![
+        format!("{from} start"),
+        format!("{from} nothing-pending"),
+        format!("{from} check {to}"),
+        format!("{from} staged {to}"),
+        format!("{from} apply-scheduled"),
+        format!("{to} start"),
+        format!("{to} arg after-update"),
+        format!("{to} event updated {from}"),
+        format!("{to} event first_run"),
+        format!("{to} confirmed"),
+    ]
+}
+
+/// Waits for the outcome lines of a confirmed update from `from` to `release` and checks what
+/// it leaves behind: the record, the kept versions, the link and the integration. The one
+/// definition of "the update's outcome", so a variant (a UI that dies, no UI) is compared with
+/// the headless run line by line. Returns the lines.
+pub fn expect_confirmed_update(lab: &Lab, release: &Release, from: &str) -> Vec<String> {
+    let to = release.version;
+    let want = confirmed_update_lines(from, to);
+    let want: Vec<&str> = want.iter().map(String::as_str).collect();
+    let lines = lab.expect_lines(&want);
     lab.wait_runtime_gone();
     assert_eq!(
         lab.record(),
-        Some(record("2.0.0", Some("1.0.0"), &[], 0)),
+        Some(record(to, Some(from), &[], 0)),
         "the record after the confirmed update"
     );
     // GC keeps the current and the previous version, and there is nothing older.
-    assert_eq!(lab.versions(), ["1.0.0", "2.0.0"]);
-    assert_current_link(lab, "2.0.0");
-    assert_integration(lab, &lab.entry_rel(&V2));
+    assert_eq!(lab.versions(), [from, to]);
+    assert_current_link(lab, to);
+    assert_integration(lab, &lab.entry_rel(release));
     assert_log_is_schema_1(lab);
     lines
 }
@@ -432,6 +462,12 @@ fn row_attempt_counter(lab: &mut Lab) -> Vec<String> {
 }
 
 fn row_uninstall(lab: &mut Lab) -> Vec<String> {
+    uninstall_and_check(lab, &lab.root.join("versions/4.0.0").join(RUNTIME_FILE))
+}
+
+/// Uninstalls through the runtime at `runtime` and checks what is gone and what stays (a
+/// foreign desktop entry and command are planted first, and the data home itself).
+pub fn uninstall_and_check(lab: &Lab, runtime: &std::path::Path) -> Vec<String> {
     // Foreign files beside the install's own: another app's entry and command.
     let foreign_desktop = lab.data.join("applications/other.desktop");
     let foreign_bin = lab.home.join(".local/bin/other-tool");
@@ -442,8 +478,7 @@ fn row_uninstall(lab: &mut Lab) -> Vec<String> {
     .expect("plant a desktop entry");
     std::fs::write(&foreign_bin, b"#!/bin/sh\n").expect("plant a command");
 
-    let runtime = lab.root.join("versions/4.0.0").join(RUNTIME_FILE);
-    let (code, stdout) = lab.run_runtime(&runtime, "uninstall");
+    let (code, stdout) = lab.run_runtime(runtime, "uninstall");
     assert_eq!(code, 0, "uninstall exited {code}: {stdout}");
     assert!(
         stdout.contains("\"outcome\":\"uninstalled\""),
