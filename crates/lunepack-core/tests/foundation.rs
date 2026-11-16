@@ -554,11 +554,17 @@ const FORBIDDEN: &[&str] = &[
     "unsafe",
 ];
 
-/// The one narrow exception (M4-D12, user decision Q30): budgeted parallel decode in the stage
-/// engine uses scoped threads. Exactly these (file, token) pairs; nothing else in `std::thread`.
+/// The narrow exceptions. Exactly these (file, token) pairs, each a whole path or name.
+///
+/// - M4-D12, user decision Q30: budgeted parallel decode in the stage engine uses scoped threads;
+///   nothing else in `std::thread`.
+/// - M6-D1: the `Child` trait's two method names `take_stdin` and `take_stdout` (they hand out a
+///   piped child's pipe ends); the core touches no standard stream itself.
 const ALLOWED: &[(&str, &str)] = &[
     ("stage.rs", "std::thread::scope"),
     ("stage.rs", "std::thread::panicking"),
+    ("process.rs", "take_stdin"),
+    ("process.rs", "take_stdout"),
 ];
 
 fn is_ident_char(c: char) -> bool {
@@ -566,7 +572,7 @@ fn is_ident_char(c: char) -> bool {
 }
 
 /// Remove each allowed token of `file` from `code`, but only where the token is a whole path
-/// (not followed by an identifier character) and the line is not a `use` item.
+/// (not glued to an identifier character on either side) and the line is not a `use` item.
 fn without_allowed(file: &str, code: &str) -> String {
     if code.trim_start().starts_with("use ") || code.trim_start().starts_with("pub use ") {
         return code.to_string();
@@ -581,7 +587,9 @@ fn without_allowed(file: &str, code: &str) -> String {
         while let Some(at) = tail.find(token) {
             let after = &tail[at + token.len()..];
             rest.push_str(&tail[..at]);
-            if after.chars().next().is_some_and(is_ident_char) {
+            let glued = rest.chars().next_back().is_some_and(is_ident_char)
+                || after.chars().next().is_some_and(is_ident_char);
+            if glued {
                 rest.push_str(token);
             }
             tail = after;
@@ -624,6 +632,27 @@ fn core_source_has_no_ambient_capabilities() {
         scanned += 1;
     }
     assert!(scanned >= 7, "scanned only {scanned} files");
+}
+
+/// The stream exception is exactly the two method names of `Child`, in `process.rs` only.
+#[test]
+fn stream_method_exception_is_narrow() {
+    for line in [
+        "    fn take_stdin(&mut self) -> Option<Box<dyn Write + Send>>;",
+        "    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>>;",
+    ] {
+        assert_eq!(forbidden_in_line("process.rs", line), None, "{line}");
+        assert!(forbidden_in_line("lib.rs", line).is_some(), "{line}");
+    }
+    for line in [
+        "let s = std::io::stdin();",
+        "let o = std::io::stdout();",
+        "take_stdin_all();",
+        "my_take_stdin();",
+        "stdin.read(&mut b);",
+    ] {
+        assert!(forbidden_in_line("process.rs", line).is_some(), "{line}");
+    }
 }
 
 /// The thread exception is exactly `std::thread::scope` and `std::thread::panicking` in `stage.rs`.

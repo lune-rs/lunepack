@@ -14,8 +14,8 @@ use std::fmt;
 
 use lunepack_core::state::{InstallState, Loaded, UserScope};
 use lunepack_core::{
-    AttemptOutcome, ConfirmOutcome, FileKind, IntegrationRequest, LifecycleEvent, ProcessId, Scope,
-    SpawnSpec, TokenCheck, UserLayout, Version, reconcile_current,
+    AttemptOutcome, ChildStdio, ConfirmOutcome, FileKind, IntegrationRequest, LifecycleEvent,
+    ProcessId, Scope, SpawnSpec, TokenCheck, UserLayout, Version, reconcile_current,
 };
 
 use crate::Error;
@@ -210,6 +210,7 @@ pub fn startup_for(inst: &Installation, args: Vec<OsString>) -> Result<Startup, 
                     args,
                     env_set: Vec::new(),
                     env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
+                    stdio: ChildStdio::Null,
                 });
                 return Ok(Startup {
                     events: Vec::new(),
@@ -355,6 +356,7 @@ pub fn apply_and_restart_for(
         args,
         env_set: Vec::new(),
         env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
+        stdio: ChildStdio::Null,
     })?;
     Ok(ApplyScheduled { version })
 }

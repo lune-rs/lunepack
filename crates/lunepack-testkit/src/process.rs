@@ -5,14 +5,15 @@
 //! host. Clones share one state, so a test keeps a handle while the code under test owns another.
 
 use core::time::Duration;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use lunepack_core::{
-    Child, Error, ExitKind, Process, ProcessError, ProcessErrorKind, ProcessId, SpawnSpec,
-    WaitOutcome,
+    Child, ChildStdio, Error, ExitKind, Process, ProcessError, ProcessErrorKind, ProcessId,
+    SpawnSpec, WaitOutcome,
 };
 
 /// One call to `spawn_detached` or `spawn_child`, as the fake saw it.
@@ -30,6 +31,8 @@ pub struct SpawnRecord {
     pub env_remove: Vec<OsString>,
     /// The id given to a spawned child (`None` for a detached spawn).
     pub child: Option<ProcessId>,
+    /// What the spec asked for as standard input and output.
+    pub stdio: ChildStdio,
 }
 
 impl std::fmt::Debug for SpawnRecord {
@@ -41,6 +44,7 @@ impl std::fmt::Debug for SpawnRecord {
             .field("env_set", &self.env_set.len())
             .field("env_remove", &self.env_remove.len())
             .field("child", &self.child)
+            .field("stdio", &self.stdio)
             .finish_non_exhaustive()
     }
 }
@@ -72,6 +76,155 @@ impl ChildScript {
     }
 }
 
+/// The size of a Linux pipe buffer, the default capacity of the fake's pipes.
+const DEFAULT_PIPE_CAPACITY: usize = 64 * 1024;
+
+struct PipeState {
+    buf: VecDeque<u8>,
+    capacity: usize,
+    writer_gone: bool,
+    reader_gone: bool,
+}
+
+/// One in-memory pipe: a bounded byte queue with blocking reads and writes, like an OS pipe.
+struct Pipe {
+    state: Mutex<PipeState>,
+    changed: Condvar,
+}
+
+impl Pipe {
+    fn new(capacity: usize) -> Arc<Pipe> {
+        Arc::new(Pipe {
+            state: Mutex::new(PipeState {
+                buf: VecDeque::new(),
+                capacity: capacity.max(1),
+                writer_gone: false,
+                reader_gone: false,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn state(&self) -> MutexGuard<'_, PipeState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn wait<'a>(&self, guard: MutexGuard<'a, PipeState>) -> MutexGuard<'a, PipeState> {
+        self.changed
+            .wait(guard)
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The reading end is gone: writes fail with a broken pipe.
+    fn close_reader(&self) {
+        self.state().reader_gone = true;
+        self.changed.notify_all();
+    }
+
+    /// The writing end is gone: reads drain what is queued, then report the end of file.
+    fn close_writer(&self) {
+        self.state().writer_gone = true;
+        self.changed.notify_all();
+    }
+}
+
+/// The reading end of one of the fake's pipes. Dropping it closes the pipe for the writer.
+pub struct FakePipeReader(Arc<Pipe>);
+
+/// The writing end of one of the fake's pipes. Dropping it is the end of file for the reader.
+pub struct FakePipeWriter(Arc<Pipe>);
+
+impl Read for FakePipeReader {
+    /// Blocks until a byte is queued or the writer is gone (then `Ok(0)`).
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut st = self.0.state();
+        loop {
+            if !st.buf.is_empty() {
+                let n = out.len().min(st.buf.len());
+                for (slot, byte) in out.iter_mut().zip(st.buf.drain(..n)) {
+                    *slot = byte;
+                }
+                self.0.changed.notify_all();
+                return Ok(n);
+            }
+            if st.writer_gone || st.reader_gone {
+                return Ok(0);
+            }
+            st = self.0.wait(st);
+        }
+    }
+}
+
+impl Write for FakePipeWriter {
+    /// Queues all of `data`, blocking while the pipe is full (as a blocking OS pipe does); a pipe
+    /// whose reader is gone fails with `BrokenPipe`.
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let mut st = self.0.state();
+        let mut written = 0;
+        while written < data.len() {
+            if st.reader_gone || st.writer_gone {
+                return if written > 0 {
+                    Ok(written)
+                } else {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                };
+            }
+            let room = st.capacity.saturating_sub(st.buf.len());
+            if room == 0 {
+                st = self.0.wait(st);
+                continue;
+            }
+            let n = room.min(data.len() - written);
+            st.buf.extend(&data[written..written + n]);
+            written += n;
+            self.0.changed.notify_all();
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for FakePipeReader {
+    fn drop(&mut self) {
+        self.0.close_reader();
+    }
+}
+
+impl Drop for FakePipeWriter {
+    fn drop(&mut self) {
+        self.0.close_writer();
+    }
+}
+
+impl std::fmt::Debug for FakePipeReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakePipeReader").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for FakePipeWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakePipeWriter").finish_non_exhaustive()
+    }
+}
+
+/// The ends of a piped fake child's pipes that the child itself would hold: what it reads as
+/// standard input and where it writes standard output. A test plays the child with these (taken
+/// with [`FakeProcess::take_child_pipes`]); dropping one is the child closing that stream.
+#[derive(Debug)]
+pub struct FakeChildPipes {
+    /// What the code under test wrote to the child's standard input.
+    pub stdin: FakePipeReader,
+    /// What the child writes as standard output, for the code under test to read.
+    pub stdout: FakePipeWriter,
+}
+
 struct Inner {
     exe: PathBuf,
     me: ProcessId,
@@ -86,6 +239,8 @@ struct Inner {
     in_use: VecDeque<bool>,
     in_use_log: Vec<(PathBuf, Vec<ProcessId>)>,
     terminated: Vec<ProcessId>,
+    pipe_capacity: usize,
+    child_pipes: BTreeMap<ProcessId, FakeChildPipes>,
 }
 
 /// A scripted [`Process`].
@@ -123,6 +278,8 @@ impl FakeProcess {
                 in_use: VecDeque::new(),
                 in_use_log: Vec::new(),
                 terminated: Vec::new(),
+                pipe_capacity: DEFAULT_PIPE_CAPACITY,
+                child_pipes: BTreeMap::new(),
             })),
         }
     }
@@ -169,6 +326,20 @@ impl FakeProcess {
         lock(&self.inner).running.remove(&id);
     }
 
+    /// Sets the capacity in bytes of the pipes of later piped spawns (the default is 64 KiB, a
+    /// Linux pipe's): a writer blocks while its pipe holds that much.
+    pub fn set_pipe_capacity(&self, bytes: usize) {
+        lock(&self.inner).pipe_capacity = bytes;
+    }
+
+    /// The child's ends of the pipes of piped child `id`, once (`None` for a child that is not
+    /// piped, an unknown id and a second call). A test reads what the code under test sent and
+    /// writes what the child would; the fake's own end of file and broken pipe follow the child's
+    /// exit or termination.
+    pub fn take_child_pipes(&self, id: ProcessId) -> Option<FakeChildPipes> {
+        lock(&self.inner).child_pipes.remove(&id)
+    }
+
     /// Every spawn so far, in order.
     pub fn spawns(&self) -> Vec<SpawnRecord> {
         lock(&self.inner).spawns.clone()
@@ -191,7 +362,7 @@ impl FakeProcess {
 
     fn record(&self, detached: bool, spec: &SpawnSpec) -> Result<Option<ProcessId>, Error> {
         let mut inner = lock(&self.inner);
-        if !spec.program.is_absolute() {
+        if !spec.program.is_absolute() || (detached && spec.stdio != ChildStdio::Null) {
             return Err(ProcessError::new(ProcessErrorKind::InvalidRequest, "spawn")
                 .about(&spec.program)
                 .into());
@@ -217,8 +388,26 @@ impl FakeProcess {
             env_set: spec.env_set.clone(),
             env_remove: spec.env_remove.clone(),
             child,
+            stdio: spec.stdio,
         });
         Ok(child)
+    }
+}
+
+/// The fake child's own pipe handles, to close its ends when it exits.
+struct ChildPipes {
+    stdin: Arc<Pipe>,
+    stdout: Arc<Pipe>,
+    /// The code under test's ends, until it takes them.
+    engine_stdin: Option<FakePipeWriter>,
+    engine_stdout: Option<FakePipeReader>,
+}
+
+impl ChildPipes {
+    /// The child is gone: nothing reads its input and nothing more is written to its output.
+    fn close(&self) {
+        self.stdin.close_reader();
+        self.stdout.close_writer();
     }
 }
 
@@ -228,6 +417,15 @@ struct FakeChild {
     polls: u32,
     done: Option<ExitKind>,
     shared: Arc<Mutex<Inner>>,
+    pipes: Option<ChildPipes>,
+}
+
+impl FakeChild {
+    fn ended(&mut self) {
+        if let Some(pipes) = &self.pipes {
+            pipes.close();
+        }
+    }
 }
 
 impl Child for FakeChild {
@@ -248,6 +446,7 @@ impl Child for FakeChild {
         }
         self.done = Some(exit);
         lock(&self.shared).running.remove(&self.id);
+        self.ended();
         Ok(Some(exit))
     }
 
@@ -258,7 +457,19 @@ impl Child for FakeChild {
         if self.done.is_none() {
             self.done = Some(ExitKind::Signal(15));
         }
+        drop(shared);
+        self.ended();
         Ok(())
+    }
+
+    fn take_stdin(&mut self) -> Option<Box<dyn Write + Send>> {
+        let w = self.pipes.as_mut()?.engine_stdin.take()?;
+        Some(Box::new(w))
+    }
+
+    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+        let r = self.pipes.as_mut()?.engine_stdout.take()?;
+        Some(Box::new(r))
     }
 }
 
@@ -283,16 +494,33 @@ impl Process for FakeProcess {
         let id = self
             .record(false, spec)?
             .expect("a child spawn always has an id");
-        let script = lock(&self.inner)
-            .scripts
-            .pop_front()
-            .unwrap_or_else(ChildScript::runs);
+        let mut inner = lock(&self.inner);
+        let script = inner.scripts.pop_front().unwrap_or_else(ChildScript::runs);
+        let pipes = (spec.stdio == ChildStdio::Piped).then(|| {
+            let stdin = Pipe::new(inner.pipe_capacity);
+            let stdout = Pipe::new(inner.pipe_capacity);
+            inner.child_pipes.insert(
+                id,
+                FakeChildPipes {
+                    stdin: FakePipeReader(stdin.clone()),
+                    stdout: FakePipeWriter(stdout.clone()),
+                },
+            );
+            ChildPipes {
+                engine_stdin: Some(FakePipeWriter(stdin.clone())),
+                engine_stdout: Some(FakePipeReader(stdout.clone())),
+                stdin,
+                stdout,
+            }
+        });
+        drop(inner);
         Ok(Box::new(FakeChild {
             id,
             script,
             polls: 0,
             done: None,
             shared: self.inner.clone(),
+            pipes,
         }))
     }
 
@@ -332,6 +560,8 @@ impl Process for FakeProcess {
 ///   helper is, or is not, the leader of its own session) and, for each of `stdin`, `stdout` and
 ///   `stderr`, `<name> null` or `<name> other` (the descriptor is `/dev/null` or is not).
 ///
+/// - `cat`: copies its standard input to its standard output until end of file, then exits 0.
+///
 /// A helper creates every file atomically (writes `<file>.tmp`, then renames it), so a reader that
 /// sees `file` sees all of it.
 ///
@@ -340,9 +570,12 @@ impl Process for FakeProcess {
 /// `parent`); `spawn_child` and its exit kinds; `wait_exit` on a running child, on a zombie, on
 /// an id with another start time (a reused pid) and on a pid that does not exist; `terminate`
 /// (SIGTERM, then escalation after `grace`); `spawn_detached` (arguments reach the program
-/// verbatim without a shell, `env_set` and `env_remove`, a new session, null streams); refusals
-/// (a relative program, a missing program) that leak no argument, environment value or directory;
-/// and `tree_in_use`.
+/// verbatim without a shell, `env_set` and `env_remove`, a new session, null streams); piped
+/// children (`ChildStdio::Piped`: a round trip through `cat` that is large enough to need both
+/// directions at once, the end of file when the input is dropped, the error stream still null, the
+/// pipe ends handed out once, and a child that ends while its pipes are held); refusals (a
+/// relative program, a missing program, a detached spawn with pipes) that leak no argument,
+/// environment value or directory; and `tree_in_use`.
 pub fn run_process_suite(process: &dyn Process, helper: &Path) {
     let scratch = std::env::temp_dir().join(format!(
         "lunepack-process-suite-{}-{}",
@@ -564,6 +797,7 @@ fn process_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
     );
 
     detached_cases(process, helper, scratch);
+    piped_cases(process, helper, scratch);
     refusal_cases(process, scratch);
     in_use_cases(process, helper, scratch);
 }
@@ -643,6 +877,131 @@ fn detached_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
     );
 }
 
+/// A `ChildStdio::Piped` spec for `helper args`.
+fn piped_spec(helper: &Path, args: &[&str]) -> SpawnSpec {
+    let mut spec = helper_spec(helper, args);
+    spec.stdio = ChildStdio::Piped;
+    spec
+}
+
+fn piped_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
+    // A null child hands out no pipe ends.
+    let mut null = process
+        .spawn_child(&helper_spec(helper, &["exit", "0"]))
+        .expect("spawn a null child");
+    assert!(
+        null.take_stdin().is_none(),
+        "a null child has no input pipe"
+    );
+    assert!(
+        null.take_stdout().is_none(),
+        "a null child has no output pipe"
+    );
+    wait_for_exit(null.as_mut(), "null child");
+
+    // A round trip through `cat`. 300 KiB is more than a pipe holds in either direction, so the
+    // writer and the reader must run at once; the end of the input is the end of the output.
+    let mut cat = Reaper(
+        process
+            .spawn_child(&piped_spec(helper, &["cat"]))
+            .expect("spawn a piped child"),
+    );
+    let mut stdin = cat.0.take_stdin().expect("the input pipe");
+    let mut stdout = cat.0.take_stdout().expect("the output pipe");
+    assert!(
+        cat.0.take_stdin().is_none(),
+        "the input pipe is handed out once"
+    );
+    assert!(
+        cat.0.take_stdout().is_none(),
+        "the output pipe is handed out once"
+    );
+    let payload: Vec<u8> = (0..300 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx_read = tx.clone();
+    std::thread::spawn(move || {
+        let mut got = Vec::new();
+        let result = stdout.read_to_end(&mut got).map(|_| got);
+        let _ = tx_read.send(("read", result.ok()));
+    });
+    std::thread::spawn(move || {
+        let ok = stdin
+            .write_all(&payload)
+            .and_then(|()| stdin.flush())
+            .is_ok();
+        // Dropping the input is the child's end of file.
+        drop(stdin);
+        let _ = tx.send(("write", ok.then(Vec::new)));
+    });
+    let mut read = None;
+    let mut wrote = false;
+    for _ in 0..2 {
+        let (what, got) = rx
+            .recv_timeout(LIMIT)
+            .expect("the round trip through cat did not finish");
+        match what {
+            "read" => read = Some(got.expect("reading the child's output")),
+            _ => wrote = got.is_some(),
+        }
+    }
+    assert!(wrote, "writing the child's input");
+    assert!(
+        read.expect("read result") == expected,
+        "cat returned other bytes than it was given"
+    );
+    assert_eq!(
+        wait_for_exit(cat.0.as_mut(), "cat"),
+        ExitKind::Success,
+        "cat ends at the end of its input"
+    );
+
+    // The error stream of a piped child is still null; input and output are the pipes.
+    let probe = scratch.join("probe-piped");
+    let mut child = process
+        .spawn_child(&piped_spec(helper, &["probe", &probe.to_string_lossy()]))
+        .expect("spawn a piped probe");
+    assert_eq!(
+        wait_for_exit(child.as_mut(), "piped probe"),
+        ExitKind::Success
+    );
+    let text = wait_for_file(&probe, "piped probe");
+    assert!(
+        text.ends_with("stdin other\nstdout other\nstderr null\n"),
+        "a piped child's streams: {text:?}"
+    );
+
+    // A child that ends while the parent still holds its pipes: the output reaches its end of
+    // file, and the input is a broken pipe.
+    let mut sleeper = Reaper(
+        process
+            .spawn_child(&piped_spec(helper, &["sleep", "600"]))
+            .expect("spawn a piped sleeper"),
+    );
+    let mut stdin = sleeper.0.take_stdin().expect("the input pipe");
+    let mut stdout = sleeper.0.take_stdout().expect("the output pipe");
+    sleeper
+        .0
+        .terminate(Duration::from_secs(10))
+        .expect("terminate the piped sleeper");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut rest = Vec::new();
+        let read = stdout.read_to_end(&mut rest).map(|_| rest.len());
+        let write = stdin.write_all(b"too late").and_then(|()| stdin.flush());
+        let _ = tx.send((read.ok(), write.err().map(|e| e.kind())));
+    });
+    let (read, write) = rx
+        .recv_timeout(LIMIT)
+        .expect("the pipes of an ended child did not close");
+    assert_eq!(read, Some(0), "the output of an ended child is at its end");
+    assert_eq!(
+        write,
+        Some(std::io::ErrorKind::BrokenPipe),
+        "the input of an ended child"
+    );
+}
+
 fn refusal_cases(process: &dyn Process, scratch: &Path) {
     let mut relative = SpawnSpec::new("relative/program");
     relative.args = vec![OsString::from("SECRET-ARG-VALUE")];
@@ -681,6 +1040,19 @@ fn refusal_cases(process: &dyn Process, scratch: &Path) {
             assert!(!shown.contains(&dir_text), "{name}: leaks a path: {shown}");
         }
     }
+
+    // A detached program has no owner for pipes: refused, with a typed error that shows no argument.
+    let mut piped = piped_spec(&scratch.join("never-started"), &["SECRET-ARG-VALUE"]);
+    piped.args = vec![OsString::from("SECRET-ARG-VALUE")];
+    let err = process
+        .spawn_detached(&piped)
+        .expect_err("a detached spawn with pipes");
+    assert_eq!(
+        process_kind(&err, "a detached spawn with pipes"),
+        ProcessErrorKind::InvalidRequest
+    );
+    let shown = format!("{err} / {err:?}");
+    assert!(!shown.contains("SECRET-ARG-VALUE"), "{shown}");
 }
 
 fn in_use_cases(process: &dyn Process, helper: &Path, scratch: &Path) {

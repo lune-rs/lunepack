@@ -33,7 +33,10 @@ pub use hasher::FakeHasher;
 pub use http_server::LoopbackServer;
 pub use integration::{FakeIntegration, IntegrationCall, IntegrationOp, run_integration_suite};
 pub use memfs::{MemFs, RecoverMode};
-pub use process::{ChildScript, FakeProcess, SpawnRecord, run_process_suite};
+pub use process::{
+    ChildScript, FakeChildPipes, FakePipeReader, FakePipeWriter, FakeProcess, SpawnRecord,
+    run_process_suite,
+};
 pub use rng::FakeRng;
 pub use seeds::{Seed, fuzz_seeds, sample_update_config};
 pub use signer::FakeSigner;

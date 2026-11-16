@@ -12,6 +12,11 @@
 //! - `detach-then <exit|sleep> <mode> <arg>...`: starts this binary with `<mode> <arg>...` through
 //!   `LinuxProcess::spawn_detached`, then exits 0 (`exit`) or sleeps for 600 s (`sleep`).
 //!
+//! - `cat`: copies its standard input to its standard output until end of file (the suite's mode).
+//! - `fds <file> [<ready>]`: creates `file` holding one line per open descriptor, `<fd> <target>`
+//!   (the target as `/proc/self/fd` reads it, `pipe:[inode]` for a pipe), and then, when `ready` is
+//!   given, creates `ready` and sleeps 600 s.
+//!
 //! Every file is created atomically (`<file>.tmp`, then a rename).
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -34,6 +39,8 @@ const MODES: &[&str] = &[
     "pid-sleep",
     "leader-exit",
     "detach-then",
+    "cat",
+    "fds",
 ];
 
 /// Runs the helper mode named by `args[0]` and never returns; `false` when `args` names no mode.
@@ -108,6 +115,31 @@ pub fn run(args: &[String]) -> bool {
             });
             create(Path::new(&rest[0]), "ready\n");
             exit_this_thread();
+        }
+        "cat" => {
+            let mut input = std::io::stdin().lock();
+            let mut output = std::io::stdout().lock();
+            std::io::copy(&mut input, &mut output).expect("copy standard input to output");
+            std::io::Write::flush(&mut output).expect("flush");
+        }
+        "fds" => {
+            let mut text = String::new();
+            for entry in std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd") {
+                let entry = entry.expect("fd entry");
+                let Ok(target) = std::fs::read_link(entry.path()) else {
+                    continue;
+                };
+                text.push_str(&format!(
+                    "{} {}\n",
+                    entry.file_name().to_string_lossy(),
+                    target.display()
+                ));
+            }
+            create(Path::new(&rest[0]), &text);
+            if let Some(ready) = rest.get(1) {
+                create(Path::new(ready), "ready\n");
+                sleep("600");
+            }
         }
         "detach-then" => {
             let mut spec = SpawnSpec::new(std::env::current_exe().expect("current_exe"));
