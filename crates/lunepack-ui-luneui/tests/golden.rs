@@ -1,12 +1,18 @@
 //! Golden frames (M6-D9): every screen and every transition of the three flows, rendered headless at
-//! scale 1.0 and fixed times, compared with the PNGs in `tests/golden`.
+//! scale 1.0 and fixed times, compared with the PNGs of the golden set of the OS the test runs on:
+//! `tests/golden/linux` (made in the reference Docker image), `tests/golden/macos` (Metal) and
+//! `tests/golden/windows` (WARP). Each OS compares against its own adapter, because a frame from
+//! another adapter differs on 10 to 24 % of the pixels in the transition strips (see the README).
 //!
 //! The comparison needs a GPU adapter, so it is `#[ignore]`d and run with `--ignored` by
-//! `scripts/ui-golden.sh` and the CI job `ui`; with no adapter it fails, it never skips. The goldens
-//! are generated in the reference Docker image only (`scripts/ui-golden.sh --docker --write`, which
-//! sets `LUNEPACK_WRITE_GOLDENS=1`, the same convention as the fuzz seeds). A plain
+//! `scripts/ui-golden.sh` and the CI job `ui`; with no adapter it fails, it never skips. With no
+//! golden set for the OS it renders everything (so CI can upload the frames) and then fails, saying
+//! how to seed the set. The Linux set is generated in the reference image only
+//! (`scripts/ui-golden.sh --docker --write`, which sets `LUNEPACK_WRITE_GOLDENS=1`, the same
+//! convention as the fuzz seeds); the other two come from the frames CI uploads (README). A plain
 //! `cargo test --workspace` stays adapter-free: it runs the checks that need no GPU (the comparison
-//! instrument, and that a golden exists for every screen the reducer can reach and for nothing else).
+//! instrument, and that the Linux set holds a golden for every screen the reducer can reach and for
+//! nothing else).
 //!
 //! Tolerance is per adapter class, chosen by `LUNEPACK_GOLDEN_CLASS` (`exact` or `cross`; the
 //! scripts and CI set it, the default is `cross`). The numbers come from the step 0 probe (notes.md
@@ -28,6 +34,9 @@ const EXACT_MAX_DELTA: u8 = 0;
 const EXACT_MAX_FRACTION: f64 = 0.0;
 /// Cross-adapter (Metal, WARP): at most this channel delta, on at most this fraction of the pixels
 /// differing at all. Measured Metal against lavapipe (notes.md "M6 step 0" (iv)): delta 2 and 3.94 %.
+/// With the real screens the same comparison reached 10.35 to 23.94 % in 11 of the 88 frames, so the
+/// bound was kept and the sets made per OS (README): it now allows the drift between two machines
+/// that run the same adapter (a developer's Mac and a CI runner), never a different adapter.
 const CROSS_MAX_DELTA: u8 = 6;
 const CROSS_MAX_FRACTION: f64 = 0.10;
 
@@ -320,8 +329,38 @@ fn options(scene: &Scene) -> RenderOptions {
     }
 }
 
+/// The golden set of the OS this test runs on.
+const SET: &str = if cfg!(target_os = "macos") {
+    "macos"
+} else if cfg!(windows) {
+    "windows"
+} else {
+    "linux"
+};
+
+/// The sets a golden directory can hold, one per OS.
+const SETS: [&str; 3] = ["linux", "macos", "windows"];
+
+fn golden_set_dir(set: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(set)
+}
+
 fn golden_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
+    golden_set_dir(SET)
+}
+
+/// The PNG file names of a set on disk; empty when the set does not exist.
+fn names_on_disk(set: &str) -> BTreeSet<String> {
+    std::fs::read_dir(golden_set_dir(set))
+        .map(|dir| {
+            dir.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".png"))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn out_dir() -> PathBuf {
@@ -467,20 +506,31 @@ fn every_screen_the_reducer_can_reach_has_a_golden_and_nothing_else_does() {
             );
         }
     }
-    let on_disk: BTreeSet<String> = std::fs::read_dir(golden_dir())
-        .expect("tests/golden exists")
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".png"))
-        .collect();
     let expected = expected_names();
-    let missing: Vec<_> = expected.difference(&on_disk).collect();
-    let stale: Vec<_> = on_disk.difference(&expected).collect();
+    // The Linux set is the reference and always there. A set of another OS is checked when it has
+    // been seeded; a half seeded one (or one with a stale file) fails here, so the plain test run
+    // of every OS notices it. A set that does not exist yet is the ignored test's to refuse.
+    let on_disk = names_on_disk("linux");
     assert!(
-        missing.is_empty(),
-        "goldens missing (run scripts/ui-golden.sh --docker --write): {missing:?}"
+        !on_disk.is_empty(),
+        "the Linux golden set (tests/golden/linux) is missing"
     );
-    assert!(stale.is_empty(), "goldens no scene names: {stale:?}");
+    for set in SETS {
+        let on_disk = names_on_disk(set);
+        if on_disk.is_empty() {
+            continue;
+        }
+        let missing: Vec<_> = expected.difference(&on_disk).collect();
+        let stale: Vec<_> = on_disk.difference(&expected).collect();
+        assert!(
+            missing.is_empty(),
+            "goldens missing from the {set} set (see tests/golden/README.md): {missing:?}"
+        );
+        assert!(
+            stale.is_empty(),
+            "goldens in the {set} set that no scene names: {stale:?}"
+        );
+    }
 }
 
 #[test]
@@ -496,6 +546,9 @@ fn the_goldens_match() {
     if write {
         std::fs::create_dir_all(golden_dir()).expect("the goldens directory");
     }
+    // No set for this OS yet: everything is rendered and saved below (CI uploads it), then the test
+    // fails with the way to seed one. Writing creates the set, so it never trips this.
+    let no_set = !write && names_on_disk(SET).is_empty();
     let mut failures = Vec::new();
     for scene in scenes() {
         let times: Vec<Duration> = scene
@@ -516,8 +569,11 @@ fn the_goldens_match() {
                 image.write_png(&golden).expect("the golden is written");
                 continue;
             }
+            if no_set {
+                continue;
+            }
             let Ok(bytes) = std::fs::read(&golden) else {
-                failures.push(format!("{name}: no golden at tests/golden/{file}"));
+                failures.push(format!("{name}: no golden at tests/golden/{SET}/{file}"));
                 continue;
             };
             let Ok(want) = icon::decode(&bytes) else {
@@ -544,6 +600,12 @@ fn the_goldens_match() {
             }
         }
     }
+    assert!(
+        !no_set,
+        "no golden set for {SET} (tests/golden/{SET}); seed it from the frames this run saved in {} \
+         (CI uploads them as the artifact ui-golden-renders-{SET}): see tests/golden/README.md",
+        out.display()
+    );
     assert!(
         failures.is_empty(),
         "{} golden frame(s) differ; the renders are in {}:\n{}",
