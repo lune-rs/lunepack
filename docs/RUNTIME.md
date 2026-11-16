@@ -195,14 +195,44 @@ log's directory, and each ends by printing one final `result` or `error` object 
 `result`'s `outcome` is `installed`, `uninstalled`, or `uninstalled_with_leftovers` (an
 integration item that is not lunepack's was kept and reported).
 
+## Setup files
+
+On Linux, `lunepack setup` (CLI.md) appends a release's signed payload and a trailer to that
+release's runtime (FORMAT.md 14). Before it reads its command line, every runtime reads at most the
+trailer's 4096 bytes from the end of its own resolved executable. Without the trailer's magic there
+it runs as described above, unchanged. With the magic it is a setup file:
+
+- A trailer that does not parse (FORMAT.md 14.2) ends the run with `verify` (7) and one `error`
+  object on stdout; it never falls back to another mode.
+- The command line is empty or `--silent`; anything else is a usage error (2).
+- The payload is verified under the trailer's root before anything is shown or written: the key
+  set, the manifest with no feed (release keys valid now), the whole pack, and the update
+  configuration read out of the pack, which must name exactly that root. A failure is `verify`
+  (7). A setup file stops installing when its key set expires or its release keys' windows end.
+- When a window may be shown (the rules below), `lunepack-ui` is read out of the pack through its
+  signed frame into a new private directory (mode 0700) under the app's cache
+  (`$XDG_CACHE_HOME/<app id>`, else `~/.cache/<app id>`) and started from there; the directory is
+  removed when the run ends. A directory an earlier run left there is removed only when its marker
+  names this app and a process that no longer runs. A release packed without `--ui`, or a UI that
+  cannot be written out, means a run without a window.
+- The welcome question shows the name, version, publisher, install location and size from the
+  verified manifest and configuration. Then the release is installed into
+  `<data home>/<app id>` from the payload's own frames, exactly as `install` commits it (its exit
+  codes, `already_installed` (23) for an existing install, and its desktop integration), with
+  progress phases `install` and `stage`. The done question's launch answer starts the installed
+  entry.
+- Events go to stderr and the run ends with one `result` or `error` object on stdout, `command`
+  `setup`.
+
 ## The window
 
-`install`, `uninstall` and `apply` show their progress and ask their questions in a window when they
-can: they start `lunepack-ui` from the directory of the runtime's own resolved path (never through
+`install`, `uninstall`, `apply` and a setup file show their progress and ask their questions in a
+window when they can: they start `lunepack-ui` from the directory of the runtime's own resolved path
+(a setup file: from its private directory, above) (never through
 `PATH`, `current` or a link), with the fixed argument `--engine`, its standard input and output as
 the channel and its error stream on `/dev/null`, and without `LUNEPACK_HEALTH_TOKEN` in its
 environment. The window only shows and asks; every answer is checked by the runtime, and a window
-that fails changes no outcome and no exit code. No window is started under `--silent` (`install`,
+that fails changes no outcome and no exit code. No window is started under `--silent` (`install`, a setup file,
 `uninstall`) or `--no-ui` (`apply`, `apply-and-restart`), when `LUNEPACK_NO_UI` is set to anything
 but empty or `0`, on Linux when neither `DISPLAY` nor `WAYLAND_DISPLAY` is set, or when
 `lunepack-ui` is missing; the mode then runs headless and every question takes its default
