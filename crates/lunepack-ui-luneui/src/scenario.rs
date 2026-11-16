@@ -29,6 +29,11 @@ pub fn location(os: Os) -> String {
 
 /// A 128 by 128 PNG icon drawn in code: a dark rounded tile with a small graph of three nodes.
 pub fn sample_icon_png() -> Vec<u8> {
+    static ICON: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    ICON.get_or_init(draw_sample_icon).clone()
+}
+
+fn draw_sample_icon() -> Vec<u8> {
     const N: u32 = 128;
     const SS: u32 = 4;
     let k = 64.0 / N as f32;

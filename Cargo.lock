@@ -2259,6 +2259,7 @@ dependencies = [
 name = "lunepack-ui-luneui"
 version = "0.0.0"
 dependencies = [
+ "accesskit_consumer",
  "lune-ui",
  "lunepack-core",
  "png",

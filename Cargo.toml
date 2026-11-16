@@ -79,3 +79,7 @@ windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
 # The window stack the UI binary needs, named through lunepack-ui-luneui's re-exports so the
 # boundary check still sees it reachable only through that crate (the version LuneUI uses).
 winit = "0.30"
+
+# Tests only (lunepack-ui-luneui): AccessKit's own consumer, the tree the OS adapters run, already in
+# the lock through the platform adapters, replays the screens' accessibility tree.
+accesskit_consumer = "0.39"
