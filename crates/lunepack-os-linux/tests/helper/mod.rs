@@ -6,6 +6,9 @@
 //!   maps}` are denied to its own user without `CAP_SYS_PTRACE`, like `(sd-pam)` or ssh-agent),
 //!   creates `ready`, then sleeps. The extra arguments only appear in its command line.
 //! - `pid-sleep <file> <secs>`: creates `file` holding `<pid> <start ticks>`, then sleeps.
+//! - `leader-exit <ready> <secs>`: starts a thread that sleeps for `secs` and then exits the
+//!   process, creates `ready`, then ends the main thread alone (`SYS_exit`), so the thread-group
+//!   leader is a zombie while the other thread runs.
 //! - `detach-then <exit|sleep> <mode> <arg>...`: starts this binary with `<mode> <arg>...` through
 //!   `LinuxProcess::spawn_detached`, then exits 0 (`exit`) or sleeps for 600 s (`sleep`).
 //!
@@ -29,6 +32,7 @@ const MODES: &[&str] = &[
     "hold",
     "nodump",
     "pid-sleep",
+    "leader-exit",
     "detach-then",
 ];
 
@@ -96,6 +100,15 @@ pub fn run(args: &[String]) -> bool {
             );
             sleep(&rest[1]);
         }
+        "leader-exit" => {
+            let secs = rest[1].clone();
+            std::thread::spawn(move || {
+                sleep(&secs);
+                std::process::exit(0);
+            });
+            create(Path::new(&rest[0]), "ready\n");
+            exit_this_thread();
+        }
         "detach-then" => {
             let mut spec = SpawnSpec::new(std::env::current_exe().expect("current_exe"));
             spec.args = rest[1..].iter().map(Into::into).collect();
@@ -159,4 +172,13 @@ fn set_not_dumpable() {
     // unused arguments are zero as the call requires.
     let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     assert_eq!(rc, 0, "prctl(PR_SET_DUMPABLE, 0)");
+}
+
+#[allow(unsafe_code)]
+fn exit_this_thread() -> ! {
+    // SAFETY: the raw exit(2) system call (not exit_group) ends only the calling thread and takes
+    // one integer. Nothing on this thread's stack needs a destructor (the helper's arguments are
+    // leaked with the process), and the other thread ends the process with exit_group later.
+    unsafe { libc::syscall(libc::SYS_exit, 0) };
+    unreachable!("SYS_exit returned");
 }

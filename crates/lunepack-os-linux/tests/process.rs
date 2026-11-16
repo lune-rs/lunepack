@@ -60,6 +60,10 @@ mod linux {
         ("a_process_with_an_open_file_in_the_tree_uses_it", in_use_fd),
         ("a_shell_script_from_the_tree_uses_it", in_use_scripts),
         (
+            "a_process_whose_leader_exited_is_judged_by_its_live_threads",
+            zombie_leader,
+        ),
+        (
             "a_non_dumpable_process_unrelated_to_the_tree_does_not_use_it",
             nodump_unrelated,
         ),
@@ -401,6 +405,47 @@ mod linux {
         assert!(os().tree_in_use(&other, &[]).unwrap(), "the holder's cwd");
         child.0.kill().unwrap();
         child.0.wait().unwrap();
+        assert!(!os().tree_in_use(&tree, &[]).unwrap(), "after the exit");
+    }
+
+    /// A process whose thread-group leader has ended while another thread runs: `/proc/<pid>/exe`
+    /// and `cwd` are gone, so the scan reads the live thread instead (F9): its cwd in the tree is
+    /// in use, an unrelated directory is not.
+    fn zombie_leader(scratch: &Path) {
+        let tree = scratch.join("tree");
+        let other = scratch.join("other");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let ready = scratch.join("ready");
+        let child = Reap(
+            Command::new(helper())
+                .arg("leader-exit")
+                .arg(&ready)
+                .arg("600")
+                .current_dir(&tree)
+                .spawn()
+                .unwrap(),
+        );
+        wait_for_file(&ready);
+        let pid = child.0.id();
+        let deadline = Instant::now() + LIMIT;
+        while stat_fields(Some(pid))[0] != "Z" {
+            assert!(Instant::now() < deadline, "the leader did not end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            std::fs::read_link(format!("/proc/{pid}/cwd")).is_err(),
+            "the leader holds no cwd"
+        );
+        assert!(
+            os().tree_in_use(&tree, &[]).unwrap(),
+            "a live thread's cwd in the tree"
+        );
+        assert!(
+            !os().tree_in_use(&other, &[]).unwrap(),
+            "an unrelated tree is not in use"
+        );
+        drop(child);
         assert!(!os().tree_in_use(&tree, &[]).unwrap(), "after the exit");
     }
 

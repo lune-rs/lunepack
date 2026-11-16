@@ -330,7 +330,10 @@ to what lunepack made.
   canonical text, that are real directories (checked with `lstat` right before the removal), that
   the record does not keep (current, previous, pending, staged) and that no other process of the
   user runs from or has open (`exe`, `cwd`, mappings, descriptors; a process that cannot be read
-  counts as using it). Any error keeps the tree. The one exception is a process the kernel denies
+  counts as using it). A process whose files vanish under the read (one inside its exit, or one
+  whose main thread has ended while other threads run) is read through its live threads and
+  re-probed for at most 200 ms: it is skipped only once it has exited or all its live threads read
+  cleanly, and otherwise counts as using the tree. Any error keeps the tree. The one exception is a process the kernel denies
   inspection of by design (`EACCES` or `EPERM` on those reads: a non-dumpable process of the user,
   such as `(sd-pam)` or an ssh-agent, present on every desktop login and CI runner): counting it as
   in use would keep every tree forever, so its command line decides instead, and it uses the tree
