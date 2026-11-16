@@ -169,7 +169,9 @@ pub fn startup() -> Result<Startup, Error> {
 ///    token is supervised and counts nothing; any other start counts an attempt, and the one
 ///    after the third rolls back: the previous version becomes current again, the desktop
 ///    integration follows it (best effort), the previous entry is started detached with `args`
-///    and no health token, and the result says [`StartupAction::Exit`];
+///    and no health token, and the result says [`StartupAction::Exit`] (also when that relaunch
+///    fails: the rollback is committed). A previous version whose tree or config cannot be
+///    opened is [`Error::RollbackUnavailable`] with nothing committed;
 /// 3. the events queued for this version are delivered, marked so in the same commit.
 ///
 /// A tree that is not installed, or an install with no current version yet, continues with no
@@ -201,12 +203,14 @@ pub fn startup_for(inst: &Installation, args: Vec<OsString>) -> Result<Startup, 
             AttemptOutcome::RollBack => {
                 let previous = roll_back(inst, layout, &store, &loaded, &record)?;
                 drop(guard);
-                p.process.spawn_detached(&SpawnSpec {
+                // The rollback is committed: a relaunch that fails cannot undo it, and this
+                // version must still exit. The next start of the previous version recovers.
+                let _ = p.process.spawn_detached(&SpawnSpec {
                     program: previous.entry_path(),
                     args,
                     env_set: Vec::new(),
                     env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
-                })?;
+                });
                 return Ok(Startup {
                     events: Vec::new(),
                     action: StartupAction::Exit,
@@ -221,12 +225,16 @@ pub fn startup_for(inst: &Installation, args: Vec<OsString>) -> Result<Startup, 
     Ok(Startup::go_on(events, is_pending(&now, own)))
 }
 
-/// Rolls `inst`'s pending version back under the held lock: commits the rollback, reconciles
+/// Rolls `inst`'s pending version back under the held lock. The previous version's installation
+/// is opened first: when its tree or config is missing or invalid there is nothing to roll back
+/// to, and the call is [`Error::RollbackUnavailable`] with nothing committed (the record stays
+/// pending, as the runtime's applier leaves it). Then it commits the rollback, reconciles
 /// `current`, and refreshes the desktop integration from the previous version's config (the bad
 /// version's command link names as `stale_bins`). Returns the previous version's installation.
 ///
-/// The refresh is best effort: the record already names the previous version, the entries point
-/// through `current`, and the next apply or install refreshes them again.
+/// Everything after the commit is best effort: the record already names the previous version,
+/// the entries point through `current`, and the previous version's own start (or the next apply
+/// or install) reconciles and refreshes them again.
 fn roll_back(
     inst: &Installation,
     layout: &UserLayout,
@@ -236,15 +244,17 @@ fn roll_back(
 ) -> Result<Installation, Error> {
     let p = &inst.platform;
     let own = inst.tree_version();
+    let previous = record
+        .previous
+        .as_ref()
+        .ok_or(Error::RollbackUnavailable)
+        .and_then(|prev| {
+            inst.version_installation(&prev.version)
+                .map_err(|_| Error::RollbackUnavailable)
+        })?;
     let next = lunepack_core::rollback(record, own)?;
     let committed = store.commit(&*p.fs, loaded, &next, &*p.hasher)?;
-    reconcile(inst, layout, &committed)?;
-    let current = committed
-        .current
-        .as_ref()
-        .map(|c| c.version.clone())
-        .ok_or(Error::RollbackUnavailable)?;
-    let previous = inst.version_installation(&current)?;
+    let _ = reconcile(inst, layout, &committed);
     let stale_bins = match (&inst.meta().bin, &previous.meta().bin) {
         (Some(bad), keep) if keep.as_ref() != Some(bad) => vec![bad.clone()],
         _ => Vec::new(),
