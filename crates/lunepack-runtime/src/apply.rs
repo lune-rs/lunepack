@@ -13,6 +13,10 @@
 //!    from the previous version's config;
 //! 3. **gc**, after the previous version was relaunched (detached, without the token).
 //!
+//! An apply that fails after the wait (window 1 refuses: no usable config, nothing staged, a held
+//! lock, a disk or state error) changes nothing and starts the current version again, detached
+//! and without the token, so the app that exited for it comes back; the exit code is the failure.
+//!
 //! The process waited for is only waited for; the only process ever signalled is the own child.
 //! Every per-version fact (entry, health timeout, install metadata) comes from that version's own
 //! config at `R/versions/<v>/lunepack-update.json`, never from this runtime's tree (M5-D17). The
@@ -352,6 +356,38 @@ fn roll_back(
     Ok(RolledBack::Done(Box::new(previous)))
 }
 
+/// After an apply that changed nothing: starts the current version again, detached, with the
+/// restart arguments and without the health token (best effort; a failure is a warning). The
+/// entry comes from the current version's own config; when the record or that config cannot be
+/// read, from this runtime's own tree, the version that just exited.
+fn relaunch_current(
+    ad: &Adapters,
+    inst: &Installation,
+    layout: &UserLayout,
+    restart: &[OsString],
+    events: &Events,
+) {
+    let current = store_of(inst, layout)
+        .load(&*ad.fs, &*ad.hasher)
+        .ok()
+        .and_then(|loaded| loaded.record)
+        .and_then(|record| record.current)
+        .and_then(|c| inst.version_installation(&c.version).ok());
+    let (entry, version) = match &current {
+        Some(current) => (current.entry_path(), current.tree_version()),
+        None => (inst.entry_path(), inst.tree_version()),
+    };
+    let relaunch = SpawnSpec {
+        program: entry,
+        args: restart.to_vec(),
+        env_set: Vec::new(),
+        env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
+    };
+    if ad.process.spawn_detached(&relaunch).is_err() {
+        events.emit(&Event::warning(Warning::RelaunchFailed, Some(version)));
+    }
+}
+
 /// The outcome of [`run_apply`] before it is reported.
 enum End {
     Confirmed,
@@ -408,7 +444,12 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
 
     let applied = match commit_apply(ad, inst, &layout, v, events) {
         Ok(applied) => applied,
-        Err(kind) => return End::Failed(kind),
+        Err(kind) => {
+            // The app has exited for this apply; nothing was committed, so it starts again as
+            // the version it was (F10). The failure stays the exit kind.
+            relaunch_current(ad, inst, &layout, &args.restart, events);
+            return End::Failed(kind);
+        }
     };
 
     // Launch, never through a shell: the new tree's entry from its own config.

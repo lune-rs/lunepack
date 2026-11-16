@@ -117,6 +117,10 @@ mod linux {
             a_missing_new_config_changes_nothing,
         ),
         (
+            "nothing_staged_relaunches_the_current_version",
+            nothing_staged_relaunches_the_current_version,
+        ),
+        (
             "a_missing_previous_config_leaves_it_pending",
             a_missing_previous_config_leaves_it_pending,
         ),
@@ -819,9 +823,44 @@ mod linux {
         let (code, _) = lab.apply(V100, target("0.1"), V110);
         assert_eq!(code, 14);
         assert_eq!(lab.record(), before);
-        assert!(lab.notes().is_empty(), "something was started");
         assert!(log_has(lab, "\"kind\":\"update_config\""));
-        assert!(!lab.root.join("current").exists());
+        // The app exited for the apply: the current version starts again, without the token.
+        assert!(
+            lab.wait_note("1.0.0 startup continue", Duration::from_secs(10)),
+            "1.0.0 was not relaunched: {}",
+            lab.notes()
+        );
+        assert!(lab.notes().contains("1.0.0 start token=no"));
+        // Its own startup reconciled `current`, to the version that is still current.
+        assert_eq!(lab.current_link(), Path::new("versions/1.0.0"));
+        assert!(!lab.notes().contains("1.1.0 start"), "1.1.0 was started");
+        assert!(!lab.notes().contains("token=yes"));
+    }
+
+    fn nothing_staged_relaunches_the_current_version(lab: &Lab) {
+        lab.tree(V100, "bin/app", "exit0", 30);
+        lab.tree(V110, "bin/app", "confirm", 30);
+        lab.commit(|r| {
+            let app = sample_update_config().app_id;
+            assert!(r.is_none());
+            InstallState::new(1, app, Scope::User, INSTALL_ID, TARGET).install(
+                version(V100),
+                10,
+                TARGET,
+                INSTALL_ID,
+            )
+        });
+        let before = lab.record();
+        let (code, _) = lab.apply(V100, target("0.1"), V110);
+        assert_eq!(code, 12);
+        assert_eq!(lab.record(), before);
+        assert!(log_has(lab, "\"kind\":\"nothing_staged\""));
+        assert!(
+            lab.wait_note("1.0.0 start token=no", Duration::from_secs(10)),
+            "1.0.0 was not relaunched: {}",
+            lab.notes()
+        );
+        assert!(!lab.notes().contains("1.1.0 start"), "1.1.0 was started");
     }
 
     fn a_missing_previous_config_leaves_it_pending(lab: &Lab) {
