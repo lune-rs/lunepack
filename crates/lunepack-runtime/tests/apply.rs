@@ -121,6 +121,14 @@ mod linux {
             nothing_staged_relaunches_the_current_version,
         ),
         (
+            "an_apply_another_applier_made_starts_nothing_more",
+            an_apply_another_applier_made_starts_nothing_more,
+        ),
+        (
+            "a_record_that_moved_on_starts_nothing_more",
+            a_record_that_moved_on_starts_nothing_more,
+        ),
+        (
             "a_missing_previous_config_leaves_it_pending",
             a_missing_previous_config_leaves_it_pending,
         ),
@@ -861,6 +869,67 @@ mod linux {
             lab.notes()
         );
         assert!(!lab.notes().contains("1.1.0 start"), "1.1.0 was started");
+    }
+
+    /// Long enough for a detached relaunch, had there been one, to note its start.
+    const NO_START_WAIT: Duration = Duration::from_secs(3);
+
+    /// F17: another applier for the same version (a second app instance, or `apply-and-restart`
+    /// called twice) committed it first and launched it; this one is refused and starts nothing.
+    fn an_apply_another_applier_made_starts_nothing_more(lab: &Lab) {
+        lab.tree(V100, "bin/app", "exit0", 30);
+        lab.tree(V110, "bin/app", "confirm", 30);
+        lab.install(V110);
+        lab.commit(|r| {
+            lunepack_core::apply(
+                r.expect("record"),
+                &version(V110),
+                sha(b"the other applier"),
+            )
+            .expect("apply")
+        });
+        let before = lab.record();
+        assert_eq!(
+            before.pending.as_ref().map(|p| p.version.clone()),
+            Some(version(V110))
+        );
+        let (code, _) = lab.apply(V100, target("0.1"), V110);
+        assert_eq!(code, 12);
+        assert_eq!(lab.record(), before);
+        assert!(log_has(lab, "\"kind\":\"nothing_staged\""));
+        assert!(
+            !lab.wait_note(" start ", NO_START_WAIT),
+            "an app was started: {}",
+            lab.notes()
+        );
+        assert!(!log_has(lab, "relaunch_failed"));
+    }
+
+    /// F17: the record names another current version and nothing pending (the update was applied
+    /// and confirmed elsewhere): the outgoing version is not started again.
+    fn a_record_that_moved_on_starts_nothing_more(lab: &Lab) {
+        lab.tree(V100, "bin/app", "exit0", 30);
+        lab.tree(V110, "bin/app", "confirm", 30);
+        lab.install(V110);
+        lab.commit(|r| {
+            let applied =
+                lunepack_core::apply(r.expect("record"), &version(V110), sha(b"elsewhere"))
+                    .expect("apply");
+            let (confirmed, _) =
+                lunepack_core::confirm(&applied, &version(V110), lunepack_core::TokenCheck::Absent)
+                    .expect("confirm");
+            confirmed
+        });
+        let before = lab.record();
+        assert!(before.pending.is_none());
+        let (code, _) = lab.apply(V100, target("0.1"), V110);
+        assert_eq!(code, 12);
+        assert_eq!(lab.record(), before);
+        assert!(
+            !lab.wait_note(" start ", NO_START_WAIT),
+            "an app was started: {}",
+            lab.notes()
+        );
     }
 
     fn a_missing_previous_config_leaves_it_pending(lab: &Lab) {
