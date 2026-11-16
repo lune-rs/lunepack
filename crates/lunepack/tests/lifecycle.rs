@@ -1102,6 +1102,115 @@ fn an_integration_conflict_stops_install_before_anything_is_written() {
 }
 
 #[test]
+fn an_integration_that_fails_once_leaves_install_resumable() {
+    let _serial = common::serial();
+    let lab = Lab::new();
+    publish_with_config(&lab, 1, V100);
+    let boot = bootstrap(&lab, V100);
+    lab.integration.script_failure(Some("disk"));
+    let got = install(&lab, &boot);
+    assert!(matches!(got, Err(Error::Integration(_))), "{got:?}");
+    let rec = lab.record();
+    assert!(rec.current.is_none(), "committed before the integration");
+    assert!(lab.integration.applied().is_empty());
+
+    lab.integration.script_failure(None);
+    install(&lab, &boot).expect("rerun");
+    assert_eq!(
+        lab.record().current.expect("current").version,
+        version(V100)
+    );
+    assert_eq!(lab.current_link(), "versions/1.0.0");
+    assert_eq!(lab.integration.applied().len(), 1);
+    common::workers_stopped();
+}
+
+/// A [`FakeIntegration`] whose successful `apply` arms `fs` to fail its next operation: the
+/// install commit that follows it.
+struct CommitFailsAfterApply {
+    inner: FakeIntegration,
+    fs: MemFs,
+}
+
+impl lunepack_core::OsIntegration for CommitFailsAfterApply {
+    fn check(
+        &self,
+        scope: lunepack_core::Scope,
+        req: &lunepack_core::IntegrationRequest,
+    ) -> Result<(), lunepack_core::IntegrationError> {
+        self.inner.check(scope, req)
+    }
+
+    fn apply(
+        &self,
+        scope: lunepack_core::Scope,
+        req: &lunepack_core::IntegrationRequest,
+    ) -> Result<lunepack_core::IntegrationReport, lunepack_core::IntegrationError> {
+        let report = self.inner.apply(scope, req)?;
+        self.fs.crash_after(self.fs.op_count());
+        Ok(report)
+    }
+
+    fn remove(
+        &self,
+        scope: lunepack_core::Scope,
+        req: &lunepack_core::IntegrationRequest,
+    ) -> Result<lunepack_core::IntegrationReport, lunepack_core::IntegrationError> {
+        self.inner.remove(scope, req)
+    }
+}
+
+#[test]
+fn a_commit_that_fails_after_the_integration_leaves_install_resumable() {
+    let _serial = common::serial();
+    let lab = Lab::new();
+    publish_with_config(&lab, 1, V100);
+    let tree = abs_path(&format!("/media/boot/{V100}"));
+    let cfg = config(
+        &lab.root(),
+        V100,
+        FEED,
+        meta("bin/app", Some("app"), &format!("App {V100}")),
+    );
+    write_tree(&lab.fs, &tree, &cfg);
+    let failing = CommitFailsAfterApply {
+        inner: lab.integration.clone(),
+        fs: lab.fs.clone(),
+    };
+    let platform = lab.platform(None).with_integration(Arc::new(failing));
+    let boot = Installation::from_exe_with(&tree.join("bin/app"), platform).expect("bootstrap");
+    let got = install(&lab, &boot);
+    assert!(got.is_err(), "the commit did not fail");
+    assert!(lab.fs.is_crashed());
+    // The integration went in before the commit; the record has no current version.
+    assert_eq!(lab.integration.applied().len(), 1);
+
+    let after = Lab {
+        fs: lab.fs.recover(lunepack_testkit::RecoverMode::KeepVolatile),
+        world: lab.world,
+        process: lab.process,
+        integration: lab.integration,
+    };
+    assert!(after.record().current.is_none(), "the commit went through");
+    let boot = Installation::from_exe_with(&tree.join("bin/app"), after.platform(None))
+        .expect("bootstrap after the crash");
+    install(&after, &boot).expect("rerun");
+    assert_eq!(
+        after.record().current.expect("current").version,
+        version(V100)
+    );
+    assert_eq!(after.current_link(), "versions/1.0.0");
+    let applies = after
+        .integration
+        .calls()
+        .iter()
+        .filter(|c| c.op == IntegrationOp::Apply)
+        .count();
+    assert_eq!(applies, 2, "the rerun applies the integration again");
+    common::workers_stopped();
+}
+
+#[test]
 fn install_into_a_machine_layout_is_machine_scope() {
     let lab = Lab::new();
     let layout = Layout::Machine {

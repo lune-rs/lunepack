@@ -953,8 +953,9 @@ impl Updater {
     /// 3. the check runs with no current version (no floor time, any release of the channel), the
     ///    newest candidate is downloaded and staged, reusing the bootstrap's files that match;
     /// 4. under the lock the installed tree's own config is read, the integration preflight runs
-    ///    again on it, the record names the version as current (events `installed` and
-    ///    `first_run`), `current` is linked and the integration applied.
+    ///    again on it, the integration is applied, the record names the version as current (events
+    ///    `installed` and `first_run`) and `current` is linked. A failure before that commit
+    ///    leaves a record with no current version, so a rerun resumes.
     ///
     /// A machine layout is [`Error::MachineScope`].
     pub fn install(
@@ -1717,10 +1718,14 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
             inner.integration.check(Scope::User, &request)?;
             let next =
                 lunepack_core::install_first(&record, version.clone(), issued, record.install_id)?;
+            // The integration goes in before the commit (F11, Q42): once the record names a
+            // current version a rerun is `AlreadyInstalled`, so nothing that can fail may be left
+            // for after it. Its entries point through `R/current`, which the reconcile below makes
+            // valid; when the commit fails they dangle until a rerun, which applies them again.
+            inner.integration.apply(Scope::User, &request)?;
             let committed = store.commit(&*inner.fs, &loaded, &next, &*inner.hasher)?;
             lunepack_core::reconcile_current(&*inner.fs, &root, &committed)
                 .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))?;
-            inner.integration.apply(Scope::User, &request)?;
             Ok(InstalledVersion {
                 version,
                 issued,
