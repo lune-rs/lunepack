@@ -25,6 +25,7 @@ pub mod policy;
 pub mod process;
 pub mod progress;
 pub mod root;
+pub mod setup;
 pub mod stage;
 pub mod state;
 pub mod target;
