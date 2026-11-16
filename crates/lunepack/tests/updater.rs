@@ -1514,3 +1514,25 @@ fn a_user_layout_gives_the_facade_layout_under_its_root() {
         }
     );
 }
+
+/// F16: a scan with no current tree ends at once, often before the polling task first looks at
+/// its job; the scan phase is still delivered, before the download phase. Before the fix about one
+/// download in seven lost it (61 of 400 in one measurement), so 100 runs catch a regression.
+#[test]
+fn every_download_delivers_its_scan_phase_even_when_the_scan_ends_at_once() {
+    let _s = serial();
+    for run in 0..100 {
+        let w = World::new();
+        w.install("1.0.0", SUITE_T0 - 10 * DAY);
+        w.publish(1, "1.1.0");
+        let u = w.updater();
+        let info = block_on(u.check()).expect("check").expect("update");
+        let (events, _downloaded) = download_events(&u, &info);
+        let first = |phase| events.iter().position(|p| p.phase == phase);
+        let scan = first(lunepack_core::Phase::Scan);
+        let download = first(lunepack_core::Phase::Download);
+        assert!(scan.is_some(), "run {run}: no scan event");
+        assert!(scan < download, "run {run}: phase order");
+    }
+    workers_stopped();
+}
