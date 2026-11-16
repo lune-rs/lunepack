@@ -4,7 +4,7 @@ Status: **draft**, awaiting approval together with `docs/FORMAT.md`.
 
 What lunepack's update and install path defends against, and what it does not. The format rules
 referred to here are in `docs/FORMAT.md`; the decisions in `docs/DECISIONS.md` (D7, D17, D21, D24,
-D33, D34, D35, M3-D1 to M3-D13, M4-D1 to M4-D23).
+D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12).
 
 ## Assets
 
@@ -167,6 +167,93 @@ engine's events and returns the user's choices. The engine treats those choices 
 input: it validates them against what the verified manifest and the install scope allow, and no
 outcome of install, apply, confirm or rollback depends on the UI being present, alive or honest.
 The UI never runs elevated, so a fault in the GPU or window stack cannot act with elevated rights.
+
+What M6 builds, and what it does and does not defend (classes 4 and 6 excepted, as everywhere):
+
+- **Frames from the UI are untrusted input to the engine** (M6-D2). A length over 1 MiB is refused
+  before any allocation; the body is strict JSON with a closed set of types and no extra, missing or
+  duplicated member; the first frame must be a hello with the engine's own build id. After that
+  the only things the UI can say are an answer to the question that is open (its id, and a value
+  from that question's set), a cancel while one is allowed, and the answer to the engine's liveness
+  probe. The engine applies a choice only after its flow reducer accepts it, and a choice carries no
+  path, name or text: the one index it can carry (the leftover to show) is checked against the list
+  the engine itself sent. So a UI that lies, floods, stalls or is replaced by a local process
+  can cancel a question that was asked, accept one, or be ignored, and nothing more. It cannot
+  choose a scope, a location, a version or a file.
+- **The UI cannot block the engine.** Every write to it goes through one bounded queue and one
+  writer thread, and a stalled write, an unanswered probe (15 s), a missing hello (20 s) or a UI
+  that will not exit after `Close` (5 s) ends in the engine killing its own child and finishing
+  headless; no engine thread is waited for without a bound. A UI lost at a question before any
+  change is a cancel, never a proceed (M6-D5). A local process that kills the UI, or that fills its
+  pipe, can therefore stop a window but not an install, and no more than it could by killing the
+  installer itself.
+- **What the UI renders comes from the signed package.** The app's name, publisher, version and
+  icon come from the signed update configuration (FORMAT.md 13.4, control characters refused) and the
+  location from the engine's own path rules. They are drawn as text, ellipsized, and the icon is a PNG
+  decoded within 1024 by 1024 pixels and 16 MiB (a bad or missing icon is a monogram, M6-D11); a
+  malicious publisher is out of scope (class 6), but a bug in the text or PNG path is a bug in a
+  process that holds no key, no token (it is removed from its environment) and no way to change an
+  outcome.
+- **The UI process is started only from the runtime's own directory** (never through `PATH`, `current`
+  or a link, and with a fixed argument and a null error stream), so a UI is as trusted as the signed
+  tree that holds it; a same-user process that can replace it can already replace the runtime
+  (class 4). Its build id must equal the runtime's.
+- **The GPU and window stack is attack surface that is kept out of everything that matters.** LuneUI,
+  `wgpu`, `winit` and AccessKit load graphics drivers and display libraries at run time and carry
+  `unsafe` code; the boundary check lets only `lunepack-ui-luneui` and `lunepack-ui` reach them, so
+  the runtime, the stub, the facade and any elevated process never link them (D17). LuneUI is the one
+  git dependency, pinned to a commit the boundary check names (D39); updating the pin is a reviewed
+  change of that constant, and a lock entry from another source or commit fails the check. A broken
+  driver, a missing display or an old glibc ends the UI with a typed exit code and the install goes
+  on headless (D36).
+- **Opening a folder** (M6-D10) is the one thing a UI answer makes the engine start: `xdg-open` on the
+  parent of a leftover the uninstall itself reported, without a shell, at most once a second.
+
+## Setup files (M6)
+
+A Linux setup file (`docs/FORMAT.md` 14, `lunepack setup`) is the release's runtime followed by the
+signed payload, so one file installs offline. It adds a path that verifies a release with no feed, and
+it runs code before the user has agreed to anything, so the rules below carry the weight.
+
+- **The file is its own trust anchor, like any installer's first download.** The trailer is not signed;
+  its root is the anchor of that install, as the root compiled into an installed tree is. Someone who
+  can change the file can replace the root and the payload together, so what protects the file in
+  transit is the same as for every first download: the user's choice of source and OS code signing
+  (below, Trust anchors), not lunepack. What lunepack adds is that a file whose parts, hashes or
+  signatures do not fit together is refused before anything is shown or written, and that a trailer
+  that is present but malformed never falls through to the ordinary runtime (exit 7).
+- **The trailer is parsed as untrusted input.** Only the last 4096 bytes are read; the body is strict
+  canonical JSON that must re-encode to the same bytes; every part must be non-empty, 8-aligned,
+  inside the file and before the trailer, not overlap another, and fit the caps of FORMAT.md 4; an
+  unknown format is a newer format. No length is trusted before it is compared with the file's size.
+- **The offline verification path** (M6-D4) is the chain of the feed path with the feed taken out: the
+  key set under the trailer's root, then the manifest under that key set's release keys that are valid
+  now at its threshold (the signatures take the place of the feed's hash binding, so the key windows
+  count), its app id equal to the key set's and its version and target equal to the trailer's, then the
+  pack against the manifest's size and hash, then the update configuration read from the pack through
+  its signed frame (frame hash before the decoder, decoded size and hash after) naming exactly that
+  root. Frames are copied into the cache only after their own hash matches, and each is checked again
+  when the tree is staged. No byte of the payload reaches a decoder, a trusted type or the disk tree
+  before its signature or hash check. The runtime inside the setup file is the file itself; the one
+  other executable it reads out, the UI, is a signed frame like any other file.
+- **Freshness is the key set's and the release key's, not a feed's.** A setup file has no feed, so it
+  has no feed expiry, no sequence and no rollback floor: it installs the one version it carries, and
+  the floors it commits are its own key set's. It stops installing when the key set's `expires` passes
+  or its release keys' windows end (FORMAT.md 14.2); nothing re-signs an old release, so a publisher
+  rebuilds setup files from a current one. The cost: a revocation by a newer key set does not reach a
+  setup file already in someone's hands, so a leaked release key (class 2) stays usable in setup
+  files until its window ends, and a short window is the defence; once installed, the app takes
+  the next key set from the feed and the revocation applies from then on.
+- **The UI's directory** (M6-D7) is made fresh by the setup (a random new name under the per-app cache,
+  mode 0700, files created with `create_new`, nothing existing reused or followed), receives the UI only
+  from the verified frame and is removed when the run ends. An earlier run's directory is removed only
+  when its marker names this app and a process that is no longer running, so a directory a local
+  process planted without that marker stays. The cache belongs to the user (class 4 applies as to
+  everything else the user owns).
+- **With a window, nothing is installed before the user answers the welcome question**, and cancelling
+  (or losing the window there) leaves nothing but the removed temporary directory; with no window the
+  question takes its headless default, so a setup file run with `--silent` installs. A setup file installs into the per-user root only, and an existing install of
+  the app is refused (`already_installed`, 23), as is a root that is not empty or not lunepack's.
 
 ## Packager and signing keys
 
@@ -452,6 +539,9 @@ stream and the item, never the value).
 | Decoder output | exactly the signed size; decoding stops as soon as it would exceed it |
 | Root walk | each step needs signatures from both roots, so its length is bounded by real rotations; a check also stops after 1024 steps |
 | Freeze | feed and key-set expiry turn a silent freeze into a reported error |
+| UI frames (M6) | a body of at most 1 MiB, checked before allocation; name and publisher at most 128 scalars, version at most 128, location at most 4096 bytes, at most 64 leftovers of at most 4096 bytes; an icon of at most 512 KiB of PNG, decoded within 1024 by 1024 pixels and 16 MiB; at most 64 frames waiting for the UI; one liveness probe out at a time |
+| UI stalls (M6) | one write in progress at most 2 s; a hello within 20 s; an answer to a probe within 15 s; 5 s to exit after `Close`; then the engine kills its own child and goes on headless |
+| Setup trailer (M6) | the last 4096 bytes of the file, parts within FORMAT.md 4's caps and the file's size; the runtime taken from the pack at most 256 MiB |
 
 Memory budget (M4-D11, M4-D13). Staging charges each decode job `length + decoder memory + 256 KiB`
 of I/O buffers against a budget (default 256 MiB) and runs at most `min(available_parallelism, 8)`

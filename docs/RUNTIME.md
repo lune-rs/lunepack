@@ -249,6 +249,34 @@ of being closed is killed, so the mode always ends. A stopped window is logged o
 from `stalled`, `hung`, `exited`, `protocol`, `build_mismatch`, `hello_timeout` and `spawn_failed`,
 and the window's own exit code as `ui_exit_code` when it exited with one.
 
+The window and the runtime are one build (D28): the window says hello first with its build id and the
+runtime refuses another. The window's own exit codes are typed, and the runtime reads them only to
+name the reason; they carry no promise outside that build.
+
+| Window exit code | Meaning | `ui_stopped` reason |
+|---|---|---|
+| 0 | closed after the runtime's `Close` | none (the normal end) |
+| 2 | usage (anything but `--engine`) | `exited` |
+| 10 | no display, or the window system could not start | `exited` |
+| 11 | no graphics adapter (a hardware one, then a software one, D36) | `exited` |
+| 12 | the runtime sent a frame the protocol or the flow does not allow | `protocol` |
+| 13 | the runtime's end of the channel closed before `Close` | `exited` |
+| 14 | the runtime's build id is not the window's | `build_mismatch` |
+
+The reasons not tied to a code are `stalled` (a frame that did not fit the bounded queue, or one write
+in progress for more than 2 seconds), `hung` (no answer to a liveness probe within 15 seconds),
+`hello_timeout` (no hello within 20 seconds of the start; the wait never holds the operation up),
+`protocol` (also for a frame, a choice or an answer the runtime refuses) and `spawn_failed` (the
+window could not be started). A window that was never wanted or never found (the rules above) logs
+nothing. With every reason the mode goes on headless: a question open at that moment takes the
+default the loss implies, which is `cancelled` (5) before any change and the headless default after
+it (M6-D5).
+
+The uninstall's `Show folder` asks the runtime to open the folder of one leftover it listed. The
+runtime checks the index against that list and starts the desktop's opener on the folder
+(`xdg-open <folder>`, without a shell, found among the absolute entries of `PATH`), at most once a second; it changes nothing.
+The window opens nothing itself.
+
 ## Cancel
 
 End the child process (SIGTERM). A download keeps its partial file and resumes on the next run.
