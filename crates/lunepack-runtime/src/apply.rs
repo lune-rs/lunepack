@@ -13,11 +13,11 @@
 //!    from the previous version's config;
 //! 3. **gc**, after the previous version was relaunched (detached, without the token).
 //!
-//! An apply that fails after the wait (window 1 refuses: no usable config, nothing staged, a held
-//! lock, a disk or state error) changes nothing and starts the version that exited again, detached
-//! and without the token, so the app comes back; the exit code is the failure. It does not when the
-//! record moved on (a version pending, or another current): another applier or a rollback
-//! elsewhere has started the app already.
+//! An apply that fails after the wait (window 1 refuses: no usable config, nothing staged, the
+//! version that exited still pending its health check, a held lock, a disk or state error) changes
+//! nothing and starts the version that exited again, detached and without the token, so the app
+//! comes back; the exit code is the failure. It does not when the record moved on (another version
+//! current or pending): another applier or a rollback elsewhere has started the app already.
 //!
 //! The process waited for is only waited for; the only process ever signalled is the own child.
 //! Every per-version fact (entry, health timeout, install metadata) comes from that version's own
@@ -393,13 +393,15 @@ fn roll_back(
 /// After an apply that changed nothing: starts the version that just exited again, detached, with
 /// the restart arguments and without the health token (best effort; a failure is a warning).
 ///
-/// Only when the record shows that nothing moved on (F17): no version pending, and the current
-/// version is this runtime's own tree's, the version that just exited. Another applier that
-/// applied the version first (a second app instance, or `apply-and-restart` called twice) has
-/// launched it already, and a rollback elsewhere has relaunched the previous version; starting
-/// one more instance would run it twice and, unsupervised, count a start against a pending
-/// version. `unmoved` is that judgement on the record window 1 loaded under the lock; when it did
-/// not get that far, the record is read here, and when it cannot be read the own tree is started
+/// Only when the record shows that nothing moved on (F17, F19): the current version is this
+/// runtime's own tree's, the version that just exited, and no other version is pending. Another
+/// applier that applied the version first (a second app instance, or `apply-and-restart` called
+/// twice) has launched it already, and a rollback elsewhere has relaunched the previous version;
+/// starting one more instance would run it twice and, unsupervised, count a start against a
+/// pending version. The version that exited may itself still be pending (it asked for the update
+/// before it confirmed): it is started again, and that start counts as an unconfirmed one.
+/// `unmoved` is that judgement on the record window 1 loaded under the lock; when it did not get
+/// that far, the record is read here, and when it cannot be read the own tree is started
 /// (M5-D18). The entry comes from the version's own config, else from this runtime's own tree.
 fn relaunch_current(
     ad: &Adapters,
@@ -435,14 +437,20 @@ fn relaunch_current(
     }
 }
 
-/// Whether `record` is where the app that exited for this apply left it: nothing pending, and
-/// `exited` current.
+/// Whether `record` is where the app that exited for this apply left it: `exited` current, and no
+/// other version pending. `exited` may itself be pending (F19): it was started for its health
+/// check and exited before it confirmed, so the core refused the apply; that is not a move.
+/// Another applier's commit makes its version current, and a rollback elsewhere of `exited`
+/// makes the previous version current: both are moves.
 fn nothing_moved_on(record: &InstallState, exited: &Version) -> bool {
-    record.pending.is_none()
+    record
+        .current
+        .as_ref()
+        .is_some_and(|c| same(&c.version, exited))
         && record
-            .current
+            .pending
             .as_ref()
-            .is_some_and(|c| same(&c.version, exited))
+            .is_none_or(|p| same(&p.version, exited))
 }
 
 /// The outcome of [`run_apply`] before it is reported.
@@ -503,8 +511,8 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
         Ok(applied) => applied,
         Err(Refused { kind, unmoved }) => {
             // The app has exited for this apply; nothing was committed, so it starts again as
-            // the version it was, unless the record moved on (F10, F17). The failure stays the
-            // exit kind.
+            // the version it was, unless the record moved on (F10, F17, F19). The failure stays
+            // the exit kind.
             relaunch_current(ad, inst, &layout, unmoved, &args.restart, events);
             return End::Failed(kind);
         }
@@ -581,4 +589,78 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
         gc(ad, inst, me, events);
     }
     end
+}
+
+#[cfg(test)]
+mod tests {
+    use lunepack::{Sha256Digest, Target, Version};
+    use lunepack_core::TokenCheck;
+    use lunepack_core::state::{InstallState, PendingRef, Scope, StagedRef};
+
+    use super::nothing_moved_on;
+
+    const TARGET: Target = Target::LinuxX86_64;
+    const INSTALL_ID: [u8; 16] = [3; 16];
+
+    fn v(text: &str) -> Version {
+        Version::parse(text).expect("version")
+    }
+
+    fn empty() -> InstallState {
+        let app = lunepack_testkit::sample_update_config().app_id;
+        InstallState::new(1, app, Scope::User, INSTALL_ID, TARGET)
+    }
+
+    /// `record` with `staged` staged (bound).
+    fn staging(record: &InstallState, staged: &str) -> InstallState {
+        let digest = Sha256Digest::from_bytes([1; 32]);
+        record.set_staged(Some((StagedRef::new(v(staged), TARGET, digest), 20)))
+    }
+
+    /// `current` installed and confirmed, `staged` staged.
+    fn installed(current: &str, staged: &str) -> InstallState {
+        staging(&empty().install(v(current), 10, TARGET, INSTALL_ID), staged)
+    }
+
+    /// `to` applied over `from` by the core's transition: pending its health check.
+    fn applied(from: &str, to: &str) -> InstallState {
+        let token = Sha256Digest::from_bytes([7; 32]);
+        lunepack_core::apply(&installed(from, to), &v(to), token).expect("apply")
+    }
+
+    /// Every record shape the applier of 1.1.0 from 1.0.0's tree can find when its commit window
+    /// refuses. Only another version current or pending is a move (F17, F19).
+    #[test]
+    fn only_another_version_current_or_pending_is_a_move() {
+        let exited = v("1.0.0");
+        // Where the app left it (a refusal commits nothing): 1.0.0 current, confirmed.
+        assert!(nothing_moved_on(&installed("1.0.0", "1.1.0"), &exited));
+        // F19: 1.0.0 itself still pending (it asked for the update before it confirmed, so the
+        // core refused), before and after an unconfirmed start was counted.
+        let pending_self = staging(&applied("0.9.0", "1.0.0"), "1.1.0");
+        assert!(nothing_moved_on(&pending_self, &exited));
+        let (counted, _) = lunepack_core::count_attempt(&pending_self, &exited).expect("count");
+        assert!(nothing_moved_on(&counted, &exited));
+        // F17: another applier applied 1.1.0 first, pending and then confirmed.
+        let other = applied("1.0.0", "1.1.0");
+        assert!(!nothing_moved_on(&other, &exited));
+        let (confirmed, _) =
+            lunepack_core::confirm(&other, &v("1.1.0"), TokenCheck::Absent).expect("confirm");
+        assert!(!nothing_moved_on(&confirmed, &exited));
+        // F17: 1.0.0 was rolled back elsewhere; 0.9.0 is current again.
+        let rolled_back = lunepack_core::rollback(&pending_self, &exited).expect("rollback");
+        assert!(!nothing_moved_on(&rolled_back, &exited));
+        // No current version.
+        assert!(!nothing_moved_on(&staging(&empty(), "1.1.0"), &exited));
+        // A shape no core transition writes (pending is always the current version): another
+        // version pending beside 1.0.0 current.
+        let mut odd = installed("1.0.0", "1.1.0");
+        odd.pending = Some(PendingRef {
+            version: v("1.1.0"),
+            attempts: 0,
+        });
+        assert!(!nothing_moved_on(&odd, &exited));
+        // Versions match by text: the same precedence with other build metadata is another tree.
+        assert!(!nothing_moved_on(&installed("1.0.0+b", "1.1.0"), &exited));
+    }
 }
