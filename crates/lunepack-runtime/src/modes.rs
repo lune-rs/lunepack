@@ -208,6 +208,7 @@ impl Kind {
             E::NothingStaged => Kind::NothingStaged,
             E::UnexpectedVersion => Kind::UnexpectedVersion,
             E::AlreadyInstalled => Kind::AlreadyInstalled,
+            E::ForeignInstallRoot => Kind::InstallMismatch,
             E::TokenMismatch => Kind::TokenMismatch,
             E::Process(_) => Kind::Process,
             E::Integration(_) => Kind::Integration,

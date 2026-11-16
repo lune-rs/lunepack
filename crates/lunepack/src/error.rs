@@ -83,6 +83,12 @@ pub enum Error {
     /// The install already has a current version.
     #[error("already installed")]
     AlreadyInstalled,
+    /// The first install's root exists and is not lunepack's: it is not a real directory, or it
+    /// is not empty and holds neither this app's install state nor only what a run cut off
+    /// before its first record leaves. Uninstall removes the root whole, so the install takes
+    /// over nothing it did not make; nothing was written.
+    #[error("the install root holds files lunepack did not make")]
+    ForeignInstallRoot,
     /// The first install found no release for this install: the channel offers none, none whose
     /// rollout admits this install yet, or none at or above the bootstrap tree's own version.
     /// Nothing was installed; a later try may succeed.

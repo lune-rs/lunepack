@@ -353,12 +353,15 @@ to what lunepack made.
   `<R>/current/`; other files are kept and reported. Then it removes `R` without following symlinks:
   a link inside a tree is deleted, never what it points to. After an environment change (a different
   `HOME` or `XDG_DATA_HOME` than at install) the derivation no longer matches and uninstall refuses;
-  a file outside `R` that lunepack made then stays. Because uninstall removes `R` whole, `install`
-  takes over an existing `R` only when it is empty, holds a record of this app id, or holds nothing
-  but a `state` directory with the lock and record files of a run cut off before its first record;
-  any other directory at that path (the app's own data from before lunepack, another packaging's
-  directory, a shared directory such as `applications`) is `install_mismatch` and nothing is
-  written.
+  a file outside `R` that lunepack made then stays. Because uninstall removes `R` whole, the first
+  install takes over an existing `R` only when it is a real directory that is empty, holds a record
+  of this app id, or holds nothing but a `state` directory with the lock and record files of a run
+  cut off before its first record; anything else at that path (a file or symlink, the app's own data
+  from before lunepack, another packaging's directory, a shared directory such as `applications`)
+  is refused before the first write, the lock included. The check is in the facade's
+  `Updater::install`, so every caller gets it: an installer built on the crate API sees
+  `Error::ForeignInstallRoot`, the runtime's `install` mode `install_mismatch` (26). It reads `R`
+  once without the lock; it guards against accidents, not against a local process racing it.
 - The `current` link is derived from the record; a link or file at that name that is not a symlink
   is refused, never replaced.
 

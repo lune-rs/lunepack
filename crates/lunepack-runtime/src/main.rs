@@ -77,7 +77,7 @@ fn main() -> ExitCode {
                 Err(e) => return headless_fail(install::COMMAND, Kind::of(&e)),
             };
             let events = stderr_events();
-            let (kind, last) = install::run_install(ad, &boot, &events);
+            let (kind, last) = install::run_install(&boot, &events);
             conclude(events, &last);
             kind
         }),

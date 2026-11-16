@@ -1146,6 +1146,102 @@ fn a_kill_around_the_install_commit_never_leaves_current_missing() {
     common::workers_stopped();
 }
 
+/// Every path under `dir` (relative, sorted), with its kind and, for a file, its bytes.
+fn listing(fs: &dyn Fs, dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut todo = vec![PathBuf::new()];
+    while let Some(rel) = todo.pop() {
+        for e in fs.list_dir(&dir.join(&rel)).expect("list") {
+            let path = rel.join(&e.name);
+            let what = match e.kind {
+                lunepack_core::FileKind::Dir => {
+                    todo.push(path.clone());
+                    "dir".to_owned()
+                }
+                lunepack_core::FileKind::File => format!(
+                    "{:?}",
+                    fs.read_capped(&dir.join(&path), 1 << 20).expect("read")
+                ),
+                other => format!("{other:?}"),
+            };
+            out.push((path, what));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// S2: the facade's install takes over an existing root only when it is lunepack's; anything
+/// else is refused before the first write, for every caller of `Updater::install`.
+#[test]
+fn install_does_not_take_over_a_root_it_did_not_make() {
+    let _serial = common::serial();
+    let foreign: [&[(&str, &[u8])]; 3] = [
+        // The app's own user data from before lunepack, at the path lunepack derives for `R`.
+        &[("settings.ini", b"theme=dark\n")],
+        // A `state` directory that is not lunepack's.
+        &[("state/notes.txt", b"mine\n")],
+        // A lock beside other files.
+        &[("state/lock", b""), ("data.db", b"rows")],
+    ];
+    for files in foreign {
+        let lab = Lab::new();
+        publish_with_config(&lab, 1, V100);
+        let boot = bootstrap(&lab, V100);
+        for (path, bytes) in files {
+            write_file(&lab.fs, &root_dir().join(path), bytes);
+        }
+        let before = listing(&lab.fs, &root_dir());
+        let got = install(&lab, &boot);
+        assert!(
+            matches!(got, Err(Error::ForeignInstallRoot)),
+            "{files:?}: {got:?}"
+        );
+        assert_eq!(
+            listing(&lab.fs, &root_dir()),
+            before,
+            "{files:?}: R was written"
+        );
+        assert!(lab.integration.applied().is_empty(), "{files:?}");
+    }
+
+    // `R` that is a file, not a directory.
+    let lab = Lab::new();
+    publish_with_config(&lab, 1, V100);
+    let boot = bootstrap(&lab, V100);
+    write_file(&lab.fs, &root_dir(), b"not a directory");
+    let got = install(&lab, &boot);
+    assert!(matches!(got, Err(Error::ForeignInstallRoot)), "{got:?}");
+    assert_eq!(
+        lab.fs.read_capped(&root_dir(), 64).expect("file"),
+        b"not a directory"
+    );
+    common::workers_stopped();
+}
+
+/// S2: what lunepack itself leaves is taken over: an empty root, and a run cut off after its lock
+/// and before its first record.
+#[test]
+fn install_takes_over_an_empty_root_or_a_cut_off_runs_lock() {
+    let _serial = common::serial();
+    for leftover in [None, Some("state/lock")] {
+        let lab = Lab::new();
+        publish_with_config(&lab, 1, V100);
+        let boot = bootstrap(&lab, V100);
+        lab.fs.create_dir_all(&root_dir()).expect("R");
+        if let Some(path) = leftover {
+            write_file(&lab.fs, &root_dir().join(path), b"");
+        }
+        install(&lab, &boot).unwrap_or_else(|e| panic!("{leftover:?}: {e}"));
+        assert_eq!(
+            lab.record().current.expect("current").version,
+            version(V100)
+        );
+        assert_eq!(lab.current_link(), "versions/1.0.0");
+    }
+    common::workers_stopped();
+}
+
 #[test]
 fn an_integration_conflict_stops_install_before_anything_is_written() {
     let _serial = common::serial();
