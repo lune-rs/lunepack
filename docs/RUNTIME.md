@@ -144,12 +144,14 @@ staged any more, the version that exited still waits for its own health check, t
 stays held, a disk or state error), the applier starts the current version's entry again instead
 (detached, with the same arguments, without a health token), so the app that exited for the update
 comes back; its exit code is the failure's, in the log. It starts nothing when the install moved on
-meanwhile (another version current or pending): another applier, such as a second instance's, or a
-rollback has started the app already. An app that requests `apply-and-restart` on its own at start,
-rather than when the user asks, can therefore loop while the apply keeps failing. If it does so
-before it confirms its health, the apply is refused while its version is pending, every start again
-counts as an unconfirmed one, and the fourth rolls that version back (see the health handshake
-below): confirm first. Because the applier holds none of the caller's streams, a shell capture
+meanwhile (another version current or pending, or the version to apply marked bad): another
+applier, such as a second instance's, or a rollback has started the app already (lunepack marks a
+version bad only when it rolls it back, and the rollback starts the previous version). An app that
+requests `apply-and-restart` on its own at start, rather than when the user asks, can therefore
+loop while the apply keeps failing. If it does so before it confirms its health, the apply is
+refused while its version is pending, every start again counts as an unconfirmed one, and the
+fourth rolls that version back (see the health handshake below): confirm first. Because the
+applier holds none of the caller's streams, a shell capture
 (`x=$(lunepack-runtime apply-and-restart --json)`) returns as soon as the command exits.
 
 The process the applier waits for is named by its pid and start time, so a pid that the system
@@ -178,7 +180,7 @@ calls `apply-and-restart`, which starts `apply` itself.
 
 | Mode | Started by | What it does |
 |---|---|---|
-| `apply --wait-pid <pid> --wait-start <ticks> --version <version> [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. An apply that fails after the wait changes nothing and starts the version that exited again (without the token), unless the state moved on (another version current or pending): then another applier, such as a second instance's, or a rollback has started the app already. Exit codes 20 to 22 are its own. |
+| `apply --wait-pid <pid> --wait-start <ticks> --version <version> [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. An apply that fails after the wait changes nothing and starts the version that exited again (without the token), unless the state moved on (another version current or pending, or the version to apply marked bad): then another applier, such as a second instance's, or a rollback has started the app already. Exit codes 20 to 22 are its own. |
 | `install` | the first-install flow, from a bootstrap tree | Installs the newest release the tree's own channel offers (M5-D8): the root, feed and channel come only from that tree's update configuration. Exit codes 23, 24, 26 and 27 are its own. |
 | `uninstall` | the uninstall flow, from a tree of the install | Removes the install this runtime stands in and the desktop integration lunepack made (M5-D10): the install root leaves its path in one rename before it is deleted, so a cut-off uninstall leaves it whole or gone, and the next install or uninstall deletes what is left. Exit codes 24, 25 and 26 are its own. |
 

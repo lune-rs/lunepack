@@ -129,6 +129,10 @@ mod linux {
             a_record_that_moved_on_starts_nothing_more,
         ),
         (
+            "an_apply_another_applier_rolled_back_starts_nothing_more",
+            an_apply_another_applier_rolled_back_starts_nothing_more,
+        ),
+        (
             "an_unconfirmed_version_that_exits_to_apply_starts_again",
             an_unconfirmed_version_that_exits_to_apply_starts_again,
         ),
@@ -951,6 +955,42 @@ mod linux {
             "an app was started: {}",
             lab.notes()
         );
+    }
+
+    /// F21: another applier for the same version (`apply-and-restart` called twice) applied it,
+    /// the version crashed, and that applier rolled it back and started 1.0.0 again, all before
+    /// this applier's commit window. The record is back where the app left it (1.0.0 current,
+    /// nothing pending) except that 1.1.0 is bad: this applier is refused and starts nothing more.
+    fn an_apply_another_applier_rolled_back_starts_nothing_more(lab: &Lab) {
+        lab.tree(V100, "bin/app", "exit0", 30);
+        lab.tree(V110, "bin/app", "crash", 30);
+        lab.install(V110);
+        lab.commit(|r| {
+            let applied = lunepack_core::apply(
+                r.expect("record"),
+                &version(V110),
+                sha(b"the other applier"),
+            )
+            .expect("apply");
+            lunepack_core::rollback(&applied, &version(V110)).expect("rollback")
+        });
+        let before = lab.record();
+        assert_eq!(
+            before.current.as_ref().map(|c| c.version.clone()),
+            Some(version(V100))
+        );
+        assert!(before.pending.is_none() && before.staged.is_none());
+        assert!(before.bad.contains(&version(V110)));
+        let (code, _) = lab.apply(V100, target("0.1"), V110);
+        assert_eq!(code, 12);
+        assert_eq!(lab.record(), before);
+        assert!(log_has(lab, "\"kind\":\"nothing_staged\""));
+        assert!(
+            !lab.wait_note(" start ", NO_START_WAIT),
+            "an app was started: {}",
+            lab.notes()
+        );
+        assert!(!log_has(lab, "relaunch_failed"));
     }
 
     /// `staged` staged (bound) in `record`, with the core's real writer.
