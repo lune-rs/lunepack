@@ -89,6 +89,45 @@ pub(crate) fn static_wrapped(
     size
 }
 
+/// `s` wrapped to `w` and cut to `max_lines`: when it needs more, the last line is elided with an
+/// ellipsis. Exposed as one static-text node. Returns the height drawn.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn clamped_text(
+    ui: &mut Ui<'_>,
+    key: &str,
+    emit: bool,
+    x: f32,
+    y: f32,
+    w: f32,
+    s: &str,
+    style: lune_ui::text::Style,
+    max_lines: usize,
+) -> f32 {
+    let spec = Spec::plain(s, style).wrapped(w);
+    let lines = ui.painter().text_lines(&spec);
+    let height = if lines.len() <= max_lines {
+        ui.painter().text(&spec, x, y).1
+    } else {
+        // The first lines as they wrap, the last one carrying the rest, cut to the width.
+        let mut cursor = y;
+        for line in &lines[..max_lines - 1] {
+            let part = s.get(line.start..line.end).unwrap_or_default().trim_end();
+            cursor += ui.painter().text(&Spec::plain(part, style), x, cursor).1;
+        }
+        let rest = s.get(lines[max_lines - 1].start..).unwrap_or_default();
+        let one = ui.painter().elide(&Spec::plain(rest, style), w);
+        cursor += ui.painter().text(&one, x, cursor).1;
+        cursor - y
+    };
+    if emit {
+        let id = ui.id(key);
+        let mut node = Node::new(id, Role::StaticText, s, Rect::new(x, y, w, height));
+        node.value = Some(Value::Text(s.to_owned()));
+        ui.node(node);
+    }
+    height
+}
+
 /// The width of `s` in `style`.
 pub(crate) fn measure(ui: &mut Ui<'_>, s: &str, style: lune_ui::text::Style) -> f32 {
     ui.painter().measure(&Spec::plain(s, style)).0
@@ -99,9 +138,9 @@ pub(crate) fn label_style(color: Rgba) -> lune_ui::text::Style {
     look::style(13.0, 17.0, 500, color)
 }
 
-/// A button's width: its label and 16 px each side.
-pub(crate) fn button_width(ui: &mut Ui<'_>, label: &str) -> f32 {
-    measure(ui, label, label_style([255; 4])) + 32.0
+/// A button's width: its label and `pad` px each side.
+pub(crate) fn button_width(ui: &mut Ui<'_>, label: &str, pad: f32) -> f32 {
+    measure(ui, label, label_style([255; 4])) + 2.0 * pad
 }
 
 /// What a button reported.
@@ -124,21 +163,32 @@ pub(crate) fn button(
     kind: ButtonKind,
     enabled: bool,
     interactive: bool,
+    label_color: Option<Rgba>,
 ) -> ButtonOut {
     if !interactive {
         let theme = *ui.theme();
-        let look = ButtonLook::of(&theme, kind, ButtonState::default());
+        let mut look = ButtonLook::of(&theme, kind, ButtonState::default());
+        look.label = label_color.unwrap_or(look.label);
         paint_button(ui, rect, label, &look, 0.0);
         return ButtonOut::default();
     }
     if enabled {
-        button_live(ui, key, rect, label, kind)
+        button_live(ui, key, rect, label, kind, label_color)
     } else {
-        ui.with_enabled(false, |ui| button_live(ui, key, rect, label, kind))
+        ui.with_enabled(false, |ui| {
+            button_live(ui, key, rect, label, kind, label_color)
+        })
     }
 }
 
-fn button_live(ui: &mut Ui<'_>, key: &str, rect: Rect, label: &str, kind: ButtonKind) -> ButtonOut {
+fn button_live(
+    ui: &mut Ui<'_>,
+    key: &str,
+    rect: Rect,
+    label: &str,
+    kind: ButtonKind,
+    label_color: Option<Rgba>,
+) -> ButtonOut {
     let id = ui.id(key);
     let theme = *ui.theme();
     let mut r = ui.interact(id, rect, Sense::CLICK_FOCUS);
@@ -156,7 +206,7 @@ fn button_live(ui: &mut Ui<'_>, key: &str, rect: Rect, label: &str, kind: Button
     let ring = ui.animate_f32(id.with("ring"), target.ring, &FOCUS);
     let look = ButtonLook {
         fill,
-        label: target.label,
+        label: label_color.unwrap_or(target.label),
         scale,
         ring,
     };
@@ -359,6 +409,7 @@ pub(crate) fn check_mark(
 pub(crate) enum Tone {
     Running,
     Ok,
+    Warn,
     Err,
 }
 
@@ -378,6 +429,13 @@ impl Tone {
                 [0xB3, 0xE8, 0xC6],
                 0.6,
                 [115, 201, 145, 102],
+            ),
+            Tone::Warn => (
+                [0x8A, 0x6F, 0x1F],
+                [0xE2, 0xB9, 0x3D],
+                [0xF3, 0xDC, 0x94],
+                0.65,
+                [226, 185, 61, 102],
             ),
             Tone::Err => (
                 [0x8E, 0x3B, 0x43],
@@ -421,16 +479,11 @@ pub(crate) fn bar(
         p.shadow(fill, 3.0, 5.0, glow);
         p.pop_clip();
         p.push_clip_rounded(fill, 3.0);
-        let split = fw * stop;
-        // Drawn 2 px past the stop and covered by the second half, so no seam shows at the join.
-        let overlap = (fw - split).min(2.0);
-        p.linear(
-            Rect::new(x, y, split + overlap, 6.0),
-            0.0,
-            rgb(a),
-            rgb(b),
-            0.0,
-        );
+        // The two halves meet on a whole device pixel, so neither edge is antialiased against the
+        // other (an overlap would show as a seam while the bar fades).
+        let sc = p.s.max(1.0);
+        let split = (((x + fw * stop) * sc).round() / sc - x).clamp(0.0, fw);
+        p.linear(Rect::new(x, y, split, 6.0), 0.0, rgb(a), rgb(b), 0.0);
         p.linear(
             Rect::new(x + split, y, fw - split, 6.0),
             0.0,
@@ -564,4 +617,81 @@ pub(crate) fn failure_mark(
         look::tint(ERR, bang),
     );
     painter.pop_xform();
+}
+
+/// One sweep of the indeterminate bar.
+pub(crate) const SWEEP_PERIOD: Duration = Duration::from_millis(2400);
+/// One breath of the Reduced indeterminate bar.
+pub(crate) const BREATH_PERIOD: Duration = Duration::from_millis(1800);
+
+/// An indeterminate 6 px bar at `(x, y)` over `w`: a soft band sweeps across the track every 2.4 s
+/// under Full; under Reduced the band fills the track and breathes in opacity (0.38 to 1, 1.8 s,
+/// no movement); under Off it holds at 0.38.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn indeterminate_bar(
+    ui: &mut Ui<'_>,
+    key: &str,
+    emit: Option<&str>,
+    x: f32,
+    y: f32,
+    w: f32,
+    t: Duration,
+    tier: MotionTier,
+) {
+    let track = Rect::new(x, y, w, 6.0);
+    let (lo, mid, hi) = ([0x9A, 0xA1, 0xA9], [0x9A, 0xA1, 0xA9], [0xE2, 0xE5, 0xE8]);
+    let rgba = |c: [u8; 3], a: u8| [c[0], c[1], c[2], a];
+    let p = ui.painter();
+    p.fill(track, 3.0, white(0.08));
+    p.ring(track, 3.0, 1.0, white(0.05), false);
+    p.push_clip_rounded(track, 3.0);
+    let (left, bw, alpha) = match tier {
+        MotionTier::Full => {
+            let e = cubic_bezier(0.45, 0.0, 0.55, 1.0, crate::anim::phase(t, SWEEP_PERIOD));
+            let bw = 0.35 * w;
+            (x + bw * (-1.0 + 3.9 * e), bw, 1.0)
+        }
+        MotionTier::Reduced => {
+            let ph = crate::anim::phase(t, BREATH_PERIOD);
+            let tri = if ph < 0.5 { ph * 2.0 } else { (1.0 - ph) * 2.0 };
+            (
+                x,
+                w,
+                0.38 + 0.62 * (0.5 - 0.5 * (std::f32::consts::PI * tri).cos()),
+            )
+        }
+        MotionTier::Off => (x, w, 0.38),
+    };
+    p.push_xform(Xform {
+        origin: (x, y),
+        scale: 1.0,
+        dx: 0.0,
+        dy: 0.0,
+        alpha,
+    });
+    // The segments meet on whole device pixels, so no antialiased edge pair leaves a seam.
+    let sc = p.s.max(1.0);
+    let snap = |v: f32| (v * sc).round() / sc;
+    let edges = [0.0, 0.4, 0.6, 1.0].map(|k| snap(left + bw * k));
+    let stops = [(lo, 0, mid, 255), (mid, 255, hi, 255), (hi, 255, hi, 0)];
+    for (i, (c0, a0, c1, a1)) in stops.into_iter().enumerate() {
+        let (x0, x1) = (edges[i], edges[i + 1]);
+        if x1 > x0 {
+            p.linear(
+                Rect::new(x0, y, x1 - x0, 6.0),
+                0.0,
+                rgba(c0, a0),
+                rgba(c1, a1),
+                0.0,
+            );
+        }
+    }
+    p.pop_xform();
+    p.pop_clip();
+    if let Some(name) = emit {
+        let id = ui.id(key);
+        let mut node = Node::new(id, Role::Progress, name, track);
+        node.states.insert(State::Busy);
+        ui.node(node);
+    }
 }

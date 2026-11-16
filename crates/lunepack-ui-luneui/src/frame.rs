@@ -14,9 +14,8 @@ use lunepack_core::ui::{Flow, Screen, UiMsg};
 
 use crate::anim;
 use crate::chrome;
-use crate::look;
-use crate::model::{ENTER_MS, LEAVE_MS, UiModel, WINDOW_IN_MS};
-use crate::screens::{Draw, Out, install};
+use crate::model::{CLOSE_MS, ENTER_MS, LEAVE_MS, UiModel, WINDOW_IN_MS};
+use crate::screens::{Draw, Out, install, uninstall, update};
 
 /// How far content slides when a screen changes, in logical pixels.
 const SLIDE: f32 = 12.0;
@@ -26,8 +25,9 @@ const SLIDE: f32 = 12.0;
 /// sends the message, asks for another frame while [`UiModel::animating`] says so, and registers
 /// [`UiModel::icon`] with the renderer under [`crate::ICON_IMAGE`].
 pub fn frame(ui: &mut Ui<'_>, model: &mut UiModel, t: Duration, tier: MotionTier) -> Option<UiMsg> {
-    let (w, h) = look::WINDOW;
-    chrome::background(ui, model.env.material);
+    let mt = model.metrics();
+    let (w, h) = (mt.w, mt.h);
+    chrome::background(ui, model.env.material, mt);
     if matches!(model.screen(), Screen::Idle | Screen::Closed) {
         return None;
     }
@@ -49,20 +49,50 @@ pub fn frame(ui: &mut Ui<'_>, model: &mut UiModel, t: Duration, tier: MotionTier
             alpha: p_in,
         });
     }
+    // After an update the window fades out: a fade and a settle to 0.98 over 180 ms.
+    let closing = model.closing_since;
+    if let Some(since) = closing {
+        let p_out = if anim::animates(tier) {
+            anim::eased(Easing::QuadIn, t, since, CLOSE_MS)
+        } else {
+            1.0
+        };
+        ui.painter().push_xform(Xform {
+            origin: (w / 2.0, h / 2.0),
+            scale: if anim::moves(tier) {
+                1.0 - 0.02 * p_out
+            } else {
+                1.0
+            },
+            dx: 0.0,
+            dy: 0.0,
+            alpha: 1.0 - p_out,
+        });
+    }
 
     chrome::glow(ui, model, t, tier);
     chrome::rail(ui, model, t, tier);
 
     let title = match model.state().flow() {
         Some(Flow::Install) => format!("Install {}", model.name),
-        _ => model.name.clone(),
+        Some(Flow::Uninstall) => format!("Uninstall {}", model.name),
+        Some(Flow::Update) => format!("Update {}", model.name),
+        None => model.name.clone(),
     };
     let dialog_id = ui.id("window");
     let out = ui.node_container(
         Node::new(dialog_id, Role::Dialog, &title, Rect::new(0.0, 0.0, w, h)),
         |ui| main_area(ui, model, t, tier),
     );
-    let close_clicked = chrome::caption_buttons(ui, true);
+    let (minimize, close_button) = match model.state().flow() {
+        Some(Flow::Update) => (true, false),
+        Some(Flow::Uninstall) => (false, true),
+        _ => (true, true),
+    };
+    let close_clicked = chrome::caption_buttons(ui, true, w, minimize, close_button);
+    if closing.is_some() {
+        ui.painter().pop_xform();
+    }
     if appearing {
         ui.painter().pop_xform();
     }
@@ -137,6 +167,7 @@ fn main_area(ui: &mut Ui<'_>, model: &UiModel, t: Duration, tier: MotionTier) ->
             t,
             tier,
             live: false,
+            mt: model.metrics(),
             enter_at,
         };
         draw(ui, &d);
@@ -157,6 +188,7 @@ fn main_area(ui: &mut Ui<'_>, model: &UiModel, t: Duration, tier: MotionTier) ->
         t,
         tier,
         live: true,
+        mt: model.metrics(),
         enter_at,
     };
     let out = draw(ui, &d);
@@ -169,6 +201,8 @@ fn main_area(ui: &mut Ui<'_>, model: &UiModel, t: Duration, tier: MotionTier) ->
 fn draw(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
     match d.m.state().flow() {
         Some(Flow::Install) => install::main(ui, d),
-        _ => Out::default(),
+        Some(Flow::Update) => update::main(ui, d),
+        Some(Flow::Uninstall) => uninstall::main(ui, d),
+        None => Out::default(),
     }
 }

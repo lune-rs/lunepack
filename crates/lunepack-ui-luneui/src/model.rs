@@ -54,6 +54,8 @@ impl Env {
 
 /// How long the window takes to appear, in ms.
 pub const WINDOW_IN_MS: u64 = 250;
+/// How long the window takes to fade out after an update, in ms.
+pub const CLOSE_MS: u64 = 180;
 /// How long the old content takes to leave, in ms.
 pub const LEAVE_MS: u64 = 180;
 /// How long the new content takes to arrive, in ms.
@@ -86,6 +88,8 @@ pub(crate) struct View {
     pub steps: u16,
     pub caption: Option<(u64, u64)>,
     pub fail_code: Option<u32>,
+    pub outcome: Option<Outcome>,
+    pub known: bool,
     pub launch: bool,
     pub prompt: Option<(u32, lunepack_core::ui::PromptKind)>,
     pub cancellable: bool,
@@ -117,6 +121,9 @@ fn rail_index(flow: Option<Flow>, screen: Screen) -> usize {
         (Some(Flow::Install), Screen::InstallWelcome) => 0,
         (Some(Flow::Install), Screen::Installing | Screen::InstallFailed) => 1,
         (Some(Flow::Install), Screen::InstallDone) => 2,
+        (Some(Flow::Uninstall), Screen::UninstallConfirm) => 0,
+        (Some(Flow::Uninstall), Screen::Uninstalling | Screen::UninstallFailed) => 1,
+        (Some(Flow::Uninstall), Screen::UninstallDone) => 2,
         _ => 0,
     }
 }
@@ -155,7 +162,8 @@ pub struct UiModel {
     pub(crate) icon: Option<ImageData>,
     steps: u16,
     caption: Option<(u64, u64)>,
-    stage_frac: f32,
+    frac: f32,
+    known: bool,
     bar_from: f32,
     bar_to: f32,
     bar_since: Duration,
@@ -171,6 +179,8 @@ pub struct UiModel {
     pub(crate) done_since: [Option<Duration>; 3],
     pub(crate) launch: bool,
     minimize: bool,
+    pub(crate) closing_since: Option<Duration>,
+    pub(crate) dim_since: Option<Duration>,
 }
 
 impl UiModel {
@@ -187,7 +197,8 @@ impl UiModel {
             icon: None,
             steps: 0,
             caption: None,
-            stage_frac: 0.0,
+            frac: 0.0,
+            known: false,
             bar_from: 0.0,
             bar_to: 0.0,
             bar_since: Duration::ZERO,
@@ -203,12 +214,19 @@ impl UiModel {
             done_since: [None; 3],
             launch: true,
             minimize: false,
+            closing_since: None,
+            dim_since: None,
         }
     }
 
     /// The reducer's state.
     pub fn state(&self) -> &FlowState {
         &self.state
+    }
+
+    /// The sizes of the window this flow shows.
+    pub fn metrics(&self) -> crate::look::Metrics {
+        crate::look::Metrics::of(self.state.flow())
     }
 
     /// The screen to show.
@@ -256,6 +274,8 @@ impl UiModel {
                 Some(Outcome::Failed { code } | Outcome::UninstallFailed { code }) => Some(*code),
                 _ => None,
             },
+            outcome: self.state.outcome().cloned(),
+            known: self.known,
             launch: self.launch,
             prompt: self.state.open_prompt(),
             cancellable: self.state.cancellable(),
@@ -283,23 +303,32 @@ impl UiModel {
                 self.opened = t;
             }
             EngineMsg::Progress { phase, done, total } => {
-                if *total > 0
-                    && matches!(phase, Phase::Download | Phase::Stage | Phase::Install)
-                    && self.steps & bit(StepItem::Stage) == 0
-                {
+                let counts = match self.state.flow() {
+                    Some(Flow::Install) => {
+                        matches!(phase, Phase::Download | Phase::Stage | Phase::Install)
+                            && self.steps & bit(StepItem::Stage) == 0
+                    }
+                    Some(Flow::Update) => matches!(phase, Phase::Apply),
+                    Some(Flow::Uninstall) => matches!(phase, Phase::Uninstall),
+                    None => false,
+                };
+                if counts && *total > 0 {
                     self.caption = Some((*done, *total));
-                    self.stage_frac = (*done as f64 / *total as f64).clamp(0.0, 1.0) as f32;
+                    self.frac = (*done as f64 / *total as f64).clamp(0.0, 1.0) as f32;
+                    self.known = true;
                 }
             }
             EngineMsg::Step { item } => {
                 self.steps |= bit(*item);
                 if *item == StepItem::Stage {
-                    self.stage_frac = 1.0;
+                    self.frac = 1.0;
                     if let Some((_, total)) = self.caption {
                         self.caption = Some((total, total));
                     }
                 }
             }
+            EngineMsg::Outcome(Outcome::Updated) => self.closing_since = Some(t),
+            EngineMsg::Outcome(Outcome::Uninstalled { .. }) => self.dim_since = Some(t),
             _ => {}
         }
         self.sync(&before, t);
@@ -321,7 +350,8 @@ impl UiModel {
         {
             self.steps = 0;
             self.caption = None;
-            self.stage_frac = 0.0;
+            self.frac = 0.0;
+            self.known = false;
         }
         self.sync(&before, t);
         Ok(())
@@ -329,11 +359,17 @@ impl UiModel {
 
     fn bar_target(&self) -> f32 {
         match self.state.outcome() {
-            Some(Outcome::Installed | Outcome::Updated | Outcome::Uninstalled { .. }) => 1.0,
+            Some(
+                Outcome::Installed
+                | Outcome::Updated
+                | Outcome::RolledBack { .. }
+                | Outcome::Uninstalled { .. },
+            ) => 1.0,
             Some(Outcome::Failed { .. } | Outcome::UninstallFailed { .. }) => self.bar_to,
             // One fraction drives the bar, the percentage and the bytes: the staged bytes done of
             // the total. Nothing before the first byte pair; full once the files are staged.
-            _ => self.stage_frac,
+            _ if self.state.screen() == Screen::UpdateStarting => 1.0,
+            _ => self.frac,
         }
     }
 
@@ -356,7 +392,8 @@ impl UiModel {
             self.rail_since = t;
         }
         for (i, since) in self.done_since.iter_mut().enumerate() {
-            let finished = i < idx && self.state.flow() == Some(Flow::Install);
+            let finished =
+                i < idx && matches!(self.state.flow(), Some(Flow::Install | Flow::Uninstall));
             match (finished, *since) {
                 (true, None) => *since = Some(t),
                 (false, Some(_)) => *since = None,
@@ -384,17 +421,30 @@ impl UiModel {
                 | Screen::UpdateStarting
                 | Screen::Uninstalling
         ) && self.state.outcome().is_none();
-        (running && anim::moves(tier))
+        (running && anim::animates(tier) && (anim::moves(tier) || !self.known))
             || anim::running(t, self.opened, WINDOW_IN_MS)
             || anim::running(t, self.screen_since, LEAVE_MS + ENTER_MS)
             || anim::running(t, self.glow_since, GLOW_MS)
             || anim::running(t, self.rail_since, RAIL_MS)
+            || self
+                .closing_since
+                .is_some_and(|s| anim::running(t, s, CLOSE_MS))
+            || self.dim_since.is_some_and(|s| anim::running(t, s, GLOW_MS))
             || anim::running(t, self.bar_since, BAR_MS)
             || self
                 .done_since
                 .iter()
                 .flatten()
                 .any(|s| anim::running(t, *s, MARK_MS))
+    }
+
+    /// Whether the window may be closed now: the engine closed it, or the update finished and the
+    /// window has faded out (`Outcome::Updated`, 180 ms). The binary closes the window then.
+    pub fn closable(&self, t: Duration, tier: lune_ui::motion::MotionTier) -> bool {
+        self.is_closed()
+            || self
+                .closing_since
+                .is_some_and(|s| !anim::animates(tier) || !anim::running(t, s, CLOSE_MS))
     }
 
     /// The answer to the window's close button or the OS close request: the screen's Cancel or
@@ -417,12 +467,18 @@ impl UiModel {
                 match kind {
                     K::Welcome | K::Confirm => vec![c(ChoiceValue::Cancel)],
                     K::Failed => vec![c(ChoiceValue::Close)],
+                    K::Done if self.state.flow() == Some(Flow::Uninstall) => {
+                        vec![c(ChoiceValue::Close)]
+                    }
                     K::Done if finish_ok => vec![
                         c(ChoiceValue::Finish { launch: false }),
                         c(ChoiceValue::Close),
                     ],
                     K::Done => vec![],
-                    K::RolledBack => vec![c(ChoiceValue::Acknowledge)],
+                    // Esc has nothing to cancel on a rolled-back update; the window's close
+                    // button (which the update window lacks) and Enter acknowledge it.
+                    K::RolledBack if finish_ok => vec![c(ChoiceValue::Acknowledge)],
+                    K::RolledBack => vec![],
                 }
             }
             None => vec![UiMsg::Cancel],

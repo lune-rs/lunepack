@@ -217,3 +217,214 @@ pub fn install_failed(os: Os, proceed_ms: u64, fail_ms: u64, code: u32) -> Vec<T
     ));
     s
 }
+
+/// The version an update goes to.
+pub const NEW_VERSION: &str = "1.5.0";
+
+/// The hello of an update window: the demo app going from [`APP_VERSION`] to [`NEW_VERSION`].
+pub fn update_hello() -> EngineMsg {
+    EngineMsg::Hello {
+        build_id: build_id(),
+        flow: Flow::Update,
+        app: AppCard {
+            name: APP_NAME.to_owned(),
+            version: NEW_VERSION.to_owned(),
+            from_version: Some(APP_VERSION.to_owned()),
+            publisher: None,
+            icon_png: Some(sample_icon_png()),
+        },
+        details: Details {
+            location: None,
+            size_bytes: None,
+        },
+    }
+}
+
+/// The update window waiting for the app to close, open at 0 ms.
+pub fn update_waiting() -> Vec<Timed> {
+    vec![at(0, Step::Engine(update_hello()))]
+}
+
+/// Waiting, then applying from `apply_ms` with `percent` done.
+pub fn update_applying(apply_ms: u64, percent: u64) -> Vec<Timed> {
+    let mut s = update_waiting();
+    s.push(at(
+        apply_ms,
+        Step::Engine(EngineMsg::Progress {
+            phase: Phase::Apply,
+            done: percent,
+            total: 100,
+        }),
+    ));
+    s
+}
+
+/// Applying (74 %), then starting the new version from `start_ms`.
+pub fn update_starting(apply_ms: u64, start_ms: u64) -> Vec<Timed> {
+    let mut s = update_applying(apply_ms, 74);
+    s.push(at(
+        start_ms,
+        Step::Engine(EngineMsg::Progress {
+            phase: Phase::Launch,
+            done: 0,
+            total: 0,
+        }),
+    ));
+    s
+}
+
+/// Starting, then rolled back at `rb_ms`, with the OK prompt.
+pub fn update_rolled_back(apply_ms: u64, start_ms: u64, rb_ms: u64) -> Vec<Timed> {
+    let mut s = update_starting(apply_ms, start_ms);
+    s.push(at(
+        rb_ms,
+        Step::Engine(EngineMsg::Outcome(Outcome::RolledBack {
+            from: NEW_VERSION.to_owned(),
+            to: APP_VERSION.to_owned(),
+        })),
+    ));
+    s.push(at(
+        rb_ms,
+        Step::Engine(EngineMsg::Prompt {
+            id: 1,
+            kind: PromptKind::RolledBack,
+        }),
+    ));
+    s
+}
+
+/// Applying (74 %), then a failure with `code` at `fail_ms`, with the failed prompt.
+pub fn update_failed(apply_ms: u64, fail_ms: u64, code: u32) -> Vec<Timed> {
+    let mut s = update_applying(apply_ms, 74);
+    s.push(at(
+        fail_ms,
+        Step::Engine(EngineMsg::Outcome(Outcome::Failed { code })),
+    ));
+    s.push(at(
+        fail_ms,
+        Step::Engine(EngineMsg::Prompt {
+            id: 1,
+            kind: PromptKind::Failed,
+        }),
+    ));
+    s
+}
+
+/// Starting, then `Updated` at `done_ms` (the window fades out).
+pub fn update_updated(apply_ms: u64, start_ms: u64, done_ms: u64) -> Vec<Timed> {
+    let mut s = update_starting(apply_ms, start_ms);
+    s.push(at(
+        done_ms,
+        Step::Engine(EngineMsg::Outcome(Outcome::Updated)),
+    ));
+    s
+}
+
+/// The hello of an uninstall.
+pub fn uninstall_hello(os: Os) -> EngineMsg {
+    EngineMsg::Hello {
+        build_id: build_id(),
+        flow: Flow::Uninstall,
+        app: AppCard {
+            name: APP_NAME.to_owned(),
+            version: APP_VERSION.to_owned(),
+            from_version: None,
+            publisher: None,
+            icon_png: Some(sample_icon_png()),
+        },
+        details: Details {
+            location: Some(location(os)),
+            size_bytes: None,
+        },
+    }
+}
+
+/// The confirm screen, open at 0 ms.
+pub fn uninstall_confirm(os: Os) -> Vec<Timed> {
+    vec![
+        at(0, Step::Engine(uninstall_hello(os))),
+        at(
+            0,
+            Step::Engine(EngineMsg::Prompt {
+                id: 1,
+                kind: PromptKind::Confirm,
+            }),
+        ),
+    ]
+}
+
+/// Confirm, the user's Uninstall at `proceed_ms`, then removing, 40 % along 1.5 s later with the
+/// shortcuts removed.
+pub fn uninstall_removing(os: Os, proceed_ms: u64) -> Vec<Timed> {
+    let mut s = uninstall_confirm(os);
+    s.push(at(proceed_ms, Step::Choose(ChoiceValue::Proceed)));
+    s.push(at(
+        proceed_ms + 300,
+        Step::Engine(EngineMsg::Step {
+            item: StepItem::Integrate,
+        }),
+    ));
+    s.push(at(
+        proceed_ms + 500,
+        Step::Engine(EngineMsg::Progress {
+            phase: Phase::Uninstall,
+            done: 40,
+            total: 100,
+        }),
+    ));
+    s
+}
+
+/// Removing, then done at `done_ms` with `leftovers`.
+pub fn uninstall_done(os: Os, proceed_ms: u64, done_ms: u64, leftovers: Vec<String>) -> Vec<Timed> {
+    let mut s = uninstall_removing(os, proceed_ms);
+    s.push(at(
+        done_ms,
+        Step::Engine(EngineMsg::Step {
+            item: StepItem::Remove,
+        }),
+    ));
+    s.push(at(
+        done_ms,
+        Step::Engine(EngineMsg::Outcome(Outcome::Uninstalled { leftovers })),
+    ));
+    s.push(at(
+        done_ms,
+        Step::Engine(EngineMsg::Prompt {
+            id: 2,
+            kind: PromptKind::Done,
+        }),
+    ));
+    s
+}
+
+/// Removing, then a failure with `code` at `fail_ms`.
+pub fn uninstall_failed(os: Os, proceed_ms: u64, fail_ms: u64, code: u32) -> Vec<Timed> {
+    let mut s = uninstall_removing(os, proceed_ms);
+    s.push(at(
+        fail_ms,
+        Step::Engine(EngineMsg::Outcome(Outcome::UninstallFailed { code })),
+    ));
+    s.push(at(
+        fail_ms,
+        Step::Engine(EngineMsg::Prompt {
+            id: 2,
+            kind: PromptKind::Failed,
+        }),
+    ));
+    s
+}
+
+/// `n` demo leftover paths under the install location of `os`; the last is over 200 characters.
+pub fn leftovers(os: Os, n: usize) -> Vec<String> {
+    let base = location(os);
+    (0..n)
+        .map(|i| {
+            if i + 1 == n && n > 1 {
+                format!("{base}/app-1.4.0/{}", "very-long-folder-name/".repeat(10))
+            } else {
+                format!("{base}/app-1.4.{i}")
+            }
+        })
+        .collect()
+}

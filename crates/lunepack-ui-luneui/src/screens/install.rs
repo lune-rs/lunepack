@@ -26,7 +26,7 @@ pub(crate) fn main(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
     }
 }
 
-fn title(ui: &mut Ui<'_>, d: &Draw<'_>, text: &str) {
+pub(crate) fn title(ui: &mut Ui<'_>, d: &Draw<'_>, text: &str) {
     widgets::static_text(
         ui,
         "title",
@@ -40,7 +40,7 @@ fn title(ui: &mut Ui<'_>, d: &Draw<'_>, text: &str) {
 }
 
 /// The line under the title, wrapped to the content; returns its bottom edge.
-fn note(ui: &mut Ui<'_>, d: &Draw<'_>, text: &str) -> f32 {
+pub(crate) fn note(ui: &mut Ui<'_>, d: &Draw<'_>, text: &str) -> f32 {
     let (_, h) = widgets::static_wrapped(
         ui,
         "note",
@@ -123,12 +123,14 @@ fn welcome(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
                 label: "Cancel",
                 kind: ButtonKind::Secondary,
                 enabled: open,
+                danger: false,
             },
             Btn {
                 name: "install",
                 label: "Install",
                 kind: ButtonKind::Primary,
                 enabled: open,
+                danger: false,
             },
         ],
     );
@@ -146,7 +148,7 @@ fn welcome(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
 }
 
 /// `text` cut at its start so its tail (the folder name of a path) stays, within `max_w`.
-fn fit_end(ui: &mut Ui<'_>, text: &str, style: Style, max_w: f32) -> String {
+pub(crate) fn fit_end(ui: &mut Ui<'_>, text: &str, style: Style, max_w: f32) -> String {
     if widgets::measure(ui, text, style) <= max_w {
         return text.to_owned();
     }
@@ -208,7 +210,7 @@ fn installing(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
     widgets::text(ui, CONTENT_X + CONTENT_W - w, 94.0, &pct, cap, None);
 
     let mut running_seen = false;
-    for (i, label) in strings::INSTALL_ROWS.iter().enumerate() {
+    for (i, label) in strings::install_rows(d.m.env.os).iter().enumerate() {
         let y = 125.0 + 26.0 * i as f32;
         let (cx, cy) = (CONTENT_X + 6.0, y + 13.0);
         let done = v.steps & step_bit(ROW_ITEMS[i]) != 0;
@@ -243,6 +245,7 @@ fn installing(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
             label: "Cancel",
             kind: ButtonKind::Secondary,
             enabled: v.cancellable,
+            danger: false,
         }],
     );
     Out {
@@ -286,6 +289,7 @@ fn done(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
             label: "Finish",
             kind: ButtonKind::Primary,
             enabled: open,
+            danger: false,
         }],
     );
     let finish = |launch| d.choice(ChoiceValue::Finish { launch });
@@ -298,15 +302,36 @@ fn done(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
 }
 
 fn failed(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
+    failed_screen(
+        ui,
+        d,
+        strings::install_failed_title(),
+        &strings::install_failed_note(d.m.env.os),
+        "Install failed",
+        true,
+    )
+}
+
+/// The failed layout both flows share: the title and a line, the error bar at the fraction
+/// reached, a card with the reason, Copy details bottom-left and Close (and, when the flow can
+/// retry, Try again) bottom-right.
+pub(crate) fn failed_screen(
+    ui: &mut Ui<'_>,
+    d: &Draw<'_>,
+    heading: &str,
+    line: &str,
+    what: &str,
+    retry: bool,
+) -> Out {
     let m = d.m;
     let code = d.v.fail_code.unwrap_or(70);
-    title(ui, d, strings::install_failed_title());
-    let note_bottom = note(ui, d, &strings::install_failed_note(m.env.os));
+    title(ui, d, heading);
+    let note_bottom = note(ui, d, line);
     let bar_y = note_bottom + 16.0;
     widgets::bar(
         ui,
         "bar",
-        d.live.then_some("Installation failed"),
+        d.live.then_some(what),
         CONTENT_X,
         bar_y,
         CONTENT_W,
@@ -338,7 +363,7 @@ fn failed(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
     }
 
     let open = d.v.prompt.is_some();
-    let copy_w = widgets::button_width(ui, "Copy details");
+    let copy_w = widgets::button_width(ui, "Copy details", d.mt.btn_pad);
     let copy_rect = Rect::new(CONTENT_X, CONTENT_BOTTOM - 32.0, copy_w, 32.0);
     let copy = widgets::button(
         ui,
@@ -348,42 +373,51 @@ fn failed(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
         ButtonKind::Secondary,
         true,
         d.live,
+        None,
     );
     if copy.clicked {
         let details = format!(
-            "{} {}\nInstall failed: {} (exit code {code})",
+            "{} {}\n{what}: {} (exit code {code})",
             m.name,
             m.version,
             strings::kind_name(code)
         );
         ui.clipboard_write(details);
     }
-    let (clicked, focused) = super::button_group(
-        ui,
-        d,
-        &[
-            Btn {
-                name: "close",
-                label: "Close",
-                kind: ButtonKind::Secondary,
-                enabled: open,
-            },
-            Btn {
-                name: "retry",
-                label: "Try again",
-                kind: ButtonKind::Primary,
-                enabled: open,
-            },
-        ],
-    );
+    let mut group = vec![Btn {
+        name: "close",
+        label: "Close",
+        kind: if retry {
+            ButtonKind::Secondary
+        } else {
+            ButtonKind::Primary
+        },
+        enabled: open,
+        danger: false,
+    }];
+    if retry {
+        group.push(Btn {
+            name: "retry",
+            label: "Try again",
+            kind: ButtonKind::Primary,
+            enabled: open,
+            danger: false,
+        });
+    }
+    let (clicked, focused) = super::button_group(ui, d, &group);
+    let primary = if retry {
+        ChoiceValue::Retry
+    } else {
+        ChoiceValue::Close
+    };
     let mut out = Out {
         focused: focused || copy.focused,
-        primary: d.choice(ChoiceValue::Retry),
+        primary: d.choice(primary),
         ..Out::default()
     };
     if clicked[0] {
         out.msg = d.choice(ChoiceValue::Close);
-    } else if clicked[1] {
+    } else if retry && clicked[1] {
         out.msg = d.choice(ChoiceValue::Retry);
     }
     out
