@@ -612,6 +612,46 @@ fn progress_coalesces_and_wakes_only_on_the_dirty_transition() {
     );
 }
 
+/// F16: a phase that starts and ends between two pumps (a short scan whose job finished before
+/// the polling task looked at it) is still delivered, at its last state, before the next phase.
+#[test]
+fn progress_never_drops_a_phase_that_ran_between_two_pumps() {
+    let _s = serial();
+    let (sink, mut pump) = progress(Phase::Scan, 0);
+    let mut events: Vec<Progress> = Vec::new();
+    let mut record = |p: &Progress| events.push(p.clone());
+
+    // Scan, then Download, then Stage, with no pump in between.
+    sink.set_phase(Phase::Scan, 0);
+    sink.set_total(30);
+    sink.add_done(30);
+    sink.set_phase(Phase::Download, 0);
+    sink.set_phase(Phase::Stage, 8);
+    sink.add_done(3);
+    assert!(pump.pump(&mut record));
+    assert!(!pump.pump(&mut record), "nothing new since the last pump");
+
+    // A phase change after everything was delivered queues nothing more.
+    sink.set_phase(Phase::Download, 4);
+    assert!(pump.pump(&mut record));
+    // Restarting the same phase replaces it: one event.
+    sink.set_phase(Phase::Download, 5);
+    sink.set_phase(Phase::Download, 6);
+    assert!(pump.pump(&mut record));
+
+    let seen: Vec<(Phase, u64, u64)> = events.iter().map(|p| (p.phase, p.done, p.total)).collect();
+    assert_eq!(
+        seen,
+        vec![
+            (Phase::Scan, 30, 30),
+            (Phase::Download, 0, 0),
+            (Phase::Stage, 3, 8),
+            (Phase::Download, 0, 4),
+            (Phase::Download, 0, 6),
+        ]
+    );
+}
+
 #[test]
 fn progress_wakes_a_task_polling_under_every_executor() {
     let _s = serial();

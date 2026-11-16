@@ -10,7 +10,8 @@
 //!   cancels from elsewhere. Partial downloads stay resumable, a half-built
 //!   tree is resumed or discarded by the next call, and state changes only at a commit.
 //! - **Progress.** The optional callback runs on the thread that polls the operation, never on a
-//!   worker, and sees coalesced counters, so a slow callback does not stall a download.
+//!   worker, and sees coalesced counters, so a slow callback does not stall a download. Every
+//!   phase that ran is delivered at least once, at its last state, before the next phase's events.
 //! - **Lock.** Every operation takes `<state dir>/lock`; another holder gives [`Error::Busy`]. The
 //!   OS releases it when a holder dies.
 //! - **Locations.** A [`Layout`] names the state, cache and versions directories. An installed

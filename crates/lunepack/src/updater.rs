@@ -594,7 +594,7 @@ pub type ProgressCallback = Box<dyn FnMut(&Progress) + Send>;
 /// Options of [`Updater::download`] (and, carried by [`Downloaded`], of [`Updater::stage`]).
 #[derive(Default)]
 pub struct DownloadOptions {
-    /// Called with coalesced progress events on the polling thread.
+    /// Called with coalesced progress events on the polling thread; no phase that ran is skipped.
     pub progress: Option<ProgressCallback>,
     /// Cancels the operation (dropping its future does too).
     pub cancel: Option<CancelToken>,
