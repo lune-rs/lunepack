@@ -4,17 +4,30 @@
 //! Workers never call the app's callback themselves, so the callback runs on the thread that polls
 //! the operation. Updates between two polls collapse into one event. A worker's update wakes the
 //! polling task only on the clean-to-dirty transition, so a flood of updates costs one wake.
+//!
+//! Coalescing never drops a whole phase (C9): a phase change while updates are still undelivered
+//! first queues the last snapshot of the phase it ends, and the next pump delivers the queued
+//! snapshots, oldest first, before the latest. A phase that starts and ends between two polls (a
+//! short scan whose job finished before its first poll) is still seen once, at its last state.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Waker;
 
 use lunepack_core::{FileProgress, Phase, Progress};
 
+/// Most phase-end snapshots kept between two pumps. Phase changes come from the operation's own
+/// code on the polling thread (a handful per operation), so the cap is never reached in practice;
+/// it only bounds memory.
+const PHASE_QUEUE_CAP: usize = 16;
+
 struct Meta {
     phase: Phase,
     total: u64,
     file: Option<FileProgress>,
+    /// The last snapshots of phases that ended with updates still undelivered, oldest first.
+    ended: VecDeque<Progress>,
 }
 
 struct Shared {
@@ -39,8 +52,8 @@ impl Shared {
         }
     }
 
-    fn snapshot(&self) -> Progress {
-        let meta = lock(&self.meta);
+    /// The current snapshot, read under the held `meta` lock.
+    fn snapshot_of(&self, meta: &Meta) -> Progress {
         Progress {
             phase: meta.phase,
             done: self.done.load(Ordering::SeqCst),
@@ -59,6 +72,7 @@ pub fn progress(phase: Phase, total: u64) -> (ProgressSink, ProgressPump) {
             phase,
             total,
             file: None,
+            ended: VecDeque::new(),
         }),
         waker: Mutex::new(None),
     });
@@ -115,10 +129,19 @@ impl ProgressSink {
         self.shared.mark_dirty();
     }
 
-    /// Starts `phase` with `total` bytes to do: `done` goes back to 0 and the file to none.
+    /// Starts `phase` with `total` bytes to do: `done` goes back to 0 and the file to none. When
+    /// the phase it ends has updates the pump has not delivered yet (its own start included), its
+    /// last snapshot is queued so the callback still sees it.
     pub fn set_phase(&self, phase: Phase, total: u64) {
         {
             let mut meta = lock(&self.shared.meta);
+            if meta.phase != phase && self.shared.dirty.load(Ordering::SeqCst) {
+                let last = self.shared.snapshot_of(&meta);
+                if meta.ended.len() >= PHASE_QUEUE_CAP {
+                    meta.ended.pop_front();
+                }
+                meta.ended.push_back(last);
+            }
             meta.phase = phase;
             meta.total = total;
             meta.file = None;
@@ -151,19 +174,28 @@ impl ProgressPump {
         }
     }
 
-    /// Calls `callback` at most once, with the latest snapshot, and only when it differs from the
-    /// last one delivered. Returns whether it was called.
+    /// Calls `callback` with the last snapshot of each phase that ended since the last pump
+    /// (oldest first), then with the latest snapshot; a snapshot equal to the one delivered just
+    /// before it is skipped. Returns whether it was called.
     pub fn pump<F: FnMut(&Progress) + ?Sized>(&mut self, callback: &mut F) -> bool {
         if !self.shared.dirty.swap(false, Ordering::SeqCst) {
             return false;
         }
-        let snapshot = self.shared.snapshot();
-        if self.last.as_ref() == Some(&snapshot) {
-            return false;
+        let (ended, snapshot) = {
+            let mut meta = lock(&self.shared.meta);
+            let ended = std::mem::take(&mut meta.ended);
+            (ended, self.shared.snapshot_of(&meta))
+        };
+        let mut called = false;
+        for event in ended.into_iter().chain(std::iter::once(snapshot)) {
+            if self.last.as_ref() == Some(&event) {
+                continue;
+            }
+            callback(&event);
+            self.last = Some(event);
+            called = true;
         }
-        callback(&snapshot);
-        self.last = Some(snapshot);
-        true
+        called
     }
 }
 
