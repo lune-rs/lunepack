@@ -71,3 +71,7 @@ lune-ui = { git = "https://github.com/lune-rs/luneui-rs", rev = "cbeae0109f970ea
 # its icon decoder (png); both are already in LuneUI's graph, so the lock gains no package.
 wgpu = "30"
 png = "0.18"
+
+# OS adapters (M6 step 9, M6-D8): the Windows reduce-motion reader calls user32 through windows-sys,
+# already in the lock for other crates; no window stack.
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
