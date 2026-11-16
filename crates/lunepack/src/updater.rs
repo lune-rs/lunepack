@@ -949,7 +949,8 @@ impl Updater {
     ///    preflight before anything is written;
     /// 2. the install state is created when there is none (a fresh install id from the random
     ///    source); a record with no current version resumes, one with a current version is
-    ///    [`Error::AlreadyInstalled`];
+    ///    [`Error::AlreadyInstalled`] once `current` is put back from it (a run cut off after its
+    ///    commit, before the link, still ends startable; a failing link is that error instead);
     /// 3. the check runs with no current version (no floor time, any release of the channel), the
     ///    newest candidate is downloaded and staged, reusing the bootstrap's files that match; no
     ///    candidate at all, or a newest candidate older than the bootstrap's own version (never a
@@ -957,7 +958,9 @@ impl Updater {
     /// 4. under the lock the installed tree's own config is read, the integration preflight runs
     ///    again on it, the integration is applied, the record names the version as current (events
     ///    `installed` and `first_run`) and `current` is linked. A failure before that commit
-    ///    leaves a record with no current version, so a rerun resumes.
+    ///    leaves a record with no current version, so a rerun resumes; a failure (or a cut-off
+    ///    run) after it leaves `current` to a rerun, which links it and is
+    ///    [`Error::AlreadyInstalled`].
     ///
     /// A machine layout is [`Error::MachineScope`].
     pub fn install(
@@ -1032,6 +1035,7 @@ async fn check(inner: Arc<Inner>) -> Result<Option<UpdateInfo>, Error> {
 async fn check_first(
     inner: &Arc<Inner>,
     cancel: &CancelToken,
+    root: &Path,
 ) -> Result<Option<UpdateInfo>, Error> {
     let lock = take_lock(inner, cancel).await?;
     let snap = on_job(inner, Some(&lock), cancel, "state-load", |inner, _| {
@@ -1039,7 +1043,15 @@ async fn check_first(
     })
     .await?;
     if snap.record().current.is_some() {
-        return Err(Error::AlreadyInstalled);
+        let record = snap.record().clone();
+        let root = root.to_path_buf();
+        let outcome = on_job(inner, Some(&lock), cancel, "reconcile", move |inner, _| {
+            Ok(already_installed(&*inner.fs, &root, &record))
+        })
+        .await;
+        return Err(match outcome {
+            Ok(e) | Err(e) => e,
+        });
     }
     check_from(inner, &lock, cancel, snap, None).await
 }
@@ -1556,6 +1568,17 @@ fn install_root_of(state_dir: &Path, versions_dir: &Path) -> Result<PathBuf, Err
     Ok(root.to_path_buf())
 }
 
+/// What a first install that finds a current version returns (F15). `current` is first put
+/// back from the record (idempotent, and never ahead of it), so a run cut off between the install
+/// commit and the link, or whose reconcile failed, still ends with a startable install; a
+/// reconcile that fails again is that error, so a retry can still fix it.
+fn already_installed(fs: &dyn Fs, root: &Path, record: &InstallState) -> Error {
+    match lunepack_core::reconcile_current(fs, root, record) {
+        Ok(()) => Error::AlreadyInstalled,
+        Err(e) => Error::from(lunepack_core::Error::Layout(e)),
+    }
+}
+
 /// The integration request for `meta` of the install at `root`.
 fn integration_request(
     app_id: &AppId,
@@ -1615,6 +1638,7 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
     // The record: created when missing, resumed when it has no current version.
     {
         let lock = take_lock(&inner, &cancel).await?;
+        let state_root = root.clone();
         on_job(
             &inner,
             Some(&lock),
@@ -1630,7 +1654,9 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
                 };
                 let loaded = store.load(&*inner.fs, &*inner.hasher)?;
                 match &loaded.record {
-                    Some(record) if record.current.is_some() => Err(Error::AlreadyInstalled),
+                    Some(record) if record.current.is_some() => {
+                        Err(already_installed(&*inner.fs, &state_root, record))
+                    }
                     Some(_) => Ok(()),
                     None => {
                         let mut install_id = [0u8; lunepack_core::policy::INSTALL_ID_BYTES];
@@ -1653,7 +1679,7 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
 
     // The bootstrap's own version is the floor (S1, D25): a replayed, still unexpired feed whose
     // newest release is older than the tree the user ran installs nothing.
-    let info = check_first(&inner, &cancel)
+    let info = check_first(&inner, &cancel, &root)
         .await?
         .filter(|info| info.version >= boot_version)
         .ok_or(Error::NoRelease)?;
@@ -1700,7 +1726,7 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
             let loaded = store.load(&*inner.fs, &*inner.hasher)?;
             let record = loaded.record.clone().ok_or(Error::NotInstalled)?;
             if record.current.is_some() {
-                return Err(Error::AlreadyInstalled);
+                return Err(already_installed(&*inner.fs, &root, &record));
             }
             let version = info.version.clone();
             let staged_here = record
@@ -1727,6 +1753,8 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
             // current version a rerun is `AlreadyInstalled`, so nothing that can fail may be left
             // for after it. Its entries point through `R/current`, which the reconcile below makes
             // valid; when the commit fails they dangle until a rerun, which applies them again.
+            // When the reconcile fails, or the run ends before it, a rerun links `current` from
+            // the committed record before it reports `AlreadyInstalled` (F15).
             inner.integration.apply(Scope::User, &request)?;
             let committed = store.commit(&*inner.fs, &loaded, &next, &*inner.hasher)?;
             lunepack_core::reconcile_current(&*inner.fs, &root, &committed)

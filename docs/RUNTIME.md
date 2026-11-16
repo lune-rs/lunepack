@@ -119,7 +119,7 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 20 | `rolled_back` | (apply) the new version failed its health check and was rolled back |
 | 21 | `wait_timeout` | (apply) the process waited for did not exit in time; nothing changed |
 | 22 | `rollback_unavailable` | (apply) the previous version cannot be started; the new one stays pending |
-| 23 | `already_installed` | (install) the install already has a current version |
+| 23 | `already_installed` | (install) the install already has a current version; `current` is linked from its record first, so a run cut off after its commit still ends startable |
 | 24 | `integration` | (install, uninstall) the desktop integration failed or is in the way |
 | 25 | `in_use` | (uninstall) a process still runs from the install |
 | 26 | `install_mismatch` | (install, uninstall) the install is not the one this environment derives |
