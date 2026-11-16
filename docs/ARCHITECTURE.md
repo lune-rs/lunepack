@@ -21,6 +21,8 @@ M4-D1 to M4-D23, M5-D2 to M5-D17).
 | `lunepack` | The app-facing facade and the composition root for apps that embed lunepack: `UpdaterBuilder` wires the default adapters (`WorkerTransport` over `UreqTransport` for `http(s)`, `DirSource` for `file:`, `StdFs`, the LZMA codec, SHA-256 and Ed25519 from `lunepack-crypto`, `SystemClock`), each swappable. `Updater` offers `check`, `download`, `stage` as `Send + 'static` futures that need no particular executor, the synchronous `installed` and `staged`, and `lunepack::blocking` for apps without a runtime. Under it, std-only task plumbing (worker jobs, bounded pipes, a built-in `block_on`, `WorkerTransport` that runs any `BlockingTransport` on worker threads, progress coalescing) and the fetch engine (documents, feed URLs, the cache, Range runs, pack resume, the full-pack fallback) (M4-D1 to M4-D3). Also `SystemClock` (M3-D5), the only wall-clock `Clock`. Since M5 it also finds an installed app from its own executable (`Installation`, which reads the update configuration of the tree and derives the install root `R`) and offers the lifecycle calls over the core's transitions: `startup`, `confirm_healthy`, `apply_and_restart` and `Updater::install` (M5-D2 to M5-D8); it wires the Linux process and integration adapters in `Platform::native`. | core, adapters |
 | `lunepack-runtime` | Binary, static musl on Linux, one per version tree and placed beside the app's entry by the packager (D28, M5-D7). Its composition root (`main.rs`) wires the Linux adapters and runs a mode named on its command line: `apply` (started detached by `apply_and_restart`: wait for the app to exit, commit the staged version, flip `current`, start it with a health token, supervise it, roll it back if it fails or does not confirm in time, then collect old trees), `install` (the first install from a bootstrap tree) and `uninstall`. Progress and results are schema-1 JSON events on its log (`R/logs/runtime.log`) or stderr; every outcome has a stable exit code. It does its work through the facade, and the same calls back the app-facing command line of D42 (`check`, `download`, `startup`, `confirm`: JSON Lines schema 1 and stable exit codes, `docs/RUNTIME.md`). Service and UI are later milestones. | core, adapters, facade |
 | `lunepack-cli` | Binary `lunepack` and the packager's composition root: `init`, `keys`, `pack`, `feed add` and `refresh`, `verify` and `inspect` (`docs/CLI.md`). It holds the I/O the core must not have: `lunepack.toml`, signer specs, the release-directory walk, the pack pipeline (assemble a temporary copy, code-sign, hash, pack on a worker pool within a memory budget, sign), self-verification of every output with the core verifiers, and placement by temp file and rename. Pure rules (codec choice, layout, manifest, signing, document writers) stay in the core (M3-D1). | core, adapters, facade |
+| `lunepack-ui-luneui` | The UI adapter (M6; a skeleton until its steps land): the installer, update and uninstall screens drawn with LuneUI. It decides nothing; the engine does. The only crate that may depend on `lune-ui`, the one dependency from a git source (D39 (b)); the GPU and window stack under it (`wgpu`, `winit`, AccessKit) is reachable only through it (below). `publish = false`. | core |
+| `lunepack-ui` | Binary `lunepack-ui` (M6; a skeleton until its steps land): the separate process the runtime spawns to show those screens. The only crate that depends on `lunepack-ui-luneui`, and no crate depends on it. | core, adapters |
 | `xtask` | Repository tooling: the boundary check, the key-container file check and the optional denylist scan. | nothing in the workspace |
 
 A language binding (a C ABI crate, later others) is one more adapter crate over the core and adds no logic.
@@ -157,7 +159,8 @@ check does not recognise is a violation, and an internal error exits 2, never 0.
   neither from crates.io nor, without a source, one of that lock's own members by name and version
   (the workspace members, or the probe's own package); this catches git and other-registry sources
   and path dependencies, including those redirected by `[patch]`, `[replace]` or a
-  `.cargo/config.toml` patch, because the lock records what cargo actually resolved. A `[patch]` or
+  `.cargo/config.toml` patch, because the lock records what cargo actually resolved. The one
+  exception is the workspace lock's LuneUI source (D39 (b), below). A `[patch]` or
   `[replace]` section in the root or a probe manifest is flagged too. The check does not read
   `.cargo/config.toml` itself; it sees a config patch only through the lock it produced.
 - `fuzz/` (M2-D9): its `Cargo.lock` is held to the same rule, with the workspace's members (by name
@@ -183,6 +186,21 @@ check does not recognise is a violation, and an internal error exits 2, never 0.
   match, so `openssl-probe` is allowed). An edge that matches no entry or several, or a
   `dependencies` value that is not an array of strings, is a violation too, because the graph
   cannot be trusted. Probe locks are exempt: they are throwaway and outside the workspace.
+
+- LuneUI and its GPU and window stack (M6; D17, D39 (b)):
+  - the only git source is `https://github.com/lune-rs/luneui-rs` at one exact commit, set by
+    `LUNEUI_GIT_URL` and `LUNEUI_REV`. A dependency on any of LuneUI's own packages (`LUNEUI_CRATES`)
+    must carry exactly that source as `cargo metadata` reports it, so another URL, another commit,
+    a `branch` or a `tag`, or no `rev`, is a violation. In the workspace lock only that exact source
+    string (with the same commit after `#`) may be a git source, only LuneUI's own packages may come
+    from it, and they may come from nowhere else. Probe and fuzz locks get no such exception;
+  - `lune-ui` is confined (`CONFINED`) to `lunepack-ui-luneui`, and `lunepack-ui-luneui` is a
+    dependency of `lunepack-ui` alone, `lunepack-ui` of nothing (`ONLY_DEPENDED_ON_BY`; any kind,
+    and the fuzz project's path dependencies too);
+  - `lune-ui*`, `wgpu*`, `winit*` and `accesskit*` (a family is the name, or the name continued
+    with `-` or `_`) are reachable only through `lunepack-ui-luneui`
+    (`REACH_FAMILIES_ONLY_THROUGH`, the walk of M4-D16 over the lock graph). So the only crates
+    whose dependency closure holds `wgpu` or `winit` are `lunepack-ui-luneui` and `lunepack-ui`.
 
 Adding a crate is one line in `ROLES` in `xtask/src/boundaries.rs`.
 
