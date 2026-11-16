@@ -31,7 +31,7 @@ use lunepack_core::{
 };
 use lunepack_testkit::{
     FakeCodec, FakeHasher, FakeIntegration, FakeProcess, FakeRng, FakeVerifier, IntegrationOp,
-    MemFs, PackBuilder,
+    MemFs, PackBuilder, abs_path,
 };
 
 const DATA_HOME: &str = "/home/u/.local/share";
@@ -48,8 +48,10 @@ fn token_hex(raw: &[u8; 32]) -> OsString {
         .into()
 }
 
+/// Test paths are written in POSIX form and made absolute on this platform with `abs_path` (on
+/// Windows `/a` has no drive and is not absolute, so discovery would find no candidate).
 fn root_dir() -> PathBuf {
-    Path::new(DATA_HOME).join(app_id().as_str())
+    abs_path(DATA_HOME).join(app_id().as_str())
 }
 
 fn meta(entry: &str, bin: Option<&str>, name: &str) -> InstallMeta {
@@ -167,7 +169,7 @@ impl Lab {
             .with_integration(Arc::new(self.integration.clone()))
             .with_rng(Arc::new(FakeRng::new(9)))
             .with_health_token(token)
-            .with_data_home(PathBuf::from(DATA_HOME))
+            .with_data_home(abs_path(DATA_HOME))
             .with_busy_wait(Duration::from_millis(300))
     }
 
@@ -223,7 +225,7 @@ fn an_installed_tree_is_found_from_its_entry_with_its_layout() {
 #[test]
 fn a_tree_outside_an_install_is_not_installed_and_installs_under_the_data_home() {
     let lab = Lab::new();
-    let tree = PathBuf::from("/media/boot/app-1.0.0");
+    let tree = abs_path("/media/boot/app-1.0.0");
     let cfg = config(&lab.root(), V100, FEED, meta("bin/app", None, "App"));
     write_tree(&lab.fs, &tree, &cfg);
     let inst = Installation::from_exe_with(&tree.join("bin/app"), lab.platform(None))
@@ -236,8 +238,9 @@ fn a_tree_outside_an_install_is_not_installed_and_installs_under_the_data_home()
 #[test]
 fn no_config_up_the_tree_is_no_update_config() {
     let lab = Lab::new();
-    write_file(&lab.fs, Path::new("/opt/dev/bin/app"), b"app");
-    let got = Installation::from_exe_with(Path::new("/opt/dev/bin/app"), lab.platform(None));
+    let exe = abs_path("/opt/dev/bin/app");
+    write_file(&lab.fs, &exe, b"app");
+    let got = Installation::from_exe_with(&exe, lab.platform(None));
     assert!(matches!(got, Err(Error::NoUpdateConfig)), "{got:?}");
 }
 
@@ -245,7 +248,7 @@ fn no_config_up_the_tree_is_no_update_config() {
 fn the_entry_and_the_runtime_beside_it_find_the_same_tree() {
     let lab = Lab::new();
     for (entry, dir) in [("app", ""), ("bin/app", "bin")] {
-        let tree = PathBuf::from(format!("/t/{}", entry.replace('/', "-")));
+        let tree = abs_path(&format!("/t/{}", entry.replace('/', "-")));
         let cfg = config(&lab.root(), V100, FEED, meta(entry, None, "App"));
         write_tree(&lab.fs, &tree, &cfg);
         for exe in [entry.to_owned(), format!("{dir}/lunepack-runtime")] {
@@ -261,7 +264,7 @@ fn the_entry_and_the_runtime_beside_it_find_the_same_tree() {
 #[test]
 fn a_config_that_is_a_directory_or_a_symlink_is_refused_where_it_is_found() {
     let lab = Lab::new();
-    let tree = PathBuf::from("/t/dir");
+    let tree = abs_path("/t/dir");
     lab.fs
         .create_dir_all(&tree.join("lunepack-update.json"))
         .expect("dir");
@@ -269,11 +272,11 @@ fn a_config_that_is_a_directory_or_a_symlink_is_refused_where_it_is_found() {
     let got = Installation::from_exe_with(&tree.join("app"), lab.platform(None));
     assert!(matches!(got, Err(Error::UpdateConfig(_))), "{got:?}");
 
-    let tree = PathBuf::from("/t/link");
+    let tree = abs_path("/t/link");
     let cfg = config(&lab.root(), V100, FEED, meta("app", None, "App"));
     write_file(
         &lab.fs,
-        Path::new("/elsewhere/cfg.json"),
+        &abs_path("/elsewhere/cfg.json"),
         &cfg.to_bytes().expect("bytes"),
     );
     lab.fs.create_dir_all(&tree).expect("dir");
@@ -287,7 +290,7 @@ fn a_config_that_is_a_directory_or_a_symlink_is_refused_where_it_is_found() {
 #[test]
 fn a_nested_config_found_first_decides_and_the_outer_one_is_never_used() {
     let lab = Lab::new();
-    let outer = PathBuf::from("/t/outer");
+    let outer = abs_path("/t/outer");
     let cfg = config(&lab.root(), V100, FEED, meta("bin/app", None, "App"));
     write_tree(&lab.fs, &outer, &cfg);
     // A foreign config beside the entry: it names an entry the exe is not in.
@@ -358,7 +361,7 @@ fn another_version_is_opened_from_its_own_config() {
 #[test]
 fn a_config_whose_feed_was_edited_to_a_plain_http_host_is_refused_before_any_request() {
     let lab = Lab::new();
-    let tree = PathBuf::from("/t/edited");
+    let tree = abs_path("/t/edited");
     let cfg = config(&lab.root(), V100, FEED, meta("app", None, "App"));
     write_tree(&lab.fs, &tree, &cfg);
     // The written document, with its feed member edited.
@@ -671,7 +674,7 @@ fn startup_delivers_this_versions_events_once() {
 #[test]
 fn a_tree_that_is_not_installed_continues_with_nothing() {
     let lab = Lab::new();
-    let tree = PathBuf::from("/media/boot/app");
+    let tree = abs_path("/media/boot/app");
     write_tree(
         &lab.fs,
         &tree,
@@ -912,7 +915,7 @@ fn publish_with_config(lab: &Lab, seq: u64, v: &str) {
 
 /// A bootstrap tree of `v` outside the install.
 fn bootstrap(lab: &Lab, v: &str) -> Installation {
-    let tree = PathBuf::from(format!("/media/boot/{v}"));
+    let tree = abs_path(&format!("/media/boot/{v}"));
     let cfg = config(
         &lab.root(),
         v,

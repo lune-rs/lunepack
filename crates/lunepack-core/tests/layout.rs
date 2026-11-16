@@ -8,7 +8,7 @@ use lunepack_core::{
     Target, UpdateConfig, UserLayout, Version, discover, reconcile_current, tree_candidates,
     version_config_path,
 };
-use lunepack_testkit::{MemFs, sample_update_config};
+use lunepack_testkit::{MemFs, abs_path, sample_update_config};
 
 fn v(text: &str) -> Version {
     Version::parse(text).unwrap()
@@ -22,14 +22,17 @@ fn config(entry: &str, version: &str) -> UpdateConfig {
 }
 
 /// `discover` the way the facade drives it: the first candidate of `exe` holding a config is
-/// `tree` (given here), at the walk depth `tree_candidates` gives it.
+/// `tree` (given here), at the walk depth `tree_candidates` gives it. Both are POSIX-form
+/// absolute paths, made absolute on this platform with `abs_path` (on Windows `/a` has no drive
+/// and is not absolute; the Windows forms have their own test below).
 fn find(exe: &str, tree: &str, config: &UpdateConfig) -> Result<Discovery, LayoutError> {
-    let exe = Path::new(exe);
-    let (tree, k) = tree_candidates(exe)
+    let exe = abs_path(exe);
+    let want = abs_path(tree);
+    let (tree, k) = tree_candidates(&exe)
         .into_iter()
-        .find(|(t, _)| t == Path::new(tree))
+        .find(|(t, _)| *t == want)
         .unwrap_or_else(|| panic!("{} is not a candidate of {}", tree, exe.display()));
-    discover(exe, &tree, k, config)
+    discover(&exe, &tree, k, config)
 }
 
 #[test]
@@ -54,25 +57,21 @@ fn user_layout_names_the_directories_under_the_root() {
 #[test]
 fn tree_candidates_walk_up_from_the_exe_directory() {
     assert_eq!(
-        tree_candidates(Path::new("/a/b/app")),
+        tree_candidates(&abs_path("/a/b/app")),
         vec![
-            (PathBuf::from("/a/b"), 0),
-            (PathBuf::from("/a"), 1),
-            (PathBuf::from("/"), 2),
+            (abs_path("/a/b"), 0),
+            (abs_path("/a"), 1),
+            (abs_path("/"), 2),
         ]
     );
-    assert_eq!(
-        tree_candidates(Path::new("/app")),
-        vec![(PathBuf::from("/"), 0)]
-    );
+    assert_eq!(tree_candidates(&abs_path("/app")), vec![(abs_path("/"), 0)]);
 }
 
 #[test]
 fn tree_candidates_stop_at_31_and_refuse_a_relative_or_dotted_exe() {
-    let deep: PathBuf = std::iter::once("/".to_owned())
-        .chain((0..40).map(|i| format!("d{i}")))
-        .chain(std::iter::once("app".to_owned()))
-        .collect();
+    let mut deep = abs_path("/");
+    deep.extend((0..40).map(|i| format!("d{i}")));
+    deep.push("app");
     let got = tree_candidates(&deep);
     assert_eq!(got.len(), MAX_TREE_DEPTH + 1);
     assert_eq!(got.last().unwrap().1, MAX_TREE_DEPTH);
@@ -82,15 +81,16 @@ fn tree_candidates_stop_at_31_and_refuse_a_relative_or_dotted_exe() {
         deep.ancestors().nth(MAX_TREE_DEPTH + 1).unwrap()
     );
     // Exactly 31 levels above the exe's directory reaches the root, which is included.
-    let exact: PathBuf = std::iter::once("/".to_owned())
-        .chain((0..MAX_TREE_DEPTH).map(|i| format!("d{i}")))
-        .chain(std::iter::once("app".to_owned()))
-        .collect();
+    let mut exact = abs_path("/");
+    exact.extend((0..MAX_TREE_DEPTH).map(|i| format!("d{i}")));
+    exact.push("app");
     let got = tree_candidates(&exact);
-    assert_eq!(got.last().unwrap(), &(PathBuf::from("/"), MAX_TREE_DEPTH));
-    for bad in ["app", "bin/app", "/a/../b/app", "./app"] {
+    assert_eq!(got.last().unwrap(), &(abs_path("/"), MAX_TREE_DEPTH));
+    for bad in ["app", "bin/app", "./app"] {
         assert!(tree_candidates(Path::new(bad)).is_empty(), "{bad}");
     }
+    let dotted = abs_path("/a/../b/app");
+    assert!(tree_candidates(&dotted).is_empty(), "{}", dotted.display());
 }
 
 const R: &str = "/home/u/.local/share/org.example.hello";
@@ -109,7 +109,7 @@ fn the_entry_and_the_runtime_beside_it_find_the_installed_tree() {
             assert_eq!(
                 got.unwrap(),
                 Discovery::Installed {
-                    root: PathBuf::from(R),
+                    root: abs_path(R),
                     version: v("1.2.0"),
                 },
                 "entry {entry}, exe {exe}"
@@ -148,10 +148,10 @@ fn an_exe_outside_the_entry_directory_is_not_this_tree() {
 #[test]
 fn a_tree_that_is_not_the_exes_ancestor_is_not_this_tree() {
     let c = config("bin/app", "1.2.0");
-    let exe = Path::new("/x/versions/1.2.0/bin/app");
-    let got = discover(exe, Path::new("/y/versions/1.2.0"), 1, &c);
+    let exe = abs_path("/x/versions/1.2.0/bin/app");
+    let got = discover(&exe, &abs_path("/y/versions/1.2.0"), 1, &c);
     assert!(matches!(got, Err(LayoutError::NotThisTree)), "{got:?}");
-    let got = discover(Path::new("bin/app"), Path::new("/x"), 1, &c);
+    let got = discover(Path::new("bin/app"), &abs_path("/x"), 1, &c);
     assert!(matches!(got, Err(LayoutError::NotThisTree)), "{got:?}");
 }
 
@@ -188,7 +188,7 @@ fn a_tree_not_named_for_its_version_under_versions_is_not_installed() {
         )
         .unwrap(),
         Discovery::Installed {
-            root: PathBuf::from("/r"),
+            root: abs_path("/r"),
             version: v("1.0.0-RC1"),
         }
     );
