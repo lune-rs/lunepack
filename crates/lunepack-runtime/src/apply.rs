@@ -30,8 +30,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use lunepack::{
-    Child, ExitKind, FileKind, HEALTH_TOKEN_VAR, Installation, IntegrationRequest, LockGuard,
-    Phase, Sha256Digest, SpawnSpec, UserLayout, Version, WaitOutcome,
+    Child, ChildStdio, ExitKind, FileKind, HEALTH_TOKEN_VAR, Installation, IntegrationRequest,
+    LockGuard, Phase, Sha256Digest, SpawnSpec, UserLayout, Version, WaitOutcome,
 };
 use lunepack_core::state::{InstallState, Scope, UserScope};
 
@@ -435,6 +435,7 @@ fn relaunch_current(
         args: restart.to_vec(),
         env_set: Vec::new(),
         env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
+        stdio: ChildStdio::Null,
     };
     if ad.process.spawn_detached(&relaunch).is_err() {
         events.emit(&Event::warning(Warning::RelaunchFailed, Some(version)));
@@ -536,6 +537,7 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
         args: args.restart.clone(),
         env_set: vec![(OsString::from(HEALTH_TOKEN_VAR), hex(&applied.token))],
         env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
+        stdio: ChildStdio::Null,
     };
     let mut child = ad.process.spawn_child(&spec).ok();
     drop(spec);
@@ -574,6 +576,7 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
                     args: args.restart.clone(),
                     env_set: Vec::new(),
                     env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
+                    stdio: ChildStdio::Null,
                 };
                 if ad.process.spawn_detached(&relaunch).is_err() {
                     events.emit(&Event::warning(

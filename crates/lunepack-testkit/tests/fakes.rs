@@ -12,12 +12,12 @@ use std::time::{Duration, Instant};
 use lunepack_core::error::{CodecError, SignatureError};
 use lunepack_core::fetch::classify;
 use lunepack_core::{
-    AppId, BlockingResponse, BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId,
-    DecodeReport, Encoder, Error, ExitKind, FileKind, FrameView, Fs, FsErrorKind, Hasher, Head,
-    InstallMeta, IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration, Process,
-    ProcessError, ProcessErrorKind, ProcessId, RangeError, RelPath, Request, ResponseInfo, Rng,
-    Scope, Sha256Digest, SignatureAlg, Signer, SpawnSpec, StreamView, Transport, TransportError,
-    TransportErrorKind, Validator, Verifier, WaitOutcome,
+    AppId, BlockingResponse, BlockingTransport, ByteRange, CancelToken, ChildStdio, Clock, Codec,
+    CodecId, DecodeReport, Encoder, Error, ExitKind, FileKind, FrameView, Fs, FsErrorKind, Hasher,
+    Head, InstallMeta, IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration,
+    Process, ProcessError, ProcessErrorKind, ProcessId, RangeError, RelPath, Request, ResponseInfo,
+    Rng, Scope, Sha256Digest, SignatureAlg, Signer, SpawnSpec, StreamView, Transport,
+    TransportError, TransportErrorKind, Validator, Verifier, WaitOutcome,
 };
 use lunepack_testkit::*;
 
@@ -1792,6 +1792,122 @@ fn fake_process_records_spawns_and_scripts_children() {
         .spawn_detached(&SpawnSpec::new("relative/app"))
         .unwrap_err();
     assert!(matches!(&err, Error::Process(e) if e.kind == ProcessErrorKind::InvalidRequest));
+}
+
+fn piped(program: &str) -> SpawnSpec {
+    let mut spec = SpawnSpec::new(abs_path(program));
+    spec.stdio = ChildStdio::Piped;
+    spec
+}
+
+#[test]
+fn fake_process_pipes_carry_bytes_both_ways_and_end_with_the_child() {
+    let fake = FakeProcess::new("/opt/app/bin/app");
+    assert_eq!(
+        SpawnSpec::new("/x").stdio,
+        ChildStdio::Null,
+        "null by default"
+    );
+
+    // A null child has no pipes, and the fake says so.
+    let mut null = fake
+        .spawn_child(&SpawnSpec::new(abs_path("/opt/ui")))
+        .unwrap();
+    assert!(null.take_stdin().is_none() && null.take_stdout().is_none());
+    assert!(fake.take_child_pipes(null.id()).is_none());
+    assert_eq!(fake.spawns()[0].stdio, ChildStdio::Null);
+
+    let mut child = fake.spawn_child(&piped("/opt/ui")).unwrap();
+    let id = child.id();
+    assert_eq!(fake.spawns()[1].stdio, ChildStdio::Piped);
+    let mut stdin = child.take_stdin().expect("input");
+    let mut stdout = child.take_stdout().expect("output");
+    assert!(child.take_stdin().is_none() && child.take_stdout().is_none());
+    let mut theirs = fake.take_child_pipes(id).expect("the child's ends");
+    assert!(fake.take_child_pipes(id).is_none(), "once");
+
+    // Both directions.
+    stdin.write_all(b"to the child").unwrap();
+    let mut buf = [0u8; 12];
+    theirs.stdin.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"to the child");
+    theirs.stdout.write_all(b"back").unwrap();
+    let mut buf = [0u8; 4];
+    stdout.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"back");
+
+    // Dropping the engine's input is the child's end of file, after what was queued.
+    stdin.write_all(b"last").unwrap();
+    drop(stdin);
+    let mut rest = Vec::new();
+    theirs.stdin.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"last");
+
+    // The child's exit closes its output (end of file for the reader) and its input (broken pipe
+    // for the writer), though the test still holds its ends.
+    theirs.stdout.write_all(b"tail").unwrap();
+    child.terminate(Duration::from_millis(1)).unwrap();
+    let mut tail = Vec::new();
+    stdout.read_to_end(&mut tail).unwrap();
+    assert_eq!(
+        tail, b"tail",
+        "queued output is still readable, then the end"
+    );
+    let err = theirs.stdout.write_all(b"after").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+}
+
+#[test]
+fn fake_process_pipes_block_when_full_and_break_when_the_reader_is_gone() {
+    let fake = FakeProcess::new("/opt/app/bin/app");
+    fake.set_pipe_capacity(8);
+    let mut child = fake.spawn_child(&piped("/opt/ui")).unwrap();
+    let mut stdin = child.take_stdin().unwrap();
+    let mut theirs = fake.take_child_pipes(child.id()).unwrap();
+    // 20 bytes into an 8 byte pipe: the writer waits for the reader.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let r = stdin.write_all(&[7u8; 20]);
+        let _ = tx.send(r.is_ok());
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the writer must block while the pipe is full"
+    );
+    let mut got = Vec::new();
+    while got.len() < 20 {
+        let mut buf = [0u8; 8];
+        let n = theirs.stdin.read(&mut buf).unwrap();
+        assert!(n > 0);
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(got, vec![7u8; 20]);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+    writer.join().unwrap();
+
+    // A blocked writer is released with an error when the reader goes away.
+    let mut child = fake.spawn_child(&piped("/opt/ui")).unwrap();
+    let mut stdin = child.take_stdin().unwrap();
+    let theirs = fake.take_child_pipes(child.id()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let _ = tx.send(stdin.write_all(&[1u8; 64]).map_err(|e| e.kind()));
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    drop(theirs);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5)),
+        Ok(Err(io::ErrorKind::BrokenPipe))
+    );
+    writer.join().unwrap();
+}
+
+#[test]
+fn fake_process_refuses_a_detached_spawn_with_pipes() {
+    let fake = FakeProcess::new("/opt/app/bin/app");
+    let err = fake.spawn_detached(&piped("/opt/ui")).unwrap_err();
+    assert!(matches!(&err, Error::Process(e) if e.kind == ProcessErrorKind::InvalidRequest));
+    assert!(fake.spawns().is_empty(), "nothing was recorded");
 }
 
 fn integration_request(id: &str, root: &str) -> IntegrationRequest {

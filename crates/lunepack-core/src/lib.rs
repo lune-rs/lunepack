@@ -79,7 +79,8 @@ pub use pack::{
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
 pub use process::{
-    Child, ExitKind, Process, ProcessError, ProcessErrorKind, ProcessId, SpawnSpec, WaitOutcome,
+    Child, ChildStdio, ExitKind, Process, ProcessError, ProcessErrorKind, ProcessId, SpawnSpec,
+    WaitOutcome,
 };
 pub use progress::{FileProgress, Phase, Progress, Source};
 pub use root::{RootDocument, TrustedRoot, advance_root};
