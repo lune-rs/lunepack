@@ -262,7 +262,7 @@ in the release directory.
 ```
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
-    [--runtime <RUNTIME>] [--config <CONFIG>]
+    [--runtime <RUNTIME>] [--ui <UI>] [--config <CONFIG>]
 ```
 
 - `--version`: SemVer 2.0.0, used verbatim as the directory name. A directory of equal precedence with
@@ -275,6 +275,8 @@ lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-di
 - `--app-id`: when given, it must equal the config's.
 - `--runtime`: the static runtime to place beside the entry. Required when the config has `[update]`,
   refused without it (see "Self-updating apps").
+- `--ui`: the `lunepack-ui` binary to place beside the runtime. Needs `--runtime` and `[update]`, and
+  is refused without them. Without it no UI is placed. A file over 64 MiB is refused.
 
 Pre-checks run before any encoding: `keys.json` verifies; every `--sign` key is in the key set and
 inside its window; the signers reach the threshold; the manifest and pack do not exist yet; the target
@@ -309,7 +311,10 @@ With `[update]` (and then `[install]`, which is required; `[install]` without `[
   (a header check only, until those runtimes exist). Anything else is refused.
 - After the input is copied and before code signing and hashing, `pack` copies the runtime to
   `<directory of install.entry>/lunepack-runtime` (`lunepack-runtime.exe` for `windows-*`), marked
-  executable, and writes the update configuration at the tree's root, `lunepack-update.json`
+  executable, and, with `--ui`, the UI to `<directory of install.entry>/lunepack-ui` (`lunepack-ui.exe`
+  for `windows-*`), also marked executable. A `linux-*` UI may be dynamically linked (glibc); the
+  runtime may not. The UI's bytes are checked against the target's format and machine, like the
+  runtime's. Then it writes the update configuration at the tree's root, `lunepack-update.json`
   (`Contents/Resources/lunepack-update.json` for `macos-*`, assumed until M8). The configuration holds
   the app id and root from `lunepack.toml`, the `--version` and `--target` of this pack, the feed, the
   channel, the health timeout and the install metadata. It holds no timestamp. Stdout gets one
@@ -322,7 +327,9 @@ Reserved names, each an error before anything is written:
 
 - a file or directory named `lunepack-update.json` (any case) at any depth of the input, so nothing
   can shadow the root configuration when an executable looks for the nearest one above itself;
-- a file named `lunepack-runtime` or `lunepack-runtime.exe` (any case) in the entry's directory.
+- a file named `lunepack-runtime` or `lunepack-runtime.exe` (any case) in the entry's directory, or a
+  file named `lunepack-ui` or `lunepack-ui.exe` there, with or without `--ui`: the runtime starts a
+  UI from its own directory, so the name is never left to an app file.
 
 The feed (`[update] feed`) must pass the feed rule of FORMAT.md 13.3, which `pack` checks with the same
 function a client runs before its first request: `https://` with a lowercase DNS name or an IPv4
