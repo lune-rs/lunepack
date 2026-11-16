@@ -24,6 +24,11 @@
 //! Every per-version fact (entry, health timeout, install metadata) comes from that version's own
 //! config at `R/versions/<v>/lunepack-update.json`, never from this runtime's tree (M5-D17). The
 //! token is in the child's environment only: never in argv, an event, the log or an exit path.
+//!
+//! With a UI (M6), the update window follows the events and never holds the operation up: the
+//! outcome is decided, any relaunch done and old trees collected before the window hears of it.
+//! On success the window closes; after a rollback (the previous version already started) or a
+//! failure it shows a prompt the user dismisses, and a UI lost there changes nothing.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -35,9 +40,12 @@ use lunepack::{
 };
 use lunepack_core::state::{InstallState, Scope, UserScope};
 
+use lunepack_core::ui::{ChoiceValue, Outcome, PromptKind, StepItem};
+
 use crate::events::{Event, Events, Reason, Warning};
 use crate::gc::gc;
 use crate::modes::{Adapters, ApplyArgs, Kind};
+use crate::ui_host::UiHost;
 
 /// The mode's name in events.
 pub const COMMAND: &str = "apply";
@@ -468,24 +476,58 @@ fn nothing_moved_on(record: &InstallState, exited: &Version, applying: &Version)
 /// The outcome of [`run_apply`] before it is reported.
 enum End {
     Confirmed,
-    RolledBack,
+    /// Rolled back to this version, which was started again.
+    RolledBack(Version),
     Superseded,
     Unavailable,
     Failed(Kind),
 }
 
 /// Runs the `apply` mode for `inst` (the runtime's own installation, the outgoing version) and
-/// reports the outcome as the final event. Returns the exit kind.
-pub fn run_apply(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Events) -> Kind {
+/// reports the outcome as the final event, then in `ui`. Returns the exit kind.
+pub fn run_apply(
+    ad: &Adapters,
+    inst: &Installation,
+    args: &ApplyArgs,
+    events: &Events,
+    ui: &UiHost,
+) -> Kind {
     let end = apply_inner(ad, inst, args, events);
+    let kind = report(inst, args, &end, events);
+    // The window hears of the outcome only now: the operation never waits for it.
+    match &end {
+        End::Confirmed => {
+            ui.steps(&[StepItem::Confirm]);
+            ui.outcome(Outcome::Updated);
+        }
+        End::RolledBack(previous) => {
+            ui.steps(&[StepItem::Rollback]);
+            ui.outcome(Outcome::RolledBack {
+                from: args.version.to_string(),
+                to: previous.to_string(),
+            });
+            let _: ChoiceValue = ui.prompt(PromptKind::RolledBack, events, &mut |_| {});
+        }
+        End::Superseded | End::Unavailable | End::Failed(_) => {
+            ui.outcome(Outcome::Failed {
+                code: u32::from(kind.code()),
+            });
+            let _: ChoiceValue = ui.prompt(PromptKind::Failed, events, &mut |_| {});
+        }
+    }
+    kind
+}
+
+/// Emits the final event of `end`; its exit kind.
+fn report(inst: &Installation, args: &ApplyArgs, end: &End, events: &Events) -> Kind {
     let tree_version = Some(inst.tree_version().clone());
     let version = Some(args.version.clone());
     let (kind, outcome) = match end {
         End::Confirmed => (Kind::Ok, "confirmed"),
-        End::RolledBack => (Kind::RolledBack, "rolled_back"),
+        End::RolledBack(_) => (Kind::RolledBack, "rolled_back"),
         End::Superseded => (Kind::RolledBack, "rolled_back_elsewhere"),
         End::Unavailable => (Kind::RollbackUnavailable, ""),
-        End::Failed(kind) => (kind, ""),
+        End::Failed(kind) => (*kind, ""),
     };
     if outcome.is_empty() {
         events.emit(&Event::Error {
@@ -584,7 +626,7 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
                         Some(previous.tree_version()),
                     ));
                 }
-                break End::RolledBack;
+                break End::RolledBack(previous.tree_version().clone());
             }
             Ok(RolledBack::NotOurs(Decided::Confirmed)) => break End::Confirmed,
             Ok(RolledBack::NotOurs(_)) => break End::Superseded,

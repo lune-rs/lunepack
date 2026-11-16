@@ -171,6 +171,7 @@ fn update(inst: &Installation) -> Result<String, &'static str> {
         expect_version: Some(staged.version().clone()),
         wait_for: None,
         restart_args: vec![OsString::from(AFTER_UPDATE)],
+        ui: lunepack::UiChoice::Auto,
     })
     .map_err(|_| "apply")?;
     Ok("apply-scheduled".to_owned())

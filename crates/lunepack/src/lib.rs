@@ -123,8 +123,8 @@ pub use executor::block_on;
 pub use feed_rule::check_config_feed;
 pub use installation::{HEALTH_TOKEN_VAR, Installation, Platform};
 pub use lifecycle::{
-    ApplyOptions, ApplyScheduled, Startup, StartupAction, apply_and_restart, apply_and_restart_for,
-    confirm_for, confirm_healthy, startup, startup_for,
+    ApplyOptions, ApplyScheduled, Startup, StartupAction, UiChoice, apply_and_restart,
+    apply_and_restart_for, confirm_for, confirm_healthy, startup, startup_for,
 };
 pub use updater::{
     DownloadOptions, Downloaded, InstalledVersion, Layout, ProgressCallback, StagedVersion,

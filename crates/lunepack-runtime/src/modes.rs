@@ -247,6 +247,8 @@ pub struct ApplyArgs {
     pub version: Version,
     /// The arguments the new version (or, after a rollback, the previous one) is started with.
     pub restart: Vec<OsString>,
+    /// `--no-ui`: no update window (D41).
+    pub no_ui: bool,
 }
 
 impl std::fmt::Debug for ApplyArgs {
@@ -256,6 +258,7 @@ impl std::fmt::Debug for ApplyArgs {
             .field("wait", &self.wait)
             .field("version", &self.version.to_string())
             .field("restart", &self.restart.len())
+            .field("no_ui", &self.no_ui)
             .finish()
     }
 }
@@ -263,12 +266,18 @@ impl std::fmt::Debug for ApplyArgs {
 /// A parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// `apply --wait-pid <u32> --wait-start <u64> --version <ver> [-- <args>…]`.
+    /// `apply --wait-pid <u32> --wait-start <u64> --version <ver> [--no-ui] [-- <args>…]`.
     Apply(ApplyArgs),
-    /// `install`: the first install from the bootstrap tree this runtime belongs to.
-    Install,
-    /// `uninstall`: removes the install this runtime belongs to.
-    Uninstall,
+    /// `install [--silent]`: the first install from the bootstrap tree this runtime belongs to.
+    Install {
+        /// `--silent`: no UI and no prompt (D41).
+        silent: bool,
+    },
+    /// `uninstall [--silent]`: removes the install this runtime belongs to.
+    Uninstall {
+        /// `--silent`: no UI and no prompt (D41).
+        silent: bool,
+    },
     /// An app-facing command (`check`, `download`, `startup`, `confirm`).
     Command(crate::cli::args::Parsed),
 }
@@ -282,14 +291,23 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
     let (mode, rest) = args.split_first().ok_or(UsageError)?;
     match mode.to_str() {
         Some("apply") => parse_apply(rest).map(Mode::Apply),
-        // No options: everything they use is derived, nothing comes from argv (M5-D10).
-        Some("install") if rest.is_empty() => Ok(Mode::Install),
-        Some("uninstall") if rest.is_empty() => Ok(Mode::Uninstall),
+        // Only `--silent`: everything they use is derived, nothing comes from argv (M5-D10).
+        Some("install") => silent_only(rest).map(|silent| Mode::Install { silent }),
+        Some("uninstall") => silent_only(rest).map(|silent| Mode::Uninstall { silent }),
         Some(word) => match crate::cli::args::Command::named(word) {
             Some(command) => crate::cli::args::parse(command, rest).map(Mode::Command),
             None => Err(UsageError),
         },
         None => Err(UsageError),
+    }
+}
+
+/// The options of `install` and `uninstall`: nothing, or `--silent` once.
+fn silent_only(rest: &[OsString]) -> Result<bool, UsageError> {
+    match rest {
+        [] => Ok(false),
+        [flag] if flag == "--silent" => Ok(true),
+        _ => Err(UsageError),
     }
 }
 
@@ -310,12 +328,21 @@ fn parse_apply(args: &[OsString]) -> Result<ApplyArgs, UsageError> {
     let mut start: Option<u64> = None;
     let mut version: Option<Version> = None;
     let mut restart = Vec::new();
+    let mut no_ui = false;
     let mut i = 0;
     while i < args.len() {
         let name = args[i].to_str().ok_or(UsageError)?;
         if name == "--" {
             restart.extend_from_slice(&args[i + 1..]);
             break;
+        }
+        if name == "--no-ui" {
+            if no_ui {
+                return Err(UsageError);
+            }
+            no_ui = true;
+            i += 1;
+            continue;
         }
         let value = args.get(i + 1).ok_or(UsageError)?;
         match name {
@@ -345,6 +372,7 @@ fn parse_apply(args: &[OsString]) -> Result<ApplyArgs, UsageError> {
             wait: ProcessId { pid, start_ticks },
             version,
             restart,
+            no_ui,
         }),
         _ => Err(UsageError),
     }
@@ -385,6 +413,25 @@ mod tests {
         );
         assert_eq!(a.version.to_string(), "1.1.0");
         assert_eq!(a.restart, os(&["--version", "x"]));
+        assert!(!a.no_ui);
+        let got = parse(&os(&[
+            "apply",
+            "--no-ui",
+            "--version",
+            "1.1.0",
+            "--wait-start",
+            "77",
+            "--wait-pid",
+            "42",
+            "--",
+            "--no-ui",
+        ]))
+        .expect("parse");
+        let Mode::Apply(a) = got else {
+            panic!("not apply");
+        };
+        assert!(a.no_ui);
+        assert_eq!(a.restart, os(&["--no-ui"]));
     }
 
     #[test]
@@ -408,6 +455,16 @@ mod tests {
             os(&["apply"]),
             ok(&["--wait-pid", "3"]),
             ok(&["--json"]),
+            ok(&["--no-ui", "--no-ui"]),
+            ok(&["--no-ui=1"]),
+            ok(&["--no-ui", "1"]),
+            os(&["install", "--silent", "--silent"]),
+            os(&["install", "--silent=1"]),
+            os(&["install", "--silent", "x"]),
+            os(&["install", "--Silent"]),
+            os(&["uninstall", "--silent", "--silent"]),
+            os(&["uninstall", "--silent=yes"]),
+            os(&["uninstall", "--no-ui"]),
             ok(&["extra"]),
             os(&["apply", "--wait-pid", "1", "--wait-start", "2"]),
             os(&[
@@ -489,9 +546,23 @@ mod tests {
     }
 
     #[test]
-    fn install_and_uninstall_take_no_arguments() {
-        assert_eq!(parse(&os(&["install"])), Ok(Mode::Install));
-        assert_eq!(parse(&os(&["uninstall"])), Ok(Mode::Uninstall));
+    fn install_and_uninstall_take_only_silent() {
+        assert_eq!(
+            parse(&os(&["install"])),
+            Ok(Mode::Install { silent: false })
+        );
+        assert_eq!(
+            parse(&os(&["uninstall"])),
+            Ok(Mode::Uninstall { silent: false })
+        );
+        assert_eq!(
+            parse(&os(&["install", "--silent"])),
+            Ok(Mode::Install { silent: true })
+        );
+        assert_eq!(
+            parse(&os(&["uninstall", "--silent"])),
+            Ok(Mode::Uninstall { silent: true })
+        );
     }
 
     #[test]

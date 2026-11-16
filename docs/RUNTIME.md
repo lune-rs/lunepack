@@ -35,13 +35,14 @@ lunepack-runtime <command> [options] [-- <args>]
 | `download` | `--channel <name>`, `--expect-version <version>` | Runs `check`, then downloads and stages the update it found. |
 | `startup` | `-- <args>` | Delivers the lifecycle events queued for this version and says whether to go on. |
 | `confirm` | none | Confirms that this version works. |
-| `apply-and-restart` | `--wait-pid <pid>`, `--expect-version <version>`, `-- <args>` | Starts the applier for the staged version, which applies it and starts the new version with `<args>` once the waited-for process has exited. |
+| `apply-and-restart` | `--wait-pid <pid>`, `--expect-version <version>`, `--no-ui`, `-- <args>` | Starts the applier for the staged version, which applies it and starts the new version with `<args>` once the waited-for process has exited. With `--no-ui` the applier shows no update window. |
 
 Global options, accepted by every command: `--json` (output JSON Lines instead of text) and
 `--expect-schema <N>` (the schema the caller understands; anything but `1` is the error
 `schema_mismatch`, before anything else happens).
 
-The grammar is closed. Every option may appear once. An unknown option, a repeated one, an option
+The grammar is closed. Every option may appear once; a flag (`--json`, `--no-ui`, `--silent`) takes
+no value. An unknown option, a repeated one, an option
 that does not belong to the command, a value that does not parse (a channel name outside the rule of
 `docs/FORMAT.md` 10.5, a version that is not in its canonical text, a number with a sign or leading
 zeros, a `--wait-pid` of 0 or 1), a missing value, the `--option=value` form and any stray word are a usage error: exit code 2,
@@ -180,18 +181,43 @@ calls `apply-and-restart`, which starts `apply` itself.
 
 | Mode | Started by | What it does |
 |---|---|---|
-| `apply --wait-pid <pid> --wait-start <ticks> --version <version> [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. An apply that fails after the wait changes nothing and starts the version that exited again (without the token), unless the state moved on (another version current or pending, or the version to apply marked bad): then another applier, such as a second instance's, or a rollback has started the app already. Exit codes 20 to 22 are its own. |
-| `install` | the first-install flow, from a bootstrap tree | Installs the newest release the tree's own channel offers (M5-D8): the root, feed and channel come only from that tree's update configuration. Exit codes 23, 24, 26 and 27 are its own. |
-| `uninstall` | the uninstall flow, from a tree of the install | Removes the install this runtime stands in and the desktop integration lunepack made (M5-D10): the install root leaves its path in one rename before it is deleted, so a cut-off uninstall leaves it whole or gone, and the next install or uninstall deletes what is left. Exit codes 24, 25 and 26 are its own. |
+| `apply --wait-pid <pid> --wait-start <ticks> --version <version> [--no-ui] [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. An apply that fails after the wait changes nothing and starts the version that exited again (without the token), unless the state moved on (another version current or pending, or the version to apply marked bad): then another applier, such as a second instance's, or a rollback has started the app already. Exit codes 20 to 22 are its own. |
+| `install [--silent]` | the first-install flow, from a bootstrap tree | Installs the newest release the tree's own channel offers (M5-D8): the root, feed and channel come only from that tree's update configuration. Exit codes 23, 24, 26 and 27 are its own. |
+| `uninstall [--silent]` | the uninstall flow, from a tree of the install | Removes the install this runtime stands in and the desktop integration lunepack made (M5-D10): the install root leaves its path in one rename before it is deleted, so a cut-off uninstall leaves it whole or gone, and the next install or uninstall deletes what is left. Exit codes 24, 25 and 26 are its own. |
 
-`install` and `uninstall` take no options at all: the install root is derived from the runtime's own
-resolved path and the environment, never from an argument or the state. Every mode follows the
+`install` and `uninstall` take one option, `--silent` (no window and no question), and nothing that
+names a place: the install root is derived from the runtime's own resolved path and the environment,
+never from an argument or the state. Every mode follows the
 closed grammar above (a refusal is exit code 2 and one fixed line). `apply` logs schema-1 events to
 `logs/runtime.log` under the install root (rotated at 1 MiB to `runtime.log.1`). `install` and
 `uninstall` log them to stderr, because the first has no install yet and the second removes the
 log's directory, and each ends by printing one final `result` or `error` object on stdout. The
 `result`'s `outcome` is `installed`, `uninstalled`, or `uninstalled_with_leftovers` (an
 integration item that is not lunepack's was kept and reported).
+
+## The window
+
+`install`, `uninstall` and `apply` show their progress and ask their questions in a window when they
+can: they start `lunepack-ui` from the directory of the runtime's own resolved path (never through
+`PATH`, `current` or a link), with the fixed argument `--engine`, its standard input and output as
+the channel and its error stream on `/dev/null`, and without `LUNEPACK_HEALTH_TOKEN` in its
+environment. The window only shows and asks; every answer is checked by the runtime, and a window
+that fails changes no outcome and no exit code. No window is started under `--silent` (`install`,
+`uninstall`) or `--no-ui` (`apply`, `apply-and-restart`), when `LUNEPACK_NO_UI` is set to anything
+but empty or `0`, on Linux when neither `DISPLAY` nor `WAYLAND_DISPLAY` is set, or when
+`lunepack-ui` is missing; the mode then runs headless and every question takes its default
+(proceed; the app is not launched). The app-facing commands never start one.
+
+`install` asks before it installs, and `uninstall` before it removes: cancelling there, or the window
+being lost there (it exits, crashes, stops answering or breaks the protocol), ends the mode with
+`cancelled` (5) and nothing changed. A window lost while the operation runs is closed, and the
+operation goes on headless. After the outcome, the window's answer only decides whether `install`
+tries again after a failure or starts the app, and whether `uninstall` opens a folder it lists;
+`apply` relaunches and decides before the window hears of the outcome. A window that stops reading,
+does not answer a liveness probe at a question within 15 seconds or does not exit within 5 seconds
+of being closed is killed, so the mode always ends. A stopped window is logged once as a `warning` with `code` `ui_stopped`, a `reason`
+from `stalled`, `hung`, `exited`, `protocol`, `build_mismatch`, `hello_timeout` and `spawn_failed`,
+and the window's own exit code as `ui_exit_code` when it exited with one.
 
 ## Cancel
 
