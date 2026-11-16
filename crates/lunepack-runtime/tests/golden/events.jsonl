@@ -15,5 +15,7 @@
 {"schema":1,"type":"progress","phase":"rollback","done":0,"total":0,"file":null,"version":"1.1.0","reason":"spawn_failed"}
 {"schema":1,"type":"warning","code":"gc_in_use","version":"1.0.0"}
 {"schema":1,"type":"warning","code":"sink_dropped","version":null}
+{"schema":1,"type":"warning","code":"ui_stopped","version":null,"reason":"stalled"}
+{"schema":1,"type":"warning","code":"ui_stopped","version":null,"reason":"exited","ui_exit_code":11}
 {"schema":1,"type":"result","command":"apply","tree_version":"1.0.0","outcome":"confirmed","version":"1.1.0"}
 {"schema":1,"type":"error","command":"install","tree_version":null,"kind":"integration","exit_code":24}

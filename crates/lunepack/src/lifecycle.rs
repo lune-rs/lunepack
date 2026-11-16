@@ -53,6 +53,17 @@ impl Startup {
     }
 }
 
+/// Whether the applier shows its update window (D41).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiChoice {
+    /// The window shows when the runtime's UI is present and a display is there; the
+    /// `LUNEPACK_NO_UI` environment variable still turns it off.
+    #[default]
+    Auto,
+    /// No window: the applier runs headless (`apply --no-ui`).
+    Never,
+}
+
 /// Options of [`apply_and_restart`].
 #[derive(Clone, Default)]
 pub struct ApplyOptions {
@@ -62,6 +73,8 @@ pub struct ApplyOptions {
     pub wait_for: Option<ProcessId>,
     /// The arguments the new version is started with.
     pub restart_args: Vec<OsString>,
+    /// Whether the applier shows its update window.
+    pub ui: UiChoice,
 }
 
 impl fmt::Debug for ApplyOptions {
@@ -71,6 +84,7 @@ impl fmt::Debug for ApplyOptions {
             .field("expect_version", &self.expect_version)
             .field("wait_for", &self.wait_for)
             .field("restart_args", &self.restart_args.len())
+            .field("ui", &self.ui)
             .finish()
     }
 }
@@ -315,8 +329,9 @@ pub fn apply_and_restart(options: ApplyOptions) -> Result<ApplyScheduled, Error>
 
 /// Starts `inst`'s own runtime, detached, to apply the staged version once the waited-for process
 /// (by default this one) has exited:
-/// `lunepack-runtime apply --wait-pid <pid> --wait-start <ticks> --version <v> -- <restart args>`,
-/// with no health token in its environment. The caller exits next.
+/// `lunepack-runtime apply --wait-pid <pid> --wait-start <ticks> --version <v> [--no-ui] --
+/// <restart args>` (`--no-ui` for [`UiChoice::Never`]), with no health token in its environment.
+/// The caller exits next.
 ///
 /// The staged version is read again (C9): none, one that is not usable (FORMAT.md 12.7), a tree
 /// that is not a real directory, or a staged entry without its bound `staged_issued` is
@@ -345,11 +360,14 @@ pub fn apply_and_restart_for(
         wait.start_ticks.to_string(),
         "--version".to_owned(),
         version.to_string(),
-        "--".to_owned(),
     ]
     .into_iter()
     .map(OsString::from)
     .collect();
+    if options.ui == UiChoice::Never {
+        args.push(OsString::from("--no-ui"));
+    }
+    args.push(OsString::from("--"));
     args.extend(options.restart_args);
     p.process.spawn_detached(&SpawnSpec {
         program: inst.runtime_path(),

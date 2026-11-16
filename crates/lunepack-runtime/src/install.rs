@@ -11,16 +11,30 @@
 //! This mode refuses a bootstrap that lies under `R` (an installed tree runs `apply`, not
 //! `install`). The facade refuses an `R` that exists and is not lunepack's (not a real directory,
 //! or not empty and holding neither this app's record nor only what a cut-off run leaves; S2),
-//! which this mode reports as `install_mismatch`. It never launches the app.
+//! which this mode reports as `install_mismatch`.
+//!
+//! With a UI (M6), the welcome prompt comes before anything else: `cancel` there, or the UI lost
+//! there, ends the mode with `cancelled` and nothing changed (M6-D5). After the outcome comes the
+//! done prompt, whose `finish{launch:true}` starts the installed app (detached, without a health
+//! token, the only action a choice after the outcome takes), or the failed prompt, whose `retry`
+//! runs the install again. Headless (no UI, `--silent`), every prompt takes its default: proceed,
+//! and the app is not launched.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use lunepack::{DownloadOptions, Installation, Phase, Progress};
+use std::ffi::OsString;
 
-use crate::events::{Event, Events};
-use crate::modes::Kind;
+use lunepack::{
+    ChildStdio, DownloadOptions, HEALTH_TOKEN_VAR, Installation, Phase, Progress, SpawnSpec,
+    UserLayout, Version,
+};
+use lunepack_core::ui::{ChoiceValue, Outcome, PromptKind, StepItem};
+
+use crate::events::{Event, Events, Warning};
+use crate::modes::{Adapters, Kind};
+use crate::ui_host::UiHost;
 
 /// The mode's name in events.
 pub const COMMAND: &str = "install";
@@ -30,10 +44,78 @@ pub const OUTCOME: &str = "installed";
 const FORWARD_POLL: Duration = Duration::from_millis(50);
 
 /// Runs the `install` mode from `boot`, the bootstrap tree this runtime belongs to (its platform
-/// carries the data home). Returns the exit kind and the final event.
-pub fn run_install(boot: &Installation, events: &Events) -> (Kind, Event) {
+/// carries the data home), with its prompts in `ui`. Returns the exit kind and the final event.
+pub fn run_install(
+    ad: &Adapters,
+    boot: &Installation,
+    events: &Events,
+    ui: &UiHost,
+) -> (Kind, Event) {
+    if ui.prompt(PromptKind::Welcome, events, &mut |_| {}) != ChoiceValue::Proceed {
+        ui.outcome(Outcome::Cancelled);
+        return report(boot, Err(Kind::Cancelled));
+    }
+    loop {
+        let result = install(boot, events);
+        match &result {
+            Ok(_) => {
+                ui.steps(&[
+                    StepItem::Verify,
+                    StepItem::Stage,
+                    StepItem::Commit,
+                    StepItem::Integrate,
+                ]);
+                ui.outcome(Outcome::Installed);
+            }
+            Err(kind) => ui.outcome(Outcome::Failed {
+                code: u32::from(kind.code()),
+            }),
+        }
+        let kind = match &result {
+            Ok(_) => PromptKind::Done,
+            Err(_) => PromptKind::Failed,
+        };
+        match ui.prompt(kind, events, &mut |_| {}) {
+            ChoiceValue::Retry => continue,
+            ChoiceValue::Finish { launch: true } => {
+                if let Ok(version) = &result {
+                    launch(ad, boot, version, events);
+                }
+            }
+            _ => {}
+        }
+        return report(boot, result);
+    }
+}
+
+/// Starts the installed version's entry (from its own config), detached, with no arguments and
+/// without a health token; a failure is a warning.
+fn launch(ad: &Adapters, boot: &Installation, version: &Version, events: &Events) {
+    let started = boot.install_root().ok().and_then(|root| {
+        let tree = UserLayout::from_root(root).version_dir(version);
+        let entry = boot
+            .meta()
+            .entry
+            .components()
+            .fold(tree, |dir, part| dir.join(part));
+        let installed = Installation::from_exe_with(&entry, ad.platform.clone()).ok()?;
+        let spec = SpawnSpec {
+            program: installed.entry_path(),
+            args: Vec::new(),
+            env_set: Vec::new(),
+            env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
+            stdio: ChildStdio::Null,
+        };
+        ad.process.spawn_detached(&spec).ok()
+    });
+    if started.is_none() {
+        events.emit(&Event::warning(Warning::RelaunchFailed, Some(version)));
+    }
+}
+
+fn report(boot: &Installation, result: Result<Version, Kind>) -> (Kind, Event) {
     let tree_version = Some(boot.tree_version().clone());
-    match install(boot, events) {
+    match result {
         Ok(version) => (
             Kind::Ok,
             Event::Result {

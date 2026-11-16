@@ -4,7 +4,8 @@
 //! to a [`Kind`].
 
 use lunepack::{
-    ApplyOptions, CancelToken, DownloadOptions, HEALTH_TOKEN_VAR, Installation, Platform, blocking,
+    ApplyOptions, CancelToken, DownloadOptions, HEALTH_TOKEN_VAR, Installation, Platform, UiChoice,
+    blocking,
 };
 
 use super::WaitTarget;
@@ -112,7 +113,7 @@ fn confirm(inst: &Installation) -> Result<Body, Kind> {
 }
 
 /// `apply-and-restart`: the facade starts this tree's runtime detached (`apply`, standard streams
-/// null, a new session), which waits for `wait`, applies the staged version and starts the new
+/// null, a new session; with `--no-ui` the applier shows no update window), which waits for `wait`, applies the staged version and starts the new
 /// tree's entry with the arguments after `--`. Nothing is started when the wait target is not a
 /// running process, when nothing usable is staged, or when the staged version is not the one
 /// `--expect-version` names. The target is only ever waited on.
@@ -129,6 +130,11 @@ fn apply_and_restart(
             expect_version: parsed.expect_version.clone(),
             wait_for: Some(wait),
             restart_args: parsed.passed_args.clone(),
+            ui: if parsed.no_ui {
+                UiChoice::Never
+            } else {
+                UiChoice::Auto
+            },
         },
     )
     .map_err(|e| Kind::of(&e))?;

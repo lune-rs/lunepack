@@ -17,16 +17,26 @@
 //! tombstone is removed without following a symlink: a link inside a tree is removed, never what
 //! it points to. A cut-off run so leaves `R` whole (rerun the uninstall) or gone (a reinstall works,
 //! and the next install or uninstall removes the tombstone), never half removed.
+//!
+//! With a UI (M6), the confirm prompt comes before anything else: `cancel` there, or the UI lost
+//! there, ends the mode with `cancelled` and nothing changed (M6-D5). The UI process, started from
+//! the tree being removed, is the one process besides this one the in-use scan excludes (by pid
+//! and start time). After the outcome the done prompt lists the integration items kept; `reveal`
+//! opens the folder of one of them (M6-D10, `xdg-open` without a shell), which changes nothing.
 
 use std::path::Path;
 
-use lunepack::{FileKind, Installation, IntegrationRequest, Phase, ProcessId, Version};
+use lunepack::{
+    FileKind, Installation, IntegrationItem, IntegrationRequest, Phase, ProcessId, Version,
+};
 use lunepack_core::layout::TOMBSTONE_RANDOM_BYTES;
 use lunepack_core::state::{Scope, UserScope};
+use lunepack_core::ui::{ChoiceValue, Outcome, PromptKind, StepItem};
 
 use crate::apply::{LOCK_WAIT, lock_retry};
 use crate::events::{Event, Events, Warning};
 use crate::modes::{Adapters, Kind};
+use crate::ui_host::{self, UiHost};
 
 /// The mode's name in events.
 pub const COMMAND: &str = "uninstall";
@@ -35,17 +45,50 @@ pub const OUTCOME: &str = "uninstalled";
 /// The result's outcome when an integration item that is not lunepack's was kept.
 pub const OUTCOME_LEFTOVERS: &str = "uninstalled_with_leftovers";
 
+/// An integration item kept, with the command-link name it was checked under.
+type Kept = (IntegrationItem, Option<String>);
+
 /// Runs the `uninstall` mode for `inst` (the installation this runtime belongs to), with
-/// `data_home` the environment's per-user data home (canonical). Returns the exit kind and the
-/// final event.
+/// `data_home` the environment's per-user data home (canonical), and its prompts in `ui`.
+/// Returns the exit kind and the final event.
 pub fn run_uninstall(
     ad: &Adapters,
     inst: &Installation,
     data_home: &Path,
     events: &Events,
+    ui: &UiHost,
 ) -> (Kind, Event) {
+    if ui.prompt(PromptKind::Confirm, events, &mut |_| {}) != ChoiceValue::Proceed {
+        ui.outcome(Outcome::Cancelled);
+        return report(inst, Err(Kind::Cancelled));
+    }
+    let result = uninstall(ad, inst, data_home, events, ui.child_id());
+    match &result {
+        Ok(kept) => {
+            ui.steps(&[StepItem::Integrate, StepItem::Remove]);
+            let paths = ui_host::leftovers(leftover_paths(inst, kept));
+            ui.outcome(Outcome::Uninstalled {
+                leftovers: paths.clone(),
+            });
+            ui.prompt(PromptKind::Done, events, &mut |index| {
+                if let Some(path) = paths.get(index as usize) {
+                    reveal(ad, Path::new(path));
+                }
+            });
+        }
+        Err(kind) => {
+            ui.outcome(Outcome::UninstallFailed {
+                code: u32::from(kind.code()),
+            });
+            ui.prompt(PromptKind::Failed, events, &mut |_| {});
+        }
+    }
+    report(inst, result.map(|kept| !kept.is_empty()))
+}
+
+fn report(inst: &Installation, result: Result<bool, Kind>) -> (Kind, Event) {
     let tree_version = Some(inst.tree_version().clone());
-    match uninstall(ad, inst, data_home, events) {
+    match result {
         Ok(leftovers) => (
             Kind::Ok,
             Event::Result {
@@ -80,13 +123,65 @@ fn real_canonical_dir(ad: &Adapters, root: &Path) -> bool {
     real && std::fs::canonicalize(root).is_ok_and(|c| c == root)
 }
 
-/// Removes everything; `Ok(true)` when an integration item was kept.
+/// The paths of the kept integration items, as the UI shows them (Linux: the desktop entry under
+/// the applications directory, the command link under the bin directory).
+#[cfg(target_os = "linux")]
+fn leftover_paths(inst: &Installation, kept: &[Kept]) -> Vec<String> {
+    let Ok(dirs) = lunepack_os_linux::xdg_dirs(&lunepack_os_linux::XdgEnv::from_process()) else {
+        return Vec::new();
+    };
+    kept.iter()
+        .filter_map(|(item, bin)| match item {
+            IntegrationItem::DesktopEntry => Some(
+                dirs.applications()
+                    .join(format!("{}.desktop", inst.app_id().as_str())),
+            ),
+            IntegrationItem::BinLink => bin.as_ref().map(|b| dirs.bin().join(b)),
+            _ => None,
+        })
+        .filter_map(|p| p.to_str().map(str::to_owned))
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn leftover_paths(_inst: &Installation, _kept: &[Kept]) -> Vec<String> {
+    Vec::new()
+}
+
+/// Opens the folder holding `path` with the desktop's opener (M6-D10): `xdg-open <dir>`, found on
+/// `PATH` (absolute entries only), started detached without a shell. Best effort; other platforms
+/// open nothing until their milestones.
+#[cfg(target_os = "linux")]
+fn reveal(ad: &Adapters, path: &Path) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let Some(opener) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .filter(|d| d.is_absolute())
+            .map(|d| d.join("xdg-open"))
+            .find(|p| p.is_file())
+    }) else {
+        return;
+    };
+    let mut spec = lunepack::SpawnSpec::new(opener);
+    spec.args = vec![dir.as_os_str().to_owned()];
+    spec.env_remove = vec![std::ffi::OsString::from(lunepack::HEALTH_TOKEN_VAR)];
+    let _ = ad.process.spawn_detached(&spec);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reveal(_ad: &Adapters, _path: &Path) {}
+
+/// Removes everything; the integration items kept. `ui` is the UI process this run started, which
+/// the in-use scan does not count.
 fn uninstall(
     ad: &Adapters,
     inst: &Installation,
     data_home: &Path,
     events: &Events,
-) -> Result<bool, Kind> {
+    ui: Option<ProcessId>,
+) -> Result<Vec<Kept>, Kind> {
     let layout = inst.layout().ok_or(Kind::NotInstalled)?;
     let root = layout.root();
     // M5-D10: the root this runtime stands in must be the one this environment derives.
@@ -114,7 +209,9 @@ fn uninstall(
     }
 
     let me: ProcessId = ad.process.current().map_err(|e| Kind::of(&e.into()))?;
-    match ad.process.tree_in_use(root, &[me]) {
+    let mut exclude = vec![me];
+    exclude.extend(ui);
+    match ad.process.tree_in_use(root, &exclude) {
         Ok(false) => {}
         Ok(true) => return Err(Kind::InUse),
         Err(e) => return Err(Kind::of(&e.into())),
@@ -130,7 +227,7 @@ fn uninstall(
     {
         owners.push(other);
     }
-    let mut leftovers = false;
+    let mut kept: Vec<Kept> = Vec::new();
     for owner in &owners {
         let request = IntegrationRequest {
             app_id: inst.app_id().clone(),
@@ -142,9 +239,14 @@ fn uninstall(
             .integration
             .remove(Scope::User, &request)
             .map_err(|e| Kind::of(&e.into()))?;
-        leftovers |= !report.kept.is_empty();
+        kept.extend(
+            report
+                .kept
+                .into_iter()
+                .map(|item| (item, owner.meta().bin.clone())),
+        );
     }
-    if leftovers {
+    if !kept.is_empty() {
         events.emit(&Event::warning(Warning::IntegrationKept, None));
     }
 
@@ -168,7 +270,7 @@ fn uninstall(
         return Err(Kind::of(&e.into()));
     }
     let _ = ad.fs.sync_dir(data_home);
-    Ok(leftovers)
+    Ok(kept)
 }
 
 /// Text equality of two versions.
