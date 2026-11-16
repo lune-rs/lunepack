@@ -1211,6 +1211,26 @@ fn a_commit_that_fails_after_the_integration_leaves_install_resumable() {
 }
 
 #[test]
+fn a_channel_with_no_release_for_this_install_is_no_release_and_resumable() {
+    let _serial = common::serial();
+    let lab = Lab::new();
+    lab.world.publish_feed(1, Vec::new());
+    let boot = bootstrap(&lab, V100);
+    let got = install(&lab, &boot);
+    assert!(matches!(got, Err(Error::NoRelease)), "{got:?}");
+    assert!(lab.record().current.is_none(), "nothing installed");
+    assert!(lab.integration.applied().is_empty());
+
+    publish_with_config(&lab, 2, V100);
+    install(&lab, &boot).expect("a later try");
+    assert_eq!(
+        lab.record().current.expect("current").version,
+        version(V100)
+    );
+    common::workers_stopped();
+}
+
+#[test]
 fn install_into_a_machine_layout_is_machine_scope() {
     let lab = Lab::new();
     let layout = Layout::Machine {
