@@ -837,12 +837,15 @@ where
     cancellable(cancel, future).await??
 }
 
+/// The updater lock's file name in the lock directory.
+const LOCK_FILE: &str = "lock";
+
 /// Takes the updater lock on a short job: [`Error::Busy`] when it is held.
 async fn take_lock(inner: &Arc<Inner>, cancel: &CancelToken) -> Result<OpLock, Error> {
     on_job(inner, None, cancel, "lock", |inner, _| {
         let dir = inner.layout.lock_dir();
         inner.fs.create_dir_all(dir)?;
-        match inner.fs.try_lock(&dir.join("lock"))? {
+        match inner.fs.try_lock(&dir.join(LOCK_FILE))? {
             Some(guard) => Ok(OpLock::new(guard)),
             None => Err(Error::Busy),
         }
@@ -946,7 +949,9 @@ impl Updater {
     /// ([`Layout::user`]) with the bootstrap tree it runs from as `current_tree`:
     ///
     /// 1. the bootstrap's update config must name this app; its desktop integration passes the
-    ///    preflight before anything is written;
+    ///    preflight, and an install root that already exists must be lunepack's (empty, this
+    ///    app's install state, or what a cut-off run left; else [`Error::ForeignInstallRoot`]),
+    ///    before anything is written;
     /// 2. the install state is created when there is none (a fresh install id from the random
     ///    source); a record with no current version resumes, one with a current version is
     ///    [`Error::AlreadyInstalled`] once `current` is put back from it (a run cut off after its
@@ -1579,6 +1584,59 @@ fn already_installed(fs: &dyn Fs, root: &Path, record: &InstallState) -> Error {
     }
 }
 
+/// Whether the first install may take over `root`, its install root (S2): `root` does not exist
+/// yet, or is a real directory that is empty, or whose `state` directory (`state_dir`) holds a
+/// record of this app id, or that holds only what a run cut off before its first record leaves
+/// (a `state` directory with nothing but the lock and record files). Anything else (the app's own
+/// user data from before lunepack, another packaging's directory, a shared directory, a symlink)
+/// is [`Error::ForeignInstallRoot`]: uninstall removes `root` whole, so it must hold nothing
+/// lunepack did not make. Reads only; it runs before the install's first write.
+fn adoptable(inner: &Inner, root: &Path, state_dir: &Path) -> Result<(), Error> {
+    match inner.fs.symlink_metadata(root) {
+        Ok(None) => return Ok(()),
+        Ok(Some(meta)) if meta.kind == FileKind::Dir => {}
+        Ok(Some(_)) => return Err(Error::ForeignInstallRoot),
+        Err(e) if e.kind == lunepack_core::FsErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    let entries = inner.fs.list_dir(root)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let state_name = state_dir.file_name();
+    let has_state = entries
+        .iter()
+        .any(|e| Some(e.name.as_os_str()) == state_name && e.kind == FileKind::Dir);
+    let only_state = has_state && entries.len() == 1;
+    if !has_state {
+        return Err(Error::ForeignInstallRoot);
+    }
+    let store = UserScope {
+        dir: state_dir.to_path_buf(),
+        app_id: inner.app_id.clone(),
+    };
+    if store.load(&*inner.fs, &*inner.hasher)?.record.is_some() {
+        return Ok(());
+    }
+    let only_ours = inner.fs.list_dir(state_dir)?.iter().all(|e| {
+        e.kind == FileKind::File
+            && e.name
+                .to_str()
+                .is_some_and(|n| n == LOCK_FILE || is_record_name(n))
+    });
+    if only_state && only_ours {
+        Ok(())
+    } else {
+        Err(Error::ForeignInstallRoot)
+    }
+}
+
+/// A record file name of the state store, `<20 digits>.rec` (FORMAT.md 12.4).
+fn is_record_name(name: &str) -> bool {
+    name.strip_suffix(".rec")
+        .is_some_and(|digits| digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// The integration request for `meta` of the install at `root`.
 fn integration_request(
     app_id: &AppId,
@@ -1625,12 +1683,15 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
     ))?;
     let cancel = options.cancel.clone().unwrap_or_default();
 
-    // The bootstrap's config and the integration preflight, before the first write.
+    // The bootstrap's config, the integration preflight and the root's owner, before the first
+    // write (the lock is the first).
     let boot_root = root.clone();
+    let boot_state = state_dir.clone();
     let (target, boot_version) = on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
         let config = tree_config(&*inner.fs, &inner.app_id, &bootstrap)?;
         let request = integration_request(&inner.app_id, &boot_root, config.install.clone());
         inner.integration.check(Scope::User, &request)?;
+        adoptable(inner, &boot_root, &boot_state)?;
         Ok((config.target, config.version))
     })
     .await?;
