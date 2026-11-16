@@ -21,6 +21,8 @@ mod suites;
 mod transport;
 mod verifier;
 
+use std::path::PathBuf;
+
 pub use clock::{FakeClock, YEAR_2100_UNIX_SECS};
 pub use codec::{FakeCodec, FakeEncoded, FakeStreamLayout, Fault};
 pub use docs::{
@@ -46,3 +48,19 @@ pub use transport::{
     TransportFixture,
 };
 pub use verifier::{FAKE_INVALID_KEYS, FakeKeyPair, FakeVerifier};
+
+/// A test path written in POSIX form (`/a/b`) as an absolute path on this platform: unchanged on
+/// Unix, and on drive `C:` on Windows (`C:\a\b`), where `/a/b` has no prefix and is not absolute.
+/// For literal paths given to code that requires an absolute one (`tree_candidates`, `discover`,
+/// a spawn's program); the in-memory filesystem ignores the prefix.
+pub fn abs_path(posix: &str) -> PathBuf {
+    assert!(
+        posix.starts_with('/'),
+        "abs_path takes a path that starts with /"
+    );
+    if cfg!(windows) {
+        PathBuf::from(format!("C:{}", posix.replace('/', "\\")))
+    } else {
+        PathBuf::from(posix)
+    }
+}

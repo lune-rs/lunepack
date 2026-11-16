@@ -1719,7 +1719,8 @@ fn fake_process_records_spawns_and_scripts_children() {
     fake.set_parent(None);
     assert_eq!(fake.parent().unwrap(), None);
 
-    let mut spec = SpawnSpec::new("/opt/app/bin/app");
+    // An absolute program on this platform (on Windows `/opt/…` has no drive and is refused).
+    let mut spec = SpawnSpec::new(abs_path("/opt/app/bin/app"));
     spec.args = vec![OsString::from("--x")];
     spec.env_set = vec![(OsString::from("K"), OsString::from("V"))];
     fake.script_child(ChildScript::exits(2, ExitKind::Failure(3)));
