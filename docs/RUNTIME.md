@@ -174,7 +174,7 @@ calls `apply-and-restart`, which starts `apply` itself.
 
 | Mode | Started by | What it does |
 |---|---|---|
-| `apply --wait-pid <pid> --wait-start <ticks> --version <version> [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. An apply that fails after the wait changes nothing and starts the current version again (without the token). Exit codes 20 to 22 are its own. |
+| `apply --wait-pid <pid> --wait-start <ticks> --version <version> [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. An apply that fails after the wait changes nothing and starts the version that exited again (without the token), unless the state moved on (a version pending, or another one current): then another applier, such as a second instance's, or a rollback has started the app already. Exit codes 20 to 22 are its own. |
 | `install` | the first-install flow, from a bootstrap tree | Installs the newest release the tree's own channel offers (M5-D8): the root, feed and channel come only from that tree's update configuration. Exit codes 23, 24, 26 and 27 are its own. |
 | `uninstall` | the uninstall flow, from a tree of the install | Removes the install this runtime stands in and the desktop integration lunepack made (M5-D10). Exit codes 24, 25 and 26 are its own. |
 

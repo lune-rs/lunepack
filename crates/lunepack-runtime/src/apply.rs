@@ -14,8 +14,10 @@
 //! 3. **gc**, after the previous version was relaunched (detached, without the token).
 //!
 //! An apply that fails after the wait (window 1 refuses: no usable config, nothing staged, a held
-//! lock, a disk or state error) changes nothing and starts the current version again, detached
-//! and without the token, so the app that exited for it comes back; the exit code is the failure.
+//! lock, a disk or state error) changes nothing and starts the version that exited again, detached
+//! and without the token, so the app comes back; the exit code is the failure. It does not when the
+//! record moved on (a version pending, or another current): another applier or a rollback
+//! elsewhere has started the app already.
 //!
 //! The process waited for is only waited for; the only process ever signalled is the own child.
 //! Every per-version fact (entry, health timeout, install metadata) comes from that version's own
@@ -156,6 +158,23 @@ struct Applied {
     new: Installation,
 }
 
+/// Why window 1 committed nothing.
+struct Refused {
+    kind: Kind,
+    /// [`nothing_moved_on`] for the record window 1 loaded under the lock, when it got that far:
+    /// the relaunch is decided on the state the refusal was decided on (F17).
+    unmoved: Option<bool>,
+}
+
+impl Refused {
+    fn unread(kind: Kind) -> Self {
+        Self {
+            kind,
+            unmoved: None,
+        }
+    }
+}
+
 /// Window 1: checks and commits the apply of `v`, reconciles `current` and refreshes the
 /// integration. Nothing is changed when it fails.
 fn commit_apply(
@@ -164,36 +183,51 @@ fn commit_apply(
     layout: &UserLayout,
     v: &Version,
     events: &Events,
-) -> Result<Applied, Kind> {
+) -> Result<Applied, Refused> {
     let store = store_of(inst, layout);
-    let guard = lock_retry(ad, &layout.state_dir(), LOCK_WAIT).map_err(kind_of)?;
-    let loaded = store.load(&*ad.fs, &*ad.hasher).map_err(kind_of)?;
-    let record = loaded.record.clone().ok_or(Kind::NotInstalled)?;
-    let current = record.current.as_ref().ok_or(Kind::NotInstalled)?;
+    let guard =
+        lock_retry(ad, &layout.state_dir(), LOCK_WAIT).map_err(|e| Refused::unread(kind_of(e)))?;
+    let loaded = store
+        .load(&*ad.fs, &*ad.hasher)
+        .map_err(|e| Refused::unread(kind_of(e)))?;
+    let Some(record) = loaded.record.clone() else {
+        return Err(Refused::unread(Kind::NotInstalled));
+    };
+    let unmoved = nothing_moved_on(&record, inst.tree_version());
+    let refused = |kind| Refused {
+        kind,
+        unmoved: Some(unmoved),
+    };
+    let current = record
+        .current
+        .as_ref()
+        .ok_or_else(|| refused(Kind::NotInstalled))?;
     let staged_is_v = record.staged.as_ref().is_some_and(|s| same(&s.version, v));
     if !staged_is_v {
-        return Err(Kind::NothingStaged);
+        return Err(refused(Kind::NothingStaged));
     }
     let tree_is_dir = matches!(
         ad.fs.symlink_metadata(&layout.version_dir(v)),
         Ok(Some(meta)) if meta.kind == FileKind::Dir
     );
     if !tree_is_dir {
-        return Err(Kind::NothingStaged);
+        return Err(refused(Kind::NothingStaged));
     }
     // The new version's own config decides its entry, timeout and integration; without a usable
     // one nothing is committed.
-    let new = inst.version_installation(v).map_err(|e| Kind::of(&e))?;
+    let new = inst
+        .version_installation(v)
+        .map_err(|e| refused(Kind::of(&e)))?;
     // The outgoing version's config only names command links to retire.
     let outgoing = inst.version_installation(&current.version).ok();
 
     let mut token = [0u8; 32];
-    ad.rng.fill(&mut token).map_err(kind_of)?;
+    ad.rng.fill(&mut token).map_err(|e| refused(kind_of(e)))?;
     let token_sha256 = ad.hasher.sha256(&token);
-    let next = lunepack_core::apply(&record, v, token_sha256).map_err(kind_of)?;
+    let next = lunepack_core::apply(&record, v, token_sha256).map_err(|e| refused(kind_of(e)))?;
     let committed = store
         .commit(&*ad.fs, &loaded, &next, &*ad.hasher)
-        .map_err(kind_of)?;
+        .map_err(|e| refused(kind_of(e)))?;
     reconcile(ad, layout, &committed, events);
     refresh_integration(ad, layout, outgoing.as_ref(), &new, events);
     drop(guard);
@@ -356,25 +390,38 @@ fn roll_back(
     Ok(RolledBack::Done(Box::new(previous)))
 }
 
-/// After an apply that changed nothing: starts the current version again, detached, with the
-/// restart arguments and without the health token (best effort; a failure is a warning). The
-/// entry comes from the current version's own config; when the record or that config cannot be
-/// read, from this runtime's own tree, the version that just exited.
+/// After an apply that changed nothing: starts the version that just exited again, detached, with
+/// the restart arguments and without the health token (best effort; a failure is a warning).
+///
+/// Only when the record shows that nothing moved on (F17): no version pending, and the current
+/// version is this runtime's own tree's, the version that just exited. Another applier that
+/// applied the version first (a second app instance, or `apply-and-restart` called twice) has
+/// launched it already, and a rollback elsewhere has relaunched the previous version; starting
+/// one more instance would run it twice and, unsupervised, count a start against a pending
+/// version. `unmoved` is that judgement on the record window 1 loaded under the lock; when it did
+/// not get that far, the record is read here, and when it cannot be read the own tree is started
+/// (M5-D18). The entry comes from the version's own config, else from this runtime's own tree.
 fn relaunch_current(
     ad: &Adapters,
     inst: &Installation,
     layout: &UserLayout,
+    unmoved: Option<bool>,
     restart: &[OsString],
     events: &Events,
 ) {
-    let current = store_of(inst, layout)
-        .load(&*ad.fs, &*ad.hasher)
-        .ok()
-        .and_then(|loaded| loaded.record)
-        .and_then(|record| record.current)
-        .and_then(|c| inst.version_installation(&c.version).ok());
-    let (entry, version) = match &current {
-        Some(current) => (current.entry_path(), current.tree_version()),
+    let unmoved = unmoved.or_else(|| {
+        store_of(inst, layout)
+            .load(&*ad.fs, &*ad.hasher)
+            .ok()
+            .and_then(|loaded| loaded.record)
+            .map(|record| nothing_moved_on(&record, inst.tree_version()))
+    });
+    if unmoved == Some(false) {
+        return;
+    }
+    let own = inst.version_installation(inst.tree_version()).ok();
+    let (entry, version) = match &own {
+        Some(own) => (own.entry_path(), own.tree_version()),
         None => (inst.entry_path(), inst.tree_version()),
     };
     let relaunch = SpawnSpec {
@@ -386,6 +433,16 @@ fn relaunch_current(
     if ad.process.spawn_detached(&relaunch).is_err() {
         events.emit(&Event::warning(Warning::RelaunchFailed, Some(version)));
     }
+}
+
+/// Whether `record` is where the app that exited for this apply left it: nothing pending, and
+/// `exited` current.
+fn nothing_moved_on(record: &InstallState, exited: &Version) -> bool {
+    record.pending.is_none()
+        && record
+            .current
+            .as_ref()
+            .is_some_and(|c| same(&c.version, exited))
 }
 
 /// The outcome of [`run_apply`] before it is reported.
@@ -444,10 +501,11 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
 
     let applied = match commit_apply(ad, inst, &layout, v, events) {
         Ok(applied) => applied,
-        Err(kind) => {
+        Err(Refused { kind, unmoved }) => {
             // The app has exited for this apply; nothing was committed, so it starts again as
-            // the version it was (F10). The failure stays the exit kind.
-            relaunch_current(ad, inst, &layout, &args.restart, events);
+            // the version it was, unless the record moved on (F10, F17). The failure stays the
+            // exit kind.
+            relaunch_current(ad, inst, &layout, unmoved, &args.restart, events);
             return End::Failed(kind);
         }
     };
