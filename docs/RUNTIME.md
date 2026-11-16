@@ -137,7 +137,13 @@ standard streams on `/dev/null`, no health token in its environment). It prints 
 exits; the app exits next. The applier waits for the process it was given, then applies the update,
 starts the new tree's entry (from that tree's own update configuration, without a shell, with the
 arguments after `--` and a fresh health token) and supervises its health check (above); its events
-go to the runtime's log, `logs/runtime.log` under the install. Because the applier holds none of the
+go to the runtime's log, `logs/runtime.log` under the install. When the apply fails after the wait
+with nothing changed (the new version's configuration is missing or invalid, nothing usable is
+staged any more, the install lock stays held, a disk or state error), the applier starts the current
+version's entry again instead (detached, with the same arguments, without a health token), so the
+app that exited for the update comes back; its exit code is the failure's, in the log. An app that
+requests `apply-and-restart` on its own at start, rather than when the user asks, can therefore
+loop while the apply keeps failing. Because the applier holds none of the
 caller's streams, a shell capture (`x=$(lunepack-runtime apply-and-restart --json)`) returns as soon
 as the command exits.
 
@@ -167,7 +173,7 @@ calls `apply-and-restart`, which starts `apply` itself.
 
 | Mode | Started by | What it does |
 |---|---|---|
-| `apply --wait-pid <pid> --wait-start <ticks> --version <version> [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. Exit codes 20 to 22 are its own. |
+| `apply --wait-pid <pid> --wait-start <ticks> --version <version> [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. An apply that fails after the wait changes nothing and starts the current version again (without the token). Exit codes 20 to 22 are its own. |
 | `install` | the first-install flow, from a bootstrap tree | Installs the newest release the tree's own channel offers (M5-D8): the root, feed and channel come only from that tree's update configuration. Exit codes 23, 24 and 26 are its own. |
 | `uninstall` | the uninstall flow, from a tree of the install | Removes the install this runtime stands in and the desktop integration lunepack made (M5-D10). Exit codes 24, 25 and 26 are its own. |
 
