@@ -31,6 +31,7 @@ pub mod target;
 pub mod traits;
 pub mod transport;
 pub mod trust;
+pub mod ui;
 pub mod update_config;
 pub mod version;
 pub mod write;
