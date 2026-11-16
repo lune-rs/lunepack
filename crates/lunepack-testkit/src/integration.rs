@@ -195,6 +195,7 @@ fn suite_request(sandbox: &Path, id: &str, name: &str, bin: &str) -> Integration
             categories: vec!["Utility".to_owned(), "Development".to_owned()],
             bin: Some(bin.to_owned()),
             terminal: false,
+            publisher: None,
         },
         stale_bins: Vec::new(),
     }

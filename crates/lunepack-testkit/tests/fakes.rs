@@ -1922,6 +1922,7 @@ fn integration_request(id: &str, root: &str) -> IntegrationRequest {
             categories: vec![],
             bin: None,
             terminal: false,
+            publisher: None,
         },
         stale_bins: vec![],
     }

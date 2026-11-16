@@ -940,6 +940,52 @@ fn update_pack_places_runtime_and_config() {
     }
 }
 
+/// `[install] publisher` (M6-D3) is written into the signed config; absent stays absent; a bad
+/// value is refused naming the field.
+#[cfg(unix)]
+#[test]
+fn update_pack_writes_the_publisher() {
+    let pack_with = |toml: &str| {
+        let w = World::new(1, 1);
+        w.append_config(toml);
+        let dir = w.release_dir("rel", &[]);
+        let input = tempfile::tempdir().unwrap();
+        app_tree(input.path(), "bin/app");
+        let runtime = w.dir.path().join("runtime");
+        fs::write(&runtime, runtime_elf(62, false)).unwrap();
+        let out = pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&runtime),
+            "1.0.0",
+            "linux-x86_64",
+        );
+        (w, dir, out)
+    };
+    let (w, dir, out) = pack_with(&UPDATE_TOML.replace(
+        "comment = \"Says hello\"",
+        "comment = \"Says hello\"\npublisher = \"Acme\"",
+    ));
+    assert_ok(&out, "pack with a publisher");
+    let (_, files) = w.verify(&dir, "1.0.0", Target::LinuxX86_64);
+    let doc = lunepack_core::UpdateConfig::parse(&files["lunepack-update.json"]).unwrap();
+    assert_eq!(doc.install.publisher.as_deref(), Some("Acme"));
+
+    let (w, dir, out) = pack_with(UPDATE_TOML);
+    assert_ok(&out, "pack without a publisher");
+    let (_, files) = w.verify(&dir, "1.0.0", Target::LinuxX86_64);
+    let bytes = &files["lunepack-update.json"];
+    assert!(!String::from_utf8_lossy(bytes).contains("publisher"));
+    let doc = lunepack_core::UpdateConfig::parse(bytes).unwrap();
+    assert_eq!(doc.install.publisher, None);
+
+    let (_w, _dir, out) =
+        pack_with(&UPDATE_TOML.replace("comment = \"Says hello\"", "publisher = \"Ac\\\\me\""));
+    let err = assert_fails(&out, 1, "a publisher with a backslash");
+    assert!(err.contains("[install] publisher"), "{err:?}");
+}
+
 /// C2: the same inputs (the runtime's bytes included), keys and clock give identical bytes; a
 /// different runtime gives a different pack.
 #[cfg(unix)]

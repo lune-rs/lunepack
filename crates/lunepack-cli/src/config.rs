@@ -54,6 +54,7 @@ struct RawInstall {
     entry: String,
     name: String,
     comment: Option<String>,
+    publisher: Option<String>,
     icon: Option<String>,
     #[serde(default)]
     categories: Vec<String>,
@@ -154,6 +155,7 @@ fn update_settings(file: &str, u: RawUpdate, i: RawInstall) -> Result<UpdateSett
         categories: i.categories,
         bin: i.bin,
         terminal: i.terminal,
+        publisher: i.publisher,
     };
     Ok(UpdateSettings {
         feed: u.feed,

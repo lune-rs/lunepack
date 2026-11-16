@@ -63,6 +63,7 @@ fn meta(entry: &str, bin: Option<&str>, name: &str) -> InstallMeta {
         categories: Vec::new(),
         bin: bin.map(str::to_owned),
         terminal: false,
+        publisher: None,
     }
 }
 

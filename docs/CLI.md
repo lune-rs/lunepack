@@ -69,6 +69,7 @@ health_timeout_secs = 60                      # default 60, 5..=3600
 entry = "bin/hello"          # the executable, relative to the tree (required, must be exec)
 name = "Hello"               # the display name (required)
 comment = "Says hello"       # optional
+publisher = "Acme"           # optional: shown beside "verified" by the installer; left out when unset
 icon = "assets/hello.svg"    # optional: a .png or .svg file of the tree
 categories = ["Utility"]     # optional: freedesktop category names
 bin = "hello"                # optional: the name of the command-line link
