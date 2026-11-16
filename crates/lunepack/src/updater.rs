@@ -26,15 +26,17 @@ use lunepack_core::state::{
     Floors, InstallCounters, InstallState, Loaded, MachineScope as MachineStore, RootParts,
     StagedRef, UserScope,
 };
+use lunepack_core::update_config::MAX_UPDATE_CONFIG_BYTES;
 use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, CancelToken, Channel, ClockReading, Codec,
-    FileKind, Fs, Hasher, IntegrationRequest, Limits, OsIntegration, Phase, Progress, Request, Rng,
-    Sha256Digest, SourceFor, StageEnv, StageError, StageInput, Target, Transport, TransportError,
-    TrustedRoot, UPDATE_CONFIG_FILE, UpdateConfigError, VerifiedEntry, VerifiedManifest, Verifier,
-    Version, advance_root, select_candidate, verify_feed, verify_key_set, verify_manifest,
+    FileKind, Fs, Hasher, IntegrationRequest, Limits, OsIntegration, Phase, Progress, ReadAt,
+    RelPath, Request, Rng, Sha256Digest, SourceFor, StageEnv, StageError, StageInput, Target,
+    Transport, TransportError, TrustedRoot, UPDATE_CONFIG_FILE, UpdateConfig, UpdateConfigError,
+    VerifiedEntry, VerifiedManifest, Verifier, Version, advance_root, read_entry, select_candidate,
+    verify_feed, verify_key_set, verify_manifest, verify_payload_manifest,
 };
 
-use crate::cache::{Cache, CacheKind};
+use crate::cache::{Cache, CacheKind, PartTools};
 use crate::fetch::{self, FeedUrls, FetchCtx, FrameNeed, PackTarget, cancellable};
 use crate::progress::{ProgressPump, ProgressSink, progress};
 use crate::task::{OpLock, spawn_job};
@@ -642,6 +644,45 @@ impl Downloaded {
     }
 }
 
+/// One part of an offline payload: `length` bytes at `offset` of the payload file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadPart {
+    /// Where the part starts in the payload file.
+    pub offset: u64,
+    /// Its length in bytes.
+    pub length: u64,
+}
+
+/// An offline payload (M6-D4), the input of [`Updater::install_from_payload`]: a file holding a
+/// release's key set, manifest and pack, and the version and target it was built for. Nothing in
+/// it is trusted: every part is checked before use.
+pub struct OfflinePayload {
+    /// The file the parts are read from.
+    pub file: Arc<dyn ReadAt>,
+    /// The key set (`keys.json`).
+    pub keys: PayloadPart,
+    /// The manifest of `version` for `target`.
+    pub manifest: PayloadPart,
+    /// The release's pack.
+    pub pack: PayloadPart,
+    /// The version the payload installs; the manifest must name it byte for byte.
+    pub version: Version,
+    /// The target the payload is for.
+    pub target: Target,
+}
+
+impl fmt::Debug for OfflinePayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OfflinePayload")
+            .field("keys", &self.keys)
+            .field("manifest", &self.manifest)
+            .field("pack", &self.pack)
+            .field("version", &self.version)
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
 // ---- the updater ---------------------------------------------------------------------------------
 
 /// The updater handle: cheap to clone (an `Arc`), `Send + Sync`.
@@ -975,6 +1016,43 @@ impl Updater {
     ) -> impl Future<Output = Result<InstalledVersion, Error>> + Send + 'static {
         let inner = Arc::clone(&self.inner);
         async move { install(inner, options).await }
+    }
+
+    /// The first install from an offline payload (M6-D4: a setup file), with no network: the
+    /// payload installs exactly its own version. For the same layouts as [`Updater::install`]; no
+    /// bootstrap tree is needed, and the transport is never used.
+    ///
+    /// 1. Under the lock, an install whose record names a current version is
+    ///    [`Error::AlreadyInstalled`] (after `current` is put back from it, as `install`).
+    /// 2. Verification, before anything is written, in FORMAT.md 11.1 order: `root` is the
+    ///    trusted root (the setup file's); the key set verifies against it with no floors (a first
+    ///    install) and its expiry at the clock's `now`; the manifest verifies against the key set
+    ///    ([`lunepack_core::verify_payload_manifest`]: release keys valid at `now`, the app id
+    ///    the key set's, the version and target the payload's); the pack part's size is the
+    ///    manifest's. The update config is read from the pack before staging
+    ///    ([`lunepack_core::read_entry`]) and must name this app, the payload's version and
+    ///    target and exactly `root` ([`UpdateConfigError::RootMismatch`] otherwise); its desktop
+    ///    integration passes the preflight. Each part is read within its cap.
+    /// 3. The install root must be lunepack's (as `install`: [`Error::ForeignInstallRoot`]), and
+    ///    the install state is created when there is none, as `install` does.
+    /// 4. Every file entry's frame is copied out of the pack into the cache (phase `Install`),
+    ///    each checked against its signed hash; the tree is staged from those frames (phase
+    ///    `Stage`). The staged tree's config must again be exactly `root`'s; otherwise the tree is
+    ///    removed and the install fails with no current version recorded.
+    /// 5. As `install`'s commit: under the lock the integration preflight runs on the staged tree's
+    ///    config, the integration is applied, the record names the version as current (events
+    ///    `installed` and `first_run`) with the floors raised to `root`, the key set's version and
+    ///    no feed `seq`, and `current` is linked.
+    ///
+    /// A failure or cancel leaves no current version and no floor raised; a rerun resumes.
+    pub fn install_from_payload(
+        &self,
+        payload: OfflinePayload,
+        root: TrustedRoot,
+        options: DownloadOptions,
+    ) -> impl Future<Output = Result<InstalledVersion, Error>> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        async move { install_from_payload(inner, payload, root, options).await }
     }
 
     /// The installed version; `Ok(None)` in a development run (no install state). Takes no lock.
@@ -1328,7 +1406,7 @@ async fn refuse_case_collision(
     lock: &OpLock,
     cancel: &CancelToken,
     record: &InstallState,
-    info: &UpdateInfo,
+    version: &Version,
     versions_dir: &Path,
 ) -> Result<(), Error> {
     let mut names: Vec<String> = record
@@ -1339,7 +1417,7 @@ async fn refuse_case_collision(
         .chain(record.pending.iter().map(|p| p.version.to_string()))
         .chain(record.staged.iter().map(|s| s.tree.clone()))
         .collect();
-    let candidate = info.version.to_string();
+    let candidate = version.to_string();
     let dir = versions_dir.to_path_buf();
     on_job(
         inner,
@@ -1389,7 +1467,15 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
         let lock = take_lock(&inner, &cancel).await?;
         let snap = load_fresh(&inner, &lock, &cancel, &info).await?;
         let manifest = Arc::clone(&info.manifest);
-        refuse_case_collision(&inner, &lock, &cancel, snap.record(), &info, &versions_dir).await?;
+        refuse_case_collision(
+            &inner,
+            &lock,
+            &cancel,
+            snap.record(),
+            &info.version,
+            &versions_dir,
+        )
+        .await?;
         let all_frames = frames_of(&manifest);
         let mut use_pack: HashSet<usize> = HashSet::new();
         let (mut range_tried, mut pack_tried) = (false, false);
@@ -1844,5 +1930,489 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
             })
         },
     )
+    .await
+}
+
+// ---- offline install -----------------------------------------------------------------------------
+
+/// The pack inside an offline payload: `length` bytes at `offset` of `file`, which the caller has
+/// checked lie inside it.
+struct PayloadWindow {
+    file: Arc<dyn ReadAt>,
+    offset: u64,
+    length: u64,
+}
+
+impl ReadAt for PayloadWindow {
+    fn size(&self) -> Result<u64, lunepack_core::FsError> {
+        Ok(self.length)
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), lunepack_core::FsError> {
+        let inside = offset
+            .checked_add(buf.len() as u64)
+            .is_some_and(|end| end <= self.length);
+        if !inside {
+            return Err(lunepack_core::FsError::new(
+                lunepack_core::FsErrorKind::Other,
+                Path::new("payload"),
+                Some(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            ));
+        }
+        self.file.read_exact_at(self.offset + offset, buf)
+    }
+}
+
+/// `part` must lie inside a file of `file_size` bytes.
+fn check_part(part: PayloadPart, file_size: u64) -> Result<(), Error> {
+    match part.offset.checked_add(part.length) {
+        Some(end) if end <= file_size => Ok(()),
+        _ => Err(Error::Verify(lunepack_core::Error::Field(
+            "payload part lies outside the payload file",
+        ))),
+    }
+}
+
+/// The bytes of `part` of `file`, refused above `cap` before anything is read.
+fn read_part(
+    file: &dyn ReadAt,
+    part: PayloadPart,
+    what: &'static str,
+    cap: u64,
+) -> Result<Vec<u8>, Error> {
+    if part.length > cap {
+        return Err(Error::Verify(lunepack_core::Error::TooLarge {
+            what,
+            size: part.length,
+            cap,
+        }));
+    }
+    check_part(part, file.size()?)?;
+    let mut bytes = vec![0u8; usize::try_from(part.length).unwrap_or(0)];
+    file.read_exact_at(part.offset, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// What the offline verification produced.
+struct VerifiedPayload {
+    manifest: Arc<VerifiedManifest>,
+    pack: Arc<PayloadWindow>,
+    floors: Floors,
+}
+
+/// Step 2 of [`Updater::install_from_payload`]: reads only.
+fn verify_payload(
+    inner: &Inner,
+    payload: &OfflinePayload,
+    root: &TrustedRoot,
+    install_root: &Path,
+) -> Result<VerifiedPayload, Error> {
+    let (hasher, verifier) = (&*inner.hasher, &*inner.verifier);
+    let file = &*payload.file;
+    // A first install: no floor time (the clock is plausible) and no stored floors (P6).
+    let clock = ClockReading::read(&*inner.clock, None);
+    let keys_bytes = read_part(file, payload.keys, "keys", Limits::V1.keys_doc_bytes)?;
+    let keys = verify_key_set(
+        root,
+        &keys_bytes,
+        &lunepack_core::RollbackFloor::default(),
+        &clock,
+        hasher,
+        verifier,
+    )?;
+    let manifest_bytes = read_part(
+        file,
+        payload.manifest,
+        "manifest",
+        Limits::V1.manifest_doc_bytes,
+    )?;
+    let manifest = verify_payload_manifest(
+        &keys,
+        (&payload.version, payload.target),
+        &manifest_bytes,
+        clock.now(),
+        hasher,
+        verifier,
+    )?;
+    check_part(payload.pack, file.size()?)?;
+    if payload.pack.length != manifest.pack().size() {
+        return Err(Error::Verify(lunepack_core::Error::ArtifactSize {
+            expected: manifest.pack().size(),
+            actual: payload.pack.length,
+        }));
+    }
+    let pack = Arc::new(PayloadWindow {
+        file: Arc::clone(&payload.file),
+        offset: payload.pack.offset,
+        length: payload.pack.length,
+    });
+
+    // FORMAT.md 13.6: the config before staging, so a foreign root writes nothing.
+    let config_path = RelPath::parse(UPDATE_CONFIG_FILE)
+        .map_err(|_| Error::Config("the update config's name is not a path"))?;
+    let config_bytes = read_entry(
+        &manifest,
+        &config_path,
+        &*pack,
+        &*inner.codec,
+        hasher,
+        MAX_UPDATE_CONFIG_BYTES,
+    )?;
+    let config = UpdateConfig::parse(&config_bytes).map_err(Error::UpdateConfig)?;
+    check_payload_config(
+        &inner.app_id,
+        &config,
+        root,
+        manifest.version(),
+        manifest.target(),
+    )?;
+    let request = integration_request(&inner.app_id, install_root, config.install);
+    inner.integration.check(Scope::User, &request)?;
+
+    Ok(VerifiedPayload {
+        manifest: Arc::new(manifest),
+        pack,
+        floors: Floors {
+            // The walk from the payload's root reaches only that root offline; the key set named
+            // it (`root_version`), so it is the highest root this install verified.
+            root: Some(RootParts::from_trusted(root)),
+            keyset_version: keys.version(),
+            feed_seq: std::collections::BTreeMap::new(),
+        },
+    })
+}
+
+/// A payload's (or its staged tree's) config must be this app's, of the manifest's version and
+/// target, under exactly `root` (M6-D4: the installed app trusts the root that verified it).
+fn check_payload_config(
+    app_id: &AppId,
+    config: &UpdateConfig,
+    root: &TrustedRoot,
+    version: &Version,
+    target: Target,
+) -> Result<(), Error> {
+    if &config.app_id != app_id {
+        return Err(Error::UpdateConfig(UpdateConfigError::RootMismatch(
+            "app_id",
+        )));
+    }
+    config.check_root(root).map_err(Error::UpdateConfig)?;
+    if !crate::installation::same_version(&config.version, version) || config.target != target {
+        return Err(Error::UpdateConfig(UpdateConfigError::Invalid {
+            field: "version",
+            rule: "is not the version of its directory",
+        }));
+    }
+    Ok(())
+}
+
+/// Loads the user record under `lock`: an install with a current version is
+/// [`Error::AlreadyInstalled`] (after `current` is put back from it).
+async fn refuse_installed(
+    inner: &Arc<Inner>,
+    lock: &OpLock,
+    cancel: &CancelToken,
+    root: &Path,
+) -> Result<(), Error> {
+    let root = root.to_path_buf();
+    on_job(inner, Some(lock), cancel, "state-check", move |inner, _| {
+        let Layout::User { state_dir, .. } = &inner.layout else {
+            return Err(Error::MachineScope);
+        };
+        let store = UserScope {
+            dir: state_dir.clone(),
+            app_id: inner.app_id.clone(),
+        };
+        match store.load(&*inner.fs, &*inner.hasher)?.record {
+            Some(record) if record.current.is_some() => {
+                Err(already_installed(&*inner.fs, &root, &record))
+            }
+            _ => Ok(()),
+        }
+    })
+    .await
+}
+
+async fn install_from_payload(
+    inner: Arc<Inner>,
+    payload: OfflinePayload,
+    root: TrustedRoot,
+    mut options: DownloadOptions,
+) -> Result<InstalledVersion, Error> {
+    let Layout::User {
+        state_dir,
+        versions_dir,
+        ..
+    } = &inner.layout
+    else {
+        return Err(Error::MachineScope);
+    };
+    let (state_dir, versions_dir) = (state_dir.clone(), versions_dir.clone());
+    let install_root = install_root_of(&state_dir, &versions_dir)?;
+    if root.app_id() != &inner.app_id {
+        return Err(Error::Verify(lunepack_core::Error::AppIdMismatch));
+    }
+    let cancel = options.cancel.clone().unwrap_or_default();
+    let (sink, mut pump) = progress(Phase::Install, 0);
+    let mut callback = options.progress.take();
+    with_progress(&mut pump, &mut callback, async {
+        // 1. An installed record is `AlreadyInstalled` before anything else.
+        {
+            let lock = take_lock(&inner, &cancel).await?;
+            refuse_installed(&inner, &lock, &cancel, &install_root).await?;
+        }
+
+        // 2. Verification; nothing is written.
+        let check_root = root.clone();
+        let check_install_root = install_root.clone();
+        let verified = on_job(&inner, None, &cancel, "payload-verify", move |inner, _| {
+            verify_payload(inner, &payload, &check_root, &check_install_root)
+        })
+        .await?;
+        let manifest = Arc::clone(&verified.manifest);
+        let version = manifest.version().clone();
+        let target = manifest.target();
+
+        // 3. The install root, then the record, as `install`.
+        let boot_root = install_root.clone();
+        let boot_state = state_dir.clone();
+        on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
+            clear_tombstones(inner, &boot_root);
+            adoptable(inner, &boot_root, &boot_state)
+        })
+        .await?;
+        let lock = take_lock(&inner, &cancel).await?;
+        let state_root = install_root.clone();
+        let snap = on_job(
+            &inner,
+            Some(&lock),
+            &cancel,
+            "state-create",
+            move |inner, _| {
+                let store = UserScope {
+                    dir: state_dir.clone(),
+                    app_id: inner.app_id.clone(),
+                };
+                let loaded = store.load(&*inner.fs, &*inner.hasher)?;
+                match &loaded.record {
+                    Some(record) if record.current.is_some() => {
+                        return Err(already_installed(&*inner.fs, &state_root, record));
+                    }
+                    Some(_) => {}
+                    None => {
+                        let mut install_id = [0u8; lunepack_core::policy::INSTALL_ID_BYTES];
+                        inner.rng.fill(&mut install_id)?;
+                        let record = InstallState::new(
+                            loaded.next_seq,
+                            inner.app_id.clone(),
+                            lunepack_core::Scope::User,
+                            install_id,
+                            target,
+                        );
+                        store.commit(&*inner.fs, &loaded, &record, &*inner.hasher)?;
+                    }
+                }
+                inner.load()
+            },
+        )
+        .await?;
+        refuse_case_collision(
+            &inner,
+            &lock,
+            &cancel,
+            snap.record(),
+            &version,
+            &versions_dir,
+        )
+        .await?;
+
+        // 4. The frames into the cache (phase `Install`), then the tree (phase `Stage`).
+        let frames = frames_of(&manifest);
+        let copy_total = {
+            let mut seen = HashSet::new();
+            frames
+                .iter()
+                .filter(|(_, f)| seen.insert(f.sha256))
+                .fold(0u64, |sum, (_, f)| sum.saturating_add(f.length))
+        };
+        sink.set_phase(Phase::Install, copy_total);
+        let copy_sink = sink.clone();
+        let copy_pack = Arc::clone(&verified.pack);
+        let copy_frames: Vec<FrameNeed> = frames.iter().map(|(_, f)| f.clone()).collect();
+        on_job(
+            &inner,
+            Some(&lock),
+            &cancel,
+            "payload-copy",
+            move |inner, cancel| {
+                let cache = inner.cache();
+                cache.ensure_dirs()?;
+                let keep: HashSet<Sha256Digest> = copy_frames.iter().map(|f| f.sha256).collect();
+                cache.cleanup(&keep, &HashSet::new())?;
+                let tools = PartTools {
+                    hasher: &*inner.hasher,
+                    cancel,
+                };
+                let mut done = HashSet::new();
+                for f in &copy_frames {
+                    if !done.insert(f.sha256) {
+                        continue;
+                    }
+                    let added = |n: u64| copy_sink.add_done(n);
+                    if !cache.store_frame(
+                        &*copy_pack,
+                        f.offset,
+                        f.length,
+                        &f.sha256,
+                        &tools,
+                        &added,
+                    )? {
+                        return Err(Error::Verify(lunepack_core::Error::Frame(
+                            lunepack_core::error::FrameError::FrameHash,
+                        )));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await?;
+
+        sink.set_phase(Phase::Stage, file_bytes(&manifest));
+        let stage_sink = sink.clone();
+        let stage_manifest = Arc::clone(&manifest);
+        let dir = versions_dir.clone();
+        let outcome = on_job(
+            &inner,
+            Some(&lock),
+            &cancel,
+            "stage",
+            move |inner, cancel| {
+                let cache = inner.cache();
+                let sources = stage_manifest
+                    .entries()
+                    .iter()
+                    .map(|e| match e {
+                        VerifiedEntry::File {
+                            frame: Some(frame), ..
+                        } => SourceFor::Frame(cache.path(CacheKind::Frame, &frame.sha256())),
+                        // Directories, symlinks and empty files ignore their source.
+                        _ => SourceFor::Frame(PathBuf::new()),
+                    })
+                    .collect();
+                let last = AtomicU64::new(0);
+                let progress = |p: Progress| forward(&stage_sink, &last, &p);
+                let input = StageInput {
+                    manifest: &stage_manifest,
+                    versions_dir: dir,
+                    sources,
+                };
+                let env = StageEnv {
+                    fs: &*inner.fs,
+                    codec: &*inner.codec,
+                    hasher: &*inner.hasher,
+                    workers: inner.workers,
+                    budget_bytes: inner.budget,
+                    cancel,
+                    progress: &progress,
+                };
+                Ok(lunepack_core::stage(&input, &env))
+            },
+        )
+        .await?;
+        let staged = match outcome {
+            Ok(staged) => staged,
+            Err(StageError::Cancelled) => return Err(Error::Cancelled),
+            // The frames were hash-checked as they were copied: a failing source is local damage,
+            // and there is nothing to fetch it from.
+            Err(StageError::NeedFetch(paths)) => return Err(Error::NeedFetchExhausted(paths)),
+            Err(StageError::Unsupported) => {
+                return Err(Error::Config("the manifest needs an unsupported source"));
+            }
+            Err(StageError::Other(e)) => return Err(e.into()),
+            Err(_) => return Err(Error::Config("stage failed")),
+        };
+
+        // The staged tree's own config, again exactly the payload's root; else the tree goes.
+        let tree = staged.tree.clone();
+        let tree_root = root.clone();
+        let tree_version = version.clone();
+        on_job(
+            &inner,
+            Some(&lock),
+            &cancel,
+            "payload-root",
+            move |inner, _| {
+                let checked =
+                    crate::installation::read_config(&*inner.fs, &tree.join(UPDATE_CONFIG_FILE))
+                        .and_then(|c| c.ok_or(Error::NoUpdateConfig))
+                        .and_then(|config| {
+                            check_payload_config(
+                                &inner.app_id,
+                                &config,
+                                &tree_root,
+                                &tree_version,
+                                target,
+                            )
+                        });
+                if let Err(e) = checked {
+                    inner.fs.remove_dir_all_nofollow(&tree)?;
+                    return Err(e);
+                }
+                Ok(())
+            },
+        )
+        .await?;
+
+        // 5. The commit, as `install`'s.
+        let floors = verified.floors;
+        let issued = manifest.issued();
+        let drop_frames: Vec<Sha256Digest> = frames.iter().map(|(_, f)| f.sha256).collect();
+        on_job(
+            &inner,
+            Some(&lock),
+            &cancel,
+            "install-commit",
+            move |inner, _| {
+                let Layout::User { state_dir, .. } = &inner.layout else {
+                    return Err(Error::MachineScope);
+                };
+                let store = UserScope {
+                    dir: state_dir.clone(),
+                    app_id: inner.app_id.clone(),
+                };
+                let loaded = store.load(&*inner.fs, &*inner.hasher)?;
+                let record = loaded.record.clone().ok_or(Error::NotInstalled)?;
+                if record.current.is_some() {
+                    return Err(already_installed(&*inner.fs, &install_root, &record));
+                }
+                let tree = staged.tree;
+                let config = tree_config(&*inner.fs, &inner.app_id, &tree)?;
+                let request = integration_request(&inner.app_id, &install_root, config.install);
+                inner.integration.check(Scope::User, &request)?;
+                let next = lunepack_core::install_first(
+                    &record.raise_floors(&floors),
+                    version.clone(),
+                    issued,
+                    record.install_id,
+                )?;
+                // As `install` (F11, Q42): the integration before the commit.
+                inner.integration.apply(Scope::User, &request)?;
+                let committed = store.commit(&*inner.fs, &loaded, &next, &*inner.hasher)?;
+                lunepack_core::reconcile_current(&*inner.fs, &install_root, &committed)
+                    .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))?;
+                // Housekeeping (M4-D17): a failure here is not an error of the install.
+                let cache = inner.cache();
+                for sha in &drop_frames {
+                    let _ = cache.remove_entry(CacheKind::Frame, sha);
+                }
+                Ok(InstalledVersion {
+                    version,
+                    issued,
+                    target: committed.target,
+                })
+            },
+        )
+        .await
+    })
     .await
 }
