@@ -224,6 +224,16 @@ impl UiModel {
         &self.state
     }
 
+    /// The window's title: what the flow does to the app.
+    pub fn window_title(&self) -> String {
+        match self.state.flow() {
+            Some(Flow::Install) => format!("Install {}", self.name),
+            Some(Flow::Update) => format!("Update {}", self.name),
+            Some(Flow::Uninstall) => format!("Uninstall {}", self.name),
+            None => "Lunepack".to_owned(),
+        }
+    }
+
     /// The sizes of the window this flow shows.
     pub fn metrics(&self) -> crate::look::Metrics {
         crate::look::Metrics::of(self.state.flow())

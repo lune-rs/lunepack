@@ -119,7 +119,7 @@ impl RgbaImage {
 }
 
 /// Polls `future` to its end on the calling thread.
-fn block_on<F: Future>(future: F) -> F::Output {
+pub fn block_on<F: Future>(future: F) -> F::Output {
     struct Park(std::thread::Thread);
     impl Wake for Park {
         fn wake(self: Arc<Self>) {
