@@ -42,7 +42,10 @@ Stopped:
 - **Mix and match**: the key set is bound to the app id and root version, the feed to the app id and
   channel, the manifest by size and hash from the feed and to the app id, version and target.
 - **Rollback and replay**: floors on root version, key-set version and feed seq per channel; an old
-  but validly signed document below a floor is rejected. The client never downgrades.
+  but validly signed document below a floor is rejected. The client never downgrades. A first
+  install has no floors yet, so the bootstrap tree's own version is its floor: a replayed, still
+  unexpired feed whose newest release is older than the tree the user ran installs nothing
+  (`no_release`), and the bootstrap's own version is allowed (M5-D8).
 - **Endless data**: every download is capped by a signed size (manifests by the feed, frames and
   packs by the manifest) or by a fixed cap (root and key set 64 KiB, feed 8 MiB).
 - **Parser attacks before authentication**: the only code that sees unauthenticated bytes is the

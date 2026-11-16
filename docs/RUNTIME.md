@@ -123,7 +123,7 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 24 | `integration` | (install, uninstall) the desktop integration failed or is in the way |
 | 25 | `in_use` | (uninstall) a process still runs from the install |
 | 26 | `install_mismatch` | (install, uninstall) the install is not the one this environment derives |
-| 27 | `no_release` | (install) the channel offers no release for this install yet (none, or none whose rollout admits it); nothing was installed, retry later |
+| 27 | `no_release` | (install) the channel offers no release for this install yet (none, none whose rollout admits it, or none at or above the bootstrap's own version); nothing was installed, retry later |
 | 70 | `internal` | anything else (a worker panic, a library error this build does not know) |
 
 The table lives in one place in the runtime (`crates/lunepack-runtime/src/modes.rs`) and is pinned

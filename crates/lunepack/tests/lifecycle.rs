@@ -1231,6 +1231,43 @@ fn a_channel_with_no_release_for_this_install_is_no_release_and_resumable() {
 }
 
 #[test]
+fn a_replayed_feed_older_than_the_bootstrap_installs_nothing() {
+    let _serial = common::serial();
+    let lab = Lab::new();
+    // An authentic, unexpired feed whose newest release is 1.0.0, served to a 1.1.0 bootstrap.
+    publish_with_config(&lab, 1, V100);
+    let boot = bootstrap(&lab, V110);
+    let got = install(&lab, &boot);
+    assert!(matches!(got, Err(Error::NoRelease)), "{got:?}");
+    let rec = lab.record();
+    assert!(
+        rec.current.is_none() && rec.staged.is_none(),
+        "1.0.0 was taken"
+    );
+    assert!(lab.integration.applied().is_empty());
+    assert!(
+        matches!(
+            lab.fs.symlink_metadata(&root_dir().join("versions/1.0.0")),
+            Ok(None)
+                | Err(lunepack_core::FsError {
+                    kind: lunepack_core::FsErrorKind::NotFound,
+                    ..
+                })
+        ),
+        "1.0.0 was staged"
+    );
+
+    // The bootstrap's own version is allowed.
+    publish_with_config(&lab, 2, V110);
+    install(&lab, &boot).expect("install 1.1.0");
+    assert_eq!(
+        lab.record().current.expect("current").version,
+        version(V110)
+    );
+    common::workers_stopped();
+}
+
+#[test]
 fn install_into_a_machine_layout_is_machine_scope() {
     let lab = Lab::new();
     let layout = Layout::Machine {
