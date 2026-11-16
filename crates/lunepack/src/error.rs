@@ -83,6 +83,10 @@ pub enum Error {
     /// The install already has a current version.
     #[error("already installed")]
     AlreadyInstalled,
+    /// The first install found no release for this install: the channel offers none, or none
+    /// whose rollout admits this install yet. Nothing was installed; a later try may succeed.
+    #[error("no release is available for this install")]
+    NoRelease,
     /// The health token does not match the supervised start's, or is malformed.
     #[error("the health token does not match")]
     TokenMismatch,

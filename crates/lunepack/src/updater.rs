@@ -951,7 +951,8 @@ impl Updater {
     ///    source); a record with no current version resumes, one with a current version is
     ///    [`Error::AlreadyInstalled`];
     /// 3. the check runs with no current version (no floor time, any release of the channel), the
-    ///    newest candidate is downloaded and staged, reusing the bootstrap's files that match;
+    ///    newest candidate is downloaded and staged, reusing the bootstrap's files that match; no
+    ///    candidate at all is [`Error::NoRelease`];
     /// 4. under the lock the installed tree's own config is read, the integration preflight runs
     ///    again on it, the integration is applied, the record names the version as current (events
     ///    `installed` and `first_run`) and `current` is linked. A failure before that commit
@@ -1649,9 +1650,9 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
         .await?;
     }
 
-    let info = check_first(&inner, &cancel).await?.ok_or(Error::Config(
-        "the channel offers no release for this install",
-    ))?;
+    let info = check_first(&inner, &cancel)
+        .await?
+        .ok_or(Error::NoRelease)?;
     // A run that staged this release before it was cut off goes straight to the commit.
     let staged_info = info.clone();
     let already = on_job(&inner, None, &cancel, "state-load", move |inner, _| {

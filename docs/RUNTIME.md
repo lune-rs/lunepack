@@ -123,6 +123,7 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 24 | `integration` | (install, uninstall) the desktop integration failed or is in the way |
 | 25 | `in_use` | (uninstall) a process still runs from the install |
 | 26 | `install_mismatch` | (install, uninstall) the install is not the one this environment derives |
+| 27 | `no_release` | (install) the channel offers no release for this install yet (none, or none whose rollout admits it); nothing was installed, retry later |
 | 70 | `internal` | anything else (a worker panic, a library error this build does not know) |
 
 The table lives in one place in the runtime (`crates/lunepack-runtime/src/modes.rs`) and is pinned
@@ -174,7 +175,7 @@ calls `apply-and-restart`, which starts `apply` itself.
 | Mode | Started by | What it does |
 |---|---|---|
 | `apply --wait-pid <pid> --wait-start <ticks> --version <version> [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. An apply that fails after the wait changes nothing and starts the current version again (without the token). Exit codes 20 to 22 are its own. |
-| `install` | the first-install flow, from a bootstrap tree | Installs the newest release the tree's own channel offers (M5-D8): the root, feed and channel come only from that tree's update configuration. Exit codes 23, 24 and 26 are its own. |
+| `install` | the first-install flow, from a bootstrap tree | Installs the newest release the tree's own channel offers (M5-D8): the root, feed and channel come only from that tree's update configuration. Exit codes 23, 24, 26 and 27 are its own. |
 | `uninstall` | the uninstall flow, from a tree of the install | Removes the install this runtime stands in and the desktop integration lunepack made (M5-D10). Exit codes 24, 25 and 26 are its own. |
 
 `install` and `uninstall` take no options at all: the install root is derived from the runtime's own

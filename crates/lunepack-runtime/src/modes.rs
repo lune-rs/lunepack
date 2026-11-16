@@ -75,6 +75,9 @@ pub enum Kind {
     /// The install this runtime stands in is not the one the environment derives, or is not a
     /// real, canonical directory holding this app's record (`install`, `uninstall`; M5-D10).
     InstallMismatch,
+    /// The channel offers no release for this install yet: none at all, or none whose rollout
+    /// admits it (`install`; retryable, nothing was installed).
+    NoRelease,
     /// Anything else (a worker panic, a facade error this build does not know).
     Internal,
 }
@@ -82,7 +85,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind, in code order (for the golden of step 12).
     #[allow(dead_code)]
-    pub const ALL: [Kind; 27] = [
+    pub const ALL: [Kind; 28] = [
         Kind::Ok,
         Kind::Usage,
         Kind::NotInstalled,
@@ -109,6 +112,7 @@ impl Kind {
         Kind::Integration,
         Kind::InUse,
         Kind::InstallMismatch,
+        Kind::NoRelease,
         Kind::Internal,
     ];
 
@@ -141,6 +145,7 @@ impl Kind {
             Kind::Integration => 24,
             Kind::InUse => 25,
             Kind::InstallMismatch => 26,
+            Kind::NoRelease => 27,
             Kind::Internal => 70,
         }
     }
@@ -174,6 +179,7 @@ impl Kind {
             Kind::Integration => "integration",
             Kind::InUse => "in_use",
             Kind::InstallMismatch => "install_mismatch",
+            Kind::NoRelease => "no_release",
             Kind::Internal => "internal",
         }
     }
@@ -206,6 +212,7 @@ impl Kind {
             E::Process(_) => Kind::Process,
             E::Integration(_) => Kind::Integration,
             E::RollbackUnavailable => Kind::RollbackUnavailable,
+            E::NoRelease => Kind::NoRelease,
             // WorkerPanicked, and any variant a later facade adds (the enum is non-exhaustive).
             _ => Kind::Internal,
         }
@@ -502,6 +509,8 @@ mod tests {
         assert_eq!(Kind::RollbackUnavailable.code(), 22);
         assert_eq!(Kind::InUse.code(), 25);
         assert_eq!(Kind::InstallMismatch.code(), 26);
+        assert_eq!(Kind::NoRelease.code(), 27);
+        assert_eq!(Kind::of(&lunepack::Error::NoRelease), Kind::NoRelease);
     }
 
     /// The rows `| <code> | `<kind>` | ... |` of the exit-code table in `docs/RUNTIME.md`.
