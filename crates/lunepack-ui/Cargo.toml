@@ -18,3 +18,13 @@ doc = false
 [dependencies]
 lunepack-core.workspace = true
 lunepack-ui-luneui.workspace = true
+
+# The reduce-motion reader of the OS the binary is built for (M6-D8).
+[target.'cfg(windows)'.dependencies]
+lunepack-os-windows.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+lunepack-os-macos.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+lunepack-os-linux.workspace = true

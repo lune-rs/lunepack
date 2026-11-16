@@ -1,7 +1,13 @@
 //! The screens driven by a scripted fake engine.
 //!
+//! `demo --drive <path to lunepack-ui> [--flow ...] [--auto] [--fail]` acts as the engine over the real
+//! binary, so each flow shows in a window (see `drive.rs`).
+//!
 //! `demo --dump <dir> [--os windows|macos|linux] [--glass]` renders the install flow's screens
 //! and transition strips headless into `<dir>` (opaque material unless `--glass`).
+
+#[path = "demo/drive.rs"]
+mod drive;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,7 +19,7 @@ use lunepack_ui_luneui::render::{RenderOptions, Renderer, Step, Timed, at};
 use lunepack_ui_luneui::scenario;
 use lunepack_ui_luneui::{Env, Material, Os};
 
-const USAGE: &str = "usage: demo --dump <dir> [--os windows|macos|linux] [--glass] [--batch 1|2|3]";
+const USAGE: &str = "usage: demo --dump <dir> [--os windows|macos|linux] [--glass] [--batch 1|2|3]\n       demo --drive <path to lunepack-ui> [--flow install|update|uninstall] [--auto] [--fail] [--os ...]";
 
 fn ms(v: u64) -> Duration {
     Duration::from_millis(v)
@@ -371,6 +377,8 @@ fn batch3(
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut dir, mut os, mut glass, mut batch) = (None::<PathBuf>, Os::current(), false, 1u32);
+    let (mut program, mut flow, mut auto, mut fail) =
+        (None::<PathBuf>, Flow::Install, false, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--dump" => dir = args.next().map(PathBuf::from),
@@ -386,12 +394,45 @@ fn main() {
                 }
             }
             "--glass" => glass = true,
+            "--drive" => program = args.next().map(PathBuf::from),
+            "--flow" => {
+                flow = match args.next().as_deref() {
+                    Some("install") => Flow::Install,
+                    Some("update") => Flow::Update,
+                    Some("uninstall") => Flow::Uninstall,
+                    _ => {
+                        eprintln!("{USAGE}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--auto" => auto = true,
+            "--fail" => fail = true,
             "--batch" => batch = args.next().and_then(|b| b.parse().ok()).unwrap_or(1),
             _ => {
                 eprintln!("{USAGE}");
                 std::process::exit(2);
             }
         }
+    }
+    if let Some(program) = program {
+        let ending = if fail {
+            drive::Ending::Failure
+        } else {
+            drive::Ending::Success
+        };
+        match drive::drive(&program, flow, os, auto, ending) {
+            Ok(0) => eprintln!("the UI exited with code 0"),
+            Ok(code) => {
+                eprintln!("the UI exited with code {code}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("demo: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
     }
     let Some(dir) = dir else {
         eprintln!("{USAGE}\n(the window mode arrives with the lunepack-ui binary's event loop)");

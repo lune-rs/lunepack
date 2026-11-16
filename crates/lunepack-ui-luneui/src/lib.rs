@@ -31,6 +31,9 @@ pub use frame::frame;
 pub use icon::ICON_IMAGE;
 pub use model::{Env, Material, UiModel};
 pub use strings::Os;
+/// The toolkit, the GPU API and the window library, for the `lunepack-ui` binary: the boundary check
+/// lets this crate alone depend on them, so the binary names them through here.
+pub use {lune_ui, wgpu, winit};
 
 /// The UI family the fonts register under.
 pub const FONT_FAMILY: &str = "RznSans";

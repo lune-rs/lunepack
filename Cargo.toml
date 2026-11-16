@@ -75,3 +75,7 @@ png = "0.18"
 # OS adapters (M6 step 9, M6-D8): the Windows reduce-motion reader calls user32 through windows-sys,
 # already in the lock for other crates; no window stack.
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+
+# The window stack the UI binary needs, named through lunepack-ui-luneui's re-exports so the
+# boundary check still sees it reachable only through that crate (the version LuneUI uses).
+winit = "0.30"

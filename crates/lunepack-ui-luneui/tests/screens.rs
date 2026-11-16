@@ -833,3 +833,31 @@ fn the_rail_icon_dims_and_the_version_reads_removed_after_an_uninstall() {
     assert!(!tree_has(&before, "Removed"));
     assert!(tree_has(&before, "Version 1.4.0"));
 }
+
+#[test]
+fn a_hello_from_another_build_is_refused_and_a_message_out_of_order_is_a_protocol_error() {
+    use lunepack_core::ui::{PromptKind, ProtocolError};
+    use lunepack_ui_luneui::UiModel;
+    let env = Env {
+        os: Os::Linux,
+        material: Material::Opaque,
+    };
+    let mut model = UiModel::new(env);
+    let mut hello = scenario::install_hello(Os::Linux, "Lunegit", false);
+    if let EngineMsg::Hello { build_id, .. } = &mut hello {
+        *build_id = "0.0.0+ui999".to_owned();
+    }
+    assert_eq!(
+        model.apply(&hello, Duration::ZERO),
+        Err(ProtocolError::BuildIdMismatch)
+    );
+    assert_eq!(model.screen(), Screen::Idle, "nothing was applied");
+    let prompt = EngineMsg::Prompt {
+        id: 1,
+        kind: PromptKind::Welcome,
+    };
+    assert!(matches!(
+        model.apply(&prompt, Duration::ZERO),
+        Err(ProtocolError::OutOfOrder(_))
+    ));
+}

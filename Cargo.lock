@@ -2249,6 +2249,9 @@ name = "lunepack-ui"
 version = "0.0.0"
 dependencies = [
  "lunepack-core",
+ "lunepack-os-linux",
+ "lunepack-os-macos",
+ "lunepack-os-windows",
  "lunepack-ui-luneui",
 ]
 
@@ -2261,6 +2264,7 @@ dependencies = [
  "png",
  "thiserror 2.0.21",
  "wgpu",
+ "winit",
 ]
 
 [[package]]

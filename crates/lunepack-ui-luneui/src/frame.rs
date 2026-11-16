@@ -73,12 +73,7 @@ pub fn frame(ui: &mut Ui<'_>, model: &mut UiModel, t: Duration, tier: MotionTier
     chrome::glow(ui, model, t, tier);
     chrome::rail(ui, model, t, tier);
 
-    let title = match model.state().flow() {
-        Some(Flow::Install) => format!("Install {}", model.name),
-        Some(Flow::Uninstall) => format!("Uninstall {}", model.name),
-        Some(Flow::Update) => format!("Update {}", model.name),
-        None => model.name.clone(),
-    };
+    let title = model.window_title();
     let dialog_id = ui.id("window");
     let out = ui.node_container(
         Node::new(dialog_id, Role::Dialog, &title, Rect::new(0.0, 0.0, w, h)),
