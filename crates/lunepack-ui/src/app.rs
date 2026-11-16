@@ -118,16 +118,16 @@ impl App {
     fn setup(&self, event_loop: &ActiveEventLoop) -> Result<Shown, Exit> {
         let m = Metrics::FULL;
         let size = (f64::from(m.w), f64::from(m.h));
-        let mut attrs = glass_attributes("Lunepack", size, size, false)
+        let attrs = glass_attributes("Lunepack", size, size, false)
             .with_resizable(false)
             // The screens draw their own title strip on every OS.
             .with_decorations(false)
             .with_transparent(self.env.material == Material::Glass);
         #[cfg(target_os = "macos")]
-        {
+        let attrs = {
             use lunepack_ui_luneui::winit::platform::macos::WindowAttributesExtMacOS;
-            attrs = attrs.with_has_shadow(true);
-        }
+            attrs.with_has_shadow(true)
+        };
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
