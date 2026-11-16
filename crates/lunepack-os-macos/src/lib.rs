@@ -85,6 +85,8 @@ mod tests {
         );
     }
 
+    // Uses /bin/sleep, /usr/bin/false and /bin/echo, which exist only on Unix.
+    #[cfg(unix)]
     #[test]
     fn a_missing_or_slow_helper_is_unknown_not_a_hang() {
         assert_eq!(run_bounded("/nonexistent/helper", &[]), None);
