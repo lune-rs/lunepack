@@ -79,6 +79,12 @@ if [ "$docker_mode" -eq 0 ]; then
 fi
 
 command -v docker >/dev/null 2>&1 || die "docker is not installed"
+# The container runs as root with every capability dropped, so on a Linux host (no Docker
+# Desktop file sharing) it can write to /out only when the directory lets anyone write. Sticky,
+# so the directory's owner can still remove what the container wrote.
+if [ "$(uname -s)" = Linux ]; then
+  chmod 1777 "$out_dir"
+fi
 docker info >/dev/null 2>&1 || die "the Docker daemon is not running"
 dockerfile=scripts/ui-golden.Dockerfile
 if command -v shasum >/dev/null 2>&1; then
