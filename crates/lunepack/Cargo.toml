@@ -12,6 +12,32 @@ workspace = true
 
 [dependencies]
 lunepack-core.workspace = true
+# The default adapters; the facade is the composition root for embedding apps.
+lunepack-codec-lzma.workspace = true
+lunepack-crypto.workspace = true
+lunepack-fs.workspace = true
+lunepack-http.workspace = true
+# Processes and the XDG desktop integration (the crate is empty outside Linux).
+lunepack-os-linux.workspace = true
+thiserror.workspace = true
+# The cache's part sidecars (strict JSON on read through the core) and feed URL resolution.
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 lunepack-testkit.workspace = true
+# The default-adapter build test uses a real temporary directory.
+tempfile = { workspace = true }
+# The plumbing and scenario suites run under five executors (M4 step 10): the built-in
+# `block_on`, futures' `block_on`, tokio current-thread and multi-thread, and smol. Tests only;
+# the facade's own task plumbing is std-only (M4-D3).
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
+smol = "2"
+
+# Own main: the cross-process tests re-run this binary as a child process (as lunepack-crypto's
+# signer test does), and the child's stdout carries a line protocol the libtest harness would break.
+[[test]]
+name = "cross_process"
+harness = false

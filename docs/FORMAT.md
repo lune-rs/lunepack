@@ -444,7 +444,7 @@ An artifact reference is `{path, size, sha256}`:
 | `issued` | time the manifest was written |
 | `pack` | artifact reference (7.1) to the release's pack; `size` may be 0 when no entry has a frame |
 | `entries` | 0 to 200,000 entries (8.1); the set passes the tree rules (10.2) |
-| `install` | reserved: defined by a later revision (install metadata: entry point, shortcuts, associations, minimum OS). v1 writers MUST NOT write it, and v1 readers reject a manifest that carries it |
+| `install` | reserved: defined by a later revision, for install metadata a client needs before it downloads (such as a minimum OS). The entry point, name and icon are in the tree's update configuration (section 13), which the manifest covers by its file hash. v1 writers MUST NOT write it, and v1 readers reject a manifest that carries it |
 | `deltas` | reserved: defined by a later revision (per-file delta assets). v1 writers MUST NOT write it, and v1 readers reject a manifest that carries it |
 
 - The reader checks the manifest's byte length and SHA-256 against the feed's artifact reference
@@ -658,7 +658,9 @@ The reader persists, per app, the highest values it has verified:
 - the feed `seq`, per channel.
 
 A document below its floor MUST be rejected; equal is allowed. After a check verifies documents,
-the floors are raised to their values.
+the floors are raised to their values. Where the floors are persisted (the install-state record and,
+for a per-machine install, the per-user counters records) and how a reader treats that record is
+section 12.
 
 ### 11.3 Freshness and the implausible clock
 
@@ -693,3 +695,460 @@ logic in the format.
 - Known answer: install id `000102030405060708090a0b0c0d0e0f` and seed
   `44abc528db54f66d40174cfcdd43bab36285a5d953cbd185c672350a46f89691` give the first 8 hash bytes
   `f728fb2e5aacef3c` and bucket `6700`.
+
+## 12. Install state
+
+An install keeps what it knows about itself (its versions, the staged tree, the versions marked bad
+and the anti-rollback floors of 11.2) as numbered **records**. Unlike sections 2 to 9 these are not
+signed documents and the packager never writes them: the writer is the reader side (the in-app
+library, and later the runtime and the privileged engine). The record is a **cross-version
+contract** (D28): one lunepack version writes it and another reads it, after an update or a
+rollback, and the Windows stub (C5) reads it too. A per-user install's state is writable by that
+user (THREAT-MODEL class 4), so a reader treats every record as untrusted local input and checks
+every rule below, failing closed.
+
+### 12.1 Files
+
+- A store is one directory. Each record is its own file, `<seq>.rec`, where `<seq>` is the record's
+  sequence number in exactly 20 decimal digits, zero-padded (`00000000000000000007.rec`), and
+  `seq ≤ 2^53 − 1`.
+- A record file is created once and never rewritten, renamed or appended to; a change is a new
+  record with the next `seq`.
+- Any other name (including a 20-digit name above `2^53 − 1`) is not a record. Readers ignore it
+  and writers never delete it.
+
+### 12.2 Frame
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic, the ASCII bytes `LPST` |
+| 4 | 1 | frame format, `1` |
+| 5 | 4 | `len`, the payload length, unsigned big-endian |
+| 9 | `len` | payload: strict JSON (12.3) |
+| 9 + `len` | 32 | SHA-256 of every byte before it (magic through payload) |
+
+A record file is at most 1 MiB (1048576 bytes) in all, and its length is exactly `9 + len + 32`.
+
+### 12.3 Payload
+
+The payload follows 3.1 with one difference: `null` is the value of a field the tables mark "or
+null", and every field in the tables is required (a nullable field is written as `null`, never
+omitted). Integers follow 3.1 (`0 ..= 2^53 − 1`).
+
+Every record has:
+
+| Field | Type | Rule |
+|---|---|---|
+| `format` | integer | `1` |
+| `kind` | string | `install-state` or `install-counters` |
+| `critical` | array of strings | v1 writes `[]` (12.8) |
+| `seq` | integer | equals the `<seq>` of the file name |
+| `app_id` | string | the app id (10.6); equals the app's own |
+
+An `install-state` record also has:
+
+| Field | Type | Rule |
+|---|---|---|
+| `scope` | string | `user` or `machine` (12.6) |
+| `install_id` | string | the install id of 11.5: 32 lowercase hex characters |
+| `target` | string | the target the install uses (10.4) |
+| `current` | object or null | `{version, issued}`: the installed version and its manifest's `issued` (the floor time of 11.3); `null` before the first install completes |
+| `previous` | object or null | `{version}`: the version installed before `current` |
+| `pending` | object or null | `{version, attempts}`: a version waiting for its health check (written from M5) |
+| `staged` | object or null | `{version, target, manifest_sha256, tree}`: a staged version tree (12.7) |
+| `bad` | array of strings | versions marked bad (11.4), in strictly increasing precedence (sorted, no precedence twice), at most 1000 |
+| `floors` | object | the floors of 11.2, below |
+| `health` | object or null | `{version, token_sha256}`: the supervised launch of the pending version (12.9); `null` when there is none |
+| `lifecycle` | object or null | `{events}`: lifecycle events not yet delivered (12.9), at most 16, oldest first; `null` when there are none |
+| `staged_issued` | object or null | `{version, manifest_sha256, issued}`: the `issued` of the staged manifest (12.9) |
+
+An `install-counters` record (12.6) has, besides the common fields, only `install_id` and
+`floors`.
+
+`floors` is `{root, keyset_version, feed_seq}`:
+
+- `root` is the highest verified root (5.2) as its parts, `{version, threshold, keys}`, or `null`
+  before the first check. `version ≥ 1`, `1 ≤ threshold ≤ len(keys) ≤ 16`, each key 64 lowercase hex
+  characters, no key twice. The parts are kept, not just the version, so the rotation walk starts
+  from that root even when the host no longer has `root-<k>.json`.
+- `keyset_version` is the highest verified key-set `version` (`0`: none).
+- `feed_seq` maps a channel id (10.5) to the highest verified feed `seq`; at most 64 channels.
+
+Further rules: every version is a version of 10.3; `staged.tree` is one path component that passes
+10.1 and equals the text of `staged.version`; `staged.manifest_sha256`, `health.token_sha256` and
+`staged_issued.manifest_sha256` are digests (3.2). Each entry of `lifecycle.events` is one of
+`{kind: "installed", version}`, `{kind: "updated", from, to}` and `{kind: "first_run", version}`.
+An object inside a record (`current`, `previous`, `pending`, `staged`, `floors`, `floors.root`,
+`health`, `lifecycle`, an event, `staged_issued`) has exactly its listed members; an unknown member
+there makes the record invalid (12.8).
+
+`health`, `lifecycle` and `staged_issued` were added in M5 as top-level members (12.8 (a)), so a
+record written before them lacks them: a reader takes a missing one as `null`. Every writer from M5
+writes all three.
+
+The lunepack writer emits the members of every object in byte order of their names. A reader does
+not depend on member order. This example is generated by the writer (a test checks it):
+
+<!-- golden: install-state, generated by crates/lunepack-core/tests/state.rs -->
+```json
+{
+  "app_id": "org.example.hello",
+  "bad": [
+    "1.0.1"
+  ],
+  "critical": [],
+  "current": {
+    "issued": 1790000000,
+    "version": "1.0.0"
+  },
+  "floors": {
+    "feed_seq": {
+      "stable": 42
+    },
+    "keyset_version": 3,
+    "root": {
+      "keys": [
+        "fd60726cbdd246cb4f0e3363570e580a8af3c1a59eda73cf9c8672330459cb8f",
+        "b960725ba13c46b7c70e3357e59a57fc7af3c2191d427457fc8672046509cb58"
+      ],
+      "threshold": 1,
+      "version": 2
+    }
+  },
+  "format": 1,
+  "health": null,
+  "install_id": "000102030405060708090a0b0c0d0e0f",
+  "kind": "install-state",
+  "lifecycle": {
+    "events": [
+      {
+        "from": "0.9.0",
+        "kind": "updated",
+        "to": "1.0.0"
+      },
+      {
+        "kind": "first_run",
+        "version": "1.0.0"
+      }
+    ]
+  },
+  "pending": null,
+  "previous": {
+    "version": "0.9.0"
+  },
+  "scope": "user",
+  "seq": 1,
+  "staged": {
+    "manifest_sha256": "3eb81763329a6df94982c6816f9e82b0e59f232d945ff3d24733debc97d1e321",
+    "target": "linux-x86_64",
+    "tree": "1.1.0",
+    "version": "1.1.0"
+  },
+  "staged_issued": {
+    "issued": 1800000000,
+    "manifest_sha256": "3eb81763329a6df94982c6816f9e82b0e59f232d945ff3d24733debc97d1e321",
+    "version": "1.1.0"
+  },
+  "target": "linux-x86_64"
+}
+```
+
+(The keys and digest in the example come from the test suite's fake hasher; they are not real
+SHA-256 values.)
+
+### 12.4 Reading
+
+A reader loads the newest record that was completely written, or fails. It never returns an older
+record while a newer whole one exists (M4-D23).
+
+1. List the directory. A missing or empty directory has no record. The **next seq** is the highest
+   record name plus 1 (1 when there is none), whatever the files hold, so the number of a torn file
+   is never reused.
+2. Try the record files from the highest `seq` down. A file whose kind is not a regular file, whose
+   size is over the cap (read at most 1 MiB + 1 bytes), or that vanished is skipped. Any other read
+   failure stops the load.
+3. **Integrity checks; a failure skips the file** (it is torn, flipped or misnamed) and the next
+   lower one is tried: the magic, a frame format byte of `0`, the length (`9 + len + 32` equals the
+   file size), the SHA-256, and the payload's `seq` equal to the file name's. (The payload is parsed
+   to read `seq`; a payload that fails the strict JSON check or has no integer `seq` stops, as in
+   step 5.)
+4. **Newer format; stops the load**, with nothing written: a frame format byte above `1`, a payload
+   `format` above `1`, or any entry in `critical`.
+5. **A whole record that is refused stops the load**, with nothing written: the payload fails the
+   strict JSON check (3.1), `format` is `0`, `kind` is not the expected kind, `app_id` is not the
+   app's, a field is missing, unknown inside an object or of the wrong type, or a rule of 12.3 is
+   broken. Its checksum shows a writer wrote it whole, so falling back to an older record (with lower
+   floors) would be a rollback.
+6. Otherwise the first record that passes is the state.
+
+### 12.5 Writing
+
+The writer holds the install's lock (M4-D15) from the load to the end of the commit.
+
+1. The new record's `seq` is the next seq of 12.4 (at most `2^53 − 1`) and its `app_id` is the
+   app's. No floor is lower than the loaded record's (field by field, as in 12.6). The writer runs
+   12.4's checks over the bytes it is about to write and writes only what passes.
+2. Create the file with create-new semantics; an existing file is a conflict and nothing is written.
+   Missing directories of the store are created first, each synced in its parent.
+3. Write the frame, sync the file, then sync the directory. The record is committed when the
+   directory sync returns.
+4. Only then prune, best effort: of the record files below the new `seq`, delete those that fail an
+   integrity check (12.4 step 3) and the valid ones beyond the 3 highest valid (the new one counts).
+   Leave every other file, including a record that would stop a load and any file whose name is not a
+   record name.
+
+A crash at any point leaves the previous record or the new one as the state, and the new one once
+step 3 completed.
+
+### 12.6 Scopes
+
+- **Per-user install** (`scope: user`): one store in the install's state directory, read and written
+  by the library.
+- **Per-machine install** (`scope: machine`): the `install-state` store in the machine state
+  directory is written only by the privileged engine; the library reads it and never writes it.
+  Each user keeps the floors they have verified for that install as `install-counters` records in
+  `<user state dir>/<install_id as 32 hex>/`. A counters record whose `install_id` differs from the
+  machine record's is invalid (the load stops). A check starts from the **effective floors**, the
+  field-wise higher of the machine record's and the user's: the higher key-set version, per channel
+  the higher feed `seq`, and the higher root, ordered by `version`, then `threshold`, then the key
+  bytes in order (so a lower root version never replaces a higher one).
+
+### 12.7 Trees on disk
+
+- Version `V`'s tree is `<versions dir>/<V's version text>`; staging builds it there (M4-D18).
+  Version texts that differ only in ASCII letter case (`1.0.0-RC1`, `1.0.0-rc1`) are different
+  versions but one directory on a case-insensitive file system, so staging refuses a version whose
+  directory name collides, ignoring case, with the current, previous, pending or staged version's, or
+  with any entry of the versions directory (`Error::VersionDirCollision`); nothing is written.
+- The **current tree** is the layout's explicit current tree when one is given (for a layout whose
+  live tree is not under the versions directory), else `<versions dir>/<current.version text>`. It
+  counts only when it is a real directory (a symlink is not followed); otherwise there is none and
+  every file is fetched. A machine install's tree is only read.
+- A `staged` entry is usable only when `staged.version` is newer than `current.version` by
+  precedence, is not in `bad`, `staged.target` equals the record's `target`, and the tree directory
+  `<versions dir>/<staged.tree>` exists as a real directory. Otherwise it is ignored and the next
+  staging resumes or discards the tree.
+
+### 12.8 Evolution
+
+- (a) Within `format: 1`, an unknown **top-level** member is ignored by readers and kept verbatim by
+  every writer through every change of the record. An unknown member inside a known object makes the
+  record invalid, so new data is added as new top-level members. A writer that adds a member older
+  readers must not ignore names it in `critical`; a reader that finds a name it does not implement in
+  `critical` stops (12.4 step 4). v1 implements no critical name.
+- (b) `format` (frame byte and payload) is raised only for a change an older reader cannot handle by
+  (a): a frame layout change or a changed meaning. Additive changes never raise it; no raise is
+  planned for v1.
+- (c) An older reader that meets a newer format fails closed and writes nothing; the library reports
+  it from every operation. A build that raises the format keeps writing the old one until its own
+  version is confirmed healthy, so a rollback before that never leaves a record the previous version
+  cannot read.
+- `health`, `lifecycle` and `staged_issued` are such members (M5, 12.9): an M4 reader keeps them
+  verbatim. An `install-counters` record has no `health`; a reader keeps one it finds there as an
+  unknown member, and when present it is an object or `null`.
+
+### 12.9 Lifecycle members
+
+- **`staged_issued`** names the staged entry it belongs to. It is **bound** only when its `version`
+  is the text of `staged.version` and its `manifest_sha256` equals `staged.manifest_sha256`; its
+  `issued` is then that manifest's `issued`. A writer that sets `staged` writes the bound value with
+  it, and one that clears `staged` clears it. An older writer keeps it verbatim while it changes
+  `staged`, so an unbound value (or a missing one) is read without error and counts as absent:
+  applying the staged version needs a bound value, and without one the app stages again. A writer
+  drops an unbound value with its next record.
+- **Apply.** Applying the staged version `V` (usable by 12.7, with a bound `staged_issued`, no
+  `pending`, and fewer than 1000 versions in `bad`) sets `previous` to the old current,
+  `current` to `{V, staged_issued.issued}` (so the floor time of 11.3 is the running release's),
+  `pending` to `{V, 0}` and `health` to `{V, SHA-256 of the token}`, and clears `staged` and
+  `staged_issued`. The token itself is never written.
+- **Confirm.** A start of the pending version confirms it: with a token whose SHA-256 equals
+  `health.token_sha256` (a token that does not match changes nothing), or, per user, with no token.
+  A confirmation clears `pending` and `health`.
+- **Attempts.** An unsupervised start of the pending version adds 1 to `pending.attempts`; the start
+  that would make it 4 rolls back instead.
+- **Rollback.** Rolling the pending version back sets `current` to `{previous, current.issued}`
+  (the floor time never decreases), clears `previous`, `pending` and `health`, adds the version to
+  `bad`, and drops its events.
+- **Events.** `installed` and `first_run` are queued by a first install, `updated` and `first_run`
+  by an apply. Each is for one version (`version`, or `to` for `updated`) and is delivered at most
+  once, by that version's first start, which removes it in the same record.
+
+## 13. Update configuration
+
+Every version tree that updates itself carries one **update configuration**: a strict-JSON file that
+says which root, feed and channel the tree updates from and how the app is installed (D44 (a),
+M5-D3). It is not signed on its own. It is an ordinary file entry of the release's manifest, so the
+manifest's `sha256` of the file covers it, and staging (C3) checks that hash like any other file's.
+Like the install state (section 12) it is a **cross-version contract** (D28): one version's runtime
+reads another version's configuration. Every reader treats it as untrusted local input (an installed
+tree is writable by its user) and checks every rule below, failing closed.
+
+The packager writes it only for an app whose `lunepack.toml` has `[update]` (M5-D7). Its reader is
+`lunepack_core::UpdateConfig::parse` and its writer `UpdateConfig::to_bytes`; the writer runs the
+reader over the bytes it is about to write and writes only what passes.
+
+### 13.1 Location
+
+- On Linux and Windows targets the file is `lunepack-update.json` at the version tree's root
+  (`<tree>/lunepack-update.json`). On macOS targets it is `Contents/Resources/lunepack-update.json`
+  inside the bundle tree (assumed until M8 settles the bundle layout).
+- The location is fixed for format 1 and never moves within it, so any version's runtime reads
+  another version's configuration at the same place (M5-D17). An executable finds its tree by
+  walking up from its own directory to the nearest configuration; the packager refuses an input
+  that holds a file of that name anywhere, so nothing shadows it.
+- The runtime is `lunepack-runtime` (`lunepack-runtime.exe` on Windows targets) in the directory of
+  `install.entry` (C4).
+
+### 13.2 Payload
+
+The file follows 3.1 with one difference: `null` is the value of a member the tables mark "or
+null", and every member in the tables is required (a nullable member is written as `null`, never
+omitted). It is at most 64 KiB (65536 bytes).
+
+| Member | Type | Rule |
+|---|---|---|
+| `format` | integer | `1` |
+| `kind` | string | `update-config` |
+| `critical` | array of strings | v1 writes `[]` (13.7) |
+| `app_id` | string | the app id (10.6); equals the root's app id |
+| `version` | string | the tree's own version (10.3) |
+| `target` | string | the tree's target (10.4) |
+| `root` | object | the trusted root the tree updates under, as its parts `{version, threshold, keys}` (5.2): `version ≥ 1`, `1 ≤ threshold ≤ len(keys) ≤ 16`, each key 64 lowercase hex characters, no key twice |
+| `feed` | string | the release directory's URL, by the feed rule (13.3) |
+| `channel` | string | the channel the tree follows (10.5) |
+| `health_timeout_secs` | integer | `5 ..= 3600`: how long a supervised start may take to confirm its health (the packager's default is 60) |
+| `install` | object | the install metadata (13.4) |
+
+The lunepack writer emits the members of every object in byte order of their names, pretty-printed
+with two-space indentation and a final newline. A reader does not depend on member order or
+whitespace. This example is generated by the writer (a test checks it):
+
+<!-- golden: update-config, generated by crates/lunepack-core/tests/update_config.rs -->
+```json
+{
+  "app_id": "org.example.hello",
+  "channel": "stable",
+  "critical": [],
+  "feed": "https://updates.example.org/hello/",
+  "format": 1,
+  "health_timeout_secs": 60,
+  "install": {
+    "bin": "hello",
+    "categories": [
+      "Utility",
+      "Development"
+    ],
+    "comment": "Says hello",
+    "entry": "bin/hello",
+    "icon": "share/hello.png",
+    "name": "Hello",
+    "terminal": false
+  },
+  "kind": "update-config",
+  "root": {
+    "keys": [
+      "fd60726cbdd246cb4f0e3363570e580a8af3c1a59eda73cf9c8672330459cb8f",
+      "b960725ba13c46b7c70e3357e59a57fc7af3c2191d427457fc8672046509cb58"
+    ],
+    "threshold": 1,
+    "version": 2
+  },
+  "target": "linux-x86_64",
+  "version": "1.0.0"
+}
+```
+
+(The keys in the example come from the test suite's fake hasher; they are not real keys.)
+
+### 13.3 Feed
+
+`feed` is the URL of the release directory, the one that holds `keys.json` and
+`feed-<channel>.json` (section 1). It must pass every rule below, checked by the writer and by every
+reader (M5-D16). A string that passes is already in the canonical form of the WHATWG URL parser, so
+parsing it changes nothing and a check of the string is a check of what the transport connects to.
+
+- At most 2048 bytes, every byte in ASCII `0x21`–`0x7E`: no space, tab, CR or LF (the WHATWG parser
+  strips tabs and newlines silently), control or non-ASCII byte.
+- None of `\ % ? # @ " < > ^ ` { | }` anywhere, so there is no userinfo, query, fragment,
+  percent-encoding or backslash (which the parser reads as `/`).
+- The scheme is lowercase and exactly `https://`, `http://` or `file:///`.
+- An `https` host is lowercase LDH labels (each 1–63 bytes of `[a-z0-9-]`, not starting or ending
+  with `-`, at most 253 bytes in all, no trailing dot) or a canonical dotted-quad (four decimal
+  parts `0`–`255` without leading zeros). A host whose last label is all digits or starts with `0x`
+  must be a canonical dotted-quad, because the parser reads `127.1` and `0x7f.1` as IPv4. A
+  bracketed IPv6 host is refused for `https` in v1.
+- An `http` host is exactly a canonical dotted-quad whose first part is `127`, or exactly `[::1]`.
+  Nothing else: not `localhost` (a name the resolver maps, so its target cannot be proven), not
+  another IPv6 spelling of loopback, not another address.
+- A port is optional for `http` and `https`: decimal `1`–`65535`, no leading zero, and not the
+  scheme's default (`443`, `80`), which the parser would drop.
+- The path starts and ends with `/`. Its segments are `[A-Za-z0-9._~-]+` and neither `.` nor `..`.
+  A `file:` path may start with one Windows drive segment `[A-Z]:` (`file:///C:/releases/`). The
+  writer appends the final `/` when the configured value lacks it, then checks.
+
+Why `http:` only to a loopback literal: release content is signature-verified whatever the
+transport, but plain HTTP to another host would expose the update metadata and let a network
+attacker hold an install on old metadata until it expires. Loopback stays on the machine (a local
+mirror, the test suites' servers). An `http:` feed from the configuration is fetched with no proxy
+(environment or system) and no redirect, because either could carry the request off the host.
+
+The facade's `check_config_feed` is the authoritative check, run by the packager and before any
+request: it applies these rules, then parses the string with the URL parser the transport uses, and
+refuses unless the parsed URL serialises to the input byte for byte, its scheme is the one the rules
+saw, it has no user name or password, and an `http` host parses to an IPv4 address with first octet
+127 or to `::1`. The library's own `UpdaterBuilder` takes any feed URL as before; these rules bind
+only a feed read from an update configuration.
+
+### 13.4 Install metadata
+
+`install` is `{entry, name, comment, icon, categories, bin, terminal}` (M5-D4), with exactly these
+members; an unknown member makes the document invalid (13.7).
+
+| Member | Type | Rule |
+|---|---|---|
+| `entry` | string | the executable the runtime launches: a path (10.1) of at most 32 components; its file name is not `lunepack-runtime` or `lunepack-runtime.exe`, and no component is `lunepack-update.json` (both compared ignoring ASCII case). The packager checks that it is a file with `exec` |
+| `name` | string | the display name: 1 to 128 Unicode scalar values |
+| `comment` | string or null | a one-line description: 0 to 512 Unicode scalar values |
+| `icon` | string or null | a PNG or SVG file in the tree: a path as for `entry`, ending in `.png` or `.svg` (ignoring ASCII case) |
+| `categories` | array of strings | freedesktop main and additional category names: at most 16, each `[A-Za-z0-9-]{1,64}`, no name twice |
+| `bin` | string or null | the name of the command-line link (`~/.local/bin/<bin>` on Linux): `[A-Za-z0-9._-]{1,64}`, not starting with `-` or `.` |
+| `terminal` | boolean | whether the app runs in a terminal |
+
+`name` and `comment` hold no C0 or C1 control character, no DEL, no U+2028 or U+2029, no `\`, and
+no leading or trailing whitespace, so neither can break a line of a desktop entry or start an escape.
+File associations, URL schemes and autostart are not in format 1's first revision; they arrive as new
+optional members under 13.7.
+
+### 13.5 Desktop-entry paths
+
+A path the Linux integration writes into a desktop entry's `Exec` or `Icon` value (the absolute path
+of the entry or icon under the install root) must be non-empty, with every character printable and
+none of `" ` $ \ % '`; controls, U+2028/U+2029 and invisible format characters are refused. The rule
+is `lunepack_core::desktop_safe_path`, shared by the writer's callers and the integration, so the
+value never needs quoting beyond the double quotes of the specification and never expands.
+
+### 13.6 Reading before staging
+
+M5 reads the configuration only from a tree on disk: `install` runs from a bootstrap tree that
+already holds the file, and the applier reads the new version's configuration from its staged tree.
+A client that needs `name` or `icon` before any tree exists (M6's installer) reads them through the
+verified manifest, and implements this path then:
+
+1. Verify the chain to the manifest (11.1). The configuration is the manifest's file entry at its
+   fixed path (13.1).
+2. Take that entry's frame `{codec, offset, length, sha256}` (9.0) and read
+   `pack[offset .. offset + length]`, by an HTTP Range request or from the installer's payload.
+3. Check the frame's `sha256`, decode it under the signed caps (9.2), then check the file's `sha256`
+   and `size` against the entry.
+4. Parse the bytes with this section's reader. The icon file is read the same way.
+
+### 13.7 Evolution
+
+- Within `format: 1`, an unknown **top-level** member is ignored by readers (the reader keeps it and
+  a writer that rewrites the document writes it back unchanged). An unknown member inside `root` or
+  `install` makes the document invalid, so new data is added as new top-level members, or as new
+  optional members of `install` in a revision that names them.
+- A writer that adds a member older readers must not ignore names it in `critical`. A reader that
+  finds any name in `critical` stops with "newer format"; v1 implements no critical name.
+- `format` above 1 is a newer format: the reader stops and nothing is written. `format` 0 is invalid.
+- Every refusal names the member or rule; no value from the document is shown in an error.

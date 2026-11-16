@@ -50,7 +50,7 @@ fn pick(
     install: &[u8; 16],
 ) -> Option<(String, Target)> {
     let bad: Vec<Version> = bad.iter().map(|b| v(b)).collect();
-    select_candidate(feed, &v(current), host, &bad, install, &FakeHasher)
+    select_candidate(feed, Some(&v(current)), host, &bad, install, &FakeHasher)
         .map(|c| (c.entry.version_text().to_owned(), c.entry.target()))
 }
 
@@ -232,4 +232,41 @@ fn rollout_at_0_1_and_10000_basis_points() {
         pick(&f, "1.0.0", host, &[], &in_other),
         Some(("2.0.0".into(), host))
     );
+}
+
+#[test]
+fn no_current_admits_any_release_under_the_same_rules() {
+    let fx = ChainFixture::fake();
+    let host = Target::LinuxX86_64;
+    let first = |f: &VerifiedFeed, bad: &[&str], install: &[u8; 16]| {
+        let bad: Vec<Version> = bad.iter().map(|b| v(b)).collect();
+        select_candidate(f, None, host, &bad, install, &FakeHasher)
+            .map(|c| c.entry.version_text().to_owned())
+    };
+    let f = feed(
+        &fx,
+        vec![
+            fx.release("0.1.0", &[(host, M)], None),
+            fx.release("0.2.0-rc.1", &[(host, M)], None),
+        ],
+    );
+    let me = id(1);
+    assert_eq!(first(&f, &[], &me), Some("0.2.0-rc.1".into()));
+    assert_eq!(first(&f, &["0.2.0-rc.1"], &me), Some("0.1.0".into()));
+    assert_eq!(first(&f, &["0.2.0-rc.1", "0.1.0"], &me), None);
+    // The bucket rule still holds: outside a 0-point rollout, the next release.
+    let f = feed(
+        &fx,
+        vec![
+            fx.release("2.0.0", &[(host, M)], Some((0, SEED))),
+            fx.release("1.0.0", &[(host, M)], None),
+        ],
+    );
+    assert_eq!(first(&f, &[], &me), Some("1.0.0".into()));
+    // No release for the host.
+    let f = feed(
+        &fx,
+        vec![fx.release("1.0.0", &[(Target::WindowsX86_64, M)], None)],
+    );
+    assert_eq!(first(&f, &[], &me), None);
 }

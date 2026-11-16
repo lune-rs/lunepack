@@ -5,9 +5,14 @@
 
 use std::fmt;
 
+use crate::fetch::RangeError;
+use crate::fs::FsError;
+use crate::integration::IntegrationError;
 use crate::path::{PathError, TreeError};
+use crate::process::ProcessError;
 use crate::target::TargetError;
 use crate::traits::CodecId;
+use crate::transport::TransportError;
 use crate::version::VersionError;
 
 /// Result alias for the core.
@@ -264,8 +269,9 @@ pub enum PackError {
     StoredRoundTrip(#[source] Box<Error>),
 }
 
-/// Why a frame descriptor or a frame's bytes were rejected (FORMAT.md 9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+/// Why a frame descriptor or a frame's bytes were rejected (FORMAT.md 9). Not `Copy` or `Clone`:
+/// [`FrameError::OutputWrite`] keeps the writer's `io::Error` as its source.
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FrameError {
     /// A non-empty file without a frame, or an empty file with one.
@@ -337,11 +343,8 @@ pub enum FrameError {
         size: u64,
     },
     /// The caller's output writer failed; what it holds is not the file.
-    #[error("the output writer failed: {kind}")]
-    OutputWrite {
-        /// The writer's error kind.
-        kind: std::io::ErrorKind,
-    },
+    #[error("the output writer failed")]
+    OutputWrite(#[source] std::io::Error),
     /// The decoder wrote fewer bytes than the file's size.
     #[error("decoded {actual} of {expected} bytes")]
     OutputTooShort {
@@ -363,6 +366,236 @@ pub enum FrameError {
     /// The decoded file's SHA-256 differs from the signed one.
     #[error("decoded file hash does not match")]
     FileHash,
+}
+
+/// Equality, for tests and for callers that branch on the cause: variants compare by their
+/// fields, and two [`FrameError::OutputWrite`] by the kind of their errors (`io::Error` has no
+/// equality).
+impl PartialEq for FrameError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::OutputWrite(a), Self::OutputWrite(b)) => a.kind() == b.kind(),
+            (Self::OutputWrite(_), _) | (_, Self::OutputWrite(_)) => false,
+            // Every other variant is plain data, and the derived `Debug` shows all of its fields.
+            _ => format!("{self:?}") == format!("{other:?}"),
+        }
+    }
+}
+
+impl Eq for FrameError {}
+
+/// The install-state store refused to load or commit (FORMAT.md 12). Paths are never shown.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StateError {
+    /// A filesystem operation failed.
+    #[error("{0}")]
+    Fs(#[from] FsError),
+    /// The record file for this seq already exists (another writer got there first).
+    #[error("state record {seq} already exists")]
+    Conflict {
+        /// The seq.
+        seq: u64,
+    },
+    /// A whole record is from a newer format (format byte or `format` above 1, or a `critical`
+    /// entry this build does not implement): nothing is read past it and nothing is written.
+    #[error("state record is from a newer format")]
+    NewerFormat,
+    /// A whole record (its checksum matches) fails parsing or a semantic rule; the load stops
+    /// rather than fall back to an older record (M4-D23).
+    #[error("invalid state record: {0}")]
+    Invalid(Untrusted),
+    /// The next seq would be above `2^53 - 1`.
+    #[error("state record seq space exhausted")]
+    SeqExhausted,
+    /// A record would be over the size cap.
+    #[error("state record is {size} bytes, over the {cap} byte cap")]
+    TooLarge {
+        /// The framed size.
+        size: u64,
+        /// The cap.
+        cap: u64,
+    },
+    /// A commit would lower an anti-rollback floor of the loaded record.
+    #[error("state commit would lower an anti-rollback floor")]
+    FloorLowered,
+}
+
+/// A lifecycle transition (`lifecycle`, C4, M5-D5) refused; the record is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum LifecycleError {
+    /// The record is a machine install's, which only the privileged engine writes.
+    #[error("a machine install's state is not written here")]
+    MachineScope,
+    /// The record has no current version.
+    #[error("nothing is installed")]
+    NotInstalled,
+    /// The record already has a current version.
+    #[error("already installed")]
+    AlreadyInstalled,
+    /// No usable staged version (none, not newer, bad, or another target).
+    #[error("nothing usable is staged")]
+    NothingStaged,
+    /// The staged version is not the one asked for.
+    #[error("the staged version is not the requested one")]
+    StagedVersionMismatch,
+    /// `staged_issued` is missing or names another staged entry; the app stages again.
+    #[error("the staged entry has no bound issued time")]
+    StagedIssuedUnbound,
+    /// A version is already pending its health check.
+    #[error("a version is already pending")]
+    PendingExists,
+    /// The version is not the pending one.
+    #[error("the version is not pending")]
+    NotPending,
+    /// There is no previous version to roll back to.
+    #[error("no previous version")]
+    NoPrevious,
+    /// `bad` is full, so a rollback after this apply could not record its version.
+    #[error("too many bad versions")]
+    BadFull,
+    /// A presented health token does not match the recorded one.
+    #[error("the health token does not match")]
+    TokenMismatch,
+}
+
+/// A layout rule (`layout`, M5-D2, M5-D17) refused. Paths are never shown.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum LayoutError {
+    /// The executable does not lie in the entry's directory of the tree whose config was found.
+    #[error("the executable is not in its tree's entry directory")]
+    NotThisTree,
+    /// `current` under the install root is a file or a directory, not a link.
+    #[error("the current link is not a symlink")]
+    CurrentNotALink,
+    /// A filesystem operation failed.
+    #[error("{0}")]
+    Fs(#[from] FsError),
+}
+
+/// Why [`crate::stage::stage`] did not produce a tree (C3). Paths are never shown.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StageError {
+    /// These files (manifest order) could not be placed from their sources: a missing, short or
+    /// corrupt cache file, a pack frame that fails its hash or decode, or a current-tree file that
+    /// no longer matches. The partial tree stays; the caller fetches them and calls again.
+    #[error("{} files need fetching", .0.len())]
+    NeedFetch(Vec<crate::path::RelPath>),
+    /// The cancel token was cancelled; no temporary file is left and a later call resumes.
+    #[error("cancelled")]
+    Cancelled,
+    /// A source kind this build does not implement (`SourceFor::Patch`, reserved).
+    #[error("unsupported stage source")]
+    Unsupported,
+    /// Anything else, a failure of the destination (disk full, permission) included.
+    #[error("{0}")]
+    Other(#[from] Error),
+}
+
+/// Which rule of the update-config feed (FORMAT.md 13.3) a feed string broke. The string itself is
+/// never shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FeedRule {
+    /// Longer than 2048 bytes.
+    #[error("feed is longer than 2048 bytes")]
+    TooLong,
+    /// A byte outside ASCII 0x21-0x7E (space, tab, CR, LF, a control or a non-ASCII byte).
+    #[error("feed has a byte outside printable ASCII")]
+    Byte,
+    /// One of the characters `\ % ? # @ " < > ^ ` { | }`.
+    #[error("feed has a forbidden character")]
+    Forbidden,
+    /// Not exactly `https://`, `http://` or `file:///` (lowercase).
+    #[error("feed scheme is not https://, http:// or file:///")]
+    Scheme,
+    /// An `https` host that is not lowercase LDH labels or a canonical dotted-quad.
+    #[error("feed host is not a lowercase DNS name or a canonical IPv4 address")]
+    Host,
+    /// A bracketed IPv6 host on `https` (refused in v1).
+    #[error("feed host is an IPv6 address, which https feeds do not allow in v1")]
+    Ipv6Host,
+    /// An `http` host other than a canonical `127.x.y.z` or `[::1]`.
+    #[error("http feed host is not a loopback IP literal")]
+    HttpNotLoopback,
+    /// A port that is empty, has a leading zero, is out of 1-65535 or is the scheme's default.
+    #[error("feed port is not a canonical non-default port")]
+    Port,
+    /// A path that does not start and end with `/`, or a segment outside `[A-Za-z0-9._~-]+`, `.`
+    /// or `..`.
+    #[error("feed path is not a canonical directory path")]
+    Path,
+    /// The facade's URL parser refused the string.
+    #[error("feed is not a URL the transport accepts")]
+    Unparsable,
+    /// The facade's URL parser changed the string (it would connect somewhere else than it reads).
+    #[error("feed is not in the URL parser's canonical form")]
+    Normalised,
+    /// The parsed scheme differs from the one the core rule saw.
+    #[error("feed scheme differs after parsing")]
+    SchemeMismatch,
+    /// The parsed URL carries a user name or password.
+    #[error("feed carries user information")]
+    Userinfo,
+}
+
+/// Why a path string cannot go into a desktop entry's `Exec` or `Icon` (FORMAT.md 13.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum DesktopPathError {
+    /// The path is empty.
+    #[error("desktop entry path is empty")]
+    Empty,
+    /// A control or invisible character, or one of `" ` $ \ % '`. The character is not shown.
+    #[error("desktop entry path has a character the entry cannot carry")]
+    Char,
+}
+
+/// Why an update-config document (FORMAT.md 13) was refused, by the reader or the writer. Every
+/// variant names a field or a rule; no value from the document is ever shown.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum UpdateConfigError {
+    /// Over the 64 KiB cap.
+    #[error("update config is {size} bytes, over the {cap} byte cap")]
+    TooLarge {
+        /// The size.
+        size: u64,
+        /// The cap.
+        cap: u64,
+    },
+    /// The strict JSON pre-pass (FORMAT.md 3.1) refused the bytes.
+    #[error("update config: {0}")]
+    Json(#[from] JsonError),
+    /// `format` above 1, or a `critical` name this build does not implement.
+    #[error("update config is from a newer format")]
+    NewerFormat,
+    /// A required member is missing.
+    #[error("update config has no {0}")]
+    Missing(&'static str),
+    /// An object (`root` or `install`) has a member that is not defined.
+    #[error("update config {0} has an unknown member")]
+    Unknown(&'static str),
+    /// A member has the wrong JSON type.
+    #[error("update config {0} has the wrong type")]
+    WrongType(&'static str),
+    /// A member breaks its rule.
+    #[error("update config {field}: {rule}")]
+    Invalid {
+        /// The member, as a dotted path (`install.name`).
+        field: &'static str,
+        /// The rule it breaks.
+        rule: &'static str,
+    },
+    /// The feed breaks the feed rule.
+    #[error("update config feed: {0}")]
+    Feed(FeedRule),
+    /// The app id or root parts differ from the trusted root the writer was given.
+    #[error("update config {0} does not match the trusted root")]
+    RootMismatch(&'static str),
 }
 
 /// Every way the core rejects input or fails.
@@ -576,4 +809,34 @@ pub enum Error {
         /// The clock's reading.
         now: u64,
     },
+    /// A transport failed to produce a response or a body chunk.
+    #[error("{0}")]
+    Transport(#[from] TransportError),
+    /// A response broke the HTTP response rules of the fetch (M4-D9).
+    #[error("response refused: {0}")]
+    Range(#[from] RangeError),
+    /// A filesystem operation failed.
+    #[error("{0}")]
+    Fs(#[from] FsError),
+    /// The operation's cancel token was cancelled.
+    #[error("cancelled")]
+    Cancelled,
+    /// The install-state store failed.
+    #[error("install state: {0}")]
+    State(#[from] StateError),
+    /// The operating system gave no randomness.
+    #[error("the operating system gave no randomness")]
+    Random,
+    /// A process operation failed.
+    #[error("{0}")]
+    Process(#[from] ProcessError),
+    /// The operating-system integration (desktop entry, command link) failed.
+    #[error("{0}")]
+    Integration(#[from] IntegrationError),
+    /// A lifecycle transition refused.
+    #[error("lifecycle: {0}")]
+    Lifecycle(#[from] LifecycleError),
+    /// A layout rule refused.
+    #[error("layout: {0}")]
+    Layout(#[from] LayoutError),
 }

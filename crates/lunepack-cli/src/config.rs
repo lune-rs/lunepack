@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use lunepack_core::encoding::hex_decode_array;
 use lunepack_core::limits::MAX_JSON_INT;
-use lunepack_core::{AppId, Clock, Hasher, Signer, TrustedRoot, Verifier};
+use lunepack_core::update_config::{DEFAULT_HEALTH_TIMEOUT_SECS, HEALTH_TIMEOUT_SECS};
+use lunepack_core::{
+    AppId, Channel, Clock, Hasher, InstallMeta, RelPath, Signer, TrustedRoot, Verifier,
+};
 use lunepack_crypto::{CommandSigner, Ed25519Signer};
 use serde::Deserialize;
 
@@ -31,6 +34,32 @@ struct RawConfig {
     signers: BTreeMap<String, RawSigner>,
     /// The publisher state file (M3-R2-D1), relative to the config's directory.
     state: Option<String>,
+    /// How a packed tree updates itself (M5-D7); absent for an app that does not.
+    update: Option<RawUpdate>,
+    /// How the packed tree is installed (M5-D4); required with `update`.
+    install: Option<RawInstall>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUpdate {
+    feed: String,
+    channel: Option<String>,
+    health_timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInstall {
+    entry: String,
+    name: String,
+    comment: Option<String>,
+    icon: Option<String>,
+    #[serde(default)]
+    categories: Vec<String>,
+    bin: Option<String>,
+    #[serde(default)]
+    terminal: bool,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +100,23 @@ pub enum SignerSpec {
     },
 }
 
+/// The channel a packed tree follows when `[update]` names none.
+pub const DEFAULT_UPDATE_CHANNEL: &str = "stable";
+
+/// `[update]` and `[install]`, parsed: what the packager writes into the tree's update config
+/// (FORMAT.md 13). The fields are checked again by the config writer in the core.
+#[derive(Debug, Clone)]
+pub struct UpdateSettings {
+    /// The feed directory URL, as written.
+    pub feed: String,
+    /// The channel the tree follows.
+    pub channel: Channel,
+    /// How long a supervised start may take to confirm its health.
+    pub health_timeout_secs: u64,
+    /// The install metadata.
+    pub install: InstallMeta,
+}
+
 /// A parsed, validated `lunepack.toml`.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -85,7 +131,36 @@ pub struct Config {
     /// The publisher state file (M3-R2-D1): `state` resolved against the config's directory, or
     /// `lunepack-state.json` next to the config.
     pub state_path: PathBuf,
+    /// `[update]` with `[install]`, when the config has them.
+    pub update: Option<UpdateSettings>,
     signers: BTreeMap<String, SignerSpec>,
+}
+
+fn update_settings(file: &str, u: RawUpdate, i: RawInstall) -> Result<UpdateSettings> {
+    let channel = Channel::parse(u.channel.as_deref().unwrap_or(DEFAULT_UPDATE_CHANNEL))
+        .map_err(|_| anyhow!("{file}: update.channel is not a channel id"))?;
+    let health_timeout_secs = u.health_timeout_secs.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS);
+    if !HEALTH_TIMEOUT_SECS.contains(&health_timeout_secs) {
+        bail!("{file}: update.health_timeout_secs is outside 5..=3600");
+    }
+    let rel = |value: &str, field: &str| {
+        RelPath::parse(value).map_err(|_| anyhow!("{file}: install.{field} is not a tree path"))
+    };
+    let install = InstallMeta {
+        entry: rel(&i.entry, "entry")?,
+        name: i.name,
+        comment: i.comment,
+        icon: i.icon.as_deref().map(|v| rel(v, "icon")).transpose()?,
+        categories: i.categories,
+        bin: i.bin,
+        terminal: i.terminal,
+    };
+    Ok(UpdateSettings {
+        feed: u.feed,
+        channel,
+        health_timeout_secs,
+        install,
+    })
 }
 
 /// A 64-character lowercase hex value; the error names `what`, never the text.
@@ -186,12 +261,19 @@ impl Config {
             Some(s) => dir.join(s),
             None => dir.join(crate::state::DEFAULT_STATE),
         };
+        let update = match (raw.update, raw.install) {
+            (None, None) => None,
+            (None, Some(_)) => bail!("{}: [install] needs [update]", ctx()),
+            (Some(_), None) => bail!("{}: [update] needs [install]", ctx()),
+            (Some(u), Some(i)) => Some(update_settings(&ctx(), u, i)?),
+        };
         Ok(Config {
             app_id,
             root_version: raw.root.version,
             root_threshold: raw.root.threshold,
             root_keys,
             state_path,
+            update,
             signers,
         })
     }

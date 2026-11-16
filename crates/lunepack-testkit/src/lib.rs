@@ -10,10 +10,18 @@ mod codec;
 mod docs;
 pub mod exe_headers;
 mod hasher;
+mod http_server;
+mod integration;
+mod memfs;
+mod process;
+mod rng;
 mod seeds;
 mod signer;
 mod suites;
+mod transport;
 mod verifier;
+
+use std::path::PathBuf;
 
 pub use clock::{FakeClock, YEAR_2100_UNIX_SECS};
 pub use codec::{FakeCodec, FakeEncoded, FakeStreamLayout, Fault};
@@ -22,10 +30,37 @@ pub use docs::{
     run_trust_chain_suite,
 };
 pub use hasher::FakeHasher;
-pub use seeds::{Seed, fuzz_seeds};
+pub use http_server::LoopbackServer;
+pub use integration::{FakeIntegration, IntegrationCall, IntegrationOp, run_integration_suite};
+pub use memfs::{MemFs, RecoverMode};
+pub use process::{ChildScript, FakeProcess, SpawnRecord, run_process_suite};
+pub use rng::FakeRng;
+pub use seeds::{Seed, fuzz_seeds, sample_update_config};
 pub use signer::FakeSigner;
 pub use suites::{
-    HashKat, SHA256_KATS, SignFixture, VerifyKat, run_clock_suite, run_codec_suite,
-    run_hasher_suite, run_signer_suite, run_verifier_suite,
+    HashKat, SHA256_KATS, SignFixture, TransportCaps, VerifyKat, run_blocking_transport_suite,
+    run_blocking_transport_suite_with, run_clock_suite, run_codec_suite, run_fs_suite,
+    run_fs_suite_with, run_hasher_suite, run_rng_suite, run_signer_suite, run_transport_suite,
+    run_verifier_suite,
+};
+pub use transport::{
+    FAKE_BASE_URL, FakeBlockingTransport, FakeOrigin, FakeTransport, SeenRequest, TransportFault,
+    TransportFixture,
 };
 pub use verifier::{FAKE_INVALID_KEYS, FakeKeyPair, FakeVerifier};
+
+/// A test path written in POSIX form (`/a/b`) as an absolute path on this platform: unchanged on
+/// Unix, and on drive `C:` on Windows (`C:\a\b`), where `/a/b` has no prefix and is not absolute.
+/// For literal paths given to code that requires an absolute one (`tree_candidates`, `discover`,
+/// a spawn's program); the in-memory filesystem ignores the prefix.
+pub fn abs_path(posix: &str) -> PathBuf {
+    assert!(
+        posix.starts_with('/'),
+        "abs_path takes a path that starts with /"
+    );
+    if cfg!(windows) {
+        PathBuf::from(format!("C:{}", posix.replace('/', "\\")))
+    } else {
+        PathBuf::from(posix)
+    }
+}

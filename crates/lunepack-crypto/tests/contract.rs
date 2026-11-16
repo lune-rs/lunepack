@@ -7,8 +7,10 @@ use getrandom::SysRng;
 use getrandom::rand_core::UnwrapErr;
 use lunepack_core::error::SignatureError;
 use lunepack_core::{Error, Hasher, SignatureAlg, Verifier};
-use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
-use lunepack_testkit::{SHA256_KATS, VerifyKat, run_hasher_suite, run_verifier_suite};
+use lunepack_crypto::{Ed25519Verifier, OsRng, Sha256Hasher};
+use lunepack_testkit::{
+    SHA256_KATS, VerifyKat, run_hasher_suite, run_rng_suite, run_verifier_suite,
+};
 
 fn hex(s: &str) -> Vec<u8> {
     let s: String = s.split_whitespace().collect();
@@ -221,4 +223,21 @@ fn hasher_and_verifier_are_object_safe_and_shareable() {
     assert_traits::<dyn Verifier>();
     let _h: Box<dyn Hasher> = Box::new(Sha256Hasher);
     let _v: Box<dyn Verifier> = Box::new(Ed25519Verifier);
+}
+
+#[test]
+fn os_rng_passes_the_rng_suite() {
+    run_rng_suite(&OsRng);
+}
+
+#[test]
+fn os_rng_draws_differ_and_fill_large_buffers() {
+    use lunepack_core::Rng;
+    let mut a = vec![0u8; 4096];
+    let mut b = vec![0u8; 4096];
+    OsRng.fill(&mut a).unwrap();
+    OsRng.fill(&mut b).unwrap();
+    assert_ne!(a, b);
+    // Random 4096 bytes are not mostly zero.
+    assert!(a.iter().filter(|x| **x == 0).count() < 100);
 }
