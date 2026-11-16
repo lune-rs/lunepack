@@ -351,6 +351,13 @@ fn batch3(
         &scenario::uninstall_done(os, 1000, 4000, scenario::leftovers(os, 1)),
         &strip("N9", 4000, &[0, 120, 240, 360, 600]),
     )?;
+    // Batch 1 re-check: install's installing -> done transition (the dot colour and rail code).
+    let idone = scenario::install_done(os, 1000, 4000);
+    let ifull = RenderOptions {
+        flow: Flow::Install,
+        ..*full
+    };
+    shoot(r, dir, &ifull, &idone, &strip("B1-I3", 4000, &[0, 120]))?;
     let mut focus = scenario::uninstall_confirm(os);
     focus.push(at(700, Step::Key(lune_ui::input::NamedKey::Tab)));
     focus.push(at(800, Step::Key(lune_ui::input::NamedKey::Tab)));
