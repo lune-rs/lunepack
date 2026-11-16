@@ -21,6 +21,9 @@ winit.workspace = true
 png.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+accesskit_consumer.workspace = true
+
 [[example]]
 name = "demo"
 path = "examples/demo.rs"

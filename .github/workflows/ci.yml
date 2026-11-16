@@ -165,3 +165,84 @@ jobs:
         env:
           LUNEPACK_E2E_REQUIRE: '1'
         run: ./scripts/e2e.sh --inside --runtime "$RUNNER_TEMP/runtime/lunepack-runtime"
+
+  ui:
+    # the UI (M6): the golden frames of every screen and transition, the accessibility tree, the
+    # smoke test of the real `lunepack-ui` binary against a scripted engine, and the size report.
+    # linux-golden compares in the reference image (scripts/ui-golden.Dockerfile: the same Mesa as a
+    # local run, so the tolerance is exact); macos and windows render natively and compare with the
+    # cross-adapter tolerance; linux-baseline (the oldest runner) builds the release binary, records
+    # the glibc it needs and runs the smoke test under Xvfb with the distribution's Mesa, comparing no
+    # pixels. Every leg uploads what it rendered and reports the binary's size (D37 (b): reported,
+    # never a failure). The signing keys of the size report are made in the job and never leave it.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-golden, os: ubuntu-latest }
+          - { name: linux-baseline, os: ubuntu-22.04 }
+          - { name: macos, os: macos-latest }
+          - { name: windows, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      LUNEPACK_GOLDEN_OUT: ${{ github.workspace }}/target/ui-golden-out
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Xvfb and Mesa (the distribution's software Vulkan driver) for the smoke test
+        if: matrix.name == 'linux-baseline'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb mesa-vulkan-drivers libvulkan1 libxkbcommon-x11-0 libx11-xcb1 binutils
+      - name: Golden frames in the reference image
+        if: matrix.name == 'linux-golden'
+        run: ./scripts/ui-golden.sh --docker
+      - name: Golden frames, natively (cross-adapter tolerance)
+        if: matrix.name == 'macos' || matrix.name == 'windows'
+        shell: bash
+        env:
+          LUNEPACK_GOLDEN_CLASS: cross
+        run: cargo test -p lunepack-ui-luneui --locked --test golden -- --ignored
+      - name: Accessibility tree, keyboard and the checks that need no GPU
+        run: cargo test -p lunepack-ui-luneui --locked --test access --test golden
+      - name: Smoke test of the binary (natively)
+        if: matrix.name == 'macos' || matrix.name == 'windows'
+        shell: bash
+        run: cargo test -p lunepack-ui --locked --test smoke -- --ignored
+      - name: Smoke test of the binary under Xvfb
+        if: matrix.name == 'linux-baseline'
+        run: xvfb-run -a cargo test -p lunepack-ui --locked --test smoke -- --ignored
+      - name: Build the release binary and the packager
+        shell: bash
+        run: cargo build --release --locked -p lunepack-ui -p lunepack-cli
+      - name: Size report (raw size and the frame length lunepack pack chooses)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ext=
+          if [ "$RUNNER_OS" = Windows ]; then ext=.exe; fi
+          ./scripts/ci/ui-size.sh "target/release/lunepack-ui$ext" "target/release/lunepack$ext"
+      - name: The glibc the binary needs (derived from the binary)
+        if: matrix.name == 'linux-baseline'
+        run: |
+          set -euo pipefail
+          highest=$(objdump -T target/release/lunepack-ui | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -n 1)
+          [ -n "$highest" ] || { echo "no GLIBC_ symbol version found in the binary" >&2; exit 1; }
+          echo "highest glibc symbol version: $highest"
+          {
+            echo "### lunepack-ui glibc baseline (ubuntu-22.04)"
+            echo
+            echo "Highest GLIBC_ version in the dynamic symbols (objdump -T): \`$highest\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+      # actions/upload-artifact v7.0.2 (lightweight tag, resolves directly to the commit)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always() && matrix.name != 'linux-baseline'
+        with:
+          name: ui-golden-renders-${{ matrix.name }}
+          path: target/ui-golden-out
+          if-no-files-found: error
+          retention-days: 7
