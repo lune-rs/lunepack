@@ -77,3 +77,91 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Check at the MSRV
         run: cargo +1.88.0 check --workspace --all-targets --locked
+
+  os-trust:
+    # the production transport honours the OS trust store and the system proxy (a regression check,
+    # not an experiment: scripts/ci/os-trust.sh and .ps1, ported from probe P-N1). The scripts
+    # change the hosted runner's trust store and proxy settings and undo them on every exit path.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, shell: bash }
+          - { os: macos-latest, shell: bash }
+          - { os: windows-latest, shell: pwsh }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: OS trust and system proxy (bash)
+        if: matrix.shell == 'bash'
+        timeout-minutes: 20
+        shell: bash
+        run: ./scripts/ci/os-trust.sh
+      - name: OS trust and system proxy (pwsh)
+        if: matrix.shell == 'pwsh'
+        timeout-minutes: 20
+        shell: pwsh
+        run: ./scripts/ci/os-trust.ps1
+
+  runtime-musl:
+    # the static musl runtime (M5-D7), built by scripts/build-runtime.sh, which also checks that it
+    # is static and prints its size. The binary is an artifact for the E2E job. The job uses no credentials.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x86_64, triple: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: linux-aarch64, triple: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install musl-tools (the C compiler for the musl target) and the Rust target
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add "${{ matrix.triple }}"
+      - name: Build the runtime and check that it is static
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/runtime"
+          ./scripts/build-runtime.sh "${{ matrix.target }}" --out "$RUNNER_TEMP/runtime/lunepack-runtime"
+      # actions/upload-artifact v7.0.2 (lightweight tag, resolves directly to the commit)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: lunepack-runtime-${{ matrix.target }}
+          path: ${{ runner.temp }}/runtime/lunepack-runtime
+          if-no-files-found: error
+          retention-days: 7
+
+  e2e-linux:
+    # the end-to-end suite of the Linux runtime (M5-D13) on the hosted x86_64 runner: install,
+    # updates, rollbacks and uninstall through the static runtime built by `runtime-musl`. It is
+    # not part of the gate; a skip here is a failure (LUNEPACK_E2E_REQUIRE).
+    needs: runtime-musl
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # actions/download-artifact v8.0.2 (lightweight tag, resolves directly to the commit)
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: lunepack-runtime-linux-x86_64
+          path: ${{ runner.temp }}/runtime
+      - name: Install desktop-file-utils (the suite validates the desktop entries it writes)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends desktop-file-utils
+      - name: End-to-end suite
+        env:
+          LUNEPACK_E2E_REQUIRE: '1'
+        run: ./scripts/e2e.sh --inside --runtime "$RUNNER_TEMP/runtime/lunepack-runtime"

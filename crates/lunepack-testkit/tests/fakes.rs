@@ -1,9 +1,23 @@
 //! The testkit's own tests: the fakes pass the contract suites, and each fake rejects what it must.
 
+use std::ffi::OsString;
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
+
 use lunepack_core::error::{CodecError, SignatureError};
+use lunepack_core::fetch::classify;
 use lunepack_core::{
-    Clock, Codec, CodecId, DecodeReport, Encoder, Error, FrameView, Hasher, Sha256Digest,
-    SignatureAlg, Signer, StreamView, Verifier,
+    AppId, BlockingResponse, BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId,
+    DecodeReport, Encoder, Error, ExitKind, FileKind, FrameView, Fs, FsErrorKind, Hasher, Head,
+    InstallMeta, IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration, Process,
+    ProcessError, ProcessErrorKind, ProcessId, RangeError, RelPath, Request, ResponseInfo, Rng,
+    Scope, Sha256Digest, SignatureAlg, Signer, SpawnSpec, StreamView, Transport, TransportError,
+    TransportErrorKind, Validator, Verifier, WaitOutcome,
 };
 use lunepack_testkit::*;
 
@@ -445,4 +459,1535 @@ fn signer_suite_catches_a_non_deterministic_or_wrong_signer() {
     }
     let caught = std::panic::catch_unwind(|| run_signer_suite(&WrongKey, &FakeVerifier, b"x"));
     assert!(caught.is_err());
+}
+
+// ---- transports (M4 step 2) --------------------------------------------------------------------------
+
+/// A minimal HTTP/1.1 client over a raw `TcpStream`: the transport the loopback server is tested
+/// with, since the real adapter lives in `lunepack-http`. Follows up to 5 redirects, lowercases
+/// header names, keeps duplicates, reads the body by `content-length` or to the end of the
+/// connection, sends no `Accept-Encoding`, and checks the cancel token before connecting and before
+/// every read.
+struct RawTcpTransport;
+
+fn cancelled(url: &str) -> TransportError {
+    TransportError::new(TransportErrorKind::Cancelled, url, None)
+}
+
+struct RawBody {
+    stream: TcpStream,
+    buffered: Vec<u8>,
+    pos: usize,
+    remaining: Option<u64>,
+    cancel: CancelToken,
+    url: String,
+}
+
+impl Read for RawBody {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(io::Error::other(cancelled(&self.url)));
+        }
+        if buf.is_empty() || self.remaining == Some(0) {
+            return Ok(0);
+        }
+        let n = if self.pos < self.buffered.len() {
+            let n = buf.len().min(self.buffered.len() - self.pos);
+            buf[..n].copy_from_slice(&self.buffered[self.pos..self.pos + n]);
+            self.pos += n;
+            n
+        } else {
+            self.stream.read(buf)?
+        };
+        if let Some(left) = self.remaining.as_mut() {
+            if n == 0 {
+                return Err(io::Error::other(TransportError::new(
+                    TransportErrorKind::Io,
+                    &self.url,
+                    Some("connection closed before content-length bytes".into()),
+                )));
+            }
+            *left = left.saturating_sub(n as u64);
+        }
+        Ok(n)
+    }
+}
+
+impl BlockingTransport for RawTcpTransport {
+    fn get(
+        &self,
+        request: &Request,
+        cancel: &CancelToken,
+    ) -> Result<BlockingResponse, TransportError> {
+        let io_err = |e: io::Error| {
+            TransportError::new(TransportErrorKind::Io, &request.url, Some(Box::new(e)))
+        };
+        let mut url = request.url.clone();
+        for _ in 0..=5 {
+            if cancel.is_cancelled() {
+                return Err(cancelled(&request.url));
+            }
+            let rest = url
+                .strip_prefix("http://")
+                .ok_or_else(|| TransportError::new(TransportErrorKind::Unsupported, &url, None))?;
+            let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+            let path = if path.is_empty() { "/" } else { path };
+            let mut stream = TcpStream::connect(authority).map_err(|e| {
+                TransportError::new(TransportErrorKind::Connect, &url, Some(Box::new(e)))
+            })?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .map_err(io_err)?;
+            let mut head = format!(
+                "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: lunepack-test\r\n"
+            );
+            if let Some(range) = request.range {
+                head.push_str(&format!("Range: {}\r\n", range.header_value()));
+            }
+            if let Some(validator) = &request.if_range {
+                head.push_str(&format!("If-Range: {}\r\n", validator.header_value()));
+            }
+            head.push_str("Connection: close\r\n\r\n");
+            stream.write_all(head.as_bytes()).map_err(io_err)?;
+
+            // Read until the end of the response head.
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let end = loop {
+                if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at;
+                }
+                let n = stream.read(&mut tmp).map_err(io_err)?;
+                if n == 0 {
+                    return Err(TransportError::new(
+                        TransportErrorKind::Protocol,
+                        &url,
+                        Some("connection closed inside the head".into()),
+                    ));
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            };
+            let text = String::from_utf8_lossy(&buf[..end]).into_owned();
+            let mut lines = text.split("\r\n");
+            let status: u16 = lines
+                .next()
+                .and_then(|l| l.split(' ').nth(1))
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| TransportError::new(TransportErrorKind::Protocol, &url, None))?;
+            let headers: Vec<(String, Vec<u8>)> = lines
+                .filter_map(|l| l.split_once(':'))
+                .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().as_bytes().to_vec()))
+                .collect();
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                let location = headers
+                    .iter()
+                    .find(|(n, _)| n == "location")
+                    .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+                    .unwrap_or_default();
+                url = if location.starts_with("http://") {
+                    location
+                } else {
+                    format!("http://{authority}{location}")
+                };
+                continue;
+            }
+            let remaining = headers
+                .iter()
+                .find(|(n, _)| n == "content-length")
+                .and_then(|(_, v)| std::str::from_utf8(v).ok()?.parse::<u64>().ok());
+            return Ok(BlockingResponse {
+                head: Head { status, headers },
+                body: Box::new(RawBody {
+                    stream,
+                    buffered: buf[end + 4..].to_vec(),
+                    pos: 0,
+                    remaining,
+                    cancel: cancel.clone(),
+                    url: request.url.clone(),
+                }),
+            });
+        }
+        Err(TransportError::new(
+            TransportErrorKind::Unsupported,
+            &request.url,
+            Some("too many redirects".into()),
+        ))
+    }
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "future still pending after 10 s");
+        std::thread::yield_now();
+    }
+}
+
+const LARGE: &str = TransportFixture::LARGE;
+
+fn url(name: &str) -> String {
+    format!("{FAKE_BASE_URL}/{name}")
+}
+
+fn request(name: &str, range: Option<ByteRange>, if_range: Option<Validator>) -> Request {
+    Request {
+        url: url(name),
+        range,
+        if_range,
+    }
+}
+
+fn first_100() -> Option<ByteRange> {
+    Some(ByteRange {
+        first: 0,
+        last: Some(99),
+    })
+}
+
+/// A whole response through the blocking fake: the head and the body (or the first body error).
+fn fetch_blocking(
+    t: &FakeBlockingTransport,
+    request: &Request,
+) -> (Head, Result<Vec<u8>, io::Error>) {
+    let response = t.get(request, &CancelToken::new()).expect("a response");
+    let mut body = Vec::new();
+    let result = response.body.take(8 * 1024 * 1024).read_to_end(&mut body);
+    (response.head, result.map(|_| body))
+}
+
+fn info_of(head: &Head) -> Result<ResponseInfo, RangeError> {
+    ResponseInfo::from_head(head)
+}
+
+#[test]
+fn the_blocking_fake_passes_the_blocking_suite() {
+    let t = FakeBlockingTransport::fixture();
+    run_blocking_transport_suite(&t, FAKE_BASE_URL, &|| t.requests());
+}
+
+#[test]
+fn the_async_fake_passes_the_async_suite() {
+    let t = FakeTransport::fixture();
+    run_transport_suite(&t, FAKE_BASE_URL, &|| t.requests());
+}
+
+#[test]
+fn the_loopback_server_passes_the_suite_through_a_raw_tcp_client() {
+    let server = LoopbackServer::fixture().expect("bind");
+    run_blocking_transport_suite(&RawTcpTransport, &server.base_url(), &|| {
+        server.origin().requests()
+    });
+}
+
+#[test]
+fn the_suites_catch_a_transport_that_breaks_the_contract() {
+    // A fake that ignores Range answers 200 to a range request: the suite must fail.
+    let broken = std::panic::catch_unwind(|| {
+        let t = FakeBlockingTransport::fixture().with_fault(TransportFault::IgnoreRange);
+        run_blocking_transport_suite(&t, FAKE_BASE_URL, &|| t.requests());
+    });
+    assert!(
+        broken.is_err(),
+        "the suite passed a transport that ignores Range"
+    );
+    // ...and one that gzips.
+    let broken = std::panic::catch_unwind(|| {
+        let t = FakeTransport::fixture().with_fault(TransportFault::GzipEncoded);
+        run_transport_suite(&t, FAKE_BASE_URL, &|| t.requests());
+    });
+    assert!(
+        broken.is_err(),
+        "the suite passed a transport that sends content-encoding"
+    );
+}
+
+#[test]
+fn the_suites_catch_a_transport_that_sends_accept_encoding() {
+    let t = FakeBlockingTransport::fixture();
+    let broken = std::panic::catch_unwind(|| {
+        run_blocking_transport_suite(&t, FAKE_BASE_URL, &|| {
+            let mut log = t.requests();
+            for r in &mut log {
+                r.accept_encoding = Some("gzip".to_owned());
+            }
+            log
+        });
+    });
+    assert!(broken.is_err());
+}
+
+#[test]
+fn every_fake_logs_what_it_was_sent() {
+    let t = FakeBlockingTransport::fixture();
+    let etag = Validator::from_etag(b"\"x\"").unwrap();
+    let _ = fetch_blocking(&t, &request(LARGE, first_100(), Some(etag)));
+    let log = t.requests();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].url, format!("/{LARGE}"));
+    assert_eq!(log[0].range, first_100());
+    assert_eq!(log[0].range_header.as_deref(), Some("bytes=0-99"));
+    assert_eq!(log[0].if_range.as_deref(), Some("\"x\""));
+    assert_eq!(log[0].accept_encoding, None);
+    // A redirect logs both hops.
+    t.origin().clear_requests();
+    let _ = fetch_blocking(&t, &request(TransportFixture::ALIAS, None, None));
+    assert_eq!(t.requests().len(), 2);
+}
+
+#[test]
+fn faults_through_the_blocking_fake() {
+    let len = TransportFixture::LARGE_LEN as u64;
+    let with = |f: TransportFault| FakeBlockingTransport::fixture().with_fault(f);
+
+    // IgnoreRange: 200 with everything.
+    let t = with(TransportFault::IgnoreRange);
+    let (head, body) = fetch_blocking(&t, &request(LARGE, first_100(), None));
+    assert_eq!(head.status, 200);
+    assert_eq!(body.unwrap().len() as u64, len);
+    assert_eq!(
+        classify(first_100(), &info_of(&head).unwrap(), len, 100),
+        Ok(lunepack_core::Outcome::Full)
+    );
+
+    // WrongContentRange and NoContentRange are refused by the core's rules.
+    let t = with(TransportFault::WrongContentRange);
+    let (head, _) = fetch_blocking(&t, &request(LARGE, first_100(), None));
+    assert_eq!(head.status, 206);
+    assert!(matches!(
+        classify(first_100(), &info_of(&head).unwrap(), len, 100),
+        Err(RangeError::ContentRangeMismatch { .. })
+    ));
+    let t = with(TransportFault::NoContentRange);
+    let (head, _) = fetch_blocking(&t, &request(LARGE, first_100(), None));
+    assert_eq!(
+        classify(first_100(), &info_of(&head).unwrap(), len, 100),
+        Err(RangeError::ContentRangeMissing)
+    );
+
+    // TruncateAfter: content-length says more than arrives.
+    let t = with(TransportFault::TruncateAfter(10));
+    let (head, body) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(body.unwrap().len(), 10);
+    assert_eq!(info_of(&head).unwrap().content_length, Some(len));
+
+    // Endless: more than the file, no end, no content-length.
+    let t = with(TransportFault::Endless);
+    let (head, body) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(info_of(&head).unwrap().content_length, None);
+    assert_eq!(
+        body.unwrap().len(),
+        8 * 1024 * 1024,
+        "stopped only by the test's cap"
+    );
+
+    // ExtraBytes.
+    let t = with(TransportFault::ExtraBytes(7));
+    let (head, body) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(info_of(&head).unwrap().content_length, None);
+    assert_eq!(body.unwrap().len() as u64, len + 7);
+
+    // Status.
+    let t = with(TransportFault::Status(503));
+    let (head, body) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(head.status, 503);
+    assert!(body.unwrap().is_empty());
+
+    // GzipEncoded and DuplicateHeader are refused by the core's rules.
+    let t = with(TransportFault::GzipEncoded);
+    let (head, _) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(info_of(&head), Err(RangeError::ContentCoding));
+    let t = with(TransportFault::DuplicateHeader("etag"));
+    let (head, _) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(
+        info_of(&head),
+        Err(RangeError::DuplicateHeader { name: "etag" })
+    );
+    // A header the answer lacks is added twice.
+    let t = with(TransportFault::DuplicateHeader("x-new"));
+    let (head, _) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(head.headers.iter().filter(|(n, _)| n == "x-new").count(), 2);
+
+    // ErrorAfter: n good bytes, then an I/O error that carries a TransportError.
+    let t = with(TransportFault::ErrorAfter(10));
+    let response = t
+        .get(&request(LARGE, None, None), &CancelToken::new())
+        .unwrap();
+    let mut body = response.body;
+    let mut got = Vec::new();
+    let err = body.read_to_end(&mut got).unwrap_err();
+    assert_eq!(got.len(), 10);
+    let inner = err
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<TransportError>()
+        .unwrap();
+    assert_eq!(inner.kind, TransportErrorKind::Io);
+}
+
+#[test]
+fn change_etag_after_makes_the_old_validator_stale() {
+    let t = FakeBlockingTransport::fixture().with_fault(TransportFault::ChangeETagAfter(1));
+    let (head, _) = fetch_blocking(&t, &request(LARGE, None, None));
+    let validator = info_of(&head).unwrap().validator.unwrap();
+    let (head, body) = fetch_blocking(&t, &request(LARGE, first_100(), Some(validator.clone())));
+    assert_eq!(head.status, 200, "the tag changed, so If-Range fails");
+    assert_eq!(body.unwrap().len(), TransportFixture::LARGE_LEN);
+    assert_ne!(info_of(&head).unwrap().validator, Some(validator));
+}
+
+#[test]
+fn slow_chunks_deliver_one_byte_at_a_time_through_the_async_fake() {
+    let t = FakeTransport::fixture().with_fault(TransportFault::SlowChunks);
+    block_on(async {
+        let mut response = t
+            .get(request(TransportFixture::ONE_BYTE, None, None))
+            .await
+            .unwrap();
+        assert_eq!(response.body.next_chunk().await.unwrap(), Some(vec![0x41]));
+        assert_eq!(response.body.next_chunk().await.unwrap(), None);
+        let mut response = t.get(request(LARGE, first_100(), None)).await.unwrap();
+        let mut sizes = Vec::new();
+        while let Some(chunk) = response.body.next_chunk().await.unwrap() {
+            sizes.push(chunk.len());
+        }
+        assert_eq!(sizes, vec![1; 100]);
+    });
+}
+
+#[test]
+fn pending_forever_never_resolves_next_chunk() {
+    let t = FakeTransport::fixture().with_fault(TransportFault::PendingForever);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut response = block_on(t.get(request(LARGE, None, None))).unwrap();
+    let mut chunk = response.body.next_chunk();
+    for _ in 0..1000 {
+        assert!(matches!(chunk.as_mut().poll(&mut cx), Poll::Pending));
+    }
+}
+
+#[test]
+fn the_async_fake_reports_error_after_and_endless() {
+    let t = FakeTransport::fixture().with_fault(TransportFault::ErrorAfter(10));
+    block_on(async {
+        let mut response = t.get(request(LARGE, None, None)).await.unwrap();
+        let mut got = 0;
+        let err = loop {
+            match response.body.next_chunk().await {
+                Ok(Some(chunk)) => got += chunk.len(),
+                Ok(None) => panic!("the body ended without the error"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!((got, err.kind), (10, TransportErrorKind::Io));
+    });
+    let t = FakeTransport::fixture().with_fault(TransportFault::Endless);
+    block_on(async {
+        let mut response = t.get(request(LARGE, None, None)).await.unwrap();
+        let mut got = 0usize;
+        while got < 1_000_000 {
+            got += response
+                .body
+                .next_chunk()
+                .await
+                .unwrap()
+                .expect("endless")
+                .len();
+        }
+    });
+}
+
+#[test]
+fn the_blocking_fake_stops_a_read_when_cancelled() {
+    let t = FakeBlockingTransport::fixture().with_fault(TransportFault::Endless);
+    let cancel = CancelToken::new();
+    let mut response = t.get(&request(LARGE, None, None), &cancel).unwrap();
+    let mut buf = [0u8; 4096];
+    assert!(response.body.read(&mut buf).unwrap() > 0);
+    cancel.cancel();
+    let err = response.body.read(&mut buf).unwrap_err();
+    let inner = err
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<TransportError>()
+        .unwrap();
+    assert_eq!(inner.kind, TransportErrorKind::Cancelled);
+    // And before the request.
+    assert_eq!(
+        t.get(&request(LARGE, None, None), &cancel)
+            .unwrap_err()
+            .kind,
+        TransportErrorKind::Cancelled
+    );
+}
+
+#[test]
+fn fakes_refuse_urls_without_a_scheme_and_follow_at_most_five_redirects() {
+    let t = FakeBlockingTransport::fixture();
+    let err = t
+        .get(
+            &Request {
+                url: "large.bin".to_owned(),
+                range: None,
+                if_range: None,
+            },
+            &CancelToken::new(),
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, TransportErrorKind::Unsupported);
+    t.origin().redirect("/loop-a", "/loop-b");
+    t.origin().redirect("/loop-b", "/loop-a");
+    let err = t
+        .get(&request("loop-a", None, None), &CancelToken::new())
+        .unwrap_err();
+    assert_eq!(err.kind, TransportErrorKind::Unsupported);
+}
+
+#[test]
+fn the_fake_transports_are_object_safe_and_shareable() {
+    let a: Arc<dyn Transport> = Arc::new(FakeTransport::fixture());
+    let b: Arc<dyn BlockingTransport> = Arc::new(FakeBlockingTransport::fixture());
+    let (a2, b2) = (a.clone(), b.clone());
+    std::thread::spawn(move || {
+        drop(a2.get(request(LARGE, None, None)));
+        let _ = b2.get(&request(LARGE, None, None), &CancelToken::new());
+    })
+    .join()
+    .unwrap();
+}
+
+// ---- the loopback server ------------------------------------------------------------------------------
+
+fn raw(server: &LoopbackServer, name: &str, range: Option<ByteRange>) -> (Head, Vec<u8>) {
+    let request = Request {
+        url: server.url(name),
+        range,
+        if_range: None,
+    };
+    let mut response = RawTcpTransport
+        .get(&request, &CancelToken::new())
+        .expect("a response");
+    let mut body = Vec::new();
+    response.body.read_to_end(&mut body).expect("body");
+    (response.head, body)
+}
+
+#[test]
+fn the_loopback_server_binds_only_to_127_0_0_1() {
+    let server = LoopbackServer::fixture().unwrap();
+    assert!(server.addr().ip().is_loopback() && server.addr().is_ipv4());
+    assert!(server.base_url().starts_with("http://127.0.0.1:"));
+}
+
+#[test]
+fn the_loopback_server_answers_404_and_redirects_and_ranges() {
+    let server = LoopbackServer::fixture().unwrap();
+    let (head, _) = raw(&server, "nope.bin", None);
+    assert_eq!(head.status, 404);
+    let large = TransportFixture::bytes(LARGE).unwrap();
+    let (head, body) = raw(&server, TransportFixture::ALIAS, None);
+    assert_eq!((head.status, body), (200, large.clone()));
+    let (head, body) = raw(
+        &server,
+        LARGE,
+        Some(ByteRange {
+            first: 10,
+            last: Some(19),
+        }),
+    );
+    assert_eq!((head.status, body), (206, large[10..20].to_vec()));
+    // An unsatisfiable range.
+    let (head, _) = raw(
+        &server,
+        LARGE,
+        Some(ByteRange {
+            first: large.len() as u64,
+            last: None,
+        }),
+    );
+    assert_eq!(head.status, 416);
+    // A user-added file and redirect.
+    server.origin().put("/new/file", b"hello".to_vec());
+    server.origin().redirect("/old", "/new/file");
+    assert_eq!(raw(&server, "old", None).1, b"hello");
+}
+
+#[test]
+fn the_loopback_server_puts_faults_on_the_wire() {
+    let server = LoopbackServer::fixture().unwrap();
+    let len = TransportFixture::LARGE_LEN;
+
+    // One byte per chunk still delivers the whole body.
+    server.origin().set_faults(vec![TransportFault::SlowChunks]);
+    let (_, body) = raw(&server, TransportFixture::ONE_BYTE, None);
+    assert_eq!(body, [0x41]);
+    let (_, body) = raw(
+        &server,
+        LARGE,
+        Some(ByteRange {
+            first: 0,
+            last: Some(999),
+        }),
+    );
+    assert_eq!(body.len(), 1000);
+
+    // ExtraBytes: no content-length, the connection close ends a longer body.
+    server
+        .origin()
+        .set_faults(vec![TransportFault::ExtraBytes(5)]);
+    let (head, body) = raw(&server, LARGE, None);
+    assert!(head.headers.iter().all(|(n, _)| n != "content-length"));
+    assert_eq!(body.len(), len + 5);
+
+    // Truncation and an error both end the body early while content-length promises more.
+    for fault in [
+        TransportFault::TruncateAfter(10),
+        TransportFault::ErrorAfter(10),
+    ] {
+        server.origin().set_faults(vec![fault.clone()]);
+        let request = Request {
+            url: server.url(LARGE),
+            range: None,
+            if_range: None,
+        };
+        let mut response = RawTcpTransport.get(&request, &CancelToken::new()).unwrap();
+        let mut body = Vec::new();
+        let result = response.body.read_to_end(&mut body);
+        assert!(
+            result.is_err(),
+            "{fault:?}: a short body must be an error, got {} bytes",
+            body.len()
+        );
+        assert_eq!(body.len(), 10, "{fault:?}");
+    }
+
+    // Status and content-encoding.
+    server
+        .origin()
+        .set_faults(vec![TransportFault::Status(503)]);
+    assert_eq!(raw(&server, LARGE, None).0.status, 503);
+    server
+        .origin()
+        .set_faults(vec![TransportFault::GzipEncoded]);
+    assert_eq!(
+        info_of(&raw(&server, LARGE, None).0),
+        Err(RangeError::ContentCoding)
+    );
+    server
+        .origin()
+        .set_faults(vec![TransportFault::DuplicateHeader("etag")]);
+    assert!(info_of(&raw(&server, LARGE, None).0).is_err());
+}
+
+#[test]
+fn the_loopback_server_logs_requests() {
+    let server = LoopbackServer::fixture().unwrap();
+    raw(&server, LARGE, first_100());
+    let log = server.origin().requests();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].url, format!("/{LARGE}"));
+    assert_eq!(log[0].range, first_100());
+    assert_eq!(log[0].accept_encoding, None);
+}
+
+#[test]
+fn dropping_the_loopback_server_stops_it_within_a_second() {
+    let server = LoopbackServer::fixture().unwrap();
+    let addr = server.addr();
+    // A connection that never sends a request, and an endless download nobody reads.
+    let _stalled = TcpStream::connect(addr).unwrap();
+    server.origin().set_faults(vec![TransportFault::Endless]);
+    let mut endless = TcpStream::connect(addr).unwrap();
+    write!(endless, "GET /{LARGE} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut buf = [0u8; 16];
+    endless.read_exact(&mut buf).unwrap();
+    let started = Instant::now();
+    drop(server);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "stopping took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err(),
+        "the port still accepts connections"
+    );
+}
+
+// ---- MemFs (M4 step 3) -----------------------------------------------------------------------------------
+
+fn mem() -> (MemFs, &'static Path) {
+    let fs = MemFs::new();
+    let root = Path::new("/mem");
+    fs.create_dir_all(root).unwrap();
+    fs.sync_dir(Path::new("/")).unwrap();
+    (fs, root)
+}
+
+fn put(fs: &MemFs, path: &Path, bytes: &[u8], sync: bool) {
+    let mut f = fs.create_new(path).unwrap();
+    f.write_all(bytes).unwrap();
+    if sync {
+        f.sync().unwrap();
+    }
+}
+
+fn after(fs: &MemFs, mode: RecoverMode, path: &Path) -> Option<Vec<u8>> {
+    let image = fs.recover(mode);
+    image
+        .symlink_metadata(path)
+        .unwrap()
+        .map(|_| image.read_capped(path, 1 << 20).unwrap())
+}
+
+#[test]
+fn memfs_passes_the_fs_suite_with_symlinks_everywhere() {
+    let (fs, root) = mem();
+    run_fs_suite_with(&fs, root, true);
+    // The suite leaves nothing behind.
+    assert!(fs.list_dir(root).unwrap().is_empty());
+    // And on a second run over the same disk.
+    run_fs_suite(&fs, root);
+}
+
+#[test]
+fn the_fs_suite_catches_a_fs_that_follows_symlinks_on_create() {
+    // A wrapper whose create_new follows a dangling symlink (writes through it) must fail the suite.
+    struct Follows(MemFs);
+    impl Fs for Follows {
+        fn read_capped(&self, p: &Path, m: u64) -> Result<Vec<u8>, lunepack_core::FsError> {
+            self.0.read_capped(p, m)
+        }
+        fn open_read(
+            &self,
+            p: &Path,
+        ) -> Result<Box<dyn lunepack_core::ReadAt>, lunepack_core::FsError> {
+            self.0.open_read(p)
+        }
+        fn create_new(
+            &self,
+            p: &Path,
+        ) -> Result<Box<dyn lunepack_core::FileWrite>, lunepack_core::FsError> {
+            // Lets a dangling symlink through as if the path were free.
+            match self.0.create_new(p) {
+                Err(e)
+                    if e.kind == FsErrorKind::AlreadyExists
+                        && self.0.read_capped(p, 1).is_err() =>
+                {
+                    Ok(Box::new(Sink))
+                }
+                other => other,
+            }
+        }
+        fn open_append(
+            &self,
+            p: &Path,
+        ) -> Result<Box<dyn lunepack_core::FileWrite>, lunepack_core::FsError> {
+            self.0.open_append(p)
+        }
+        fn truncate(&self, p: &Path, l: u64) -> Result<(), lunepack_core::FsError> {
+            self.0.truncate(p, l)
+        }
+        fn rename(&self, a: &Path, b: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.rename(a, b)
+        }
+        fn remove_file(&self, p: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.remove_file(p)
+        }
+        fn remove_dir_all_nofollow(&self, p: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.remove_dir_all_nofollow(p)
+        }
+        fn create_dir_all(&self, p: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.create_dir_all(p)
+        }
+        fn list_dir(
+            &self,
+            p: &Path,
+        ) -> Result<Vec<lunepack_core::DirEntryInfo>, lunepack_core::FsError> {
+            self.0.list_dir(p)
+        }
+        fn symlink_metadata(
+            &self,
+            p: &Path,
+        ) -> Result<Option<lunepack_core::Meta>, lunepack_core::FsError> {
+            self.0.symlink_metadata(p)
+        }
+        fn sync_dir(&self, p: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.sync_dir(p)
+        }
+        fn copy_file(&self, a: &Path, b: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.copy_file(a, b)
+        }
+        fn set_exec(&self, p: &Path, e: bool) -> Result<(), lunepack_core::FsError> {
+            self.0.set_exec(p, e)
+        }
+        fn symlink(&self, t: &str, l: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.symlink(t, l)
+        }
+        fn read_link(&self, p: &Path) -> Result<String, lunepack_core::FsError> {
+            self.0.read_link(p)
+        }
+        fn replace_symlink(&self, t: &str, l: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.replace_symlink(t, l)
+        }
+        fn try_lock(
+            &self,
+            p: &Path,
+        ) -> Result<Option<Box<dyn lunepack_core::LockGuard>>, lunepack_core::FsError> {
+            self.0.try_lock(p)
+        }
+    }
+    struct Sink;
+    impl Write for Sink {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl lunepack_core::FileWrite for Sink {
+        fn sync(&mut self) -> Result<(), lunepack_core::FsError> {
+            Ok(())
+        }
+    }
+    let (fs, root) = mem();
+    let broken = std::panic::catch_unwind(|| run_fs_suite_with(&Follows(fs), root, true));
+    assert!(
+        broken.is_err(),
+        "the suite passed a create_new that accepts a dangling symlink"
+    );
+}
+
+#[test]
+fn a_synced_file_survives_drop_volatile_and_an_unsynced_one_does_not() {
+    let (fs, root) = mem();
+    put(&fs, &root.join("synced"), b"durable", true);
+    put(&fs, &root.join("unsynced"), b"volatile", false);
+    fs.sync_dir(root).unwrap();
+    // The entries are durable; the bytes of `unsynced` are not.
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("synced")),
+        Some(b"durable".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("unsynced")),
+        Some(Vec::new())
+    );
+    // A file whose directory was never synced is gone, synced bytes or not.
+    put(&fs, &root.join("no-dir-sync"), b"x", true);
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("no-dir-sync")),
+        None
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::KeepVolatile, &root.join("no-dir-sync")),
+        Some(b"x".to_vec())
+    );
+}
+
+#[test]
+fn keep_volatile_keeps_everything_and_torn_volatile_keeps_a_prefix() {
+    let (fs, root) = mem();
+    put(&fs, &root.join("f"), b"0123456789", false);
+    fs.sync_dir(root).unwrap();
+    let f = root.join("f");
+    assert_eq!(after(&fs, RecoverMode::DropVolatile, &f), Some(Vec::new()));
+    assert_eq!(
+        after(&fs, RecoverMode::KeepVolatile, &f),
+        Some(b"0123456789".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::TornVolatile(3), &f),
+        Some(b"012".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::TornVolatile(0), &f),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::TornVolatile(99), &f),
+        Some(b"0123456789".to_vec())
+    );
+    // An append after a sync: the synced prefix stays, `n` more bytes survive.
+    let mut w = fs.open_append(&f).unwrap();
+    w.sync().unwrap();
+    w.write_all(b"ABCDEF").unwrap();
+    assert_eq!(
+        after(&fs, RecoverMode::TornVolatile(2), &f),
+        Some(b"0123456789AB".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &f),
+        Some(b"0123456789".to_vec())
+    );
+    // A cut file keeps its synced bytes in the torn image.
+    fs.truncate(&f, 4).unwrap();
+    assert_eq!(
+        after(&fs, RecoverMode::TornVolatile(1), &f),
+        Some(b"0123456789".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::KeepVolatile, &f),
+        Some(b"0123".to_vec())
+    );
+}
+
+#[test]
+fn a_rename_is_volatile_until_its_directory_is_synced() {
+    let (fs, root) = mem();
+    put(&fs, &root.join("old"), b"data", true);
+    fs.sync_dir(root).unwrap();
+    fs.rename(&root.join("old"), &root.join("new")).unwrap();
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("old")),
+        Some(b"data".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("new")),
+        None
+    );
+    fs.sync_dir(root).unwrap();
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("old")),
+        None
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("new")),
+        Some(b"data".to_vec())
+    );
+    // The same for a removal.
+    fs.remove_file(&root.join("new")).unwrap();
+    assert!(after(&fs, RecoverMode::DropVolatile, &root.join("new")).is_some());
+    fs.sync_dir(root).unwrap();
+    assert!(after(&fs, RecoverMode::DropVolatile, &root.join("new")).is_none());
+}
+
+/// The commit sequence of M4-D5: create_new, write, sync, sync_dir.
+fn commit(fs: &MemFs, dir: &Path) -> Result<(), lunepack_core::FsError> {
+    let mut f = fs.create_new(&dir.join("rec"))?;
+    f.write_all(b"record")
+        .map_err(|e| lunepack_core::FsError::from_io(dir, e))?;
+    f.sync()?;
+    fs.sync_dir(dir)
+}
+
+#[test]
+fn crash_after_n_fails_op_n_and_everything_later() {
+    let (probe, root) = mem();
+    let before = probe.op_count();
+    commit(&probe, root).unwrap();
+    let ops = probe.op_count() - before;
+    assert_eq!(ops, 4, "create_new, write, sync, sync_dir");
+
+    for n in 0..ops {
+        let (fs, root) = mem();
+        let start = fs.op_count();
+        fs.crash_after(start + n);
+        let err = commit(&fs, root).unwrap_err();
+        assert_eq!(err.kind, FsErrorKind::Crashed, "crash at op {n}");
+        assert!(fs.is_crashed());
+        assert_eq!(fs.op_count(), start + n, "the crashed op is not counted");
+        // Everything after fails, reads included.
+        assert_eq!(
+            fs.read_capped(&root.join("rec"), 10).unwrap_err().kind,
+            FsErrorKind::Crashed
+        );
+        assert_eq!(
+            fs.create_dir_all(&root.join("x")).unwrap_err().kind,
+            FsErrorKind::Crashed
+        );
+        assert_eq!(
+            fs.try_lock(&root.join("l")).err().map(|e| e.kind),
+            Some(FsErrorKind::Crashed)
+        );
+        // The disk after the crash: the record is durable only if sync_dir ran (n == 4 never crashes).
+        let image = fs.recover(RecoverMode::DropVolatile);
+        assert!(!image.is_crashed());
+        assert_eq!(image.op_count(), 0);
+        assert_eq!(
+            image.symlink_metadata(&root.join("rec")).unwrap(),
+            None,
+            "op {n}"
+        );
+    }
+    // Crash exactly after the last op: nothing fails, the record is durable.
+    let (fs, root) = mem();
+    fs.crash_after(fs.op_count() + ops);
+    commit(&fs, root).unwrap();
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("rec")),
+        Some(b"record".to_vec())
+    );
+}
+
+#[test]
+fn a_writer_fails_with_a_crashed_fs_error_after_the_crash() {
+    let (fs, root) = mem();
+    let mut f = fs.create_new(&root.join("w")).unwrap();
+    fs.crash_now();
+    let err = f.write_all(b"x").unwrap_err();
+    let inner = err
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<lunepack_core::FsError>()
+        .unwrap();
+    assert_eq!(inner.kind, FsErrorKind::Crashed);
+    assert_eq!(f.sync().unwrap_err().kind, FsErrorKind::Crashed);
+    assert!(f.flush().is_err());
+}
+
+#[test]
+fn locks_are_per_path_and_a_killed_process_releases_them() {
+    let (fs, root) = mem();
+    let a = fs.process();
+    let b = fs.process();
+    let lock = root.join("lock");
+    let held = a.try_lock(&lock).unwrap().expect("a takes it");
+    assert!(b.try_lock(&lock).unwrap().is_none());
+    assert!(fs.try_lock(&lock).unwrap().is_none());
+    assert!(b.try_lock(&root.join("other")).unwrap().is_some());
+    fs.kill_process(&a);
+    let taken = b.try_lock(&lock).unwrap();
+    assert!(taken.is_some(), "the dead process's lock is free");
+    // The dead process's old guard dropping must not release b's lock.
+    drop(held);
+    assert!(fs.try_lock(&lock).unwrap().is_none());
+    drop(taken);
+    assert!(fs.try_lock(&lock).unwrap().is_some());
+    // A missing directory is an error, a recovered disk holds no locks.
+    assert_eq!(
+        fs.try_lock(&root.join("nodir/lock")).err().map(|e| e.kind),
+        Some(FsErrorKind::NotFound)
+    );
+    let _guard = fs.try_lock(&lock).unwrap().unwrap();
+    assert!(
+        fs.recover(RecoverMode::KeepVolatile)
+            .try_lock(&lock)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn memfs_follows_relative_symlinks_and_stops_loops() {
+    let (fs, root) = mem();
+    fs.create_dir_all(&root.join("d/e")).unwrap();
+    put(&fs, &root.join("d/file"), b"via link", true);
+    fs.symlink("../file", &root.join("d/e/rel")).unwrap();
+    assert_eq!(
+        fs.read_capped(&root.join("d/e/rel"), 100).unwrap(),
+        b"via link"
+    );
+    fs.symlink("/mem/d", &root.join("abs")).unwrap();
+    assert_eq!(
+        fs.read_capped(&root.join("abs/file"), 100).unwrap(),
+        b"via link"
+    );
+    assert_eq!(
+        fs.list_dir(&root.join("abs")).unwrap().len(),
+        2,
+        "list_dir follows a symlink to a directory"
+    );
+    fs.symlink("b", &root.join("a")).unwrap();
+    fs.symlink("a", &root.join("b")).unwrap();
+    assert_eq!(
+        fs.read_capped(&root.join("a"), 1).unwrap_err().kind,
+        FsErrorKind::Other
+    );
+    assert_eq!(
+        fs.symlink_metadata(&root.join("a"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Symlink)
+    );
+    // Symlinks are entries: volatile until the directory is synced, then durable.
+    assert!(
+        fs.recover(RecoverMode::DropVolatile)
+            .symlink_metadata(&root.join("abs"))
+            .unwrap()
+            .is_none()
+    );
+    fs.sync_dir(root).unwrap();
+    assert!(
+        fs.recover(RecoverMode::DropVolatile)
+            .symlink_metadata(&root.join("abs"))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn memfs_errors_name_only_the_file() {
+    let (fs, root) = mem();
+    let err = fs
+        .read_capped(&root.join("secret-dir/inner.txt"), 1)
+        .unwrap_err();
+    let shown = format!("{err} {err:?}");
+    assert!(
+        !shown.contains("secret-dir") && !shown.contains("/mem"),
+        "{shown}"
+    );
+    let err = fs.read_capped(&root.join("only-name.txt"), 1).unwrap_err();
+    assert!(format!("{err}").contains("only-name.txt"));
+}
+
+// ---- Rng, symlink replacement, Process and OsIntegration (M5 step 3) -----------------------------------
+
+#[test]
+fn fake_rng_passes_the_rng_suite_and_is_deterministic() {
+    run_rng_suite(&FakeRng::new(7));
+    let draw = |seed| {
+        let mut buf = [0u8; 48];
+        FakeRng::new(seed).fill(&mut buf).unwrap();
+        buf
+    };
+    assert_eq!(draw(7), draw(7));
+    assert_ne!(draw(7), draw(8));
+    assert_ne!(
+        draw(0),
+        [0u8; 48],
+        "seed 0 must not give an all-zero stream"
+    );
+    // The same source continues, it does not restart.
+    let rng = FakeRng::new(7);
+    let mut a = [0u8; 16];
+    let mut b = [0u8; 16];
+    rng.fill(&mut a).unwrap();
+    rng.fill(&mut b).unwrap();
+    assert_ne!(a, b);
+}
+
+#[test]
+fn a_failing_fake_rng_reports_random() {
+    let mut buf = [0u8; 4];
+    assert!(matches!(
+        FakeRng::failing().fill(&mut buf),
+        Err(Error::Random)
+    ));
+}
+
+#[test]
+fn the_rng_suite_catches_a_constant_source_and_a_zero_source() {
+    struct Zeros;
+    impl Rng for Zeros {
+        fn fill(&self, buf: &mut [u8]) -> Result<(), Error> {
+            buf.fill(0);
+            Ok(())
+        }
+    }
+    struct Constant;
+    impl Rng for Constant {
+        fn fill(&self, buf: &mut [u8]) -> Result<(), Error> {
+            buf.fill(0x42);
+            Ok(())
+        }
+    }
+    assert!(std::panic::catch_unwind(|| run_rng_suite(&Zeros)).is_err());
+    assert!(std::panic::catch_unwind(|| run_rng_suite(&Constant)).is_err());
+}
+
+fn link(fs: &MemFs, dir: &Path, name: &str) -> Option<String> {
+    fs.read_link(&dir.join(name)).ok()
+}
+
+#[test]
+fn memfs_replace_symlink_counts_two_ops_and_read_link_reads_it() {
+    let (fs, root) = mem();
+    fs.symlink("v1", &root.join("current")).unwrap();
+    assert_eq!(fs.read_link(&root.join("current")).unwrap(), "v1");
+    let before = fs.op_count();
+    fs.replace_symlink("v2", &root.join("current")).unwrap();
+    assert_eq!(fs.op_count() - before, 2, "the temp link, then the rename");
+    assert_eq!(link(&fs, root, "current").as_deref(), Some("v2"));
+    let names: Vec<_> = fs
+        .list_dir(root)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names.len(), 1, "a temporary link is left: {names:?}");
+    // A refusal costs no op and changes nothing.
+    put(&fs, &root.join("file"), b"x", true);
+    let before = fs.op_count();
+    assert_eq!(
+        fs.replace_symlink("v3", &root.join("file"))
+            .unwrap_err()
+            .kind,
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(fs.op_count(), before);
+    assert_eq!(
+        fs.read_link(&root.join("file")).unwrap_err().kind,
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(
+        fs.read_link(&root.join("none")).unwrap_err().kind,
+        FsErrorKind::NotFound
+    );
+}
+
+#[test]
+fn memfs_replace_symlink_is_atomic_at_every_crash_point_and_volatile_until_sync_dir() {
+    // Crash at op 0 (before the temp link) and op 1 (before the rename): the old link survives
+    // whatever the recovery mode; after op 1 the temp link is the only trace of the attempt.
+    for n in 0..2u64 {
+        let (fs, root) = mem();
+        fs.symlink("v1", &root.join("current")).unwrap();
+        fs.sync_dir(root).unwrap();
+        fs.crash_after(fs.op_count() + n);
+        assert_eq!(
+            fs.replace_symlink("v2", &root.join("current"))
+                .unwrap_err()
+                .kind,
+            FsErrorKind::Crashed,
+            "crash at op {n}"
+        );
+        for mode in [
+            RecoverMode::DropVolatile,
+            RecoverMode::KeepVolatile,
+            RecoverMode::TornVolatile(1),
+        ] {
+            let image = fs.recover(mode);
+            assert_eq!(
+                link(&image, root, "current").as_deref(),
+                Some("v1"),
+                "crash at op {n}, {mode:?}"
+            );
+        }
+        let kept = fs.recover(RecoverMode::KeepVolatile);
+        let entries = kept.list_dir(root).unwrap().len();
+        assert_eq!(entries, 1 + n as usize, "crash at op {n}");
+        let dropped = fs.recover(RecoverMode::DropVolatile);
+        assert_eq!(dropped.list_dir(root).unwrap().len(), 1, "crash at op {n}");
+    }
+    // A completed replace is volatile until the parent is synced.
+    let (fs, root) = mem();
+    fs.symlink("v1", &root.join("current")).unwrap();
+    fs.sync_dir(root).unwrap();
+    fs.replace_symlink("v2", &root.join("current")).unwrap();
+    let image = fs.recover(RecoverMode::DropVolatile);
+    assert_eq!(link(&image, root, "current").as_deref(), Some("v1"));
+    fs.sync_dir(root).unwrap();
+    let image = fs.recover(RecoverMode::DropVolatile);
+    assert_eq!(link(&image, root, "current").as_deref(), Some("v2"));
+    assert_eq!(image.list_dir(root).unwrap().len(), 1);
+}
+
+#[test]
+fn spawn_spec_and_process_errors_show_no_argument_or_environment_value() {
+    let mut spec = SpawnSpec::new("/opt/app/bin/the-app");
+    spec.args = vec![OsString::from("ARG-SECRET")];
+    spec.env_set = vec![(
+        OsString::from("LUNEPACK_HEALTH_TOKEN"),
+        OsString::from("ENV-SECRET"),
+    )];
+    spec.env_remove = vec![OsString::from("OLD")];
+    let shown = format!("{spec:?}");
+    assert!(
+        shown.contains("the-app") && shown.contains("LUNEPACK_HEALTH_TOKEN"),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("SECRET") && !shown.contains("/opt/app"),
+        "{shown}"
+    );
+    let err = ProcessError::new(ProcessErrorKind::SpawnFailed, "spawn")
+        .about(&spec.program)
+        .caused_by(io::Error::other("failed at /home/someone/private"));
+    let shown = format!("{err} / {err:?}");
+    assert!(
+        shown.contains("the-app") && !shown.contains("/opt/app"),
+        "{shown}"
+    );
+    assert!(!shown.contains("/home/someone"), "{shown}");
+    assert!(
+        std::error::Error::source(&err).is_some(),
+        "the cause is kept"
+    );
+}
+
+#[test]
+fn fake_process_records_spawns_and_scripts_children() {
+    let fake = FakeProcess::new("/opt/app/versions/1.0.0/bin/app");
+    assert_eq!(fake.current().unwrap().pid, 100);
+    assert!(fake.parent().unwrap().is_some());
+    fake.set_parent(None);
+    assert_eq!(fake.parent().unwrap(), None);
+
+    // An absolute program on this platform (on Windows `/opt/…` has no drive and is refused).
+    let mut spec = SpawnSpec::new(abs_path("/opt/app/bin/app"));
+    spec.args = vec![OsString::from("--x")];
+    spec.env_set = vec![(OsString::from("K"), OsString::from("V"))];
+    fake.script_child(ChildScript::exits(2, ExitKind::Failure(3)));
+    let mut child = fake.spawn_child(&spec).unwrap();
+    let id = child.id();
+    // While scripted to run, wait_exit times out; the child answers None twice, then the exit.
+    assert_eq!(
+        fake.wait_exit(&id, Duration::from_secs(1)).unwrap(),
+        WaitOutcome::TimedOut
+    );
+    assert_eq!(child.try_wait().unwrap(), None);
+    assert_eq!(child.try_wait().unwrap(), None);
+    assert_eq!(child.try_wait().unwrap(), Some(ExitKind::Failure(3)));
+    assert_eq!(child.try_wait().unwrap(), Some(ExitKind::Failure(3)));
+    assert_eq!(
+        fake.wait_exit(&id, Duration::from_secs(1)).unwrap(),
+        WaitOutcome::Exited
+    );
+    // An unscripted child runs until terminated.
+    let mut other = fake.spawn_child(&spec).unwrap();
+    assert_ne!(other.id(), id);
+    assert_eq!(other.try_wait().unwrap(), None);
+    other.terminate(Duration::from_millis(1)).unwrap();
+    assert_eq!(other.try_wait().unwrap(), Some(ExitKind::Signal(15)));
+    assert_eq!(fake.terminated(), vec![other.id()]);
+    // Detached spawns are recorded with their arguments and environment.
+    fake.spawn_detached(&spec).unwrap();
+    let spawns = fake.spawns();
+    assert_eq!(spawns.len(), 3);
+    assert!(!spawns[0].detached && spawns[2].detached);
+    assert_eq!(spawns[2].args, vec![OsString::from("--x")]);
+    assert_eq!(spawns[2].child, None);
+    // Scripted waits and in-use answers come out in order, and are logged.
+    fake.script_wait(WaitOutcome::TimedOut);
+    fake.script_wait(WaitOutcome::Exited);
+    let target = ProcessId {
+        pid: 9,
+        start_ticks: 9,
+    };
+    assert_eq!(
+        fake.wait_exit(&target, Duration::from_secs(5)).unwrap(),
+        WaitOutcome::TimedOut
+    );
+    assert_eq!(
+        fake.wait_exit(&target, Duration::from_secs(5)).unwrap(),
+        WaitOutcome::Exited
+    );
+    assert_eq!(
+        fake.waits().last().unwrap(),
+        &(target, Duration::from_secs(5))
+    );
+    fake.script_in_use(true);
+    assert!(
+        fake.tree_in_use(Path::new("/opt/app/versions/1.0.0"), &[id])
+            .unwrap()
+    );
+    assert!(
+        !fake
+            .tree_in_use(Path::new("/opt/app/versions/1.0.0"), &[])
+            .unwrap()
+    );
+    assert_eq!(fake.in_use_calls()[0].1, vec![id]);
+    // Spawn failures, and a relative program, are refused with a typed error.
+    fake.fail_spawns(Some(ProcessErrorKind::NotFound));
+    let err = fake.spawn_child(&spec).err().unwrap();
+    assert!(matches!(&err, Error::Process(e) if e.kind == ProcessErrorKind::NotFound));
+    fake.fail_spawns(None);
+    let err = fake
+        .spawn_detached(&SpawnSpec::new("relative/app"))
+        .unwrap_err();
+    assert!(matches!(&err, Error::Process(e) if e.kind == ProcessErrorKind::InvalidRequest));
+}
+
+fn integration_request(id: &str, root: &str) -> IntegrationRequest {
+    IntegrationRequest {
+        app_id: AppId::parse(id).unwrap(),
+        install_root: PathBuf::from(root),
+        meta: InstallMeta {
+            entry: RelPath::parse("bin/app").unwrap(),
+            name: "App".to_owned(),
+            comment: None,
+            icon: None,
+            categories: vec![],
+            bin: None,
+            terminal: false,
+        },
+        stale_bins: vec![],
+    }
+}
+
+#[test]
+fn fake_integration_records_calls_and_scripts_conflicts() {
+    let fake = FakeIntegration::new();
+    let a = integration_request("app.a", "/data/app.a");
+    fake.check(Scope::User, &a).unwrap();
+    fake.apply(Scope::User, &a).unwrap();
+    assert_eq!(fake.applied().into_iter().collect::<Vec<_>>(), ["app.a"]);
+    assert_eq!(fake.applied_meta("app.a").unwrap().name, "App");
+    fake.script_conflict(Some(IntegrationItem::BinLink));
+    assert!(matches!(
+        fake.check(Scope::User, &a),
+        Err(IntegrationError::Conflict(IntegrationItem::BinLink))
+    ));
+    assert!(matches!(
+        fake.apply(Scope::User, &a),
+        Err(IntegrationError::Conflict(_))
+    ));
+    fake.script_conflict(None);
+    fake.script_failure(Some("disk on fire"));
+    assert!(matches!(
+        fake.apply(Scope::User, &a),
+        Err(IntegrationError::Failed("disk on fire"))
+    ));
+    fake.script_failure(None);
+    for result in [
+        fake.check(Scope::Machine, &a),
+        fake.apply(Scope::Machine, &a).map(|_| ()),
+        fake.remove(Scope::Machine, &a).map(|_| ()),
+    ] {
+        assert!(matches!(result, Err(IntegrationError::Unsupported)));
+    }
+    assert_eq!(fake.applied().len(), 1, "machine scope applied something");
+    fake.remove(Scope::User, &a).unwrap();
+    assert!(fake.applied().is_empty());
+    let ops: Vec<_> = fake.calls().iter().map(|c| c.op).collect();
+    assert_eq!(ops[..2], [IntegrationOp::Check, IntegrationOp::Apply]);
+    assert_eq!(*ops.last().unwrap(), IntegrationOp::Remove);
+    assert_eq!(fake.calls()[0].install_root, PathBuf::from("/data/app.a"));
+}
+
+/// A small real-file implementation, only to prove the suite passes a correct integration and
+/// fails a broken one. (The Linux adapter runs the suite in `lunepack-os-linux`.)
+#[cfg(unix)]
+mod suite_probe {
+    use super::*;
+    use lunepack_core::IntegrationReport;
+    use std::fs;
+
+    pub struct Probe {
+        pub home: PathBuf,
+        pub leave_bin_on_remove: bool,
+        pub ignore_checks: bool,
+    }
+
+    impl Probe {
+        fn unsafe_text(text: &str) -> bool {
+            text.chars()
+                .any(|c| c.is_control() || c == ';' || c == '\\')
+        }
+
+        fn validate(&self, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+            if self.ignore_checks {
+                return Ok(());
+            }
+            let m = &req.meta;
+            if Self::unsafe_text(&m.name) {
+                return Err(IntegrationError::UnsafeField("name"));
+            }
+            if m.comment.as_deref().is_some_and(Self::unsafe_text) {
+                return Err(IntegrationError::UnsafeField("comment"));
+            }
+            if m.categories.iter().any(|c| Self::unsafe_text(c)) {
+                return Err(IntegrationError::UnsafeField("categories"));
+            }
+            if m.bin
+                .as_deref()
+                .is_some_and(|b| b.contains('/') || b.contains(".."))
+            {
+                return Err(IntegrationError::UnsafeField("bin"));
+            }
+            lunepack_core::desktop_safe_path(&req.install_root.to_string_lossy()).map_err(
+                |reason| IntegrationError::UnsafePath {
+                    what: "install root",
+                    reason,
+                },
+            )
+        }
+
+        fn entry(&self, req: &IntegrationRequest) -> PathBuf {
+            self.home
+                .join(format!("applications/{}.desktop", req.app_id.as_str()))
+        }
+    }
+
+    impl OsIntegration for Probe {
+        fn check(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+            if scope != Scope::User {
+                return Err(IntegrationError::Unsupported);
+            }
+            self.validate(req)
+        }
+
+        fn apply(
+            &self,
+            scope: Scope,
+            req: &IntegrationRequest,
+        ) -> Result<IntegrationReport, IntegrationError> {
+            self.check(scope, req)?;
+            fs::create_dir_all(self.home.join("applications")).unwrap();
+            fs::create_dir_all(self.home.join("bin")).unwrap();
+            fs::write(
+                self.entry(req),
+                format!(
+                    "[Desktop Entry]\nName={}\nExec={}/current/{}\nX-Lunepack-App-Id={}\n",
+                    req.meta.name,
+                    req.install_root.display(),
+                    req.meta.entry,
+                    req.app_id.as_str()
+                ),
+            )
+            .unwrap();
+            if let Some(bin) = &req.meta.bin {
+                let path = self.home.join("bin").join(bin);
+                let _ = fs::remove_file(&path);
+                std::os::unix::fs::symlink(req.install_root.join("current/bin/app"), path).unwrap();
+            }
+            Ok(IntegrationReport::default())
+        }
+
+        fn remove(
+            &self,
+            scope: Scope,
+            req: &IntegrationRequest,
+        ) -> Result<IntegrationReport, IntegrationError> {
+            if scope != Scope::User {
+                return Err(IntegrationError::Unsupported);
+            }
+            let _ = fs::remove_file(self.entry(req));
+            if !self.leave_bin_on_remove
+                && let Some(bin) = &req.meta.bin
+            {
+                let _ = fs::remove_file(self.home.join("bin").join(bin));
+            }
+            Ok(IntegrationReport::default())
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_integration_suite_passes_a_correct_integration_and_catches_broken_ones() {
+    use suite_probe::Probe;
+    let run = |leave_bin_on_remove, ignore_checks| {
+        let dir = std::env::temp_dir().join(format!(
+            "lunepack-integration-probe-{}-{}-{}",
+            std::process::id(),
+            leave_bin_on_remove,
+            ignore_checks
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = std::fs::canonicalize(&dir).unwrap();
+        let probe = Probe {
+            home: home.clone(),
+            leave_bin_on_remove,
+            ignore_checks,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_integration_suite(&probe, &home)
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        result.is_ok()
+    };
+    assert!(run(false, false), "a correct integration must pass");
+    assert!(!run(true, false), "a remove that leaves the link must fail");
+    assert!(
+        !run(false, true),
+        "an integration that accepts unsafe input must fail"
+    );
 }

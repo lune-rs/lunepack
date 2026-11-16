@@ -4,7 +4,7 @@ Status: **draft**, awaiting approval together with `docs/FORMAT.md`.
 
 What lunepack's update and install path defends against, and what it does not. The format rules
 referred to here are in `docs/FORMAT.md`; the decisions in `docs/DECISIONS.md` (D7, D17, D21, D24,
-D33, D34, D35, M3-D1 to M3-D13).
+D33, D34, D35, M3-D1 to M3-D13, M4-D1 to M4-D23).
 
 ## Assets
 
@@ -42,13 +42,19 @@ Stopped:
 - **Mix and match**: the key set is bound to the app id and root version, the feed to the app id and
   channel, the manifest by size and hash from the feed and to the app id, version and target.
 - **Rollback and replay**: floors on root version, key-set version and feed seq per channel; an old
-  but validly signed document below a floor is rejected. The client never downgrades.
+  but validly signed document below a floor is rejected. The client never downgrades. A first
+  install has no floors yet, so the bootstrap tree's own version is its floor: a replayed, still
+  unexpired feed whose newest release is older than the tree the user ran installs nothing
+  (`no_release`), and the bootstrap's own version is allowed (M5-D8).
 - **Endless data**: every download is capped by a signed size (manifests by the feed, frames and
   packs by the manifest) or by a fixed cap (root and key set 64 KiB, feed 8 MiB).
 - **Parser attacks before authentication**: the only code that sees unauthenticated bytes is the
   size check, the strict JSON pre-pass, the envelope parse and base64 decoding: pure safe Rust,
   fuzzed. Payload parsers, frame descriptors and decoders run only on authenticated bytes.
 - **Tracking**: no identifying query parameters; the rollout bucket is computed locally.
+- **Hostile responses to a Range request (M4)**: see "The download path" below. A short, long,
+  mislabelled, re-encoded or mixed-version body is refused or caught by a hash before anything is
+  placed.
 
 Not stopped:
 - **Freeze**: withholding new documents (feed, key set, a root rotation) keeps clients on the
@@ -102,6 +108,17 @@ from its own user.
 Stopped: it cannot alter a per-machine install or its machine-scope state (written only by the
 privileged engine in admin-only locations).
 
+The library's own files are in the same position (M4). For a per-user install the state directory,
+the download cache and the version trees are writable by that user, so such a process can:
+- rewrite or delete the install-state records, including lowering the floors or emptying `bad`
+  (FORMAT.md 12). The records are checksummed against a torn write, not authenticated; the checksum
+  is no defence against an attacker who writes a whole record. Not stopped, like the tree itself;
+- plant or edit cache files. This gains nothing beyond what it can already do: a complete cache file
+  is named by its SHA-256 and is hashed again before use (and a frame again by `decode_verified`), so a
+  planted file fails the hash, is refetched, and at worst costs the user a download;
+- hold or release the updater lock, which only gives `Busy` or lets two operations race on files each
+  of which is checked by hash. A race can fail a stage; it cannot place unverified bytes.
+
 ### 5. Local process running as another user
 
 Stopped:
@@ -112,6 +129,11 @@ Stopped:
   caller-supplied path or URL, never runs payload code before verification, and never acts for an
   app id without a protected install record. Machine-scope floors are kept by the engine; the
   non-elevated library also keeps its own floors and enforces the higher of the two.
+- The library never writes the machine install's state (M4, FORMAT.md 12.6): it reads the machine
+  record and the tree through the layout, and writes only this user's `install-counters` records,
+  cache and lock in the user's own directories. Another user cannot lower this user's floors, and
+  this user's counters cannot lower the machine record's: a check uses the field-wise higher of the
+  two. A counters record whose install id differs from the machine record's stops the load.
 
 Not stopped: denying service to other users' updates by holding resources, within OS limits.
 
@@ -130,6 +152,12 @@ SHA-256 matched the publisher-signed manifest, and only after the descriptor (co
 sizes at most 16 MiB, BCJ2 sub-stream lengths) passed the pure-core checks. Feeding the decoder
 crafted input therefore needs a release key (class 2) or the publisher (class 6). The output is
 capped at the signed size and checked against the signed file hash before placement.
+
+The client keeps that order in memory (M4-D11). The staging engine reads exactly the signed `length`
+bytes of a frame into memory and `decode_verified` hashes those bytes and decodes the same buffer, so
+the decoder never reads bytes that were checked earlier and re-read from a file an attacker could
+change in between. A frame that does not hash right is never decoded, whether it came from the cache,
+a Range response, the full pack or the current tree.
 
 ## The UI process is untrusted (Revision 2)
 
@@ -211,6 +239,204 @@ is a publisher-side compromise (classes 2, 3 and 6), never something a client ha
   between the moves. Nothing is uploaded between them; if the publisher uploads after the first move,
   the old key is still accepted by clients until the second.
 
+## The download path (M4)
+
+The client's fetch and staging code adds untrusted input beyond the signed documents. Every item
+below is checked before it can influence a file placed in a version tree.
+
+**Response headers, Range responses and redirects.** A transport reports every header (names
+lowercased, values as raw bytes, duplicates kept) and core applies one set of rules to all
+transports (M4-D9), failing closed:
+- at most one each of `content-range`, `content-length`, `content-encoding`, `etag` and
+  `last-modified`; a duplicate fails;
+- a `206` needs a `Content-Range` that matches `bytes <first>-<last>/<total>` exactly (lowercase
+  unit, digits only, at most 16 digits, values at most 2^53 - 1), whose range equals the one
+  requested and whose total equals the signed pack size; `*`, unsatisfied-range forms and any
+  mismatch are an error, so a host cannot hand over a different window of a different file;
+- `content-encoding` absent or `identity`; `Accept-Encoding` is never sent and no coding is decoded,
+  so a compression layer cannot change the bytes between the host and the hash;
+- `If-Range` carries a strong ETag or the Last-Modified value; if the file changed (or the host
+  ignores `If-Range`), the final hash catches the mixed file, the part is deleted and the download
+  restarts once from byte 0;
+- a transport follows at most 5 redirects and returns the final response. A redirect changes where
+  bytes come from, never what they must hash to: documents are verified by signature and artifacts
+  by the signed SHA-256 and size, so a redirect to a hostile host (class 1) gains what that class
+  already has. The default transport sends only `User-Agent: lunepack`, `Range` and `If-Range`:
+  no app id, version or install id (D24).
+
+**Cache files.** The cache holds frames and packs under their SHA-256 and `.part` files with a small
+strict-JSON sidecar (the validator and a hash of the URL). All of it is local input of class 4. A
+complete file was hashed when it was finished and is hashed again when used; a `.part` longer than
+its signed size is deleted; a sidecar that is missing, does not parse or names another URL is ignored, so the part is
+resumed without `If-Range` and the final hash decides.
+Documents are never cached, so the floors alone protect them.
+
+**State records.** The install-state records are local input too (FORMAT.md 12). M4-D23 sets the
+rule for a record that is damaged or wrong:
+- a file that fails an *integrity* check (name, size cap, magic, format byte, length, checksum, or a
+  payload `seq` that differs from its name) is a torn write: it is skipped and the next lower record
+  is tried;
+- a record that passes integrity but fails parsing or the semantic rules (or names a newer format,
+  an unknown critical feature or another app id) **stops the load** and writes nothing. Its checksum
+  shows a writer wrote it whole, and falling back to an older record would let one with lower floors
+  win, which is a rollback.
+
+So the load returns the newest record that was completely written, or fails; it never returns an
+older one while a newer whole one exists. A commit refuses to lower any floor and reads back its own
+bytes before it writes. A record from a newer build (for example after an app rollback) fails closed
+with a distinct error rather than a panic.
+
+**Absent root documents and 403 (M4-D10).** The root walk asks for `root-<k+1>.json` and treats 404,
+410 and 403 as "no such root"; every other status and every transport error fails the check. The
+user decided to include 403 because an S3 bucket without `s3:ListBucket` answers 403 for a missing
+key, and a host that cannot say 404 would otherwise fail every check. It adds no attacker
+capability: an attacker who controls responses (class 1) can already answer 404 and hide a rotation,
+which is the freeze already described there, bounded by the key set's and feed's expiry.
+
+## The Linux runtime (M5)
+
+The per-user Linux runtime (`lunepack-runtime`, `docs/FORMAT.md` 12 and 13) adds code that deletes
+files, writes outside the install root, starts processes and reads configuration from a tree. It
+defends against a hostile publisher or host only through the signed manifest (the configuration is
+a file of the tree, covered by its hashes), and it takes no side against the app's own user (class 4):
+a same-user process can already edit the tree, the records and the desktop entry. What each piece
+below adds is that lunepack never acts on a path or a name it was not given by a signed tree or
+derived itself, and fails toward keeping files.
+
+**The health token (M5-D5).** The runtime draws 32 bytes from the OS random source, puts them in
+`LUNEPACK_HEALTH_TOKEN` (64 lowercase hex digits) in the environment of the one child it supervises,
+and records only their SHA-256. The token is never in an argument list, an event, the log, a result
+line or an error, and a facade error never shows it (the apply tests search the log for a planted
+token; the command line's planted-secrets test checks every stream, M5 step 14). A malformed token is `TokenMismatch`; a matching one
+is compared in constant time. Same-user processes can read another process's environment, so the
+token is not a defence against class 4. It tells the record that this start was the supervised one:
+a per-user install also lets a start with no token confirm the pending version (M5-D5), so the token
+protects nothing a local process could not do anyway. Per-machine installs, which arrive later,
+always need it (C8).
+
+**The attempt counter (M5-D5).** An unsupervised start of the pending version counts one attempt in
+the record and the fourth rolls back, so an app that never confirms (a crash on start, or a program
+that never calls `confirm`) cannot stay current. A same-user process can edit the counter, as it
+can the rest of the record (class 4); a host or publisher cannot reach it. A supervised start counts
+nothing, and a rollback marks the version bad, so the next check does not offer it again.
+
+**The wait target and the processes it starts.** The applier only waits for the process the app
+named (by pid and start time, so a reused pid is not mistaken for it, and a zombie counts as
+exited); it never signals it. The one process it ever signals is its own child, by the handle it
+got at spawn. Programs start without a shell, with arguments as separate values. The restart
+arguments travel in the detached applier's argument list after `--` (M5-D14), so they are as
+readable to other processes of the user as the app's own command line; the token never does.
+
+**Deleting files (M5-D9, M5-D10).** Three paths remove files, each driven by state and each limited
+to what lunepack made.
+- Garbage collection removes only direct children of `R/versions` whose names are a version's
+  canonical text, that are real directories (checked with `lstat` right before the removal), that
+  the record does not keep (current, previous, pending, staged) and that no other process of the
+  user runs from or has open (`exe`, `cwd`, mappings, descriptors; a process that cannot be read
+  counts as using it). A process whose files vanish under the read (one inside its exit, or one
+  whose main thread has ended while other threads run) is read through its live threads and
+  re-probed for at most 200 ms: it is skipped only once it has exited or all its live threads read
+  cleanly, and otherwise counts as using the tree. Any error keeps the tree. The one exception is a process the kernel denies
+  inspection of by design (`EACCES` or `EPERM` on those reads: a non-dumpable process of the user,
+  such as `(sd-pam)` or an ssh-agent, present on every desktop login and CI runner): counting it as
+  in use would keep every tree forever, so its command line decides instead, and it uses the tree
+  when `argv[0]` or an absolute argument, with symlinks resolved (a path through `R/current`
+  included), lies under it (M5-D9, amended by the user's decision Q40). This is a heuristic with
+  a gap: an app that is non-dumpable and was started by a relative path, or not from the tree's
+  path, is not seen. The scan also misses a process that runs from a tree with
+  none of those open, such as a script its interpreter has read completely; GC keeps current and
+  previous, so only an older tree is exposed, and the cost is a process that loses its files.
+- Uninstall derives `R` from its own resolved path, never from an argument or the state, and refuses
+  unless `R` is exactly `<data home>/<app id>`, a real and canonical directory, holding a record of
+  this app id, with no other process running from it. It removes the desktop entry only when the file
+  holds the line `X-Lunepack-App-Id=<app id>` and the command link only when it is a symlink into
+  `<R>/current/`; other files are kept and reported. Then, still under the lock, it renames `R` to a
+  tombstone beside it in the data home, `.<app id>.removing-<16 random lowercase hex>`, and removes
+  the tombstone without following symlinks: a link inside a tree is deleted, never what it points
+  to. A cut-off uninstall so leaves `R` whole (the uninstall can run again) or gone (a reinstall
+  works), never half removed (review finding F18). The tombstone's name comes from the app id only,
+  never from the state, and is never an install root, since an app id begins with `[a-z0-9]`.
+  Install, when its root is `<parent>/<app id>`, and uninstall, once `R` is validated, first remove
+  what cut-off runs left: only real directories in the data home whose name is exactly that form
+  for this app id, checked with `lstat` right before removal and removed with the same no-follow
+  rule; a file or symlink at such a name, another app's tombstone or a near miss is left alone.
+  This cleanup runs outside the install lock (the lock lives inside `R`); two runs removing one
+  tombstone at once is harmless, and an uninstall whose own removal fails reports the failure only
+  while its tombstone is still there. After an environment change (a different
+  `HOME` or `XDG_DATA_HOME` than at install) the derivation no longer matches and uninstall refuses;
+  a file outside `R` that lunepack made then stays. Because uninstall removes `R` whole, the first
+  install takes over an existing `R` only when it is a real directory that is empty, holds a record
+  of this app id, or holds nothing but a `state` directory with the lock and record files of a run
+  cut off before its first record; anything else at that path (a file or symlink, the app's own data
+  from before lunepack, another packaging's directory, a shared directory such as `applications`)
+  is refused before the first write, the lock included. The check is in the facade's
+  `Updater::install`, so every caller gets it: an installer built on the crate API sees
+  `Error::ForeignInstallRoot`, the runtime's `install` mode `install_mismatch` (26). It reads `R`
+  once without the lock; it guards against accidents, not against a local process racing it.
+- The `current` link is derived from the record; a link or file at that name that is not a symlink
+  is refused, never replaced.
+
+**Desktop entries (M5-D4, FORMAT.md 13.4 and 13.5).** Name, comment, icon, categories and the command
+name come from the signed configuration and go into a file the desktop environment reads and
+executes. They are checked before anything is written and a value that does not pass is refused,
+never escaped: names and comments reject controls and line breaks, the command name has a closed
+character set, categories are freedesktop names, the icon must be a PNG or SVG file of the tree, and
+the paths put into `Exec` and `Icon` (the install root and the entry) must contain none of the
+characters that give them another meaning in the specification (quotes, backtick, `$`, backslash,
+`%`, the apostrophe, controls and invisible format characters). The entry's bytes are fixed in shape,
+so a hostile string cannot add a key or a line. An existing entry or link that is not ours is a
+conflict, found before the first write, and nothing is overwritten.
+
+**The update configuration's feed (M5-D16).** The configuration carries the feed the runtime
+fetches metadata from, so it is checked with one rule before the first request, by the packager and
+by the client: `https:`, `file:`, or `http:` only to a loopback IP literal (`127.x.y.z` or `[::1]`),
+in the canonical form of the URL parser the transport uses, with no user information, query,
+fragment or escape. An `http:` feed from the configuration is fetched without the environment's
+proxy and without following a redirect (either would carry a plain request off the machine). A
+hostname such as `localhost` is not accepted because the resolver, not the rule, decides where it
+goes. The library path is unchanged: an app that builds the updater itself may use any URL, as in
+M4, and the signatures and hashes protect the content on any transport.
+
+**The command line as an input surface (D42, M5-D11).** The app-facing commands (`check`, `download`,
+`startup`, `confirm`, `apply-and-restart`; `docs/RUNTIME.md`) take their argv from whatever starts
+the runtime, and any process of the same user can start it with any arguments. That is no new power
+over the app (class 4 can already edit the tree and the records), but the runtime must not turn an
+argument into an action no signed tree allows. So:
+- The parser is hand-written and closed: every option is named, may appear once and has a value of a
+  fixed form; an unknown option, a repeat, an option of another command, the `--option=value` form
+  or a stray word is a usage error (exit 2), decided before any lock, state read or network access.
+  A framework parser is not used because its error text echoes the argument values.
+- No argument supplies trust material or a location: not the trusted root, the feed, the install
+  root or the tree to act on. Those come from the tree's own update configuration (`docs/FORMAT.md`
+  13), which the manifest's hashes cover, and from the runtime's own resolved path. `--channel` only
+  picks a channel name that passes the channel rule, from the feed the configuration names;
+  `--expect-version` only names the version the caller expects, and any other one is refused, never
+  taken as a downgrade; `--expect-schema` only refuses.
+- `--wait-pid` names a process that the applier waits for and never signals, identified by its pid
+  and start time, so a pid the system reuses is not mistaken for it. A caller that names a wrong or
+  exited process can delay or hasten its own update and nothing else.
+- The arguments after `--` are passed to the program the runtime starts (the new tree's entry, or
+  the previous one on rollback), as separate values with no shell. They travel in the detached
+  applier's argument list, as readable to the user's other processes as the app's own (M5-D14).
+
+**Output hygiene (C4).** What a caller reads (stdout, stderr, the exit code) and what the runtime
+logs must not carry what a same-user observer or a captured log could misuse, or what a hostile feed
+could place there. The rule is by construction, not by redaction: the only strings in any object
+come from signed documents (versions, channel names, signed relative paths), from the closed sets of
+`docs/RUNTIME.md` (kinds, phases, outcomes, reasons) and from the build. No path, URL, host name,
+header, argument value, install id, key, health token, file content or operating-system or network
+error text reaches a stream; an error is its closed kind and its exit code, and the facade's own
+error `Display` is never printed. A refused command line prints one fixed line, or, with `--json`
+before any `--`, the one `error` object with no command or tree version, and exits 2 before
+anything else happens. Progress is bounded (at most ten lines a second as JSON, one a second as
+text), a reader that stops reading cancels the operation and cannot stall it, and the log under
+`R/logs` holds the same events as the stream. Two tests hold the rule: a golden for every error
+kind and event, and a planted-secrets test that runs every command, with and without `--json`, in
+success and in each reachable error, and fails if a planted token, install id, feed host label or
+unique path component appears in plain, JSON-escaped or hex form in stdout, stderr or the log (it
+first plants one in a known output to prove the check can see it, and its failure message names the
+stream and the item, never the value).
+
 ## Denial-of-service bounds
 
 | Resource | Bound |
@@ -219,11 +445,31 @@ is a publisher-side compromise (classes 2, 3 and 6), never something a client ha
 | Signature checks per document | at most 16 signatures, each a single Ed25519 verification |
 | JSON | depth 32; duplicate keys rejected; integers at most 2^53 − 1 |
 | Counts | 16 root keys, 64 release keys, 10,000 releases, 200,000 entries |
-| Downloads | capped by signed sizes; nothing fetched is trusted before its hash matches |
+| Downloads | capped by signed sizes; nothing fetched is trusted before its hash matches. A response's `Content-Length`, when present, must equal the expected byte count and is checked before the body is read; a body is read to at most that count and fails on one byte more (M4-D9) |
+| Range requests | one at a time; at most 64 runs, else the full pack; a `200` to a Range request becomes the full-pack download, never a second request (M4-D8) |
+| Install-state records | at most 1 MiB each; at most three kept after a commit |
 | Decoder memory | the signed dictionary per LZMA2 stream, at most 16 MiB (three for BCJ2), checked before allocation; concurrent decoders limited by a memory budget |
 | Decoder output | exactly the signed size; decoding stops as soon as it would exceed it |
-| Root walk | each step needs signatures from both roots, so its length is bounded by real rotations |
+| Root walk | each step needs signatures from both roots, so its length is bounded by real rotations; a check also stops after 1024 steps |
 | Freeze | feed and key-set expiry turn a silent freeze into a reported error |
+
+Memory budget (M4-D11, M4-D13). Staging charges each decode job `length + decoder memory + 256 KiB`
+of I/O buffers against a budget (default 256 MiB) and runs at most `min(available_parallelism, 8)`
+jobs at once. The decoder memory is the frame's signed dictionaries plus a constant per codec
+measured for `lzma-rust2` (about 10 MiB for the LZMA2 variants, about 12 MiB for BCJ2, none for
+stored), and a measurement test keeps the constants above what the decoder really allocates. A job
+that alone exceeds the budget runs only when nothing else runs, so a large signed frame slows
+staging and never deadlocks it. The peak is therefore bounded by the budget plus one oversized job,
+and by the signed sizes, not by anything the host sends.
+
+Cancel latency. Cancelling or dropping an operation stops its work at the next check: the transport
+is polled on the caller's task, file I/O and decoding run on lunepack's worker threads and look at
+the cancel token between chunks, jobs and writes. The default HTTP transport is the exception: a
+worker blocked inside a socket read ends at the per-read timeout (30 s by default, a builder
+option), and the updater lock stays held until that worker returns, so a new operation meanwhile gets
+`Busy`. An injected async transport has no such delay, because its futures die with the operation's.
+A host that stalls a connection can therefore delay a retry by up to the read timeout; it cannot
+corrupt anything.
 
 ## Clock
 

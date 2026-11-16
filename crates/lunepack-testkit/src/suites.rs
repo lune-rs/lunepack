@@ -1,16 +1,21 @@
 //! Contract suites: one function per trait, run by every adapter's `tests/` against its real
 //! implementation and by this crate against the fakes. They panic (assert) on a violation.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::path::Path;
 
 use lunepack_core::encoding::{base64_encode, hex_encode};
-use lunepack_core::error::FrameError;
+use lunepack_core::error::{CodecError, FrameError};
+use lunepack_core::fetch::classify;
 use lunepack_core::frame::{MAX_DICT_SIZE, MIN_DICT_SIZE};
 use lunepack_core::{
-    Clock, Codec, CodecId, DecodeReport, EncodedFrame, Encoder, Error, FrameDesc, FrameView,
-    Hasher, Sha256Digest, SignatureAlg, Signer, StreamDesc, StreamView, U53, Verifier,
-    decode_verified,
+    BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId, DecodeReport, EncodedFrame,
+    Encoder, Error, FileKind, FrameDesc, FrameView, Fs, FsError, FsErrorKind, Hasher, Head,
+    Outcome, Request, ResponseInfo, Sha256Digest, SignatureAlg, Signer, StreamDesc, StreamView,
+    Transport, TransportError, TransportErrorKind, U53, Validator, Verifier, decode_verified,
 };
+
+use crate::transport::{SeenRequest, TransportFixture, block_on};
 
 /// A hash known answer: the input and its digest in lowercase hex.
 #[derive(Debug, Clone, Copy)]
@@ -672,6 +677,37 @@ fn codec_cases(
             );
             let res = direct(codec, id, &lie, bytes, input.len() as u64, &mut Vec::new());
             assert!(res.is_err(), "{ctx}: lying stream sizes decoded (direct)");
+
+            // 13. F6: one sub-stream whose `decoded_size` is off by one while the others and the
+            // total stay as they are (core sees only the total) is a `StreamSize` error for that
+            // stream: a stream that decodes to less than it says and one that decodes to more
+            for index in 0..3 {
+                for by in [1i64, -1] {
+                    let size = streams[index].decoded_size.get();
+                    if by < 0 && size == 0 {
+                        continue;
+                    }
+                    let mut lie = desc.clone();
+                    let s = lie.streams.as_mut().expect("streams");
+                    s[index].decoded_size = u53(size.saturating_add_signed(by));
+                    let name = format!("stream {index} {by:+}");
+                    let stream_size = |err: &Error| {
+                        matches!(
+                            err,
+                            Error::Codec(CodecError::StreamSize { index: i, .. }) if *i == index
+                        )
+                    };
+                    let err = direct(codec, id, &lie, bytes, input.len() as u64, &mut Vec::new())
+                        .expect_err("a sub-stream of the wrong size must be rejected");
+                    assert!(stream_size(&err), "{ctx}: {name} (direct): {err:?}");
+                    // Core only checks `decoded_size <= file_size`, so it lets this through.
+                    if size.saturating_add_signed(by) <= input.len() as u64 {
+                        let err = through_core(hasher, codec, &lie, bytes, input, &mut Vec::new())
+                            .expect_err("a sub-stream of the wrong size must be rejected");
+                        assert!(stream_size(&err), "{ctx}: {name} (core path): {err:?}");
+                    }
+                }
+            }
         }
     }
 
@@ -681,7 +717,7 @@ fn codec_cases(
     let err = through_core(hasher, codec, &desc, bytes, input, &mut w)
         .expect_err("a failing writer must fail the decode");
     assert!(
-        matches!(frame_error(&err), Some(FrameError::OutputWrite { .. })),
+        matches!(frame_error(&err), Some(FrameError::OutputWrite(_))),
         "{ctx}: {err}"
     );
     assert_eq!(w.after_failure, 0, "{ctx}: writes after the failure (core)");
@@ -766,4 +802,880 @@ fn long_distance_case(
     }
     let res = through_core(hasher, codec, &desc, &enc.bytes, input, &mut Vec::new());
     assert!(res.is_err(), "{ctx}: decoded with a dictionary of 4096");
+}
+
+// ---- transport suites (M4 step 2) -----------------------------------------------------------------
+
+/// How a suite gets one whole response from the transport under test.
+trait SuiteClient {
+    fn fetch(&self, request: Request) -> Result<(Head, Vec<u8>), TransportError>;
+}
+
+struct BlockingClient<'a>(&'a dyn BlockingTransport);
+
+impl SuiteClient for BlockingClient<'_> {
+    fn fetch(&self, request: Request) -> Result<(Head, Vec<u8>), TransportError> {
+        let response = self.0.get(&request, &CancelToken::new())?;
+        let mut body = Vec::new();
+        let mut reader = response.body;
+        reader.read_to_end(&mut body).map_err(|e| {
+            match e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<TransportError>())
+            {
+                Some(_) => {
+                    TransportError::new(TransportErrorKind::Io, &request.url, Some(e.into()))
+                }
+                None => panic!("body read failed with a plain I/O error: {e}"),
+            }
+        })?;
+        Ok((response.head, body))
+    }
+}
+
+struct AsyncClient<'a>(&'a dyn Transport);
+
+impl SuiteClient for AsyncClient<'_> {
+    fn fetch(&self, request: Request) -> Result<(Head, Vec<u8>), TransportError> {
+        let future = self.0.get(request);
+        block_on(async move {
+            let mut response = future.await?;
+            let mut body = Vec::new();
+            while let Some(chunk) = response.body.next_chunk().await? {
+                assert!(!chunk.is_empty(), "a body chunk is never empty");
+                body.extend_from_slice(&chunk);
+            }
+            Ok((response.head, body))
+        })
+    }
+}
+
+fn get(
+    client: &dyn SuiteClient,
+    base: &str,
+    name: &str,
+    range: Option<ByteRange>,
+    if_range: Option<Validator>,
+) -> (Head, Vec<u8>) {
+    let url = format!("{}/{name}", base.trim_end_matches('/'));
+    client
+        .fetch(Request {
+            url,
+            range,
+            if_range,
+        })
+        .unwrap_or_else(|e| panic!("GET {name} {range:?} failed: {e}"))
+}
+
+fn bounded(first: u64, last: u64) -> Option<ByteRange> {
+    Some(ByteRange {
+        first,
+        last: Some(last),
+    })
+}
+
+/// The parts of the transport contract a transport under test may not have a meaning for. Every
+/// switch is on for a network transport ([`TransportCaps::ALL`]); a switch is turned off only
+/// where the transport cannot offer the thing at all, and the caller names why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportCaps {
+    /// The server offers validators: a strong `ETag` and a `Last-Modified`, and honours
+    /// `If-Range` with them (case 3).
+    pub validators: bool,
+    /// The server can answer with the same header twice (the `DUPLICATE` fixture, case 6).
+    pub duplicate_headers: bool,
+    /// The fixture's `ALIAS` leads to the large file (a `302`, or a link) (case 5).
+    pub redirects: bool,
+    /// `seen` returns what the server saw (case 7). A transport with no wire has no such log.
+    pub request_log: bool,
+}
+
+impl TransportCaps {
+    /// Everything: an HTTP transport against a server (or a fake of one).
+    pub const ALL: TransportCaps = TransportCaps {
+        validators: true,
+        duplicate_headers: true,
+        redirects: true,
+        request_log: true,
+    };
+}
+
+fn transport_cases(
+    client: &dyn SuiteClient,
+    base: &str,
+    seen: &dyn Fn() -> Vec<SeenRequest>,
+    caps: TransportCaps,
+) {
+    let large = TransportFixture::bytes(TransportFixture::LARGE).expect("fixture");
+    let len = large.len() as u64;
+
+    // Whole files, with their exact bytes.
+    for name in [
+        TransportFixture::EMPTY,
+        TransportFixture::ONE_BYTE,
+        TransportFixture::LARGE,
+    ] {
+        let (head, body) = get(client, base, name, None, None);
+        assert_eq!(head.status, 200, "{name}: status");
+        assert_eq!(
+            body,
+            TransportFixture::bytes(name).expect("fixture"),
+            "{name}: body"
+        );
+    }
+    let (head, _) = get(client, base, TransportFixture::LARGE, None, None);
+    let info = ResponseInfo::from_head(&head).expect("a plain 200 passes the response rules");
+    assert_eq!(
+        info.content_length,
+        Some(len),
+        "content-length of the large file"
+    );
+    let etag = if caps.validators {
+        let Some(Validator::StrongETag(etag)) = info.validator.clone() else {
+            panic!("the large file's answer has no strong etag: {head:?}");
+        };
+        Some(etag)
+    } else {
+        None
+    };
+
+    // A closed range: 206 with the exact content-range.
+    let first_100 = bounded(0, 99);
+    let (head, body) = get(client, base, TransportFixture::LARGE, first_100, None);
+    assert_eq!(head.status, 206, "range 0-99: status");
+    assert_eq!(body, &large[..100], "range 0-99: body");
+    let range_value = head
+        .headers
+        .iter()
+        .find(|(n, _)| n == "content-range")
+        .map(|(_, v)| v.clone());
+    assert_eq!(
+        range_value.as_deref(),
+        Some(format!("bytes 0-99/{len}").as_bytes()),
+        "range 0-99: content-range"
+    );
+    let info = ResponseInfo::from_head(&head).expect("a 206 passes the response rules");
+    assert_eq!(
+        classify(first_100, &info, len, 100),
+        Ok(Outcome::Partial { first: 0, last: 99 }),
+        "range 0-99: classify"
+    );
+
+    // An open range.
+    let from = len - 1000;
+    let (head, body) = get(
+        client,
+        base,
+        TransportFixture::LARGE,
+        Some(ByteRange {
+            first: from,
+            last: None,
+        }),
+        None,
+    );
+    assert_eq!(head.status, 206, "open range: status");
+    assert_eq!(body, &large[from as usize..], "open range: body");
+    let info = ResponseInfo::from_head(&head).expect("rules");
+    assert_eq!(
+        info.content_range.map(|c| (c.first, c.last, c.total)),
+        Some((from, len - 1, len)),
+        "open range: content-range"
+    );
+
+    // If-Range: the current validators keep the range, a stale one drops it.
+    if let Some(etag) = &etag {
+        let (head, body) = get(
+            client,
+            base,
+            TransportFixture::LARGE,
+            first_100,
+            Some(Validator::StrongETag(etag.clone())),
+        );
+        assert_eq!(head.status, 206, "If-Range with the current etag: status");
+        assert_eq!(body, &large[..100], "If-Range with the current etag: body");
+        let last_modified = head
+            .headers
+            .iter()
+            .find(|(n, _)| n == "last-modified")
+            .and_then(|(_, v)| Validator::from_last_modified(v))
+            .expect("the answer has a last-modified");
+        let (head, _) = get(
+            client,
+            base,
+            TransportFixture::LARGE,
+            first_100,
+            Some(last_modified),
+        );
+        assert_eq!(
+            head.status, 206,
+            "If-Range with the current last-modified: status"
+        );
+        let stale = Validator::from_etag(b"\"stale\"").expect("a strong tag");
+        let (head, body) = get(
+            client,
+            base,
+            TransportFixture::LARGE,
+            first_100,
+            Some(stale),
+        );
+        assert_eq!(head.status, 200, "If-Range with a stale etag: status");
+        assert_eq!(body, large, "If-Range with a stale etag: the full body");
+        assert!(
+            head.headers.iter().all(|(n, _)| n != "content-range"),
+            "a 200 has no content-range"
+        );
+    }
+
+    // A missing name is a 404 head, not an error.
+    let (head, _) = get(client, base, TransportFixture::MISSING, None, None);
+    assert_eq!(head.status, 404, "missing file");
+
+    // A redirect is followed to the final response.
+    if caps.redirects {
+        let (head, body) = get(client, base, TransportFixture::ALIAS, None, None);
+        assert_eq!(head.status, 200, "redirect: final status");
+        assert_eq!(body, large, "redirect: final body");
+    }
+
+    // Header names are lowercase.
+    let (head, _) = get(client, base, TransportFixture::LARGE, None, None);
+    assert!(
+        head.headers
+            .iter()
+            .all(|(n, _)| *n == n.to_ascii_lowercase()),
+        "header names are lowercased: {head:?}"
+    );
+
+    // A duplicate arrives twice, in order.
+    if caps.duplicate_headers {
+        let (head, _) = get(client, base, TransportFixture::DUPLICATE, None, None);
+        assert!(
+            head.headers
+                .iter()
+                .all(|(n, _)| *n == n.to_ascii_lowercase()),
+            "header names are lowercased: {head:?}"
+        );
+        let dups: Vec<&[u8]> = head
+            .headers
+            .iter()
+            .filter(|(n, _)| n == "x-dup")
+            .map(|(_, v)| v.as_slice())
+            .collect();
+        assert_eq!(
+            dups,
+            [&b"one"[..], b"two"],
+            "a duplicate header arrives twice"
+        );
+        assert!(
+            head.headers
+                .iter()
+                .any(|(n, v)| n == "x-mixed-case" && v == b"v"),
+            "a mixed-case header arrives lowercased: {head:?}"
+        );
+    }
+
+    // What was sent: no accept-encoding anywhere, and the range and validator exactly as given.
+    if caps.request_log {
+        let log = seen();
+        assert!(!log.is_empty(), "the request log is empty");
+        assert!(
+            log.iter().all(|r| r.accept_encoding.is_none()),
+            "a request carried accept-encoding: {log:?}"
+        );
+        let large_url = format!("/{}", TransportFixture::LARGE);
+        assert!(
+            log.iter().any(|r| r.url.ends_with(&large_url)
+                && r.range_header.as_deref() == Some("bytes=0-99")
+                && r.if_range.is_none()),
+            "no request with exactly Range: bytes=0-99: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|r| r.range_header.as_deref() == Some(format!("bytes={from}-").as_str())),
+            "no request with the open range: {log:?}"
+        );
+        if let Some(etag) = &etag {
+            assert!(
+                log.iter()
+                    .any(|r| r.if_range.as_deref() == Some(etag.as_str())),
+                "no request with If-Range: {etag}: {log:?}"
+            );
+        }
+        if caps.redirects {
+            assert!(
+                log.iter()
+                    .any(|r| r.url.ends_with(&format!("/{}", TransportFixture::ALIAS)))
+                    && log.iter().filter(|r| r.url.ends_with(&large_url)).count() >= 2,
+                "the redirect hop was not logged: {log:?}"
+            );
+        }
+    }
+}
+
+/// Transport contract for the sync trait. `base_url` serves [`TransportFixture`] (for a real
+/// server, `LoopbackServer::fixture`; for a fake, its `fixture()` and `FAKE_BASE_URL`), and `seen`
+/// returns the requests the server saw (`FakeOrigin::requests`). Checks:
+///
+/// 1. whole files (0 B, 1 B, 100 KiB) arrive with their exact bytes;
+/// 2. `Range: bytes=0-99` is a `206` with `content-range: bytes 0-99/<len>` that passes the core's
+///    response rules, and an open range `first-` works;
+/// 3. `If-Range` with the current `ETag` or `Last-Modified` keeps the range (`206`), a stale
+///    `ETag` gives `200` with the full body;
+/// 4. a missing name is a `404` head, not an error;
+/// 5. a `302` is followed;
+/// 6. header names arrive lowercased and a duplicated header arrives twice;
+/// 7. no `Accept-Encoding` is ever sent, and the range and validator reach the server exactly as
+///    given;
+/// 8. a `CancelToken` cancelled before `get` fails with `TransportErrorKind::Cancelled`.
+pub fn run_blocking_transport_suite(
+    transport: &dyn BlockingTransport,
+    base_url: &str,
+    seen: &dyn Fn() -> Vec<SeenRequest>,
+) {
+    run_blocking_transport_suite_with(transport, base_url, seen, TransportCaps::ALL);
+}
+
+/// [`run_blocking_transport_suite`] with the parts a transport has no meaning for switched off
+/// ([`TransportCaps`]); everything else, the cancel check included, still runs.
+pub fn run_blocking_transport_suite_with(
+    transport: &dyn BlockingTransport,
+    base_url: &str,
+    seen: &dyn Fn() -> Vec<SeenRequest>,
+    caps: TransportCaps,
+) {
+    transport_cases(&BlockingClient(transport), base_url, seen, caps);
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        TransportFixture::LARGE
+    );
+    let request = Request {
+        url,
+        range: None,
+        if_range: None,
+    };
+    match transport.get(&request, &cancel) {
+        Err(e) => assert_eq!(
+            e.kind,
+            TransportErrorKind::Cancelled,
+            "a cancelled token before get: {e}"
+        ),
+        Ok(_) => panic!("get succeeded with a cancelled token"),
+    }
+}
+
+/// Transport contract for the async trait: checks 1 to 7 of [`run_blocking_transport_suite`] (the
+/// async `get` takes no token, so cancellation there is dropping the future). The futures are
+/// driven by a std-only `block_on` private to the testkit.
+pub fn run_transport_suite(
+    transport: &dyn Transport,
+    base_url: &str,
+    seen: &dyn Fn() -> Vec<SeenRequest>,
+) {
+    transport_cases(&AsyncClient(transport), base_url, seen, TransportCaps::ALL);
+}
+
+// ---- filesystem suite (M4 step 3) ---------------------------------------------------------------------
+
+/// Random source contract: every length from 0 to 64 is filled, exactly (nothing past the end of
+/// the slice is touched, which the slice type already guarantees, and the bytes written are not
+/// left as the zeros they started as once the slice is long enough to tell), and two draws of
+/// 32 bytes differ. A source that is deterministic by design (the fake) still passes: it differs
+/// from draw to draw.
+pub fn run_rng_suite(rng: &dyn lunepack_core::Rng) {
+    let mut tail_guard = [0xA5u8; 80];
+    for len in 0..=64usize {
+        let mut buf = vec![0u8; len];
+        rng.fill(&mut buf)
+            .unwrap_or_else(|e| panic!("fill({len}): {e}"));
+        assert_eq!(buf.len(), len);
+        if len >= 8 {
+            assert!(
+                buf.iter().any(|b| *b != 0),
+                "fill({len}) left all {len} bytes zero"
+            );
+        }
+        // A prefix of a larger buffer: the bytes after it stay as they were.
+        tail_guard.fill(0xA5);
+        rng.fill(&mut tail_guard[..len])
+            .unwrap_or_else(|e| panic!("fill(prefix {len}): {e}"));
+        assert!(
+            tail_guard[len..].iter().all(|b| *b == 0xA5),
+            "fill({len}) wrote past the slice"
+        );
+    }
+    let mut first = [0u8; 32];
+    let mut second = [0u8; 32];
+    rng.fill(&mut first).expect("first draw");
+    rng.fill(&mut second).expect("second draw");
+    assert_ne!(first, second, "two 32-byte draws were equal");
+}
+
+fn fs_kind<T>(result: Result<T, FsError>, what: &str) -> FsErrorKind {
+    match result {
+        Ok(_) => panic!("{what}: succeeded, expected an error"),
+        Err(e) => e.kind,
+    }
+}
+
+/// Filesystem contract. `root` must be an existing directory with no symlink in its path (a host
+/// temp directory canonicalised); the suite works in a directory of its own below it and removes it
+/// at the end. Symlink cases run only on Unix; [`run_fs_suite_with`] chooses.
+pub fn run_fs_suite(fs: &dyn Fs, root: &Path) {
+    run_fs_suite_with(fs, root, cfg!(unix));
+}
+
+/// [`run_fs_suite`] with the symlink cases switched on or off (`MemFs` runs them everywhere).
+pub fn run_fs_suite_with(fs: &dyn Fs, root: &Path, symlinks: bool) {
+    let base = root.join("lunepack-fs-suite");
+    if fs
+        .symlink_metadata(&base)
+        .expect("stat the suite directory")
+        .is_some()
+    {
+        fs.remove_dir_all_nofollow(&base)
+            .expect("clear an old suite directory");
+    }
+    fs.create_dir_all(&base)
+        .expect("create the suite directory");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fs_cases(fs, root, &base, symlinks);
+    }));
+    let _ = fs.remove_dir_all_nofollow(&base);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn write_file(fs: &dyn Fs, path: &Path, bytes: &[u8]) {
+    let mut f = fs.create_new(path).expect("create_new");
+    f.write_all(bytes).expect("write");
+    f.sync().expect("sync");
+}
+
+fn fs_cases(fs: &dyn Fs, root: &Path, base: &Path, symlinks: bool) {
+    // create_dir_all: nested, idempotent, a file in the way.
+    let deep = base.join("a/b/c");
+    fs.create_dir_all(&deep).expect("create_dir_all nested");
+    fs.create_dir_all(&deep).expect("create_dir_all again");
+    assert_eq!(
+        fs.symlink_metadata(&deep).unwrap().map(|m| m.kind),
+        Some(FileKind::Dir)
+    );
+    assert_eq!(
+        fs.symlink_metadata(&base.join("none")).unwrap(),
+        None,
+        "a missing path"
+    );
+    write_file(fs, &base.join("plain"), b"x");
+    assert_eq!(
+        fs_kind(
+            fs.create_dir_all(&base.join("plain/sub")),
+            "create_dir_all through a file"
+        ),
+        FsErrorKind::NotADirectory
+    );
+    fs.sync_dir(base).expect("sync_dir");
+    assert_eq!(
+        fs_kind(fs.sync_dir(&base.join("none")), "sync_dir of a missing dir"),
+        FsErrorKind::NotFound
+    );
+
+    // create_new, write, sync, read_capped at max and max + 1, errors name only the file name.
+    let file = base.join("a/data.bin");
+    let bytes: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    write_file(fs, &file, &bytes);
+    assert_eq!(
+        fs_kind(fs.create_new(&file), "create_new on an existing file"),
+        FsErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        fs.read_capped(&file, 1000).expect("read_capped at max"),
+        bytes
+    );
+    assert_eq!(
+        fs_kind(fs.read_capped(&file, 999), "read_capped at max + 1"),
+        FsErrorKind::TooLarge
+    );
+    assert_eq!(fs.read_capped(&file, u64::MAX).unwrap().len(), 1000);
+    let missing = base.join("a/missing-file.bin");
+    let err = fs.read_capped(&missing, 10).unwrap_err();
+    assert_eq!(err.kind, FsErrorKind::NotFound);
+    assert!(
+        err.to_string().contains("missing-file.bin"),
+        "the message names the file: {err}"
+    );
+    let shown = format!("{err} {err:?}");
+    assert!(
+        !shown.contains(&*root.to_string_lossy()),
+        "an error shows a full path: {shown}"
+    );
+    assert_eq!(
+        fs.symlink_metadata(&file).unwrap(),
+        Some(lunepack_core::Meta {
+            kind: FileKind::File,
+            len: 1000
+        })
+    );
+
+    // Positional reads.
+    let reader = fs.open_read(&file).expect("open_read");
+    assert_eq!(reader.size().unwrap(), 1000);
+    let mut buf = [0u8; 10];
+    reader.read_exact_at(100, &mut buf).expect("read_exact_at");
+    assert_eq!(&buf, &bytes[100..110]);
+    reader.read_exact_at(990, &mut buf).expect("read the tail");
+    assert_eq!(&buf, &bytes[990..]);
+    reader.read_exact_at(0, &mut []).expect("an empty read");
+    assert!(
+        reader.read_exact_at(991, &mut buf).is_err(),
+        "a read past the end"
+    );
+    assert_eq!(
+        fs_kind(fs.open_read(&missing), "open_read of a missing file"),
+        FsErrorKind::NotFound
+    );
+
+    // Append and truncate.
+    let mut w = fs.open_append(&file).expect("open_append");
+    w.write_all(b"tail").unwrap();
+    w.sync().unwrap();
+    assert_eq!(fs.read_capped(&file, 2000).unwrap().len(), 1004);
+    fs.truncate(&file, 10).expect("truncate");
+    assert_eq!(fs.read_capped(&file, 2000).unwrap(), &bytes[..10]);
+    assert_eq!(
+        fs_kind(fs.open_append(&missing), "open_append of a missing file"),
+        FsErrorKind::NotFound
+    );
+    assert_eq!(
+        fs_kind(fs.truncate(&missing, 0), "truncate of a missing file"),
+        FsErrorKind::NotFound
+    );
+
+    // copy_file: a new copy, never over an existing file; set_exec on files only.
+    let copy = base.join("a/copy.bin");
+    fs.copy_file(&file, &copy).expect("copy_file");
+    assert_eq!(fs.read_capped(&copy, 100).unwrap(), &bytes[..10]);
+    assert_eq!(
+        fs_kind(
+            fs.copy_file(&file, &copy),
+            "copy_file over an existing file"
+        ),
+        FsErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        fs_kind(
+            fs.copy_file(&missing, &base.join("a/c2")),
+            "copy_file of a missing file"
+        ),
+        FsErrorKind::NotFound
+    );
+    fs.open_append(&copy)
+        .and_then(|mut f| f.sync())
+        .expect("sync a copied file");
+    fs.set_exec(&copy, true).expect("set_exec on");
+    fs.set_exec(&copy, false).expect("set_exec off");
+    assert_eq!(
+        fs_kind(fs.set_exec(&missing, true), "set_exec of a missing file"),
+        FsErrorKind::NotFound
+    );
+
+    // list_dir.
+    let mut names: Vec<_> = fs
+        .list_dir(&base.join("a"))
+        .expect("list_dir")
+        .into_iter()
+        .map(|e| (e.name.to_string_lossy().into_owned(), e.kind))
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        names,
+        vec![
+            ("b".to_owned(), FileKind::Dir),
+            ("copy.bin".to_owned(), FileKind::File),
+            ("data.bin".to_owned(), FileKind::File),
+        ]
+    );
+    assert_eq!(
+        fs_kind(fs.list_dir(&missing), "list_dir of a missing dir"),
+        FsErrorKind::NotFound
+    );
+    assert!(fs.list_dir(&file).is_err(), "list_dir of a file");
+
+    // rename a file and a directory.
+    let moved = base.join("a/moved.bin");
+    fs.rename(&copy, &moved).expect("rename a file");
+    assert_eq!(fs.symlink_metadata(&copy).unwrap(), None);
+    assert_eq!(fs.read_capped(&moved, 100).unwrap(), &bytes[..10]);
+    assert_eq!(
+        fs_kind(
+            fs.rename(&missing, &base.join("zzz")),
+            "rename of a missing path"
+        ),
+        FsErrorKind::NotFound
+    );
+    fs.rename(&base.join("a/b"), &base.join("b2"))
+        .expect("rename a directory");
+    assert_eq!(
+        fs.symlink_metadata(&base.join("b2/c"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Dir)
+    );
+    fs.sync_dir(base).unwrap();
+    fs.sync_dir(&base.join("a")).unwrap();
+
+    // remove_file: a file; not a directory; not a missing path.
+    fs.remove_file(&moved).expect("remove_file");
+    assert_eq!(fs.symlink_metadata(&moved).unwrap(), None);
+    assert_eq!(
+        fs_kind(fs.remove_file(&moved), "remove_file of a missing file"),
+        FsErrorKind::NotFound
+    );
+    assert!(
+        fs.remove_file(&base.join("b2")).is_err(),
+        "remove_file of a directory"
+    );
+    assert_eq!(
+        fs_kind(
+            fs.remove_dir_all_nofollow(&base.join("plain")),
+            "remove_dir_all of a file"
+        ),
+        FsErrorKind::NotADirectory
+    );
+    fs.remove_dir_all_nofollow(&base.join("b2"))
+        .expect("remove_dir_all");
+    assert_eq!(fs.symlink_metadata(&base.join("b2")).unwrap(), None);
+    assert_eq!(
+        fs_kind(
+            fs.remove_dir_all_nofollow(&base.join("b2")),
+            "remove_dir_all of a missing dir"
+        ),
+        FsErrorKind::NotFound
+    );
+
+    // try_lock: exclusive, released on drop, per path.
+    let lock_path = base.join("lock");
+    let first = fs
+        .try_lock(&lock_path)
+        .expect("try_lock")
+        .expect("the first lock");
+    assert!(
+        fs.try_lock(&lock_path).expect("try_lock again").is_none(),
+        "a second lock"
+    );
+    let other = base.join("other-lock");
+    let second = fs
+        .try_lock(&other)
+        .expect("try_lock other")
+        .expect("a lock on another path");
+    drop(first);
+    let again = fs.try_lock(&lock_path).expect("try_lock after drop");
+    assert!(again.is_some(), "the lock is free after the guard dropped");
+    drop((again, second));
+
+    if symlinks {
+        fs_symlink_cases(fs, base);
+    }
+}
+
+fn fs_symlink_cases(fs: &dyn Fs, base: &Path) {
+    let outside = base.join("outside");
+    fs.create_dir_all(&outside).unwrap();
+    write_file(fs, &outside.join("keep.txt"), b"keep");
+
+    // A symlink to a file: reported as a symlink, read through, listed as one.
+    let target_file = base.join("target.txt");
+    write_file(fs, &target_file, b"hello");
+    let link = base.join("link-to-file");
+    fs.symlink(&target_file.to_string_lossy(), &link)
+        .expect("symlink");
+    assert_eq!(
+        fs.symlink_metadata(&link).unwrap().map(|m| m.kind),
+        Some(FileKind::Symlink)
+    );
+    assert_eq!(fs.read_capped(&link, 100).unwrap(), b"hello");
+    assert_eq!(
+        fs_kind(
+            fs.symlink(&target_file.to_string_lossy(), &link),
+            "symlink over a symlink"
+        ),
+        FsErrorKind::AlreadyExists
+    );
+
+    // create_new on a dangling symlink fails and does not write through it.
+    let dangling = base.join("dangling");
+    let dangling_target = base.join("not-there.txt");
+    fs.symlink(&dangling_target.to_string_lossy(), &dangling)
+        .unwrap();
+    assert_eq!(
+        fs_kind(fs.create_new(&dangling), "create_new on a dangling symlink"),
+        FsErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        fs.symlink_metadata(&dangling_target).unwrap(),
+        None,
+        "created through the link"
+    );
+
+    // create_dir_all through a symlink fails.
+    let dir_link = base.join("dir-link");
+    fs.symlink(&outside.to_string_lossy(), &dir_link).unwrap();
+    let err = fs.create_dir_all(&dir_link.join("new")).unwrap_err();
+    assert!(
+        matches!(
+            err.kind,
+            FsErrorKind::IsSymlink | FsErrorKind::NotADirectory | FsErrorKind::Other
+        ),
+        "create_dir_all through a symlink: {err}"
+    );
+    assert_eq!(
+        fs.symlink_metadata(&outside.join("new")).unwrap(),
+        None,
+        "created through the link"
+    );
+
+    // remove_dir_all_nofollow removes the link itself and never reaches the outside directory.
+    let tree = base.join("tree");
+    fs.create_dir_all(&tree.join("inner")).unwrap();
+    write_file(fs, &tree.join("inner/f"), b"f");
+    fs.symlink(&outside.to_string_lossy(), &tree.join("inner/escape"))
+        .unwrap();
+    fs.remove_dir_all_nofollow(&tree)
+        .expect("remove a tree holding a symlink");
+    assert_eq!(fs.symlink_metadata(&tree).unwrap(), None);
+    assert_eq!(
+        fs.read_capped(&outside.join("keep.txt"), 10).unwrap(),
+        b"keep"
+    );
+    fs.remove_dir_all_nofollow(&dir_link)
+        .expect("remove a symlink to a directory");
+    assert_eq!(fs.symlink_metadata(&dir_link).unwrap(), None);
+    assert_eq!(
+        fs.read_capped(&outside.join("keep.txt"), 10).unwrap(),
+        b"keep"
+    );
+
+    // remove_file removes a link, not its target; rename moves the link.
+    fs.remove_file(&link).expect("remove_file on a symlink");
+    assert_eq!(fs.read_capped(&target_file, 100).unwrap(), b"hello");
+    fs.rename(&dangling, &base.join("dangling2"))
+        .expect("rename a symlink");
+    assert_eq!(
+        fs.symlink_metadata(&base.join("dangling2"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Symlink)
+    );
+
+    fs_link_cases(fs, base);
+}
+
+/// `read_link` and `replace_symlink`, in a directory of their own so the entries can be counted.
+fn fs_link_cases(fs: &dyn Fs, base: &Path) {
+    let dir = base.join("links");
+    fs.create_dir_all(&dir).unwrap();
+    let names = |fs: &dyn Fs| {
+        let mut names: Vec<String> = fs
+            .list_dir(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    write_file(fs, &dir.join("file"), b"payload");
+    fs.create_dir_all(&dir.join("sub")).unwrap();
+    fs.symlink("versions/1.0.0", &dir.join("old")).unwrap();
+
+    // read_link: the target text as stored; a file, a directory and a missing path are errors.
+    assert_eq!(fs.read_link(&dir.join("old")).unwrap(), "versions/1.0.0");
+    assert_eq!(
+        fs_kind(fs.read_link(&dir.join("file")), "read_link of a file"),
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(
+        fs_kind(fs.read_link(&dir.join("sub")), "read_link of a directory"),
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(
+        fs_kind(fs.read_link(&dir.join("missing")), "read_link of nothing"),
+        FsErrorKind::NotFound
+    );
+    let before = names(fs);
+
+    // Over an existing link: the target changes, no temporary entry is left, the old target
+    // (here a directory that does not exist) is untouched.
+    fs.replace_symlink("versions/1.1.0", &dir.join("old"))
+        .expect("replace over a link");
+    assert_eq!(fs.read_link(&dir.join("old")).unwrap(), "versions/1.1.0");
+    assert_eq!(names(fs), before, "a temporary link was left behind");
+    fs.sync_dir(&dir).unwrap();
+
+    // Over an absent path: a new link, a dangling target is fine.
+    fs.replace_symlink("nowhere/at/all", &dir.join("fresh"))
+        .expect("replace over nothing");
+    assert_eq!(fs.read_link(&dir.join("fresh")).unwrap(), "nowhere/at/all");
+    assert_eq!(
+        fs.symlink_metadata(&dir.join("fresh"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Symlink)
+    );
+    assert_eq!(
+        fs.symlink_metadata(&dir.join("nowhere")).unwrap(),
+        None,
+        "created through the link"
+    );
+
+    // Over a link to a directory: the link is replaced, not the directory behind it.
+    fs.symlink("sub", &dir.join("to-dir")).unwrap();
+    fs.replace_symlink("file", &dir.join("to-dir"))
+        .expect("replace a link to a directory");
+    assert_eq!(fs.read_link(&dir.join("to-dir")).unwrap(), "file");
+    assert_eq!(
+        fs.symlink_metadata(&dir.join("sub"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Dir)
+    );
+
+    // Refusals: a file or a directory at the link; nothing changes, nothing is left behind.
+    let before = names(fs);
+    assert_eq!(
+        fs_kind(
+            fs.replace_symlink("x", &dir.join("file")),
+            "replace_symlink over a file"
+        ),
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(
+        fs_kind(
+            fs.replace_symlink("x", &dir.join("sub")),
+            "replace_symlink over a directory"
+        ),
+        FsErrorKind::NotASymlink
+    );
+    assert_eq!(fs.read_capped(&dir.join("file"), 100).unwrap(), b"payload");
+    assert_eq!(
+        fs.symlink_metadata(&dir.join("sub"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Dir)
+    );
+    assert_eq!(names(fs), before, "a refusal left an entry behind");
+
+    // A missing parent directory is an error, and creates nothing.
+    assert_eq!(
+        fs_kind(
+            fs.replace_symlink("x", &dir.join("no-such-dir/link")),
+            "replace_symlink in a missing directory"
+        ),
+        FsErrorKind::NotFound
+    );
+    assert_eq!(names(fs), before);
+    fs.remove_dir_all_nofollow(&dir).unwrap();
 }

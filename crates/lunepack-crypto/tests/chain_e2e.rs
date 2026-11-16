@@ -162,8 +162,15 @@ fn real_chain_verifies_end_to_end_and_every_one_byte_change_is_rejected() {
 
     // Candidate selection with the FORMAT.md 11.5 install id: bucket 6700 < 6701.
     let current = Version::parse("1.0.0").unwrap();
-    let candidate = select_candidate(&feed, &current, TARGET, &[], &KAT_INSTALL, &Sha256Hasher)
-        .expect("inside the rollout");
+    let candidate = select_candidate(
+        &feed,
+        Some(&current),
+        TARGET,
+        &[],
+        &KAT_INSTALL,
+        &Sha256Hasher,
+    )
+    .expect("inside the rollout");
     assert_eq!(candidate.entry.version_text(), VERSION);
     assert_eq!(candidate.entry.target(), TARGET);
 

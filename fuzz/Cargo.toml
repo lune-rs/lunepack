@@ -88,3 +88,24 @@ path = "fuzz_targets/frame.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "http"
+path = "fuzz_targets/http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state"
+path = "fuzz_targets/state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "update_config"
+path = "fuzz_targets/update_config.rs"
+test = false
+doc = false
+bench = false
