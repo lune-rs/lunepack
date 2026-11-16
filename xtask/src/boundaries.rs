@@ -37,9 +37,11 @@ pub const ROLES: &[(&str, Role)] = &[
     ("lunepack-os-windows", Role::Adapter),
     ("lunepack-os-macos", Role::Adapter),
     ("lunepack-os-linux", Role::Adapter),
+    ("lunepack-ui-luneui", Role::Adapter),
     ("lunepack", Role::Facade),
     ("lunepack-runtime", Role::Binary),
     ("lunepack-cli", Role::Binary),
+    ("lunepack-ui", Role::Binary),
     ("xtask", Role::Tool),
 ];
 
@@ -66,12 +68,66 @@ pub const CORE_EXTERNAL_ALLOWLIST: &[&str] = &[
 /// Confined dependencies (M3-D11): `(crate, packages allowed to depend on it)`. The crate brings
 /// unsafe code or asm that docs/DECISIONS.md allows only in the named adapter (D17, D34). Adding a
 /// later confined crate is one line. Matched on the package name, never the rename.
-pub const CONFINED: &[(&str, &[&str])] = &[("lzma-rust2", &["lunepack-codec-lzma"])];
+pub const CONFINED: &[(&str, &[&str])] = &[
+    ("lzma-rust2", &["lunepack-codec-lzma"]),
+    // LuneUI's facade crate (D39 (b), M6): only the UI adapter depends on it. The rest of the GPU
+    // and window stack is held by `REACH_FAMILIES_ONLY_THROUGH`.
+    ("lune-ui", &["lunepack-ui-luneui"]),
+];
+
+/// Workspace crates that only the listed workspace members may depend on, in any dependency kind
+/// (M6): `(crate, dependents)`. The UI adapter is linked by the `lunepack-ui` binary alone, and
+/// nothing links that binary (a crate cannot depend on itself, so its list is empty).
+pub const ONLY_DEPENDED_ON_BY: &[(&str, &[&str])] = &[
+    ("lunepack-ui-luneui", &["lunepack-ui"]),
+    ("lunepack-ui", &[]),
+];
 
 /// Reach-only-through crates (M4-D16): `(crate, via)`. In the lock graph of the workspace and of
 /// `fuzz/`, no workspace member may reach `crate` except through the member `via`. `ring` is the
 /// only crypto provider the project allows (D17), and only the HTTP adapter links it.
 pub const REACH_ONLY_THROUGH: &[(&str, &str)] = &[("ring", "lunepack-http")];
+
+/// Like [`REACH_ONLY_THROUGH`], for whole crate families (M6): `(family, via)`. A package belongs
+/// to a family when its name is the family name or continues it with `-` or `_` (`wgpu-hal`,
+/// `accesskit_consumer`). The GPU and window stack of LuneUI (D17, D39) is reachable only through
+/// the UI adapter, so no runtime, CLI, facade, core, test or OS crate links it.
+pub const REACH_FAMILIES_ONLY_THROUGH: &[(&str, &str)] = &[
+    ("lune-ui", "lunepack-ui-luneui"),
+    ("wgpu", "lunepack-ui-luneui"),
+    ("winit", "lunepack-ui-luneui"),
+    ("accesskit", "lunepack-ui-luneui"),
+];
+
+/// The one git source the workspace may use (D39 (b)): LuneUI at one exact commit. The declared
+/// source is what `cargo metadata` reports for a dependency; the lock source adds `#<commit>`.
+pub const LUNEUI_GIT_URL: &str = "https://github.com/lune-rs/luneui-rs";
+/// The pinned LuneUI commit, in full (the v0.7.0 tag).
+pub const LUNEUI_REV: &str = "cbeae0109f970eaede7f1826414f139bb8eace65";
+/// The packages LuneUI's repository provides to this workspace; any other package from that
+/// source, and any of these from another source, is a violation.
+pub const LUNEUI_CRATES: &[&str] = &[
+    "lune-ui",
+    "lune-ui-core",
+    "lune-ui-platform",
+    "lune-ui-wgpu",
+    "lune-ui-winit",
+];
+
+fn luneui_declared_source() -> String {
+    format!("git+{LUNEUI_GIT_URL}?rev={LUNEUI_REV}")
+}
+
+fn luneui_lock_source() -> String {
+    format!("git+{LUNEUI_GIT_URL}?rev={LUNEUI_REV}#{LUNEUI_REV}")
+}
+
+fn in_family(name: &str, family: &str) -> bool {
+    name == family
+        || name
+            .strip_prefix(family)
+            .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('_'))
+}
 
 /// Packages no lock the check reads may contain (D17), matched by exact package name, so
 /// `openssl-probe` is not `openssl`.
@@ -384,7 +440,9 @@ fn check_root(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) ->
 /// produces) is a violation. `cargo metadata --no-deps` only reports declared dependencies, so a
 /// redirection is invisible there; the lock file records what was actually resolved. A missing
 /// lock, and a `[patch]` or `[replace]` section in the root or a probe manifest, are violations
-/// too. A vendored crate would need an explicit allowlist entry here.
+/// too. A vendored crate would need an explicit allowlist entry here. The one exception is the
+/// workspace lock's LuneUI source ([`luneui_lock_source`], D39 (b)): only LuneUI's own packages may
+/// come from it, and they may come from nowhere else.
 fn check_lock(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) {
     let members: BTreeSet<(String, String)> = md
         .packages
@@ -396,6 +454,7 @@ fn check_lock(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) {
         &manifests.root,
         manifests.lock.as_ref(),
         &members,
+        true,
         out,
     );
     check_lock_graph(WORKSPACE_LABEL, manifests.lock.as_ref(), &members, out);
@@ -415,6 +474,7 @@ fn check_lock(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) {
             &probe.manifest,
             probe.lock.as_ref(),
             &members,
+            false,
             out,
         );
     }
@@ -437,6 +497,7 @@ fn check_lock(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) {
             &fuzz.manifest,
             fuzz.lock.as_ref(),
             &members,
+            false,
             out,
         );
         check_lock_graph(&fuzz.label, fuzz.lock.as_ref(), &members, out);
@@ -578,8 +639,23 @@ fn check_lock_graph(
 
     let is_member =
         |n: &LockNode| n.source.is_none() && members.contains(&(n.name.clone(), n.version.clone()));
-    for (target, via) in REACH_ONLY_THROUGH {
-        let blocked = |i: usize| is_member(&nodes[i]) && nodes[i].name == *via;
+    let rules = REACH_ONLY_THROUGH
+        .iter()
+        .map(|(t, via)| (*t, false, *via))
+        .chain(
+            REACH_FAMILIES_ONLY_THROUGH
+                .iter()
+                .map(|(t, via)| (*t, true, *via)),
+        );
+    for (target, family, via) in rules {
+        let is_target = |name: &str| {
+            if family {
+                in_family(name, target)
+            } else {
+                name == target
+            }
+        };
+        let blocked = |i: usize| is_member(&nodes[i]) && nodes[i].name == via;
         for root in (0..nodes.len()).filter(|&i| is_member(&nodes[i]) && !blocked(i)) {
             // Breadth first, so the first hit has a shortest path.
             let mut parent: Vec<Option<usize>> = vec![None; nodes.len()];
@@ -588,7 +664,7 @@ fn check_lock_graph(
             let mut queue = std::collections::VecDeque::from([root]);
             let mut hit = None;
             while let Some(at) = queue.pop_front() {
-                if nodes[at].name == *target {
+                if is_target(&nodes[at].name) {
                     hit = Some(at);
                     break;
                 }
@@ -611,8 +687,9 @@ fn check_lock_graph(
                     &nodes[root].name,
                     "reach",
                     format!(
-                        "Cargo.lock ({label}): `{}` reaches `{target}` other than through `{via}`: {}",
+                        "Cargo.lock ({label}): `{}` reaches `{}` other than through `{via}`: {}",
                         nodes[root].name,
+                        path.last().map_or("", String::as_str),
                         path.join(" -> ")
                     ),
                 ));
@@ -813,6 +890,13 @@ fn check_fuzz_dep_table(
         out.push(v(key, "fuzz-dep", "`path` is not a string"));
         return;
     };
+    if ONLY_DEPENDED_ON_BY.iter().any(|(c, _)| *c == real_name) {
+        out.push(v(
+            key,
+            "fuzz-dep",
+            format!("fuzz dependency `{key}` is `{real_name}`, which only its listed workspace dependents may depend on"),
+        ));
+    }
     let resolved = fuzz_dir.join(path);
     if !member_dirs
         .get(real_name)
@@ -843,6 +927,7 @@ fn check_lock_for(
     manifest: &toml::Table,
     lock: Option<&toml::Table>,
     members: &BTreeSet<(String, String)>,
+    allow_luneui: bool,
     out: &mut Vec<Violation>,
 ) {
     for key in ["patch", "replace"] {
@@ -889,7 +974,29 @@ fn check_lock_for(
                     ));
                 }
             }
-            Some(toml::Value::String(src)) if src == CRATES_IO_SOURCE => {}
+            Some(toml::Value::String(src)) if src == CRATES_IO_SOURCE => {
+                if allow_luneui && LUNEUI_CRATES.contains(&name) {
+                    out.push(v(
+                        name,
+                        "lock-source",
+                        format!(
+                            "Cargo.lock ({label}) resolves `{name}` from crates.io: LuneUI's packages come only from {}",
+                            luneui_lock_source()
+                        ),
+                    ));
+                }
+            }
+            Some(toml::Value::String(src)) if allow_luneui && *src == luneui_lock_source() => {
+                if !LUNEUI_CRATES.contains(&name) {
+                    out.push(v(
+                        name,
+                        "lock-source",
+                        format!(
+                            "Cargo.lock ({label}) resolves `{name}` from the LuneUI git source, which may provide only LuneUI's own packages"
+                        ),
+                    ));
+                }
+            }
             Some(toml::Value::String(src)) => out.push(v(
                 name,
                 "lock-source",
@@ -1004,6 +1111,22 @@ fn check_dependency(
                 ),
             ));
         }
+        if let Some((_, dependents)) = ONLY_DEPENDED_ON_BY.iter().find(|(c, _)| *c == dname)
+            && !dependents.contains(&package)
+        {
+            out.push(v(
+                package,
+                "confined",
+                format!(
+                    "{kind} dependency on `{dname}`: only {} may depend on it",
+                    if dependents.is_empty() {
+                        "no crate".to_string()
+                    } else {
+                        dependents.join(", ")
+                    }
+                ),
+            ));
+        }
         if let Some(role) = role {
             let mut allowed = allowed_normal(role);
             if dep.kind == DependencyKind::Development {
@@ -1029,14 +1152,26 @@ fn check_dependency(
         ));
         return;
     }
-    let from_crates_io = dep.registry.is_none()
-        && dep.path.is_none()
-        && dep.source.as_ref().map(|s| s.repr.as_str()) == Some(CRATES_IO_SOURCE);
+    let declared = dep.source.as_ref().map(|s| s.repr.as_str());
+    if LUNEUI_CRATES.contains(&dname) {
+        // LuneUI's own packages come from the pinned git source and nowhere else (D39 (b)).
+        let pinned = luneui_declared_source();
+        if dep.registry.is_some() || dep.path.is_some() || declared != Some(pinned.as_str()) {
+            out.push(v(
+                package,
+                "source",
+                format!(
+                    "`{dname}` must come from {pinned} (source {})",
+                    declared.unwrap_or("none (path)")
+                ),
+            ));
+        }
+        return;
+    }
+    let from_crates_io =
+        dep.registry.is_none() && dep.path.is_none() && declared == Some(CRATES_IO_SOURCE);
     if !from_crates_io {
-        let src = dep
-            .source
-            .as_ref()
-            .map_or("none (path)", |s| s.repr.as_str());
+        let src = declared.unwrap_or("none (path)");
         out.push(v(
             package,
             "source",

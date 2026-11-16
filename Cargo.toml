@@ -31,6 +31,7 @@ lunepack-os-linux = { path = "crates/lunepack-os-linux" }
 lunepack = { path = "crates/lunepack" }
 lunepack-runtime = { path = "crates/lunepack-runtime" }
 lunepack-cli = { path = "crates/lunepack-cli" }
+lunepack-ui-luneui = { path = "crates/lunepack-ui-luneui" }
 
 # Core's pure external crates (M2-D1); the boundary check allowlists exactly these for lunepack-core.
 serde = { version = "1", features = ["derive"] }
@@ -62,3 +63,7 @@ toml = "1.2"
 # (D23, M4-D14). ring stays confined to lunepack-http (M4-D16).
 ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier", "win-system-proxy"] }
 url = "2"
+
+# UI adapter (M6 step 1, D39 (b)): LuneUI as a git dependency pinned to a commit (the v0.7.0 tag).
+# The boundary check allows exactly this source and confines it to lunepack-ui-luneui.
+lune-ui = { git = "https://github.com/lune-rs/luneui-rs", rev = "cbeae0109f970eaede7f1826414f139bb8eace65", features = ["accesskit"] }
