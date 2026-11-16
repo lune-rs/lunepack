@@ -2,6 +2,8 @@
 //! a [`View`] and reports what the user did.
 
 pub(crate) mod install;
+pub(crate) mod uninstall;
+pub(crate) mod update;
 
 use std::time::Duration;
 
@@ -12,7 +14,7 @@ use lune_ui::widgets::button::ButtonKind;
 
 use lunepack_core::ui::{ChoiceValue, UiMsg};
 
-use crate::look::{CONTENT_BOTTOM, CONTENT_R};
+use crate::look::{self, Metrics};
 use crate::model::{UiModel, View};
 use crate::widgets;
 
@@ -24,6 +26,8 @@ pub(crate) struct Draw<'a> {
     pub tier: MotionTier,
     /// Whether this is the content the user can act on (false while it is leaving).
     pub live: bool,
+    /// The window's sizes.
+    pub mt: Metrics,
     /// When the content started to arrive, for marks that draw in with it.
     pub enter_at: Duration,
 }
@@ -54,6 +58,8 @@ pub(crate) struct Btn<'a> {
     pub label: &'a str,
     pub kind: ButtonKind,
     pub enabled: bool,
+    /// The label is drawn in the error colour (a destructive confirmation).
+    pub danger: bool,
 }
 
 /// The bottom-right button group: the last button's right edge at the content edge, 8 px apart,
@@ -62,11 +68,11 @@ pub(crate) struct Btn<'a> {
 pub(crate) fn button_group(ui: &mut Ui<'_>, d: &Draw<'_>, group: &[Btn<'_>]) -> (Vec<bool>, bool) {
     let widths: Vec<f32> = group
         .iter()
-        .map(|b| widgets::button_width(ui, b.label))
+        .map(|b| widgets::button_width(ui, b.label, d.mt.btn_pad))
         .collect();
     // Positions from the right edge; drawn left to right so the Tab order is the visual one.
     let mut xs = vec![0.0; group.len()];
-    let mut x = CONTENT_R;
+    let mut x = d.mt.content_r;
     for i in (0..group.len()).rev() {
         x -= widths[i];
         xs[i] = x;
@@ -75,8 +81,14 @@ pub(crate) fn button_group(ui: &mut Ui<'_>, d: &Draw<'_>, group: &[Btn<'_>]) -> 
     let mut clicked = vec![false; group.len()];
     let mut focused = false;
     for (i, b) in group.iter().enumerate() {
-        let rect = Rect::new(xs[i], CONTENT_BOTTOM - 32.0, widths[i], 32.0);
-        let out = widgets::button(ui, b.name, rect, b.label, b.kind, b.enabled, d.live);
+        let rect = Rect::new(
+            xs[i],
+            d.mt.content_bottom - d.mt.btn_h,
+            widths[i],
+            d.mt.btn_h,
+        );
+        let color = b.danger.then_some(look::DANGER);
+        let out = widgets::button(ui, b.name, rect, b.label, b.kind, b.enabled, d.live, color);
         clicked[i] = out.clicked;
         focused |= out.focused;
     }

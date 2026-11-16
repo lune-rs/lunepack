@@ -33,6 +33,8 @@ pub const ERR: Rgba = [0xE0, 0x6C, 0x75, 0xFF];
 pub const WARN: Rgba = [0xE2, 0xB9, 0x3D, 0xFF];
 /// The current step's dot and the spinner's arc.
 pub const DOT: Rgba = [0xC9, 0xCD, 0xD2, 0xFF];
+/// The label of a destructive confirmation.
+pub const DANGER: Rgba = [0xE8, 0x84, 0x8C, 0xFF];
 /// The opaque window background (Linux, and the software fallback).
 pub const BG_OPAQUE: Rgba = [0x18, 0x18, 0x1A, 0xFF];
 /// The monogram tile's fill.
@@ -83,4 +85,73 @@ pub fn body() -> Style {
 /// A caption: 11 on 15, white 60 %.
 pub fn caption() -> Style {
     style(11.0, 15.0, 400, white(0.6))
+}
+
+/// The sizes of one window. The installer and the uninstaller share one; the update window is a
+/// small one with a narrow rail that holds the icon only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Metrics {
+    /// Window width.
+    pub w: f32,
+    /// Window height.
+    pub h: f32,
+    /// The side rail's width, its right border included.
+    pub rail_w: f32,
+    /// The main area's left edge.
+    pub content_x: f32,
+    /// The main area's right edge.
+    pub content_r: f32,
+    /// The first line of the main area.
+    pub content_top: f32,
+    /// The bottom edge of the last row of buttons.
+    pub content_bottom: f32,
+    /// A button's height.
+    pub btn_h: f32,
+    /// A button's side padding.
+    pub btn_pad: f32,
+    /// The corner glow's centre (on both axes) and radius.
+    pub glow: (f32, f32),
+}
+
+impl Metrics {
+    /// The installer and uninstaller window.
+    pub const FULL: Metrics = Metrics {
+        w: 560.0,
+        h: 360.0,
+        rail_w: RAIL_W,
+        content_x: CONTENT_X,
+        content_r: CONTENT_R,
+        content_top: CONTENT_TOP,
+        content_bottom: CONTENT_BOTTOM,
+        btn_h: 32.0,
+        btn_pad: 16.0,
+        glow: (15.0, 97.0),
+    };
+
+    /// The update window.
+    pub const UPDATE: Metrics = Metrics {
+        w: 440.0,
+        h: 180.0,
+        rail_w: 96.0,
+        content_x: 116.0,
+        content_r: 420.0,
+        content_top: 32.0,
+        content_bottom: 164.0,
+        btn_h: 28.0,
+        btn_pad: 14.0,
+        glow: (10.0, 83.0),
+    };
+
+    /// The metrics of the window a flow shows (the installer's until a hello names the flow).
+    pub fn of(flow: Option<lunepack_core::ui::Flow>) -> Metrics {
+        match flow {
+            Some(lunepack_core::ui::Flow::Update) => Metrics::UPDATE,
+            _ => Metrics::FULL,
+        }
+    }
+
+    /// The width of the main area's content.
+    pub fn content_w(&self) -> f32 {
+        self.content_r - self.content_x
+    }
 }

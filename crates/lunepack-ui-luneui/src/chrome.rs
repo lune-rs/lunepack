@@ -16,15 +16,15 @@ use lunepack_core::ui::Flow;
 
 use crate::anim;
 use crate::icon::ICON_IMAGE;
-use crate::look::{self, CAPTION_W, ERR, OK, RAIL_W, TITLE_H, WARN, white};
+use crate::look::{self, CAPTION_W, ERR, OK, TITLE_H, WARN, white};
 use crate::model::{GLOW_MS, GlowKind, Material, RAIL_MS, UiModel};
-use crate::strings::INSTALL_STEPS;
+use crate::strings::{INSTALL_STEPS, UNINSTALL_STEPS};
 use crate::widgets;
 
 /// The window's own background.
-pub(crate) fn background(ui: &mut Ui<'_>, material: Material) {
+pub(crate) fn background(ui: &mut Ui<'_>, material: Material, mt: look::Metrics) {
     let theme = *ui.theme();
-    let (w, h) = look::WINDOW;
+    let (w, h) = (mt.w, mt.h);
     let color = match material {
         Material::Opaque => lune_ui::color::premul(look::BG_OPAQUE),
         Material::Glass => theme.glass.window.premultiplied(),
@@ -75,16 +75,17 @@ pub(crate) fn glow(ui: &mut Ui<'_>, m: &UiModel, t: Duration, tier: MotionTier) 
         if alpha <= 0.0 {
             continue;
         }
+        let (c, r) = m.metrics().glow;
         p.push_xform(Xform {
-            origin: (15.0, 15.0),
+            origin: (c, c),
             scale: 1.0,
             dx: 0.0,
             dy: 0.0,
             alpha,
         });
         p.radial(
-            [15.0, 15.0],
-            [97.0, 97.0],
+            [c, c],
+            [r, r],
             look::tint(color, 1.0),
             look::tint(color, 0.0),
             Falloff::Linear,
@@ -98,24 +99,57 @@ const ROW_STEP: f32 = 34.0;
 
 /// The side rail: the app's identity (it never moves) and the steps of the flow.
 pub(crate) fn rail(ui: &mut Ui<'_>, m: &UiModel, t: Duration, tier: MotionTier) {
-    let (_, h) = look::WINDOW;
+    let mt = m.metrics();
+    let (rail_w, h) = (mt.rail_w, mt.h);
     let p = ui.painter();
-    p.fill(Rect::new(0.0, 0.0, RAIL_W, h), 0.0, [0, 0, 0, 71]);
-    p.fill(Rect::new(RAIL_W - 1.0, 0.0, 1.0, h), 0.0, white(0.08));
+    p.fill(Rect::new(0.0, 0.0, rail_w, h), 0.0, [0, 0, 0, 71]);
+    p.fill(Rect::new(rail_w - 1.0, 0.0, 1.0, h), 0.0, white(0.08));
 
-    let tile = Rect::new(20.0, 28.0, 48.0, 48.0);
+    // The update window's rail holds the icon alone, centred.
+    let compact = m.state().flow() == Some(Flow::Update);
+    let tile = Rect::new(
+        if compact { (rail_w - 48.0) / 2.0 } else { 20.0 },
+        28.0,
+        48.0,
+        48.0,
+    );
     let id = ui.id("rail-icon");
+    // After an uninstall the icon eases to half opacity (an opacity change, so Reduced keeps it).
+    let dim = m.dim_since.map_or(0.0, |since| {
+        if anim::animates(tier) {
+            anim::eased(Easing::QuadOut, t, since, GLOW_MS)
+        } else {
+            1.0
+        }
+    });
+    let icon_alpha = 1.0 - 0.5 * dim;
     if m.icon.is_some() {
-        ui.painter()
-            .image(tile, ICON_IMAGE, Fit::Contain, ImageAlign::CENTER, 1.0);
+        ui.painter().image(
+            tile,
+            ICON_IMAGE,
+            Fit::Contain,
+            ImageAlign::CENTER,
+            icon_alpha,
+        );
     } else {
+        ui.painter().push_xform(Xform {
+            origin: (0.0, 0.0),
+            scale: 1.0,
+            dx: 0.0,
+            dy: 0.0,
+            alpha: icon_alpha,
+        });
         monogram(ui, tile, &m.name);
+        ui.painter().pop_xform();
     }
     let mut node = Node::new(id, Role::Image, &m.name, tile);
     node.description = Some("App icon".to_owned());
     ui.node(node);
 
-    let inner_w = RAIL_W - 28.0 - 12.0;
+    if compact {
+        return;
+    }
+    let inner_w = rail_w - 28.0 - 12.0;
     widgets::static_text(
         ui,
         "rail-name",
@@ -126,25 +160,45 @@ pub(crate) fn rail(ui: &mut Ui<'_>, m: &UiModel, t: Duration, tier: MotionTier) 
         look::style(14.0, 18.0, 500, white(0.9)),
         Some(inner_w),
     );
-    widgets::static_text(
-        ui,
-        "rail-version",
-        true,
-        20.0,
-        116.0,
-        &format!("Version {}", m.version),
-        look::caption(),
-        Some(inner_w),
-    );
+    // "Version 1.4.0" cross-fades to "Removed" once an uninstall is done.
+    let version_style = look::caption();
+    let removed = m.dim_since.is_some();
+    for (text, alpha, key) in [
+        (format!("Version {}", m.version), 1.0 - dim, "rail-version"),
+        ("Removed".to_owned(), dim, "rail-removed"),
+    ] {
+        if alpha <= 0.0 || (key == "rail-removed" && !removed) {
+            continue;
+        }
+        ui.painter().push_xform(Xform {
+            origin: (0.0, 0.0),
+            scale: 1.0,
+            dx: 0.0,
+            dy: 0.0,
+            alpha,
+        });
+        widgets::static_text(
+            ui,
+            key,
+            true,
+            20.0,
+            116.0,
+            &text,
+            version_style,
+            Some(inner_w),
+        );
+        ui.painter().pop_xform();
+    }
 
     let flow = m.state().flow();
     let steps: &[&str] = match flow {
         Some(Flow::Install) | None => &INSTALL_STEPS,
-        _ => &[],
+        Some(Flow::Uninstall) => &UNINSTALL_STEPS,
+        Some(Flow::Update) => &[],
     };
     // The highlight: slides under Full, cross-fades under Reduced, jumps under Off.
     let row_y = |i: f32| ROW0 + i * ROW_STEP;
-    let row = |y: f32| Rect::new(14.0, y, RAIL_W - 28.0, 30.0);
+    let row = |y: f32| Rect::new(14.0, y, rail_w - 28.0, 30.0);
     let hl = white(0.09);
     let p_move = anim::progress(t, m.rail_since, RAIL_MS);
     let (from, to) = (m.rail_from as f32, m.rail_to as f32);
@@ -171,10 +225,11 @@ pub(crate) fn rail(ui: &mut Ui<'_>, m: &UiModel, t: Duration, tier: MotionTier) 
         if finished.is_some() {
             widgets::check_mark(ui, cx - 5.0, cy - 5.0, 10.0, OK, finished, t, tier);
         } else if current {
-            let color = match (m.screen(), i) {
-                (lunepack_core::ui::Screen::InstallFailed, _) => ERR,
-                (lunepack_core::ui::Screen::InstallDone, _) => OK,
-                _ => look::DOT,
+            let color = match m.glow_to {
+                GlowKind::Err => ERR,
+                GlowKind::Ok => OK,
+                GlowKind::Warn => WARN,
+                GlowKind::Idle | GlowKind::Running => look::DOT,
             };
             ui.painter()
                 .fill(Rect::new(cx - 3.5, cy - 3.5, 7.0, 7.0), 3.5, color);
@@ -235,11 +290,22 @@ pub(crate) fn monogram(ui: &mut Ui<'_>, tile: Rect, name: &str) {
 
 /// The title strip's buttons: Minimize and Close, 46 by 32 at the top right. Returns which was
 /// clicked: `Some(false)` for Minimize and `Some(true)` for Close.
-pub(crate) fn caption_buttons(ui: &mut Ui<'_>, interactive: bool) -> Option<bool> {
-    let (w, _) = look::WINDOW;
+pub(crate) fn caption_buttons(
+    ui: &mut Ui<'_>,
+    interactive: bool,
+    w: f32,
+    minimize: bool,
+    close_button: bool,
+) -> Option<bool> {
     let mut clicked = None;
-    for (i, close) in [false, true].into_iter().enumerate() {
-        let x = w - CAPTION_W * (2 - i) as f32;
+    let shown: Vec<bool> = [(false, minimize), (true, close_button)]
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(close, _)| close)
+        .collect();
+    let n = shown.len();
+    for (i, close) in shown.into_iter().enumerate() {
+        let x = w - CAPTION_W * (n - i) as f32;
         let rect = Rect::new(x, 0.0, CAPTION_W, TITLE_H);
         let id = ui.id(if close {
             "caption-close"

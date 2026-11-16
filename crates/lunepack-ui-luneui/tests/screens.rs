@@ -9,7 +9,7 @@ use lune_ui::motion::MotionTier;
 use lune_ui::scene::Scene;
 use lune_ui::testing::FakeText;
 
-use lunepack_core::ui::{ChoiceValue, EngineMsg, Screen, UiMsg};
+use lunepack_core::ui::{ChoiceValue, EngineMsg, Flow, Screen, UiMsg};
 use lunepack_ui_luneui::render::{Player, RenderOptions, Step, Timed, at};
 use lunepack_ui_luneui::{Env, Material, Os, icon, scenario};
 
@@ -21,6 +21,7 @@ fn opts(tier: MotionTier) -> RenderOptions {
         },
         tier,
         scale: 1.0,
+        flow: Flow::Install,
     }
 }
 
@@ -499,4 +500,336 @@ fn a_still_screen_asks_for_no_more_frames() {
     }
     let (_, out, _) = player.frame(&mut text, Duration::from_millis(3000));
     assert_ne!(out.repaint, lune_ui::input::Repaint::Idle);
+}
+
+// ---- the update window ----
+
+fn flow_opts(flow: Flow, tier: MotionTier) -> RenderOptions {
+    RenderOptions { flow, ..opts(tier) }
+}
+
+/// `run` for another flow's window.
+fn run_flow(
+    flow: Flow,
+    script: &[Timed],
+    until_ms: u64,
+) -> (Player, Scene, lune_ui::access::SemanticTree, Vec<UiMsg>) {
+    let mut player = Player::new(flow_opts(flow, MotionTier::Full));
+    let mut text = FakeText;
+    let mut next = 0;
+    let (mut scene, mut tree) = (Scene::default(), Default::default());
+    for ms in (0..=until_ms).step_by(10) {
+        let now = Duration::from_millis(ms);
+        while let Some(item) = script.get(next).filter(|s| s.at <= now) {
+            next += 1;
+            player.play(item).expect("the script is valid");
+        }
+        let (s, out, _) = player.frame(&mut text, now);
+        scene = s;
+        tree = out.tree;
+    }
+    let answers = player.take_answers();
+    (player, scene, tree, answers)
+}
+
+fn only(answers: &[UiMsg], value: ChoiceValue) -> bool {
+    matches!(answers, [UiMsg::Choice { value: v, .. }] if *v == value)
+}
+
+#[test]
+fn the_update_window_has_minimize_only_and_a_busy_bar_while_waiting() {
+    let (_, _, tree, answers) = run_flow(Flow::Update, &scenario::update_waiting(), 1000);
+    assert!(find(&tree, Role::Button, "Minimize").is_some());
+    assert!(
+        find(&tree, Role::Button, "Close").is_none(),
+        "no Close caption on any update screen"
+    );
+    let bar = find(&tree, Role::Progress, "Waiting for the app to close").expect("a bar");
+    assert!(bar.states.contains(lune_ui::access::State::Busy));
+    assert!(bar.value.is_none(), "indeterminate has no value");
+    assert!(answers.is_empty());
+    let dialog = find(&tree, Role::Dialog, "Update Lunegit").expect("a dialog");
+    assert_eq!((dialog.bounds.w, dialog.bounds.h), (440.0, 180.0));
+}
+
+#[test]
+fn escape_and_enter_do_nothing_while_an_update_runs() {
+    for script in [
+        scenario::update_waiting(),
+        scenario::update_applying(1000, 74),
+        scenario::update_starting(1000, 2000),
+    ] {
+        let mut s = script;
+        s.push(at(5000, Step::Key(NamedKey::Escape)));
+        s.push(at(5100, Step::Key(NamedKey::Enter)));
+        let (_, _, _, answers) = run_flow(Flow::Update, &s, 5200);
+        assert!(answers.is_empty(), "{answers:?}");
+    }
+}
+
+#[test]
+fn the_applying_screen_shows_one_fraction() {
+    let (_, _, tree, _) = run_flow(Flow::Update, &scenario::update_applying(1000, 74), 2500);
+    let bar = find(&tree, Role::Progress, "Updating").expect("a bar");
+    match &bar.value {
+        Some(Value::Number { value, .. }) => assert!((value - 74.0).abs() < 1.0, "{value}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        tree.nodes
+            .iter()
+            .any(|n| n.name == "Switching versions \u{b7} 74%"),
+        "the caption names the same percentage"
+    );
+}
+
+#[test]
+fn a_rolled_back_update_is_acknowledged_with_enter_and_not_with_escape() {
+    let base = scenario::update_rolled_back(1000, 2000, 3000);
+    let (_, _, tree, _) = run_flow(Flow::Update, &base, 4000);
+    assert!(find(&tree, Role::Button, "OK").is_some());
+    assert!(
+        tree.nodes
+            .iter()
+            .any(|n| n.name == "1.5.0 didn't start correctly, so 1.4.0 is back.")
+    );
+    let mut s = base.clone();
+    s.push(at(4100, Step::Key(NamedKey::Escape)));
+    let (_, _, _, answers) = run_flow(Flow::Update, &s, 4200);
+    assert!(answers.is_empty(), "{answers:?}");
+    let mut s = base;
+    s.push(at(4100, Step::Key(NamedKey::Enter)));
+    let (_, _, _, answers) = run_flow(Flow::Update, &s, 4200);
+    assert!(only(&answers, ChoiceValue::Acknowledge), "{answers:?}");
+}
+
+#[test]
+fn a_failed_update_closes_on_enter_and_escape_and_tabs_copy_then_close() {
+    let base = scenario::update_failed(1000, 3000, 9);
+    let (_, _, tree, _) = run_flow(Flow::Update, &base, 4000);
+    for name in ["Copy details", "Close"] {
+        assert!(find(&tree, Role::Button, name).is_some(), "{name}");
+    }
+    for key in [NamedKey::Enter, NamedKey::Escape] {
+        let mut s = base.clone();
+        s.push(at(4100, Step::Key(key)));
+        let (_, _, _, answers) = run_flow(Flow::Update, &s, 4200);
+        assert!(only(&answers, ChoiceValue::Close), "{key:?}: {answers:?}");
+    }
+    // Tab to Copy details first (it only copies), a second Tab reaches Close.
+    let mut s = base;
+    s.push(at(4100, Step::Key(NamedKey::Tab)));
+    s.push(at(4200, Step::Key(NamedKey::Tab)));
+    s.push(at(4300, Step::Key(NamedKey::Enter)));
+    let (_, _, _, answers) = run_flow(Flow::Update, &s, 4400);
+    assert!(only(&answers, ChoiceValue::Close), "{answers:?}");
+}
+
+#[test]
+fn the_update_window_is_closable_after_it_fades_out() {
+    let (player, _, _, _) = run_flow(
+        Flow::Update,
+        &scenario::update_updated(1000, 2000, 4000),
+        4100,
+    );
+    let at_ms = |ms| Duration::from_millis(ms);
+    assert!(
+        !player.model.closable(at_ms(4100), MotionTier::Full),
+        "still fading"
+    );
+    assert!(player.model.closable(at_ms(4180), MotionTier::Full));
+    assert!(
+        player.model.closable(at_ms(4000), MotionTier::Off),
+        "Off closes at once"
+    );
+    let (player, _, _, _) = run_flow(Flow::Update, &scenario::update_starting(1000, 2000), 4100);
+    assert!(
+        !player.model.closable(at_ms(9000), MotionTier::Full),
+        "not before Updated"
+    );
+}
+
+// ---- the uninstall flow ----
+
+#[test]
+fn the_uninstall_confirm_screen_answers_proceed_and_cancel() {
+    let base = scenario::uninstall_confirm(Os::Windows);
+    let (_, _, tree, _) = run_flow(Flow::Uninstall, &base, 600);
+    for name in ["Cancel", "Uninstall", "Close"] {
+        assert!(find(&tree, Role::Button, name).is_some(), "{name}");
+    }
+    assert!(
+        find(&tree, Role::Button, "Minimize").is_none(),
+        "Close only"
+    );
+    assert!(find(&tree, Role::Dialog, "Uninstall Lunegit").is_some());
+    assert!(
+        tree.nodes
+            .iter()
+            .any(|n| n.name == "Its entry in Apps & features")
+    );
+
+    let mut s = base.clone();
+    s.push(at(700, Step::Key(NamedKey::Enter)));
+    let (player, _, _, answers) = run_flow(Flow::Uninstall, &s, 800);
+    assert!(only(&answers, ChoiceValue::Proceed), "{answers:?}");
+    assert_eq!(player.model.screen(), Screen::Uninstalling);
+
+    let mut s = base.clone();
+    s.push(at(700, Step::Key(NamedKey::Escape)));
+    let (_, _, _, answers) = run_flow(Flow::Uninstall, &s, 800);
+    assert!(only(&answers, ChoiceValue::Cancel), "{answers:?}");
+
+    let mut s = base.clone();
+    s.push(at(700, Step::Click(546.0, 12.0)));
+    let (_, _, _, answers) = run_flow(Flow::Uninstall, &s, 800);
+    assert!(
+        only(&answers, ChoiceValue::Cancel),
+        "the Close caption cancels: {answers:?}"
+    );
+
+    let mut s = base;
+    s.push(at(700, Step::Key(NamedKey::Tab)));
+    s.push(at(800, Step::Key(NamedKey::Tab)));
+    s.push(at(900, Step::Key(NamedKey::Enter)));
+    let (_, _, _, answers) = run_flow(Flow::Uninstall, &s, 1000);
+    assert!(
+        only(&answers, ChoiceValue::Proceed),
+        "Tab, Tab reaches Uninstall: {answers:?}"
+    );
+}
+
+#[test]
+fn the_removing_screen_shows_one_fraction_and_the_current_step() {
+    let (_, _, tree, _) = run_flow(
+        Flow::Uninstall,
+        &scenario::uninstall_removing(Os::Windows, 1000),
+        3000,
+    );
+    let bar = find(&tree, Role::Progress, "Removing").expect("a bar");
+    match &bar.value {
+        Some(Value::Number { value, .. }) => assert!((value - 40.0).abs() < 1.0, "{value}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        tree.nodes.iter().any(|n| n.name == "Removing files"),
+        "shortcuts are done"
+    );
+    assert!(
+        find(&tree, Role::Button, "Cancel").is_none(),
+        "nothing to cancel"
+    );
+}
+
+fn done_script(n: usize) -> Vec<Timed> {
+    scenario::uninstall_done(Os::Windows, 1000, 4000, scenario::leftovers(Os::Windows, n))
+}
+
+fn rows(tree: &lune_ui::access::SemanticTree) -> usize {
+    tree.nodes
+        .iter()
+        .filter(|n| n.role == Role::StaticText && n.value.is_some())
+        .filter(|n| n.name.contains("app-1.4") || n.name.starts_with("and "))
+        .count()
+}
+
+#[test]
+fn the_done_screens_list_at_most_three_rows_and_reveal_the_first() {
+    let (_, _, none, _) = run_flow(Flow::Uninstall, &done_script(0), 5500);
+    assert!(tree_has(&none, "Nothing was left behind."));
+    assert!(find(&none, Role::Button, "Show folder").is_none());
+    assert_eq!(rows(&none), 0);
+
+    let (_, _, one, _) = run_flow(Flow::Uninstall, &done_script(1), 5500);
+    assert!(tree_has(&one, "One item was in use and was left behind:"));
+    assert_eq!(rows(&one), 1);
+    assert!(find(&one, Role::Button, "Show folder").is_some());
+
+    let (_, _, three, _) = run_flow(Flow::Uninstall, &done_script(3), 5500);
+    assert_eq!(rows(&three), 3, "three fit");
+
+    let (_, _, six, _) = run_flow(Flow::Uninstall, &done_script(6), 5500);
+    assert!(tree_has(&six, "6 items were in use and were left behind:"));
+    assert_eq!(rows(&six), 3, "two paths and 'and 4 more'");
+    assert!(tree_has(&six, "and 4 more"));
+
+    let mut s = done_script(6);
+    s.push(at(5600, Step::Key(NamedKey::Tab)));
+    s.push(at(5700, Step::Key(NamedKey::Enter)));
+    let (_, _, _, answers) = run_flow(Flow::Uninstall, &s, 5800);
+    assert!(
+        matches!(
+            answers.last(),
+            Some(UiMsg::Choice {
+                value: ChoiceValue::Reveal { index: 0 },
+                ..
+            })
+        ),
+        "{answers:?}"
+    );
+}
+
+fn tree_has(tree: &lune_ui::access::SemanticTree, name: &str) -> bool {
+    tree.nodes.iter().any(|n| n.name == name)
+}
+
+#[test]
+fn enter_and_escape_close_every_uninstall_outcome() {
+    for script in [
+        done_script(0),
+        done_script(1),
+        scenario::uninstall_failed(Os::Windows, 1000, 4000, 9),
+    ] {
+        for key in [NamedKey::Enter, NamedKey::Escape] {
+            let mut s = script.clone();
+            s.push(at(5600, Step::Key(key)));
+            let (_, _, _, answers) = run_flow(Flow::Uninstall, &s, 5700);
+            assert!(
+                matches!(
+                    answers.last(),
+                    Some(UiMsg::Choice {
+                        value: ChoiceValue::Close,
+                        ..
+                    })
+                ),
+                "{key:?}: {answers:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_failed_uninstall_has_no_retry() {
+    let (_, _, tree, _) = run_flow(
+        Flow::Uninstall,
+        &scenario::uninstall_failed(Os::Windows, 1000, 4000, 25),
+        5500,
+    );
+    assert!(find(&tree, Role::Button, "Try again").is_none());
+    for name in ["Copy details", "Close"] {
+        assert!(find(&tree, Role::Button, name).is_some(), "{name}");
+    }
+    assert!(tree_has(&tree, "Lunegit is still installed."));
+    assert!(tree_has(
+        &tree,
+        "Lunegit is still running. Close it and try again."
+    ));
+}
+
+#[test]
+fn the_rail_icon_dims_and_the_version_reads_removed_after_an_uninstall() {
+    let (_, _, tree, _) = run_flow(Flow::Uninstall, &done_script(1), 5500);
+    assert!(tree_has(&tree, "Removed"));
+    assert!(
+        tree.nodes
+            .iter()
+            .any(|n| n.name == "Step 3 of 3: Done, current")
+    );
+    let (_, _, before, _) = run_flow(
+        Flow::Uninstall,
+        &scenario::uninstall_removing(Os::Windows, 1000),
+        3000,
+    );
+    assert!(!tree_has(&before, "Removed"));
+    assert!(tree_has(&before, "Version 1.4.0"));
 }

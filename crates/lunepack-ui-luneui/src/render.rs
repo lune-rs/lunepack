@@ -21,7 +21,7 @@ use lune_ui::testing::ScriptedInput;
 use lune_ui::text::{TextCache, TextRendering, TextSystem};
 use lune_ui::ui::{FrameConfig, Ui, UiStore};
 
-use lunepack_core::ui::{ChoiceValue, EngineMsg, UiMsg};
+use lunepack_core::ui::{ChoiceValue, EngineMsg, Flow, UiMsg};
 
 use crate::model::{Env, UiModel};
 use crate::{FONT_FAMILY, fonts, look};
@@ -85,6 +85,8 @@ pub struct RenderOptions {
     pub tier: MotionTier,
     /// Device pixels per logical pixel.
     pub scale: f32,
+    /// The flow whose window is rendered (its size).
+    pub flow: Flow,
 }
 
 impl Default for RenderOptions {
@@ -93,6 +95,7 @@ impl Default for RenderOptions {
             env: Env::current(),
             tier: MotionTier::Full,
             scale: 1.0,
+            flow: Flow::Install,
         }
     }
 }
@@ -151,7 +154,8 @@ pub struct Player {
 impl Player {
     /// A window of the installer's size at `opts.scale`, with the model waiting for a hello.
     pub fn new(opts: RenderOptions) -> Player {
-        let (w, h) = look::WINDOW;
+        let m = look::Metrics::of(Some(opts.flow));
+        let (w, h) = (m.w, m.h);
         let mut input = ScriptedInput::new((w, h), opts.scale);
         input.focus(true);
         Player {
@@ -261,7 +265,8 @@ impl Renderer {
         times: &[Duration],
         opts: &RenderOptions,
     ) -> Result<Vec<RgbaImage>, RenderError> {
-        let (lw, lh) = look::WINDOW;
+        let m = look::Metrics::of(Some(opts.flow));
+        let (lw, lh) = (m.w, m.h);
         let size = ((lw * opts.scale) as u32, (lh * opts.scale) as u32);
         let mut player = Player::new(*opts);
 
