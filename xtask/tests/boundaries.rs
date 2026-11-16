@@ -39,7 +39,7 @@ undocumented_unsafe_blocks = "deny"
     fn manifest(name: &str, lints: &str, deps: &str) -> String {
         format!(
             "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
-             rust-version = \"1.88\"\nlicense = \"MIT OR Apache-2.0\"\npublish = false\n\n\
+             rust-version = \"1.90\"\nlicense = \"MIT OR Apache-2.0\"\npublish = false\n\n\
              {lints}\n[dependencies]\n{deps}"
         )
     }
@@ -1226,7 +1226,7 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         assert_has(&fx.run().1, "lunepack-http", "edition");
         let mut fx = Fx::clean();
         fx.edit("lunepack-http", |m| {
-            *m = m.replace("rust-version = \"1.88\"", "rust-version = \"1.89\"")
+            *m = m.replace("rust-version = \"1.90\"", "rust-version = \"1.89\"")
         });
         assert_has(&fx.run().1, "lunepack-http", "rust-version");
         let mut fx = Fx::clean();

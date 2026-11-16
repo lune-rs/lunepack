@@ -87,7 +87,7 @@ pub const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates
 
 const EXPECTED_EDITION: &str = "2024";
 const EXPECTED_LICENSE: &str = "MIT OR Apache-2.0";
-const EXPECTED_MSRV: (u64, u64, u64) = (1, 88, 0);
+const EXPECTED_MSRV: (u64, u64, u64) = (1, 90, 0);
 const WORKSPACE_LABEL: &str = "<workspace>";
 
 fn role_of(name: &str) -> Option<Role> {
