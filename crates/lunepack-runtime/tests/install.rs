@@ -719,3 +719,156 @@ fn a_symlink_inside_a_tree_pointing_outside_r_is_removed_not_followed() {
     );
     assert_eq!(listing(&outside), vec!["keep.txt"]);
 }
+
+// ---- tombstones (F18) -------------------------------------------------------------------------
+
+impl Lab {
+    /// A tombstone of this app id beside `R`, as an uninstall names it.
+    fn tombstone(&self, n: u8) -> PathBuf {
+        self.data
+            .join(lunepack_core::tombstone_name(&app_id(), &[n; 8]))
+    }
+
+    /// The entries of the data home that look like this app's tombstones (by prefix, so a near
+    /// miss counts too).
+    fn tombstones(&self) -> Vec<String> {
+        let prefix = format!(".{SUITE_APP_ID}.removing-");
+        let mut names: Vec<String> = std::fs::read_dir(&self.data)
+            .map(|entries| {
+                entries
+                    .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(&prefix))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// What an uninstall cut off inside its tombstone removal leaves: the integration removed,
+    /// `R` renamed to a tombstone, and part of the tombstone removed (its `state` first; `versions`
+    /// half gone, a link pointing outside still inside). Returns the tombstone.
+    fn cut_off_uninstall(&self) -> PathBuf {
+        std::fs::remove_file(self.desktop_entry()).expect("desktop entry");
+        std::fs::remove_file(self.bin_link()).expect("bin link");
+        let tomb = self.tombstone(7);
+        std::fs::rename(&self.root, &tomb).expect("rename");
+        std::fs::remove_dir_all(tomb.join("state")).expect("state");
+        std::fs::remove_dir_all(tomb.join("versions").join(V100).join("share")).expect("share");
+        symlink(self.base.join("outside"), tomb.join("versions/link-out")).expect("link");
+        tomb
+    }
+}
+
+fn write_outside(lab: &Lab) {
+    write_file(&lab.base.join("outside/keep.txt"), b"keep me\n", false);
+}
+
+fn assert_outside_kept(lab: &Lab) {
+    assert_eq!(
+        std::fs::read(lab.base.join("outside/keep.txt")).expect("kept"),
+        b"keep me\n"
+    );
+}
+
+fn assert_installed(lab: &Lab) {
+    let record = lab.record().expect("record");
+    assert_eq!(record.current.expect("current").version.to_string(), V100);
+    assert_eq!(
+        std::fs::read_link(lab.root.join("current")).expect("current"),
+        Path::new("versions/1.0.0")
+    );
+    assert!(exists(&lab.bin_link()) && exists(&lab.desktop_entry()));
+}
+
+#[test]
+fn uninstall_goes_through_a_tombstone_and_leaves_none() {
+    let lab = Lab::new();
+    lab.installed();
+    let run = lab.run(&lab.installed_runtime(), "uninstall");
+    assert_eq!(run.code, EXIT_OK, "{run:?}");
+    run.assert_no_path(&lab);
+    assert!(!exists(&lab.root));
+    assert_eq!(lab.tombstones(), Vec::<String>::new());
+    // The data home holds nothing of the app.
+    assert_eq!(listing(&lab.data), vec!["applications"]);
+    // A reinstall works.
+    lab.installed();
+    assert_installed(&lab);
+}
+
+#[test]
+fn an_uninstall_cut_off_inside_the_tombstone_removal_is_recovered_by_reinstall() {
+    let lab = Lab::new();
+    lab.installed();
+    write_outside(&lab);
+    let tomb = lab.cut_off_uninstall();
+    assert!(!exists(&lab.root));
+
+    let run = lab.install();
+    assert_eq!(run.code, EXIT_OK, "reinstall: {run:?}");
+    assert_installed(&lab);
+    assert!(!exists(&tomb), "the tombstone stayed");
+    assert_eq!(lab.tombstones(), Vec::<String>::new());
+    assert_outside_kept(&lab);
+
+    // And the reinstalled app uninstalls.
+    let run = lab.run(&lab.installed_runtime(), "uninstall");
+    assert_eq!(run.code, EXIT_OK, "{run:?}");
+    assert!(!exists(&lab.root));
+    assert_eq!(lab.tombstones(), Vec::<String>::new());
+}
+
+#[test]
+fn a_leftover_tombstone_beside_an_empty_root_does_not_stop_install() {
+    let lab = Lab::new();
+    write_outside(&lab);
+    std::fs::create_dir_all(&lab.root).expect("empty R");
+    let tomb = lab.tombstone(9);
+    write_file(&tomb.join("versions/1.0.0/bin/app"), b"old\n", true);
+    symlink(lab.base.join("outside"), tomb.join("link-out")).expect("link");
+
+    let run = lab.install();
+    assert_eq!(run.code, EXIT_OK, "{run:?}");
+    assert_installed(&lab);
+    assert!(!exists(&tomb));
+    assert_outside_kept(&lab);
+}
+
+#[test]
+fn uninstall_removes_a_leftover_tombstone_and_nothing_else_beside_r() {
+    let lab = Lab::new();
+    lab.installed();
+    write_outside(&lab);
+    // A cut-off uninstall's tombstone of an earlier install of this app.
+    let old = lab.tombstone(1);
+    write_file(&old.join("versions/0.9.0/bin/app"), b"old\n", true);
+    symlink(lab.base.join("outside"), old.join("link-out")).expect("link");
+    // Not ours: another app's tombstone, a near miss, and a symlink at a tombstone name.
+    let theirs = lab.data.join(lunepack_core::tombstone_name(
+        &AppId::parse("org.other").expect("id"),
+        &[1; 8],
+    ));
+    write_file(&theirs.join("x"), b"theirs\n", false);
+    let near = lab.data.join(format!(".{SUITE_APP_ID}.removing-0101"));
+    write_file(&near.join("x"), b"near\n", false);
+    let link = lab.tombstone(2);
+    symlink(lab.base.join("outside"), &link).expect("tombstone-named link");
+
+    let run = lab.run(&lab.installed_runtime(), "uninstall");
+    assert_eq!(run.code, EXIT_OK, "{run:?}");
+    assert!(!exists(&lab.root) && !exists(&old));
+    assert_eq!(
+        std::fs::read(theirs.join("x")).expect("theirs"),
+        b"theirs\n"
+    );
+    assert_eq!(std::fs::read(near.join("x")).expect("near"), b"near\n");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("link")
+            .file_type()
+            .is_symlink()
+    );
+    assert_outside_kept(&lab);
+    assert_eq!(listing(&lab.base.join("outside")), vec!["keep.txt"]);
+}

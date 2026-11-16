@@ -8,15 +8,20 @@
 //! - a real directory (not a symlink) whose canonical path is itself;
 //! - holding, under its lock, an install record of this app id.
 //!
-//! Any mismatch refuses with nothing deleted. With the lock held, a process other than this one
-//! that runs from `R` (its executable, working directory, mapped or open files) refuses too.
-//! Then the desktop integration is removed (only what carries lunepack's marker, or a command
-//! link into `R/current/`; anything else is kept and reported), and `R` is removed without
-//! following a symlink: a link inside a tree is removed, never what it points to.
+//! Any mismatch refuses with nothing deleted. Once `R` is the derived one, what an earlier
+//! uninstall cut off before its end left beside it (tombstones of this app id, F18) is removed.
+//! With the lock held, a process other than this one that runs from `R` (its executable, working
+//! directory, mapped or open files) refuses. Then the desktop integration is removed (only what
+//! carries lunepack's marker, or a command link into `R/current/`; anything else is kept and
+//! reported), `R` is renamed to a fresh tombstone beside it, `.<app id>.removing-<random>`, and the
+//! tombstone is removed without following a symlink: a link inside a tree is removed, never what
+//! it points to. A cut-off run so leaves `R` whole (rerun the uninstall) or gone (a reinstall works,
+//! and the next install or uninstall removes the tombstone), never half removed.
 
 use std::path::Path;
 
 use lunepack::{FileKind, Installation, IntegrationRequest, Phase, ProcessId, Version};
+use lunepack_core::layout::TOMBSTONE_RANDOM_BYTES;
 use lunepack_core::state::{Scope, UserScope};
 
 use crate::apply::{LOCK_WAIT, lock_retry};
@@ -88,6 +93,8 @@ fn uninstall(
     if root != data_home.join(inst.app_id().as_str()) || !real_canonical_dir(ad, root) {
         return Err(Kind::InstallMismatch);
     }
+    // Best effort: a tombstone is never `R`, so one that stays changes nothing here.
+    let _ = lunepack_core::remove_tombstones(&*ad.fs, data_home, inst.app_id());
 
     let guard = lock_retry(ad, &layout.state_dir(), LOCK_WAIT).map_err(|e| Kind::of(&e))?;
     let store = UserScope {
@@ -141,13 +148,26 @@ fn uninstall(
         events.emit(&Event::warning(Warning::IntegrationKept, None));
     }
 
+    // `R` leaves its path in one rename (F18), under the lock; the tombstone is beside it in the
+    // data home, so on the same filesystem. Its removal can then be cut off without leaving a
+    // half-removed `R`.
+    let mut random = [0u8; TOMBSTONE_RANDOM_BYTES];
+    ad.rng.fill(&mut random).map_err(|e| Kind::of(&e.into()))?;
+    let tombstone = data_home.join(lunepack_core::tombstone_name(inst.app_id(), &random));
     ad.fs
-        .remove_dir_all_nofollow(root)
+        .rename(root, &tombstone)
         .map_err(|e| Kind::of(&e.into()))?;
+    let _ = ad.fs.sync_dir(data_home);
+    let removed = ad.fs.remove_dir_all_nofollow(&tombstone);
     drop(guard);
-    if let Some(parent) = root.parent() {
-        let _ = ad.fs.sync_dir(parent);
+    // A failure is one only while the tombstone is still there (another run's tombstone cleanup
+    // may have removed it under this one).
+    if let Err(e) = removed
+        && !matches!(ad.fs.symlink_metadata(&tombstone), Ok(None))
+    {
+        return Err(Kind::of(&e.into()));
     }
+    let _ = ad.fs.sync_dir(data_home);
     Ok(leftovers)
 }
 

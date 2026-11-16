@@ -951,7 +951,8 @@ impl Updater {
     /// 1. the bootstrap's update config must name this app; its desktop integration passes the
     ///    preflight, and an install root that already exists must be lunepack's (empty, this
     ///    app's install state, or what a cut-off run left; else [`Error::ForeignInstallRoot`]),
-    ///    before anything is written;
+    ///    before anything is written; then, when the install root is `<parent>/<app id>`, what an
+    ///    uninstall cut off before its end left beside it (its tombstones, F18) is removed;
     /// 2. the install state is created when there is none (a fresh install id from the random
     ///    source); a record with no current version resumes, one with a current version is
     ///    [`Error::AlreadyInstalled`] once `current` is put back from it (a run cut off after its
@@ -1584,13 +1585,27 @@ fn already_installed(fs: &dyn Fs, root: &Path, record: &InstallState) -> Error {
     }
 }
 
+/// Removes the tombstones an uninstall cut off before its end left beside `root` (F18), when
+/// `root` is `<parent>/<app id>` (the derivation of M5-D2; tombstones are named after the app id
+/// only and never sit anywhere else). Best effort: a tombstone is never the install root, so one
+/// that stays changes nothing about the install and the next install or uninstall tries again.
+fn clear_tombstones(inner: &Inner, root: &Path) {
+    if let Some(parent) = root.parent()
+        && root.file_name().is_some_and(|n| n == inner.app_id.as_str())
+    {
+        let _ = lunepack_core::remove_tombstones(&*inner.fs, parent, &inner.app_id);
+    }
+}
+
 /// Whether the first install may take over `root`, its install root (S2): `root` does not exist
 /// yet, or is a real directory that is empty, or whose `state` directory (`state_dir`) holds a
 /// record of this app id, or that holds only what a run cut off before its first record leaves
 /// (a `state` directory with nothing but the lock and record files). Anything else (the app's own
 /// user data from before lunepack, another packaging's directory, a shared directory, a symlink)
 /// is [`Error::ForeignInstallRoot`]: uninstall removes `root` whole, so it must hold nothing
-/// lunepack did not make. Reads only; it runs before the install's first write.
+/// lunepack did not make. Reads only. An uninstall renames `root` to a tombstone beside it before
+/// removing it (F18), so a cut-off uninstall leaves `root` whole or absent, never half removed;
+/// a tombstone is never looked at here.
 fn adoptable(inner: &Inner, root: &Path, state_dir: &Path) -> Result<(), Error> {
     match inner.fs.symlink_metadata(root) {
         Ok(None) => return Ok(()),
@@ -1684,13 +1699,15 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
     let cancel = options.cancel.clone().unwrap_or_default();
 
     // The bootstrap's config, the integration preflight and the root's owner, before the first
-    // write (the lock is the first).
+    // write to the install (the lock is the first); only an earlier uninstall's tombstones beside
+    // the root are removed in between (F18).
     let boot_root = root.clone();
     let boot_state = state_dir.clone();
     let (target, boot_version) = on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
         let config = tree_config(&*inner.fs, &inner.app_id, &bootstrap)?;
         let request = integration_request(&inner.app_id, &boot_root, config.install.clone());
         inner.integration.check(Scope::User, &request)?;
+        clear_tombstones(inner, &boot_root);
         adoptable(inner, &boot_root, &boot_state)?;
         Ok((config.target, config.version))
     })

@@ -1242,6 +1242,47 @@ fn install_takes_over_an_empty_root_or_a_cut_off_runs_lock() {
     common::workers_stopped();
 }
 
+/// F18: an uninstall renames `R` to a tombstone beside it before removing it; what a cut-off one
+/// left is removed by the next install, with `R` absent or empty, and nothing else beside `R` is.
+#[test]
+fn install_removes_a_cut_off_uninstalls_tombstones_and_nothing_else() {
+    let _serial = common::serial();
+    for empty_root in [false, true] {
+        let lab = Lab::new();
+        publish_with_config(&lab, 1, V100);
+        let boot = bootstrap(&lab, V100);
+        let home = abs_path(DATA_HOME);
+        let tomb = home.join(lunepack_core::tombstone_name(&app_id(), &[7; 8]));
+        write_file(&lab.fs, &tomb.join("versions/0.9.0/bin/app"), b"old");
+        let near = home.join(format!(".{}.removing-07", app_id().as_str()));
+        write_file(&lab.fs, &near.join("x"), b"near");
+        let theirs = home.join(lunepack_core::tombstone_name(
+            &lunepack_core::AppId::parse("org.other").expect("id"),
+            &[7; 8],
+        ));
+        write_file(&lab.fs, &theirs.join("x"), b"theirs");
+        if empty_root {
+            lab.fs.create_dir_all(&root_dir()).expect("R");
+        }
+
+        install(&lab, &boot).unwrap_or_else(|e| panic!("empty R {empty_root}: {e}"));
+        assert_eq!(
+            lab.record().current.expect("current").version,
+            version(V100)
+        );
+        assert_eq!(lab.fs.symlink_metadata(&tomb).expect("lstat"), None);
+        assert_eq!(
+            lab.fs.read_capped(&near.join("x"), 64).expect("near"),
+            b"near"
+        );
+        assert_eq!(
+            lab.fs.read_capped(&theirs.join("x"), 64).expect("theirs"),
+            b"theirs"
+        );
+    }
+    common::workers_stopped();
+}
+
 #[test]
 fn an_integration_conflict_stops_install_before_anything_is_written() {
     let _serial = common::serial();
