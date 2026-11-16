@@ -17,7 +17,10 @@ use std::sync::{Condvar, Mutex, PoisonError};
 
 use anyhow::{Context, Result, anyhow, bail};
 use lunepack_core::path::MAX_PATH_DEPTH;
-use lunepack_core::update_config::{RUNTIME_FILE, RUNTIME_FILE_WINDOWS, config_path, runtime_file};
+use lunepack_core::update_config::{
+    RUNTIME_FILE, RUNTIME_FILE_WINDOWS, UI_FILE, UI_FILE_WINDOWS, config_path, runtime_file,
+    ui_file,
+};
 use lunepack_core::{
     CodeSign, Codec, CodecId, Encoder, EntryKind, Hasher, InstallMeta, ManifestDocument,
     PackedFile, RelPath, ReleaseLayout, Sha256Digest, Target, UPDATE_CONFIG_FILE, pack_file,
@@ -129,8 +132,9 @@ fn make_symlink(_text: &str, at: &Path) -> Result<()> {
     )
 }
 
-/// What a pack with `[update]` adds to the tree (M5-D7): the runtime beside the entry and the
-/// update configuration at its fixed place (FORMAT.md 13.1).
+/// What a pack with `[update]` adds to the tree (M5-D7): the runtime beside the entry, the UI
+/// binary beside it when `--ui` is given (M6), and the update configuration at its fixed place
+/// (FORMAT.md 13.1).
 pub struct UpdatePlan<'a> {
     /// The target of the pack.
     pub target: Target,
@@ -138,6 +142,8 @@ pub struct UpdatePlan<'a> {
     pub install: &'a InstallMeta,
     /// The runtime's bytes, already checked against the target.
     pub runtime: &'a [u8],
+    /// The UI binary's bytes, already checked against the target; absent without `--ui`.
+    pub ui: Option<&'a [u8]>,
     /// The update configuration's canonical bytes.
     pub config: &'a [u8],
 }
@@ -149,8 +155,9 @@ fn parent_of(path: &str) -> &str {
 
 /// Fails when the input holds a name the update setup reserves (M5-D17): the configuration's file
 /// name at any depth, so nothing can shadow the root's in the nearest-ancestor discovery, or the
-/// runtime's name (either form) in the entry's directory. Names compare ignoring ASCII case, as a
-/// case-insensitive file system would.
+/// runtime's or the UI's name (either form) in the entry's directory. The UI's name is reserved
+/// whether or not `--ui` is given, since the runtime starts a UI from its own directory. Names
+/// compare ignoring ASCII case, as a case-insensitive file system would.
 pub fn check_reserved(input: &Path, entry: &RelPath) -> Result<()> {
     let entry_dir = parent_of(entry.as_str());
     for (path, ..) in walk(input)? {
@@ -161,14 +168,18 @@ pub fn check_reserved(input: &Path, entry: &RelPath) -> Result<()> {
                 "the input tree holds {text:?}; the name {UPDATE_CONFIG_FILE} is reserved for the update configuration at any depth"
             );
         }
-        if parent_of(text) == entry_dir
-            && [RUNTIME_FILE, RUNTIME_FILE_WINDOWS]
-                .iter()
-                .any(|r| name.eq_ignore_ascii_case(r))
-        {
-            bail!(
-                "the input tree holds {text:?}; the name {RUNTIME_FILE} is reserved for the runtime beside the entry"
-            );
+        if parent_of(text) == entry_dir {
+            for (reserved, what) in [
+                ([RUNTIME_FILE, RUNTIME_FILE_WINDOWS], "the runtime"),
+                ([UI_FILE, UI_FILE_WINDOWS], "the UI"),
+            ] {
+                if reserved.iter().any(|r| name.eq_ignore_ascii_case(r)) {
+                    bail!(
+                        "the input tree holds {text:?}; the name {} is reserved for {what} beside the entry",
+                        reserved[0]
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -225,9 +236,9 @@ fn write_new(path: &Path, bytes: &[u8], _exec: bool) -> Result<()> {
         .with_context(|| format!("cannot write {}", path.display()))
 }
 
-/// Checks the entry and icon in the assembled tree at `tree`, then places the runtime beside the
-/// entry and the update configuration at its fixed path (M5-D7). Runs after `assemble` and before
-/// code signing, so both files are signed, hashed and packed like the app's own.
+/// Checks the entry and icon in the assembled tree at `tree`, then places the runtime, and the UI
+/// when given, beside the entry and the update configuration at its fixed path (M5-D7). Runs after
+/// `assemble` and before code signing, so every file is signed, hashed and packed like the app's own.
 pub fn place_update(tree: &Path, plan: &UpdatePlan<'_>) -> Result<()> {
     let install = plan.install;
     let meta = regular_file_in(tree, &install.entry, "install.entry")?;
@@ -242,12 +253,14 @@ pub fn place_update(tree: &Path, plan: &UpdatePlan<'_>) -> Result<()> {
         regular_file_in(tree, icon, "install.icon")?;
     }
     let dir = parent_of(install.entry.as_str());
-    let mut runtime = tree.to_path_buf();
+    let mut beside = tree.to_path_buf();
     if !dir.is_empty() {
-        runtime.push(dir);
+        beside.push(dir);
     }
-    runtime.push(runtime_file(plan.target));
-    write_new(&runtime, plan.runtime, true)?;
+    write_new(&beside.join(runtime_file(plan.target)), plan.runtime, true)?;
+    if let Some(ui) = plan.ui {
+        write_new(&beside.join(ui_file(plan.target)), ui, true)?;
+    }
     let config = tree.join(config_path(plan.target));
     if let Some(parent) = config.parent() {
         fs::create_dir_all(parent)

@@ -19,8 +19,8 @@ use lunepack_core::error::UpdateConfigError;
 use lunepack_core::{
     AppId, ArtifactRef, Channel, ClockReading, CodeSign, Hasher, InstallMeta, PayloadKind,
     ReleaseDoc, ReleaseLayout, RollbackFloor, Signer, Target, UpdateConfig, VerifiedEntry,
-    VerifiedKeySet, Version, check_runtime_image, decode_verified, next_feed, sign_envelope,
-    verify_feed, verify_manifest,
+    VerifiedKeySet, Version, check_runtime_image, check_ui_image, decode_verified, next_feed,
+    sign_envelope, verify_feed, verify_manifest,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
@@ -33,6 +33,8 @@ use crate::release_dir;
 pub const WORK_PREFIX: &str = "lunepack-pack-";
 /// Largest `--runtime` file read, in bytes.
 const MAX_RUNTIME_BYTES: u64 = 256 * 1024 * 1024;
+/// Largest `--ui` file read, in bytes.
+const MAX_UI_BYTES: u64 = 64 * 1024 * 1024;
 /// Default memory budget of the pack stage, in MiB.
 const DEFAULT_BUDGET_MIB: u64 = 2048;
 /// The channel of the throwaway feed the self-check signs; never written anywhere.
@@ -71,6 +73,10 @@ pub struct PackArgs {
     /// refused without it.
     #[arg(long)]
     runtime: Option<PathBuf>,
+    /// The UI binary to place beside the runtime; needs `--runtime` and `[update]`, and is refused
+    /// without them. Optional: without it the UI is absent and the app runs headless.
+    #[arg(long)]
+    ui: Option<PathBuf>,
 }
 
 fn say(line: &str) -> Result<()> {
@@ -234,6 +240,7 @@ fn self_verify(
 struct Prepared {
     install: InstallMeta,
     runtime: Vec<u8>,
+    ui: Option<Vec<u8>>,
     config: Vec<u8>,
 }
 
@@ -252,30 +259,31 @@ fn config_error(e: UpdateConfigError) -> anyhow::Error {
     }
 }
 
-fn read_runtime(path: &Path) -> Result<Vec<u8>> {
+/// Reads the file named by `flag` (`--runtime` or `--ui`), refusing a non-regular file and one
+/// over `cap` bytes.
+fn read_capped(path: &Path, flag: &str, cap: u64) -> Result<Vec<u8>> {
     // Classified before opening: a FIFO blocks on open.
     let meta = fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
     if !meta.is_file() {
-        bail!("--runtime {} is not a regular file", path.display());
+        bail!("{flag} {} is not a regular file", path.display());
     }
     let mut bytes = Vec::new();
     fs::File::open(path)
-        .and_then(|f| f.take(MAX_RUNTIME_BYTES + 1).read_to_end(&mut bytes))
+        .and_then(|f| f.take(cap + 1).read_to_end(&mut bytes))
         .with_context(|| format!("cannot read {}", path.display()))?;
-    if bytes.len() as u64 > MAX_RUNTIME_BYTES {
-        bail!(
-            "--runtime {} is over {MAX_RUNTIME_BYTES} bytes",
-            path.display()
-        );
+    if bytes.len() as u64 > cap {
+        bail!("{flag} {} is over {cap} bytes", path.display());
     }
     Ok(bytes)
 }
 
 /// M5-D7: with `[update]` the runtime is required and the update config is written for this
-/// version and target; without it `--runtime` is refused. Every check that needs no tree runs here.
+/// version and target; without it `--runtime` is refused. `--ui` (M6) needs both and is refused
+/// without them. Every check that needs no tree runs here.
 fn prepare_update(
     config: &Config,
     runtime: Option<&Path>,
+    ui: Option<&Path>,
     version: &Version,
     target: Target,
 ) -> Result<Option<Prepared>> {
@@ -283,9 +291,15 @@ fn prepare_update(
         if runtime.is_some() {
             bail!("--runtime needs [update] and [install] in the config");
         }
+        if ui.is_some() {
+            bail!("--ui needs [update] and [install] in the config");
+        }
         return Ok(None);
     };
     let Some(runtime) = runtime else {
+        if ui.is_some() {
+            bail!("--ui needs --runtime");
+        }
         bail!("--runtime is required when the config has [update]");
     };
     let root = config.trusted_root(&Sha256Hasher, &Ed25519Verifier)?;
@@ -301,13 +315,22 @@ fn prepare_update(
     .map_err(config_error)?;
     // The authoritative check, the one the facade runs before any request: the URL parser agrees.
     lunepack::check_config_feed(&document.feed).map_err(config_error)?;
-    let bytes = read_runtime(runtime)?;
+    let bytes = read_capped(runtime, "--runtime", MAX_RUNTIME_BYTES)?;
     check_runtime_image(&bytes, target)
         .map_err(|e| anyhow!("--runtime is not a runtime for {}: {e}", target.as_str()))?;
+    let ui = ui
+        .map(|path| {
+            let bytes = read_capped(path, "--ui", MAX_UI_BYTES)?;
+            check_ui_image(&bytes, target)
+                .map_err(|e| anyhow!("--ui is not a UI for {}: {e}", target.as_str()))?;
+            Ok::<_, anyhow::Error>(bytes)
+        })
+        .transpose()?;
     Ok(Some(Prepared {
         install: document.install.clone(),
         config: document.to_bytes().map_err(config_error)?,
         runtime: bytes,
+        ui,
     }))
 }
 
@@ -332,7 +355,13 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         );
     }
 
-    let prepared = prepare_update(&config, args.runtime.as_deref(), &version, target)?;
+    let prepared = prepare_update(
+        &config,
+        args.runtime.as_deref(),
+        args.ui.as_deref(),
+        &version,
+        target,
+    )?;
 
     let clock = writer_clock()?;
     let now = clock.now_unix_secs();
@@ -380,6 +409,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
             target,
             install: &p.install,
             runtime: &p.runtime,
+            ui: p.ui.as_deref(),
             config: &p.config,
         }),
     };

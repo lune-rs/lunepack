@@ -33,6 +33,10 @@ pub const UPDATE_CONFIG_PATH_MACOS: &str = "Contents/Resources/lunepack-update.j
 pub const RUNTIME_FILE: &str = "lunepack-runtime";
 /// The runtime's file name on Windows targets.
 pub const RUNTIME_FILE_WINDOWS: &str = "lunepack-runtime.exe";
+/// The UI binary's file name on Linux and macOS targets, beside the runtime (M6-D1).
+pub const UI_FILE: &str = "lunepack-ui";
+/// The UI binary's file name on Windows targets.
+pub const UI_FILE_WINDOWS: &str = "lunepack-ui.exe";
 /// Largest config document in bytes.
 pub const MAX_UPDATE_CONFIG_BYTES: u64 = 64 * 1024;
 /// Longest feed string in bytes.
@@ -91,6 +95,15 @@ pub fn runtime_file(target: Target) -> &'static str {
         RUNTIME_FILE_WINDOWS
     } else {
         RUNTIME_FILE
+    }
+}
+
+/// The UI binary's file name on `target`.
+pub fn ui_file(target: Target) -> &'static str {
+    if target.is_windows() {
+        UI_FILE_WINDOWS
+    } else {
+        UI_FILE
     }
 }
 
@@ -406,16 +419,20 @@ fn read_install(value: Value) -> Result<InstallMeta, UpdateConfigError> {
     })
 }
 
-/// `install.entry`: a path (10.1) whose file name is not the runtime's (either target's form) and
-/// with no component named like the config file. Names are compared ignoring ASCII case, since a
-/// case-insensitive file system would make them the same file.
+/// `install.entry`: a path (10.1) whose file name is not the runtime's or the UI's (either target's
+/// form) and with no component named like the config file. Names are compared ignoring ASCII case,
+/// since a case-insensitive file system would make them the same file.
 fn check_entry(text: &str) -> Result<RelPath, UpdateConfigError> {
     let path =
         validate_path(text).map_err(|_| invalid("install.entry", "is not a tree path (10.1)"))?;
     check_reserved(&path, "install.entry")?;
     let file = path.components().last().unwrap_or_default();
-    if file.eq_ignore_ascii_case(RUNTIME_FILE) || file.eq_ignore_ascii_case(RUNTIME_FILE_WINDOWS) {
-        return Err(invalid("install.entry", "is the runtime's file name"));
+    let reserved = [RUNTIME_FILE, RUNTIME_FILE_WINDOWS, UI_FILE, UI_FILE_WINDOWS];
+    if reserved.iter().any(|r| file.eq_ignore_ascii_case(r)) {
+        return Err(invalid(
+            "install.entry",
+            "is the runtime's or the UI's file name",
+        ));
     }
     Ok(path)
 }

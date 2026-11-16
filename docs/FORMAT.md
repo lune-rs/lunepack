@@ -1106,7 +1106,7 @@ members; an unknown member makes the document invalid (13.7).
 
 | Member | Type | Rule |
 |---|---|---|
-| `entry` | string | the executable the runtime launches: a path (10.1) of at most 32 components; its file name is not `lunepack-runtime` or `lunepack-runtime.exe`, and no component is `lunepack-update.json` (both compared ignoring ASCII case). The packager checks that it is a file with `exec` |
+| `entry` | string | the executable the runtime launches: a path (10.1) of at most 32 components; its file name is not `lunepack-runtime`, `lunepack-runtime.exe`, `lunepack-ui` or `lunepack-ui.exe`, and no component is `lunepack-update.json` (all compared ignoring ASCII case). The packager checks that it is a file with `exec` |
 | `name` | string | the display name: 1 to 128 Unicode scalar values |
 | `comment` | string or null | a one-line description: 0 to 512 Unicode scalar values |
 | `icon` | string or null | a PNG or SVG file in the tree: a path as for `entry`, ending in `.png` or `.svg` (ignoring ASCII case) |
