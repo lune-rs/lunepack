@@ -67,3 +67,7 @@ url = "2"
 # UI adapter (M6 step 1, D39 (b)): LuneUI as a git dependency pinned to a commit (the v0.7.0 tag).
 # The boundary check allows exactly this source and confines it to lunepack-ui-luneui.
 lune-ui = { git = "https://github.com/lune-rs/luneui-rs", rev = "cbeae0109f970eaede7f1826414f139bb8eace65", features = ["accesskit"] }
+# The same crates LuneUI itself uses, for the UI adapter's headless render (wgpu's texture format) and
+# its icon decoder (png); both are already in LuneUI's graph, so the lock gains no package.
+wgpu = "30"
+png = "0.18"
