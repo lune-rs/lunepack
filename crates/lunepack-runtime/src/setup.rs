@@ -11,7 +11,7 @@
 //! Then, in order: the payload is verified under the trailer's root ([`verify_setup`]: the key set,
 //! the manifest with no feed, the whole pack, the update config read from the pack naming exactly
 //! that root); when a UI may start, `lunepack-ui` is read out of the pack through its signed frame
-//! ([`read_entry`]) into a fresh private directory under the app's cache (M6-D7) and started from
+//! ([`read_entry`](lunepack_core::read_entry)) into a fresh private directory under the app's cache (M6-D7) and started from
 //! there; the welcome prompt (name, version, publisher, location and size, all from the verified
 //! manifest and config); [`lunepack::Updater::install_from_payload`] (the commit and the desktop
 //! integration); the done prompt, whose `finish{launch:true}` starts the installed entry. The UI's
@@ -21,7 +21,6 @@
 //! Nothing from the payload runs, or is written anywhere, before its signature or hash checked.
 
 use std::ffi::OsString;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,11 +33,10 @@ use lunepack::{
     Version,
 };
 use lunepack_core::setup::{
-    MAX_SETUP_UI_BYTES, SetupPart, SetupTrailer, TRAILER_SIZE, VerifiedSetup, has_magic,
-    verify_setup,
+    SetupPart, SetupTrailer, TRAILER_SIZE, VerifiedSetup, has_magic, verify_setup,
 };
 use lunepack_core::ui::{ChoiceValue, Outcome, PromptKind, StepItem};
-use lunepack_core::{ClockReading, Hasher, Verifier, read_entry};
+use lunepack_core::{ClockReading, Hasher, Verifier};
 
 use crate::events::{Event, Events, Warning};
 use crate::modes::{Adapters, Kind};
@@ -239,7 +237,11 @@ fn extract_ui(
     own: lunepack::ProcessId,
     alive: Alive<'_>,
 ) -> Option<PathBuf> {
+    use std::io::Write as _;
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    use lunepack_core::read_entry;
+    use lunepack_core::setup::MAX_SETUP_UI_BYTES;
 
     let trailer = &prepared.found.trailer;
     let app = trailer.root.app_id().as_str();
