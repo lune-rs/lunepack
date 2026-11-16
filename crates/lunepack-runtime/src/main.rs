@@ -18,6 +18,7 @@ mod events;
 mod gc;
 mod install;
 mod modes;
+mod setup;
 mod ui_host;
 mod uninstall;
 
@@ -39,6 +40,11 @@ fn main() -> ExitCode {
     // so the parent cannot have exited and had its pid reused by the time the target is read.
     let parent = initial_parent();
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // A setup file (M6 step 7) is this runtime with a payload and a trailer at its end; that is
+    // looked at before the command line, and a runtime without the trailer goes on unchanged.
+    if let Some(kind) = setup_mode(&args) {
+        return ExitCode::from(kind.code());
+    }
     let mode = match modes::parse(&args) {
         Ok(mode) => mode,
         Err(modes::UsageError) => {
@@ -279,6 +285,95 @@ fn fail(command: &'static str, kind: Kind) -> Kind {
     kind
 }
 
+/// Setup mode (M6 step 7): `None` when this executable carries no setup trailer (the ordinary
+/// runtime), else the run's exit kind. A trailer that is malformed is `verify`; a command line
+/// other than nothing or `--silent` is a usage error.
+#[cfg(target_os = "linux")]
+fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
+    use lunepack::Process as _;
+
+    let process = lunepack_os_linux::LinuxProcess::new();
+    let exe = process.current_exe().ok()?;
+    let found = match setup::detect(
+        &lunepack_fs::StdFs::new(),
+        &exe,
+        &lunepack_crypto::Sha256Hasher,
+        &lunepack_crypto::Ed25519Verifier,
+    ) {
+        setup::Detect::None => return None,
+        setup::Detect::Malformed => {
+            conclude(stderr_events(), &setup::failed(Kind::Verify, None));
+            return Some(Kind::Verify);
+        }
+        setup::Detect::Setup(found) => found,
+    };
+    let Ok(silent) = modes::parse_setup(args) else {
+        eprintln!("{USAGE_LINE}");
+        return Some(Kind::Usage);
+    };
+    Some(run(|ad| {
+        let data_home = match data_home() {
+            Ok(dir) => dir,
+            Err(kind) => return headless_fail(setup::COMMAND, kind),
+        };
+        let env = |name: &str| std::env::var_os(name);
+        let want_ui = ui_host::ui_wanted(silent, &env);
+        let own = process.process_id(std::process::id()).ok().flatten();
+        let alive = |pid: u32, start: u64| {
+            // A process that cannot be read counts as running: its directory is kept.
+            match process.process_id(pid) {
+                Ok(Some(id)) => id.start_ticks == start,
+                Ok(None) => false,
+                Err(_) => true,
+            }
+        };
+        let cache = setup::cache_home(&env);
+        let prepared = match setup::prepare(
+            ad,
+            found,
+            &data_home,
+            cache.as_deref(),
+            want_ui,
+            own,
+            &alive,
+        ) {
+            Ok(prepared) => prepared,
+            Err(kind) => return headless_fail(setup::COMMAND, kind),
+        };
+        let (app, details) = setup::welcome(&prepared);
+        let ui = match prepared.ui_dir() {
+            // The UI was read out of the verified pack into this run's own directory (M6-D7); the
+            // host starts it from there as it starts the one beside an installed runtime.
+            Some(dir) => UiHost::start(
+                &ui_host::Start {
+                    process: std::sync::Arc::clone(&ad.process),
+                    fs: &*ad.fs,
+                    runtime_exe: &dir.join("lunepack-runtime"),
+                    env: &env,
+                    quiet: silent,
+                },
+                Flow::Install,
+                app,
+                details,
+            ),
+            None => UiHost::headless(Flow::Install),
+        };
+        let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
+        ui.report(&events);
+        let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui);
+        ui.close(&events);
+        prepared.cleanup(&*ad.fs);
+        conclude(events, &last);
+        kind
+    }))
+}
+
+/// Setup files are Linux-only in this release (M7 and M8 take theirs).
+#[cfg(not(target_os = "linux"))]
+fn setup_mode(_args: &[std::ffi::OsString]) -> Option<Kind> {
+    None
+}
+
 /// Runs `body` on the native adapters.
 #[cfg(target_os = "linux")]
 fn run(body: impl FnOnce(&modes::Adapters) -> Kind) -> Kind {
@@ -290,10 +385,12 @@ fn run(body: impl FnOnce(&modes::Adapters) -> Kind) -> Kind {
     let integration: Arc<dyn lunepack::OsIntegration> =
         Arc::new(lunepack_os_linux::XdgIntegration::from_process_env());
     let rng: Arc<dyn lunepack::Rng> = Arc::new(lunepack_crypto::OsRng);
+    let verifier: Arc<dyn lunepack::Verifier> = Arc::new(lunepack_crypto::Ed25519Verifier);
+    let codec: Arc<dyn lunepack::Codec> = Arc::new(lunepack_codec_lzma::LzmaCodec);
     let platform = lunepack::Platform::native()
         .with_fs(Arc::clone(&fs))
         .with_hasher(Arc::clone(&hasher))
-        .with_verifier(Arc::new(lunepack_crypto::Ed25519Verifier))
+        .with_verifier(Arc::clone(&verifier))
         .with_process(Arc::clone(&process))
         .with_integration(Arc::clone(&integration))
         .with_rng(Arc::clone(&rng))
@@ -302,6 +399,8 @@ fn run(body: impl FnOnce(&modes::Adapters) -> Kind) -> Kind {
     body(&modes::Adapters {
         fs,
         hasher,
+        verifier,
+        codec,
         process,
         integration,
         rng,

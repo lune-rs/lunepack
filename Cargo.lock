@@ -2225,6 +2225,7 @@ name = "lunepack-runtime"
 version = "0.0.0"
 dependencies = [
  "lunepack",
+ "lunepack-codec-lzma",
  "lunepack-core",
  "lunepack-crypto",
  "lunepack-fs",

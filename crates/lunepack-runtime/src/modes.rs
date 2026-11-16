@@ -11,7 +11,9 @@
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
-use lunepack::{Fs, Hasher, OsIntegration, Platform, Process, ProcessId, Rng, Version};
+use lunepack::{
+    Codec, Fs, Hasher, OsIntegration, Platform, Process, ProcessId, Rng, Verifier, Version,
+};
 
 /// The line a usage error prints on stderr. It names no argument value.
 pub const USAGE_LINE: &str = "lunepack-runtime: usage error";
@@ -228,6 +230,10 @@ pub struct Adapters {
     pub fs: Arc<dyn Fs>,
     /// SHA-256.
     pub hasher: Arc<dyn Hasher>,
+    /// Signature verification (setup mode, M6-D4).
+    pub verifier: Arc<dyn Verifier>,
+    /// The frame decoder (setup mode reads single entries, FORMAT.md 13.6).
+    pub codec: Arc<dyn Codec>,
     /// Processes.
     pub process: Arc<dyn Process>,
     /// The desktop integration.
@@ -300,6 +306,12 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
         },
         None => Err(UsageError),
     }
+}
+
+/// The arguments of a setup file's run (M6 step 7): nothing, or `--silent` once; anything else is
+/// a usage error.
+pub fn parse_setup(args: &[OsString]) -> Result<bool, UsageError> {
+    silent_only(args)
 }
 
 /// The options of `install` and `uninstall`: nothing, or `--silent` once.
