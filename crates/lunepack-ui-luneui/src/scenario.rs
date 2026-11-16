@@ -153,8 +153,8 @@ pub fn install_welcome(os: Os, name: &str, icon: bool) -> Vec<Timed> {
     ]
 }
 
-/// The welcome screen, the user's Install at `proceed_ms`, then a run that is 62 % along 1.5 s
-/// later: the check done and "Unpack files" running.
+/// The welcome screen, the user's Install at `proceed_ms`, then a run that is 67 % along (40.9 of 61 MB)
+/// 1.5 s later: the check done and "Unpack files" running.
 pub fn install_running(os: Os, proceed_ms: u64) -> Vec<Timed> {
     let mut s = install_welcome(os, APP_NAME, true);
     s.push(at(proceed_ms, Step::Choose(ChoiceValue::Proceed)));

@@ -331,21 +331,9 @@ impl UiModel {
         match self.state.outcome() {
             Some(Outcome::Installed | Outcome::Updated | Outcome::Uninstalled { .. }) => 1.0,
             Some(Outcome::Failed { .. } | Outcome::UninstallFailed { .. }) => self.bar_to,
-            _ => {
-                // Check 5 %, unpack 85 %, shortcuts 5 %, register 5 %.
-                let mut f = 0.0;
-                if self.steps & bit(StepItem::Verify) != 0 {
-                    f += 0.05;
-                }
-                f += 0.85 * self.stage_frac;
-                if self.steps & bit(StepItem::Integrate) != 0 {
-                    f += 0.05;
-                }
-                if self.steps & bit(StepItem::Commit) != 0 {
-                    f += 0.05;
-                }
-                f
-            }
+            // One fraction drives the bar, the percentage and the bytes: the staged bytes done of
+            // the total. Nothing before the first byte pair; full once the files are staged.
+            _ => self.stage_frac,
         }
     }
 
