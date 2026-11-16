@@ -440,8 +440,12 @@ pub(crate) fn bar(
         );
         if let Some(ph) = sheen {
             let e = cubic_bezier(0.45, 0.0, 0.55, 1.0, ph);
-            let center = x + fw * (-0.5 + 2.0 * e);
-            let half = 0.15 * fw;
+            // The two halves meet on a whole device pixel, so neither edge is antialiased
+            // against the other and no seam shows at the peak.
+            let s = p.s.max(1.0);
+            let snap = |v: f32| (v * s).round() / s;
+            let center = snap(x + fw * (-0.5 + 2.0 * e));
+            let half = snap(0.15 * fw).max(1.0 / s);
             p.linear(
                 Rect::new(center - half, y, half, 6.0),
                 0.0,

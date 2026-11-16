@@ -173,7 +173,10 @@ fn the_installing_screen_has_a_named_progress_bar_with_a_value() {
             value, min, max, ..
         }) => {
             assert_eq!((*min, *max), (0.0, 100.0));
-            assert!((value - 62.0).abs() < 1.5, "62 % along, got {value}");
+            assert!(
+                (value - 67.0).abs() < 1.5,
+                "67 % along (40.9 of 61 MB), got {value}"
+            );
         }
         other => panic!("no value: {other:?}"),
     }
