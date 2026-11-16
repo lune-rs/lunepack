@@ -481,6 +481,38 @@ fn a_rerun_after_a_kill_mid_install_resumes() {
 }
 
 #[test]
+fn a_pre_existing_foreign_root_is_not_adopted() {
+    let lab = Lab::new();
+    // The app's own user data from before lunepack, at the XDG path lunepack derives for `R`.
+    write_file(&lab.root.join("settings.ini"), b"theme=dark\n", false);
+    write_file(&lab.root.join("state/notes.txt"), b"mine\n", false);
+    let before = listing(&lab.root);
+    let run = lab.install();
+    assert_eq!(run.code, EXIT_INSTALL_MISMATCH, "{run:?}");
+    assert!(run.line().contains("\"kind\":\"install_mismatch\""));
+    run.assert_no_path(&lab);
+    assert_eq!(listing(&lab.root), before, "R was written");
+    assert!(!exists(&lab.desktop_entry()) && !exists(&lab.bin_link()));
+}
+
+#[test]
+fn a_root_holding_only_a_cut_off_runs_lock_is_adopted() {
+    let lab = Lab::new();
+    write_file(&lab.root.join("state/lock"), b"", false);
+    let run = lab.install();
+    assert_eq!(run.code, EXIT_OK, "{run:?}");
+    assert_eq!(
+        lab.record()
+            .expect("record")
+            .current
+            .expect("current")
+            .version
+            .to_string(),
+        V100
+    );
+}
+
+#[test]
 fn a_conflicting_command_link_stops_install_with_nothing_written() {
     let lab = Lab::new();
     let foreign = lab.bin_link();
