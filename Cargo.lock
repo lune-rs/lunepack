@@ -2257,6 +2257,9 @@ version = "0.0.0"
 dependencies = [
  "lune-ui",
  "lunepack-core",
+ "png",
+ "thiserror 2.0.21",
+ "wgpu",
 ]
 
 [[package]]

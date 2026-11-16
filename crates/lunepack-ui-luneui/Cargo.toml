@@ -14,3 +14,11 @@ workspace = true
 lunepack-core.workspace = true
 # LuneUI at the pinned commit (D39 (b)); only this crate may depend on it (the boundary check).
 lune-ui.workspace = true
+# Headless render (the texture format of the offscreen target) and the icon decoder (M6-D11).
+wgpu.workspace = true
+png.workspace = true
+thiserror.workspace = true
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
