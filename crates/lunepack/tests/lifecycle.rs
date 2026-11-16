@@ -628,6 +628,61 @@ fn unsupervised_starts_count_attempts_and_the_fourth_rolls_back() {
     assert_eq!(applied[0].stale_bins, vec!["app2".to_owned()]);
 }
 
+/// Three unsupervised starts of 1.1.0, so the next one rolls back.
+fn three_attempts(lab: &Lab) {
+    for _ in 1..=3u64 {
+        startup_for(&lab.open(V110, None), Vec::new()).expect("startup");
+    }
+}
+
+#[test]
+fn a_rollback_to_a_previous_version_whose_config_is_gone_commits_nothing() {
+    let lab = Lab::new();
+    let old = lab.version_tree(V100, "app");
+    lab.version_tree(V110, "app");
+    commit(&lab.fs, &root_dir(), |_| pending_110());
+    three_attempts(&lab);
+    let before = lab.record();
+    lab.fs
+        .remove_file(&old.join("lunepack-update.json"))
+        .expect("remove config");
+
+    let got = startup_for(&lab.open(V110, None), Vec::new());
+    assert!(
+        matches!(got, Err(Error::RollbackUnavailable)),
+        "{:?}",
+        got.map(|s| s.action)
+    );
+    assert_eq!(lab.record(), before, "nothing committed, still pending");
+    assert_eq!(lab.current_link(), "versions/1.1.0");
+    assert!(lab.process.spawns().is_empty());
+    assert!(
+        lab.integration
+            .calls()
+            .iter()
+            .all(|c| c.op != IntegrationOp::Apply)
+    );
+}
+
+#[test]
+fn a_rollback_whose_relaunch_and_refresh_fail_still_exits_rolled_back() {
+    let lab = Lab::new();
+    lab.version_tree(V100, "app");
+    lab.version_tree(V110, "app");
+    commit(&lab.fs, &root_dir(), |_| pending_110());
+    three_attempts(&lab);
+    lab.process
+        .fail_spawns(Some(lunepack_core::ProcessErrorKind::SpawnFailed));
+    lab.integration.script_failure(Some("disk"));
+
+    let got = startup_for(&lab.open(V110, None), Vec::new()).expect("startup");
+    assert_eq!(got.action, StartupAction::Exit);
+    let rec = lab.record();
+    assert_eq!(rec.current.expect("current").version, version(V100));
+    assert_eq!(rec.bad, vec![version(V110)]);
+    assert_eq!(lab.current_link(), "versions/1.0.0");
+}
+
 #[test]
 fn a_supervised_start_counts_nothing_and_a_malformed_token_counts() {
     let lab = Lab::new();
