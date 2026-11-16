@@ -173,11 +173,15 @@ jobs:
     # the UI (M6): the golden frames of every screen and transition, the accessibility tree, the
     # smoke test of the real `lunepack-ui` binary against a scripted engine, and the size report.
     # linux-golden compares in the reference image (scripts/ui-golden.Dockerfile: the same Mesa as a
-    # local run, so the tolerance is exact); macos and windows render natively and compare with the
-    # cross-adapter tolerance; linux-baseline (the oldest runner) builds the release binary, records
-    # the glibc it needs and runs the smoke test under Xvfb with the distribution's Mesa, comparing no
-    # pixels. Every leg uploads what it rendered and reports the binary's size (D37 (b): reported,
-    # never a failure). The signing keys of the size report are made in the job and never leave it.
+    # local run, so the tolerance is exact); macos and windows render natively and compare with their
+    # own golden set (tests/golden/macos and /windows, the cross-adapter tolerance for the drift
+    # between two machines): until a set is seeded from the artifact of this job (the README there
+    # says how) the leg renders, uploads the frames and fails with "no golden set for <os>", never
+    # comparing with another OS's frames; linux-baseline (the oldest runner) builds the release
+    # binary, records the glibc it needs and runs the smoke test under Xvfb with the distribution's
+    # Mesa, comparing no pixels. Every leg uploads what it rendered and reports the binary's size
+    # (D37 (b): reported, never a failure). The signing keys of the size report are made in the
+    # job and never leave it.
     strategy:
       fail-fast: false
       matrix:
@@ -200,15 +204,6 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xvfb mesa-vulkan-drivers libvulkan1 libxkbcommon-x11-0 libx11-xcb1 binutils
-      - name: Golden frames in the reference image
-        if: matrix.name == 'linux-golden'
-        run: ./scripts/ui-golden.sh --docker
-      - name: Golden frames, natively (cross-adapter tolerance)
-        if: matrix.name == 'macos' || matrix.name == 'windows'
-        shell: bash
-        env:
-          LUNEPACK_GOLDEN_CLASS: cross
-        run: cargo test -p lunepack-ui-luneui --locked --test golden -- --ignored
       - name: Accessibility tree, keyboard and the checks that need no GPU
         run: cargo test -p lunepack-ui-luneui --locked --test access --test golden
       - name: Smoke test of the binary (natively)
@@ -241,6 +236,17 @@ jobs:
             echo "Highest GLIBC_ version in the dynamic symbols (objdump -T): \`$highest\`"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
+      # The golden comparisons come last, before the upload: a leg with no golden set yet fails
+      # there (after rendering every frame), and the checks above still run.
+      - name: Golden frames in the reference image
+        if: matrix.name == 'linux-golden'
+        run: ./scripts/ui-golden.sh --docker
+      - name: Golden frames, natively against this OS's own set (cross-adapter tolerance)
+        if: matrix.name == 'macos' || matrix.name == 'windows'
+        shell: bash
+        env:
+          LUNEPACK_GOLDEN_CLASS: cross
+        run: cargo test -p lunepack-ui-luneui --locked --test golden -- --ignored
       # actions/upload-artifact v7.0.2 (lightweight tag, resolves directly to the commit)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always() && matrix.name != 'linux-baseline'
