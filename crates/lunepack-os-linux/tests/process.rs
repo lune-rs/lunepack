@@ -627,6 +627,18 @@ mod linux {
             .collect()
     }
 
+    /// The `pipe:[inode]` targets this test process already holds. A CI runner can hand the test
+    /// process pipes that are not close-on-exec (GitHub's did, as descriptors 142 and 145); every
+    /// child inherits those, so they are left out of the piped child's own pipes.
+    fn own_pipes() -> Vec<String> {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("read /proc/self/fd")
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .map(|target| target.to_string_lossy().into_owned())
+            .filter(|target| target.starts_with("pipe:["))
+            .collect()
+    }
+
     /// P1: the parent's ends of a piped child's pipes are close-on-exec, so the app the runtime
     /// relaunches (a sibling of the UI child, started by `spawn_detached`) or any other child
     /// started later holds neither pipe. The piped child itself holds them as descriptors 0 and 1.
@@ -642,13 +654,17 @@ mod linux {
             ],
         );
         piped.stdio = ChildStdio::Piped;
+        let inherited = own_pipes();
         let mut child = os().spawn_child(&piped).expect("spawn the piped child");
         // Held until the end: the pipes live as long as this test holds its ends.
         let _stdin = child.take_stdin().expect("input pipe");
         let _stdout = child.take_stdout().expect("output pipe");
         wait_for_file(&ready);
         let child_text = wait_for_file(&child_fds);
-        let held = pipe_targets(&child_text);
+        let held: Vec<(u32, String)> = pipe_targets(&child_text)
+            .into_iter()
+            .filter(|(_, target)| !inherited.contains(target))
+            .collect();
         // The instrument: the child holds exactly its two pipes, as descriptors 0 and 1.
         let fds: Vec<u32> = held.iter().map(|(fd, _)| *fd).collect();
         assert_eq!(fds, vec![0, 1], "the piped child's own pipes: {held:?}");
