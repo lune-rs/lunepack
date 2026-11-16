@@ -71,7 +71,10 @@ pub use lifecycle::{
     gc_keep, install_first, rollback,
 };
 pub use limits::Limits;
-pub use manifest::{EntryDoc, ManifestDocument, VerifiedEntry, VerifiedManifest, verify_manifest};
+pub use manifest::{
+    EntryDoc, ManifestDocument, VerifiedEntry, VerifiedManifest, read_entry, verify_manifest,
+    verify_payload_manifest,
+};
 pub use pack::{
     FileClass, PackedFile, ReleaseLayout, RuntimeImageError, candidates, check_runtime_image,
     check_ui_image, classify, pack_file,

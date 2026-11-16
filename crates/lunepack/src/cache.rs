@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use lunepack_core::json::parse_strict;
 use lunepack_core::{
-    CancelToken, FileKind, FileWrite, Fs, FsError, FsErrorKind, HashState, Hasher, Sha256Digest,
-    Validator,
+    CancelToken, FileKind, FileWrite, Fs, FsError, FsErrorKind, HashState, Hasher, ReadAt,
+    Sha256Digest, Validator,
 };
 use serde::{Deserialize, Serialize};
 
@@ -412,6 +412,58 @@ impl Cache {
         }
         self.fs.sync_dir(&dir)?;
         Ok(ok)
+    }
+
+    /// Copies the frame `sha`, `length` bytes at `offset` of `src` (an offline payload's pack, M6
+    /// step 6), into the cache through the same part-then-rename path as a download: any old part
+    /// and sidecar are removed, a fresh part (no sidecar: there is nothing to resume from) receives
+    /// the bytes while they are hashed, and [`Cache::finish_part`] makes it the complete entry only
+    /// when they hash to `sha`, otherwise deletes it. Whether it matched. `cancel` is checked
+    /// before every read ([`Error::Cancelled`]); on any error the part is removed. `copied` is
+    /// told the size of every chunk written.
+    pub(crate) fn store_frame(
+        &self,
+        src: &dyn ReadAt,
+        offset: u64,
+        length: u64,
+        sha: &Sha256Digest,
+        tools: &PartTools<'_>,
+        copied: &dyn Fn(u64),
+    ) -> Result<bool, Error> {
+        self.remove_part(CacheKind::Frame, sha)?;
+        let path = self.part_path(CacheKind::Frame, sha);
+        let mut part = OpenPart {
+            file: self.fs.create_new(&path)?,
+            hash: tools.hasher.sha256_start(),
+            written: 0,
+        };
+        let copy = (|| {
+            let mut buf = vec![0u8; usize::try_from(length.min(HASH_READ as u64)).unwrap_or(0)];
+            while part.written < length {
+                if tools.cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                let n = usize::try_from((length - part.written).min(HASH_READ as u64))
+                    .unwrap_or(HASH_READ);
+                let at = offset
+                    .checked_add(part.written)
+                    .ok_or(Error::Config("frame offset overflows"))?;
+                src.read_exact_at(at, &mut buf[..n])?;
+                part.file
+                    .write_all(&buf[..n])
+                    .map_err(|e| io_error(e, &path))?;
+                part.hash.update(&buf[..n]);
+                part.written += n as u64;
+                copied(n as u64);
+            }
+            Ok(())
+        })();
+        if let Err(e) = copy {
+            drop(part);
+            self.remove_part(CacheKind::Frame, sha)?;
+            return Err(e);
+        }
+        self.finish_part(CacheKind::Frame, sha, part)
     }
 }
 

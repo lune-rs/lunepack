@@ -127,8 +127,8 @@ pub use lifecycle::{
     apply_and_restart_for, confirm_for, confirm_healthy, startup, startup_for,
 };
 pub use updater::{
-    DownloadOptions, Downloaded, InstalledVersion, Layout, ProgressCallback, StagedVersion,
-    Timeouts, UpdateInfo, Updater, UpdaterBuilder,
+    DownloadOptions, Downloaded, InstalledVersion, Layout, OfflinePayload, PayloadPart,
+    ProgressCallback, StagedVersion, Timeouts, UpdateInfo, Updater, UpdaterBuilder,
 };
 pub use worker_transport::WorkerTransport;
 
