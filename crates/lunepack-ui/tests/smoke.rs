@@ -3,10 +3,11 @@
 //! `Close`. It also checks the typed exit codes of the failures that need a window (12 protocol
 //! error, 13 engine gone, 14 build-id mismatch) and that standard output carries frames only.
 //!
-//! It opens a window, so it is `#[ignore]`d and run with `--ignored` by the CI job `ui` (under Xvfb on
-//! the Linux baseline leg) and by hand. With no display or adapter it fails, it never skips. No test
-//! can click: the choices the user makes are covered by `lunepack-ui-luneui`'s `tests/access.rs`
-//! (the keyboard drives every prompt to every choice); here the engine ends each prompt itself.
+//! It opens a window, so it is `#[ignore]`d and run locally with `--ignored` (under Xvfb on
+//! a Linux machine with no display). CI does not run it (M6-D13). With no display or adapter it
+//! fails, it never skips. No test can click: the choices the user makes are covered by
+//! `lunepack-ui-luneui`'s `tests/access.rs` (the keyboard drives every prompt to every choice);
+//! here the engine ends each prompt itself.
 
 use std::io::{BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -157,7 +158,7 @@ impl Ui {
 }
 
 #[test]
-#[ignore = "opens a window: run with --ignored (the CI job `ui` does)"]
+#[ignore = "opens a window: run with --ignored (locally, before a push that touches the UI)"]
 fn the_update_flow_runs_to_updated_and_the_binary_exits_zero() {
     let mut ui = Ui::start();
     ui.expect_hello();
@@ -185,7 +186,7 @@ fn the_update_flow_runs_to_updated_and_the_binary_exits_zero() {
 }
 
 #[test]
-#[ignore = "opens a window: run with --ignored (the CI job `ui` does)"]
+#[ignore = "opens a window: run with --ignored (locally, before a push that touches the UI)"]
 fn a_rolled_back_update_waits_at_its_prompt_and_answers_pings() {
     let mut ui = Ui::start();
     ui.expect_hello();
@@ -210,7 +211,7 @@ fn a_rolled_back_update_waits_at_its_prompt_and_answers_pings() {
 }
 
 #[test]
-#[ignore = "opens a window: run with --ignored (the CI job `ui` does)"]
+#[ignore = "opens a window: run with --ignored (locally, before a push that touches the UI)"]
 fn the_install_flow_shows_its_welcome_and_answers_pings_until_closed() {
     let mut ui = Ui::start();
     ui.expect_hello();
@@ -230,7 +231,7 @@ fn the_install_flow_shows_its_welcome_and_answers_pings_until_closed() {
 }
 
 #[test]
-#[ignore = "opens a window: run with --ignored (the CI job `ui` does)"]
+#[ignore = "opens a window: run with --ignored (locally, before a push that touches the UI)"]
 fn the_uninstall_flow_shows_its_confirmation_and_answers_pings_until_closed() {
     let mut ui = Ui::start();
     ui.expect_hello();
@@ -246,7 +247,7 @@ fn the_uninstall_flow_shows_its_confirmation_and_answers_pings_until_closed() {
 }
 
 #[test]
-#[ignore = "opens a window: run with --ignored (the CI job `ui` does)"]
+#[ignore = "opens a window: run with --ignored (locally, before a push that touches the UI)"]
 fn a_frame_that_is_out_of_order_ends_the_ui_with_the_protocol_code() {
     let mut ui = Ui::start();
     ui.expect_hello();
@@ -258,7 +259,7 @@ fn a_frame_that_is_out_of_order_ends_the_ui_with_the_protocol_code() {
 }
 
 #[test]
-#[ignore = "opens a window: run with --ignored (the CI job `ui` does)"]
+#[ignore = "opens a window: run with --ignored (locally, before a push that touches the UI)"]
 fn a_hello_from_another_build_ends_the_ui_with_the_mismatch_code() {
     let mut ui = Ui::start();
     ui.expect_hello();
@@ -271,7 +272,7 @@ fn a_hello_from_another_build_ends_the_ui_with_the_mismatch_code() {
 }
 
 #[test]
-#[ignore = "opens a window: run with --ignored (the CI job `ui` does)"]
+#[ignore = "opens a window: run with --ignored (locally, before a push that touches the UI)"]
 fn the_engine_closing_its_end_before_close_ends_the_ui_with_the_gone_code() {
     let mut ui = Ui::start();
     ui.expect_hello();

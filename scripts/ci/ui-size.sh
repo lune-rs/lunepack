@@ -6,8 +6,9 @@
 #   scripts/ci/ui-size.sh <lunepack-ui> <lunepack> [summary-file]
 #
 # The throw-away signing keys are generated here, in a temporary directory that is removed on exit,
-# and never leave it. The report goes to stdout and, when a summary file is given or GITHUB_STEP_SUMMARY
-# is set, is appended to it as a Markdown table row. bash 3.2 compatible.
+# and never leave it. It is run by hand on each OS's machine (CI does not run it, M6-D13). The
+# report goes to stdout and, when a summary file is given or GITHUB_STEP_SUMMARY is set, is
+# appended to it as a Markdown table row. bash 3.2 compatible.
 set -euo pipefail
 
 usage() {
