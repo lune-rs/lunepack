@@ -7,18 +7,18 @@
 //! x86_64 by a channel delta of 2 on 0.14 to 0.37 % of the pixels (see the README).
 //!
 //! The comparison needs a GPU adapter, so it is `#[ignore]`d and run with `--ignored` by
-//! `scripts/ui-golden.sh` and the CI job `ui`; with no adapter it fails, it never skips. With no
-//! golden set for the OS it renders everything (so CI can upload the frames) and then fails, saying
-//! how to seed the set. A Linux set is generated in the reference image only
+//! `scripts/ui-golden.sh` on a developer's machine (the pixel gate is local, M6-D13; CI does not run
+//! it); with no adapter it fails, it never skips. With no golden set for the OS it renders everything
+//! and then fails, saying how to seed the set. A Linux set is generated in the reference image only
 //! (`scripts/ui-golden.sh --docker --write`, which sets `LUNEPACK_WRITE_GOLDENS=1`, the same
-//! convention as the fuzz seeds, on a machine of that CPU), or seeded from the frames CI uploads; the
-//! other two come from the frames CI uploads (README). A Linux CPU with no set fails closed like an OS
+//! convention as the fuzz seeds, on a machine of that CPU); the macOS and Windows sets are re-seeded
+//! the same way on their own machine class (README). A Linux CPU with no set fails closed like an OS
 //! with none. A plain `cargo test --workspace` stays adapter-free: it runs the checks that need no
 //! GPU (the comparison instrument, and that both Linux sets hold a golden for every screen the
 //! reducer can reach and for nothing else).
 //!
 //! Tolerance is per adapter class, chosen by `LUNEPACK_GOLDEN_CLASS` (`exact` or `cross`; the
-//! scripts and CI set it, the default is `cross`). The numbers come from the step 0 probe (notes.md
+//! scripts set it, the default is `cross`). The numbers come from the step 0 probe (notes.md
 //! "M6 step 0", items (iii) and (iv)).
 
 use std::collections::BTreeSet;
@@ -41,7 +41,7 @@ const EXACT_MAX_FRACTION: f64 = 0.0;
 /// differing at all. Measured Metal against lavapipe (notes.md "M6 step 0" (iv)): delta 2 and 3.94 %.
 /// With the real screens the same comparison reached 10.35 to 23.94 % in 11 of the 88 frames, so the
 /// bound was kept and the sets made per OS (README): it now allows the drift between two machines
-/// that run the same adapter (a developer's Mac and a CI runner), never a different adapter.
+/// that run the same adapter (two machines of one class), never a different adapter.
 const CROSS_MAX_DELTA: u8 = 6;
 const CROSS_MAX_FRACTION: f64 = 0.10;
 
@@ -560,7 +560,7 @@ fn the_goldens_match() {
     if write {
         std::fs::create_dir_all(golden_dir()).expect("the goldens directory");
     }
-    // No set for this OS yet: everything is rendered and saved below (CI uploads it), then the test
+    // No set for this OS yet: everything is rendered and saved below, then the test
     // fails with the way to seed one. Writing creates the set, so it never trips this.
     let no_set = !write && names_on_disk(SET).is_empty();
     let mut failures = Vec::new();
@@ -616,8 +616,8 @@ fn the_goldens_match() {
     }
     assert!(
         !no_set,
-        "no golden set for {SET} (tests/golden/{SET}); seed it from the frames this run saved in {} \
-         (CI uploads them as the artifact ui-golden-renders-{SET}): see tests/golden/README.md",
+        "no golden set for {SET} (tests/golden/{SET}); seed it on this machine class by running again with \
+         LUNEPACK_WRITE_GOLDENS=1 (this run's frames are in {}): see tests/golden/README.md",
         out.display()
     );
     assert!(
