@@ -18,16 +18,15 @@ use crate::anim;
 use crate::icon::ICON_IMAGE;
 use crate::look::{self, CAPTION_W, ERR, OK, TITLE_H, WARN, white};
 use crate::model::{ENTER_MS, GLOW_MS, GlowKind, LEAVE_MS, Material, RAIL_MS, UiModel};
-use crate::strings::{INSTALL_STEPS, UNINSTALL_STEPS};
+use crate::strings::{INSTALL_STEPS, Os, UNINSTALL_STEPS};
 use crate::widgets;
 
 /// The window's own background.
 pub(crate) fn background(ui: &mut Ui<'_>, material: Material, mt: look::Metrics) {
-    let theme = *ui.theme();
     let (w, h) = (mt.w, mt.h);
     let color = match material {
         Material::Opaque => lune_ui::color::premul(look::BG_OPAQUE),
-        Material::Glass => theme.glass.window.premultiplied(),
+        Material::Glass => look::WINDOW_GLASS.premultiplied(),
     };
     ui.painter()
         .acrylic(Rect::new(0.0, 0.0, w, h), 0.0, color, [0.0; 4], false);
@@ -97,19 +96,34 @@ pub(crate) fn glow(ui: &mut Ui<'_>, m: &UiModel, t: Duration, tier: MotionTier) 
 const ROW0: f32 = 152.0;
 const ROW_STEP: f32 = 34.0;
 
+/// How far the rail's content moves down on `os` (M6-D14): macOS draws its own window buttons in the
+/// top-left corner, over the rail, and the content clears them. Zero elsewhere.
+pub(crate) fn rail_drop(os: Os) -> f32 {
+    if os == Os::Macos {
+        look::MACOS_RAIL_DROP
+    } else {
+        0.0
+    }
+}
+
 /// The side rail: the app's identity (it never moves) and the steps of the flow.
 pub(crate) fn rail(ui: &mut Ui<'_>, m: &UiModel, t: Duration, tier: MotionTier) {
     let mt = m.metrics();
     let (rail_w, h) = (mt.rail_w, mt.h);
+    let fill = match m.env.material {
+        Material::Glass => look::RAIL_FILL_GLASS,
+        Material::Opaque => look::RAIL_FILL_OPAQUE,
+    };
     let p = ui.painter();
-    p.fill(Rect::new(0.0, 0.0, rail_w, h), 0.0, [0, 0, 0, 71]);
+    p.fill(Rect::new(0.0, 0.0, rail_w, h), 0.0, [0, 0, 0, fill]);
     p.fill(Rect::new(rail_w - 1.0, 0.0, 1.0, h), 0.0, white(0.08));
 
     // The update window's rail holds the icon alone, centred.
     let compact = m.state().flow() == Some(Flow::Update);
+    let drop = rail_drop(m.env.os);
     let tile = Rect::new(
         if compact { (rail_w - 48.0) / 2.0 } else { 20.0 },
-        28.0,
+        28.0 + drop,
         48.0,
         48.0,
     );
@@ -155,7 +169,7 @@ pub(crate) fn rail(ui: &mut Ui<'_>, m: &UiModel, t: Duration, tier: MotionTier) 
         "rail-name",
         true,
         20.0,
-        94.0,
+        94.0 + drop,
         &m.name,
         look::style(14.0, 18.0, 500, white(0.9)),
         Some(inner_w),
@@ -195,7 +209,7 @@ pub(crate) fn rail(ui: &mut Ui<'_>, m: &UiModel, t: Duration, tier: MotionTier) 
             key,
             true,
             20.0,
-            116.0,
+            116.0 + drop,
             &text,
             version_style,
             Some(inner_w),
@@ -210,7 +224,7 @@ pub(crate) fn rail(ui: &mut Ui<'_>, m: &UiModel, t: Duration, tier: MotionTier) 
         Some(Flow::Update) => &[],
     };
     // The highlight: slides under Full, cross-fades under Reduced, jumps under Off.
-    let row_y = |i: f32| ROW0 + i * ROW_STEP;
+    let row_y = |i: f32| ROW0 + drop + i * ROW_STEP;
     let row = |y: f32| Rect::new(14.0, y, rail_w - 28.0, 30.0);
     let hl = white(0.09);
     let p_move = anim::progress(t, m.rail_since, RAIL_MS);

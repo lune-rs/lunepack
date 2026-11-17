@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
-use lunepack_core::ui::{self, EngineMsg, Flow, UiMsg};
+use lunepack_core::ui::{self, EngineMsg, UiMsg};
 use lunepack_ui_luneui::look::{self, Metrics};
 use lunepack_ui_luneui::lune_ui::access::{AccessBridge, RootInfo};
 use lunepack_ui_luneui::lune_ui::clipboard::Clipboard;
@@ -29,9 +29,9 @@ use lunepack_ui_luneui::winit::application::ApplicationHandler;
 use lunepack_ui_luneui::winit::dpi::LogicalSize;
 use lunepack_ui_luneui::winit::event::{ElementState, MouseButton, WindowEvent};
 use lunepack_ui_luneui::winit::event_loop::{ActiveEventLoop, EventLoopProxy};
-use lunepack_ui_luneui::winit::window::{Window, WindowId};
+use lunepack_ui_luneui::winit::window::{Window, WindowButtons, WindowId};
 use lunepack_ui_luneui::{
-    Env, FONT_FAMILY, ICON_IMAGE, Material, UiModel, fonts, frame as draw_frame,
+    Env, FONT_FAMILY, ICON_IMAGE, Material, Os, UiModel, fonts, frame as draw_frame,
 };
 
 use crate::channel::{Exit, UserEvent};
@@ -120,8 +120,9 @@ impl App {
         let size = (f64::from(m.w), f64::from(m.h));
         let attrs = glass_attributes("Lunepack", size, size, false)
             .with_resizable(false)
-            // The screens draw their own title strip on every OS.
-            .with_decorations(false)
+            // Windows and Linux: the screens draw their own title strip. macOS keeps the OS's
+            // buttons over the full-size content view LuneUI's attributes ask for (M6-D14).
+            .with_decorations(self.env.os == Os::Macos)
             .with_transparent(self.env.material == Material::Glass);
         #[cfg(target_os = "macos")]
         let attrs = {
@@ -212,17 +213,31 @@ impl App {
         shown.window.set_min_inner_size(Some(size));
         shown.window.set_max_inner_size(Some(size));
         shown.window.set_title(&self.model.window_title());
+        if self.env.os == Os::Macos {
+            // The OS draws the buttons: mirror the flow's set, greyed where the flow has none, and
+            // never zoom (the window is a fixed size; M6-D14, R3-Q4).
+            let caps = look::Captions::of(self.model.state().flow());
+            let mut buttons = WindowButtons::empty();
+            if caps.close {
+                buttons |= WindowButtons::CLOSE;
+            }
+            if caps.minimize {
+                buttons |= WindowButtons::MINIMIZE;
+            }
+            shown.window.set_enabled_buttons(buttons);
+        }
         shown.window.set_visible(true);
         shown.window.focus_window();
         shown.visible = true;
     }
 
-    /// The width of the caption buttons the title strip shows for the current flow.
+    /// The width of the drawn caption buttons the title strip shows for the current flow; none on
+    /// macOS, where the OS draws them (the drag strip then spans the whole title strip).
     fn caption_width(&self) -> f32 {
-        match self.model.state().flow() {
-            Some(Flow::Update | Flow::Uninstall) => look::CAPTION_W,
-            _ => 2.0 * look::CAPTION_W,
+        if self.env.os == Os::Macos {
+            return 0.0;
         }
+        look::CAPTION_W * look::Captions::of(self.model.state().flow()).count() as f32
     }
 
     /// Draws one frame and handles its answer.

@@ -18,10 +18,10 @@ use lunepack_ui_luneui::{Env, Material, Os, scenario};
 
 const OS: Os = Os::Linux;
 
-fn options(flow: Flow) -> RenderOptions {
+fn options(os: Os, flow: Flow) -> RenderOptions {
     RenderOptions {
         env: Env {
-            os: OS,
+            os,
             material: Material::Opaque,
         },
         tier: MotionTier::Full,
@@ -39,12 +39,24 @@ fn run(
     keys: &[NamedKey],
     until: u64,
 ) -> (Vec<UiMsg>, Vec<FrameOutput>) {
+    run_on(OS, flow, script, first_key, keys, until)
+}
+
+/// [`run`] on a given OS's look.
+fn run_on(
+    os: Os,
+    flow: Flow,
+    script: &[Timed],
+    first_key: u64,
+    keys: &[NamedKey],
+    until: u64,
+) -> (Vec<UiMsg>, Vec<FrameOutput>) {
     let mut all: Vec<Timed> = script.to_vec();
     for (i, key) in keys.iter().enumerate() {
         all.push(at(first_key + 100 * i as u64, Step::Key(*key)));
     }
     all.sort_by_key(|t| t.at);
-    let mut player = Player::new(options(flow));
+    let mut player = Player::new(options(os, flow));
     let mut text = FakeText;
     let mut next = 0;
     let mut frames = Vec::new();
@@ -141,6 +153,10 @@ struct Screen {
 }
 
 fn screens() -> Vec<Screen> {
+    screens_for(OS)
+}
+
+fn screens_for(os: Os) -> Vec<Screen> {
     let both = ["Minimize", "Close"];
     let min = ["Minimize"];
     let close = ["Close"];
@@ -153,7 +169,7 @@ fn screens() -> Vec<Screen> {
         Screen {
             name: "install welcome",
             flow: Flow::Install,
-            script: scenario::install_welcome(OS, scenario::APP_NAME, true),
+            script: scenario::install_welcome(os, scenario::APP_NAME, true),
             at: 600,
             buttons: with(&both, &["Cancel", "Install"]),
             bars: vec![],
@@ -162,7 +178,7 @@ fn screens() -> Vec<Screen> {
         Screen {
             name: "installing",
             flow: Flow::Install,
-            script: scenario::install_running(OS, 1000),
+            script: scenario::install_running(os, 1000),
             at: 3000,
             buttons: with(&both, &["Cancel"]),
             bars: vec![("Installation progress", Some(67.0))],
@@ -171,7 +187,7 @@ fn screens() -> Vec<Screen> {
         Screen {
             name: "install done",
             flow: Flow::Install,
-            script: scenario::install_done(OS, 1000, 4000),
+            script: scenario::install_done(os, 1000, 4000),
             at: 5500,
             buttons: with(&both, &["Finish"]),
             bars: vec![("Installation complete", Some(100.0))],
@@ -180,7 +196,7 @@ fn screens() -> Vec<Screen> {
         Screen {
             name: "install failed",
             flow: Flow::Install,
-            script: scenario::install_failed(OS, 1000, 4000, 9),
+            script: scenario::install_failed(os, 1000, 4000, 9),
             at: 5500,
             buttons: with(&both, &["Close", "Copy details", "Try again"]),
             bars: vec![("Install failed", Some(67.0))],
@@ -234,7 +250,7 @@ fn screens() -> Vec<Screen> {
         Screen {
             name: "uninstall confirm",
             flow: Flow::Uninstall,
-            script: scenario::uninstall_confirm(OS),
+            script: scenario::uninstall_confirm(os),
             at: 600,
             buttons: with(&close, &["Cancel", "Uninstall"]),
             bars: vec![],
@@ -243,7 +259,7 @@ fn screens() -> Vec<Screen> {
         Screen {
             name: "uninstall removing",
             flow: Flow::Uninstall,
-            script: scenario::uninstall_removing(OS, 1000),
+            script: scenario::uninstall_removing(os, 1000),
             at: 3000,
             buttons: with(&close, &[]),
             bars: vec![("Removing", Some(40.0))],
@@ -252,7 +268,7 @@ fn screens() -> Vec<Screen> {
         Screen {
             name: "uninstall done, nothing left",
             flow: Flow::Uninstall,
-            script: scenario::uninstall_done(OS, 1000, 4000, vec![]),
+            script: scenario::uninstall_done(os, 1000, 4000, vec![]),
             at: 5500,
             buttons: with(&close, &["Close"]),
             bars: vec![],
@@ -261,7 +277,7 @@ fn screens() -> Vec<Screen> {
         Screen {
             name: "uninstall done, leftovers",
             flow: Flow::Uninstall,
-            script: scenario::uninstall_done(OS, 1000, 4000, scenario::leftovers(OS, 1)),
+            script: scenario::uninstall_done(os, 1000, 4000, scenario::leftovers(os, 1)),
             at: 5500,
             buttons: with(&close, &["Close", "Show folder"]),
             bars: vec![],
@@ -270,7 +286,7 @@ fn screens() -> Vec<Screen> {
         Screen {
             name: "uninstall failed",
             flow: Flow::Uninstall,
-            script: scenario::uninstall_failed(OS, 1000, 4000, 9),
+            script: scenario::uninstall_failed(os, 1000, 4000, 9),
             at: 5500,
             buttons: with(&close, &["Close", "Copy details"]),
             bars: vec![("Uninstall failed", Some(40.0))],
@@ -360,34 +376,44 @@ fn the_done_screens_checkbox_is_named_and_checked() {
 /// Tab wraps to the first.
 #[test]
 fn tab_order_is_the_visual_order_on_every_screen_with_controls() {
+    tab_order(OS);
+}
+
+/// The same order on macOS, where the OS draws the window buttons (M6-D14).
+#[test]
+fn tab_order_is_the_same_on_macos() {
+    tab_order(Os::Macos);
+}
+
+fn tab_order(os: Os) {
     /// A screen, its flow and script, when to look at it and the labels Tab visits in order.
     type TabCase<'a> = (&'a str, Flow, Vec<Timed>, u64, Vec<&'a str>);
     let cases: Vec<TabCase<'_>> = vec![
         (
             "install welcome",
             Flow::Install,
-            scenario::install_welcome(OS, scenario::APP_NAME, true),
+            scenario::install_welcome(os, scenario::APP_NAME, true),
             600,
             vec!["Cancel", "Install"],
         ),
         (
             "installing",
             Flow::Install,
-            scenario::install_running(OS, 1000),
+            scenario::install_running(os, 1000),
             3000,
             vec!["Cancel"],
         ),
         (
             "install done",
             Flow::Install,
-            scenario::install_done(OS, 1000, 4000),
+            scenario::install_done(os, 1000, 4000),
             5500,
             vec!["Open Lunegit now", "Finish"],
         ),
         (
             "install failed",
             Flow::Install,
-            scenario::install_failed(OS, 1000, 4000, 9),
+            scenario::install_failed(os, 1000, 4000, 9),
             5500,
             vec!["Copy details", "Close", "Try again"],
         ),
@@ -408,21 +434,21 @@ fn tab_order_is_the_visual_order_on_every_screen_with_controls() {
         (
             "uninstall confirm",
             Flow::Uninstall,
-            scenario::uninstall_confirm(OS),
+            scenario::uninstall_confirm(os),
             600,
             vec!["Cancel", "Uninstall"],
         ),
         (
             "uninstall done",
             Flow::Uninstall,
-            scenario::uninstall_done(OS, 1000, 4000, scenario::leftovers(OS, 1)),
+            scenario::uninstall_done(os, 1000, 4000, scenario::leftovers(os, 1)),
             5500,
             vec!["Show folder", "Close"],
         ),
         (
             "uninstall failed",
             Flow::Uninstall,
-            scenario::uninstall_failed(OS, 1000, 4000, 9),
+            scenario::uninstall_failed(os, 1000, 4000, 9),
             5500,
             vec!["Copy details", "Close"],
         ),
@@ -430,7 +456,8 @@ fn tab_order_is_the_visual_order_on_every_screen_with_controls() {
     for (name, flow, script, at_ms, order) in cases {
         let mut keys = vec![NamedKey::Tab; order.len() + 1];
         // One more Tab than controls: the last wraps to the first.
-        let (_, frames) = run(
+        let (_, frames) = run_on(
+            os,
             flow,
             &script,
             at_ms + 100,
@@ -732,5 +759,160 @@ fn no_key_answers_a_screen_that_has_nothing_to_answer() {
             4600,
         );
         assert!(answers.is_empty(), "{answers:?}");
+    }
+}
+
+/// The window buttons Windows and Linux screens draw, per flow. Written out here on purpose: the test
+/// must not share the function it checks.
+fn drawn_captions(flow: Flow) -> &'static [&'static str] {
+    match flow {
+        Flow::Install => &["Minimize", "Close"],
+        Flow::Update => &["Minimize"],
+        Flow::Uninstall => &["Close"],
+    }
+}
+
+/// `list` without one instance of each name in `drop`.
+fn without(list: &[&'static str], drop: &[&str]) -> Vec<&'static str> {
+    let mut out = list.to_vec();
+    for name in drop {
+        let at = out
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("no {name} in {list:?}"));
+        out.remove(at);
+    }
+    out
+}
+
+/// On macOS the OS draws the close and minimize buttons (M6-D14): the tree has no caption node, and
+/// every other control, name, value and bar is what the same screens show on another OS.
+#[test]
+fn on_macos_the_screens_draw_no_window_buttons_and_nothing_else_changes() {
+    for s in screens_for(Os::Macos) {
+        let (_, mac) = run_on(Os::Macos, s.flow, &s.script, s.at + 1000, &[], s.at);
+        let (_, win) = run_on(Os::Windows, s.flow, &s.script, s.at + 1000, &[], s.at);
+        let mac = consumer(mac.last().expect("a frame"));
+        let win = consumer(win.last().expect("a frame"));
+
+        let sorted = |tree: &Tree, role: &str| {
+            let mut v = labels(tree, role);
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            sorted(&win, "Button"),
+            s.buttons,
+            "{}: Windows draws its caption buttons",
+            s.name
+        );
+        let mut want = without(&s.buttons, drawn_captions(s.flow));
+        want.sort_unstable();
+        assert_eq!(sorted(&mac, "Button"), want, "{}: macOS draws none", s.name);
+        // Everything else is the same.
+        for role in ["Dialog", "ProgressIndicator", "CheckBox", "Image"] {
+            assert_eq!(
+                sorted(&mac, role),
+                sorted(&win, role),
+                "{}: the {role} nodes",
+                s.name
+            );
+        }
+        for (name, value) in &s.bars {
+            let v = numeric(&mac, "ProgressIndicator", name);
+            match value {
+                Some(expect) => {
+                    let v = v.unwrap_or_else(|| panic!("{}: {name} has no value", s.name));
+                    assert!((v - expect).abs() < 1.5, "{}: {name} is {v}", s.name);
+                }
+                None => assert_eq!(v, None, "{}: {name} is indeterminate", s.name),
+            }
+        }
+    }
+}
+
+/// Esc and Enter answer the prompts on macOS as they do elsewhere (a native close arrives as the
+/// window's close request, which the binary maps to the same Cancel or Close).
+#[test]
+fn the_keyboard_still_answers_the_prompts_on_macos() {
+    use NamedKey::{Enter, Escape};
+    let os = Os::Macos;
+    let cases = [
+        (
+            "welcome: Enter",
+            Flow::Install,
+            scenario::install_welcome(os, scenario::APP_NAME, true),
+            600,
+            Enter,
+            ChoiceValue::Proceed,
+        ),
+        (
+            "welcome: Esc",
+            Flow::Install,
+            scenario::install_welcome(os, scenario::APP_NAME, true),
+            600,
+            Escape,
+            ChoiceValue::Cancel,
+        ),
+        (
+            "update failed: Esc",
+            Flow::Update,
+            scenario::update_failed(1000, 3000, 9),
+            4500,
+            Escape,
+            ChoiceValue::Close,
+        ),
+        (
+            "uninstall confirm: Esc",
+            Flow::Uninstall,
+            scenario::uninstall_confirm(os),
+            600,
+            Escape,
+            ChoiceValue::Cancel,
+        ),
+        (
+            "uninstall done: Enter",
+            Flow::Uninstall,
+            scenario::uninstall_done(os, 1000, 4000, scenario::leftovers(os, 1)),
+            5500,
+            Enter,
+            ChoiceValue::Close,
+        ),
+    ];
+    for (name, flow, script, at_ms, key, want) in cases {
+        let (answers, _) = run_on(os, flow, &script, at_ms + 100, &[key], at_ms + 300);
+        let last = answers
+            .last()
+            .unwrap_or_else(|| panic!("{name}: no answer"));
+        assert!(choice(want)(last), "{name}: answered {last:?}");
+    }
+}
+
+/// The rail's icon tile starts at y 28 on Windows and Linux and at y 38 on macOS, whose own window
+/// buttons sit above it (M6-D14), in the full rail and in the update window's compact one.
+#[test]
+fn the_rail_icon_clears_the_native_buttons_on_macos_only() {
+    use lune_ui::access::Role;
+    for (os, top) in [(Os::Linux, 28.0), (Os::Windows, 28.0), (Os::Macos, 38.0)] {
+        for (flow, script, at_ms) in [
+            (
+                Flow::Install,
+                scenario::install_welcome(os, scenario::APP_NAME, true),
+                600,
+            ),
+            (Flow::Update, scenario::update_waiting(), 1000),
+            (Flow::Uninstall, scenario::uninstall_confirm(os), 600),
+        ] {
+            let (_, frames) = run_on(os, flow, &script, at_ms + 1000, &[], at_ms);
+            let out = frames.last().expect("a frame");
+            let icon = out
+                .tree
+                .nodes
+                .iter()
+                .find(|n| n.role == Role::Image)
+                .unwrap_or_else(|| panic!("{os:?} {flow:?}: no icon node"));
+            assert_eq!(icon.bounds.y, top, "{os:?} {flow:?}: the icon tile's top");
+            assert_eq!(icon.bounds.h, 48.0, "{os:?} {flow:?}: the tile's height");
+        }
     }
 }

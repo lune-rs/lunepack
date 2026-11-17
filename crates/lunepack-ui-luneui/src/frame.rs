@@ -14,8 +14,10 @@ use lunepack_core::ui::{Flow, Screen, UiMsg};
 
 use crate::anim;
 use crate::chrome;
+use crate::look;
 use crate::model::{CLOSE_MS, ENTER_MS, LEAVE_MS, UiModel, WINDOW_IN_MS};
 use crate::screens::{Draw, Out, install, uninstall, update};
+use crate::strings::Os;
 
 /// How far content slides when a screen changes, in logical pixels.
 const SLIDE: f32 = 12.0;
@@ -79,12 +81,13 @@ pub fn frame(ui: &mut Ui<'_>, model: &mut UiModel, t: Duration, tier: MotionTier
         Node::new(dialog_id, Role::Dialog, &title, Rect::new(0.0, 0.0, w, h)),
         |ui| main_area(ui, model, t, tier),
     );
-    let (minimize, close_button) = match model.state().flow() {
-        Some(Flow::Update) => (true, false),
-        Some(Flow::Uninstall) => (false, true),
-        _ => (true, true),
+    // macOS has its own buttons (M6-D14): the screens draw none there.
+    let close_clicked = if model.env.os == Os::Macos {
+        None
+    } else {
+        let caps = look::Captions::of(model.state().flow());
+        chrome::caption_buttons(ui, true, w, caps.minimize, caps.close)
     };
-    let close_clicked = chrome::caption_buttons(ui, true, w, minimize, close_button);
     if closing.is_some() {
         ui.painter().pop_xform();
     }
