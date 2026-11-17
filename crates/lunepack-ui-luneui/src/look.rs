@@ -5,6 +5,8 @@
 use lune_ui::color::Rgba;
 use lune_ui::text::{Font, Style};
 use lune_ui::theme::Theme;
+use lune_ui::{GlassLayer, LuminosityCurve};
+use lunepack_core::ui::Flow;
 
 /// The installer window's size in logical pixels.
 pub const WINDOW: (f32, f32) = (560.0, 360.0);
@@ -39,6 +41,34 @@ pub const DANGER: Rgba = [0xE8, 0x84, 0x8C, 0xFF];
 pub const BG_OPAQUE: Rgba = [0x18, 0x18, 0x1A, 0xFF];
 /// The monogram tile's fill.
 pub const TILE: Rgba = [0x2A, 0x2D, 0x31, 0xFF];
+
+/// The window glass layer's tint opacity at pure black (M6-D15, R3-Q2 "moderately": LuneUI's
+/// `near_black` has 0.60). Lower is more see-through; the screens' text keeps its contrast because
+/// the glass is still blurred and tinted black.
+pub const WINDOW_BLACK_MAX: f64 = 0.45;
+
+/// The side rail's black fill alpha, out of 255, on every material (M6-D15, R3-Q2: 71 before).
+/// Opaque windows draw the rail over [`BG_OPAQUE`], so only the glass look is meant to change; the
+/// opaque material keeps [`RAIL_FILL_OPAQUE`].
+pub const RAIL_FILL_GLASS: u8 = 48;
+
+/// The side rail's black fill alpha on the opaque material (unchanged by M6-D15).
+pub const RAIL_FILL_OPAQUE: u8 = 71;
+
+/// The window's glass layer (M6-D15, R3-Q2): LuneUI's `near_black::WINDOW` with a lower
+/// `black_max_opacity`. LuneUI's own constants are read, never patched (D39).
+pub const WINDOW_GLASS: GlassLayer = GlassLayer {
+    curve: LuminosityCurve {
+        black_max_opacity: WINDOW_BLACK_MAX,
+        ..lune_ui::near_black::WINDOW.curve
+    },
+    ..lune_ui::near_black::WINDOW
+};
+
+/// How far the side rail's content (icon, name, version, steps and their highlight) moves down on
+/// macOS, in logical pixels (M6-D14, step 8 batch 4): the OS's window buttons end about 21 px from the
+/// top, over the rail; the icon tile then starts at y 38, level with the main area's first line.
+pub const MACOS_RAIL_DROP: f32 = 10.0;
 
 /// White at `alpha` (0 to 1).
 pub fn white(alpha: f32) -> Rgba {
@@ -111,6 +141,42 @@ pub struct Metrics {
     pub btn_pad: f32,
     /// The corner glow's centre (on both axes) and radius.
     pub glow: (f32, f32),
+}
+
+/// The window buttons one flow's window offers (M6-D14): install can be minimized or closed, the
+/// update window only minimized, the uninstall window only closed. One function of the flow, so
+/// the buttons the screens draw (Windows, Linux) and the ones the OS draws (macOS) cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Captions {
+    /// A Minimize button.
+    pub minimize: bool,
+    /// A Close button.
+    pub close: bool,
+}
+
+impl Captions {
+    /// The buttons of the window a flow shows (the installer's until a hello names the flow).
+    pub fn of(flow: Option<Flow>) -> Captions {
+        match flow {
+            Some(Flow::Update) => Captions {
+                minimize: true,
+                close: false,
+            },
+            Some(Flow::Uninstall) => Captions {
+                minimize: false,
+                close: true,
+            },
+            Some(Flow::Install) | None => Captions {
+                minimize: true,
+                close: true,
+            },
+        }
+    }
+
+    /// How many buttons.
+    pub fn count(self) -> usize {
+        usize::from(self.minimize) + usize::from(self.close)
+    }
 }
 
 impl Metrics {
