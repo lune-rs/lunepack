@@ -173,7 +173,7 @@ jobs:
     # the UI (M6): the golden frames of every screen and transition, the accessibility tree, the
     # smoke test of the real `lunepack-ui` binary against a scripted engine, and the size report.
     # linux-golden compares in the reference image (scripts/ui-golden.Dockerfile: the same Mesa as a
-    # local run, so the tolerance is exact); macos and windows render natively and compare with their
+    # local run, so the tolerance is exact, against the set of the runner's CPU, linux-x86_64); macos and windows render natively and compare with their
     # own golden set (tests/golden/macos and /windows, the cross-adapter tolerance for the drift
     # between two machines): until a set is seeded from the artifact of this job (the README there
     # says how) the leg renders, uploads the frames and fails with "no golden set for <os>", never

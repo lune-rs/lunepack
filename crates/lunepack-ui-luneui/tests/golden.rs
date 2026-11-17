@@ -1,18 +1,21 @@
 //! Golden frames (M6-D9): every screen and every transition of the three flows, rendered headless at
-//! scale 1.0 and fixed times, compared with the PNGs of the golden set of the OS the test runs on:
-//! `tests/golden/linux` (made in the reference Docker image), `tests/golden/macos` (Metal) and
-//! `tests/golden/windows` (WARP). Each OS compares against its own adapter, because a frame from
-//! another adapter differs on 10 to 24 % of the pixels in the transition strips (see the README).
+//! scale 1.0 and fixed times, compared with the PNGs of the golden set of the OS (and, on Linux, the
+//! CPU) the test runs on: `tests/golden/linux-aarch64` and `tests/golden/linux-x86_64` (made in the
+//! reference Docker image on that CPU), `tests/golden/macos` (Metal) and `tests/golden/windows`
+//! (WARP). Each OS compares against its own adapter, because a frame from another adapter differs on
+//! 10 to 24 % of the pixels in the transition strips, and lavapipe on arm64 differs from lavapipe on
+//! x86_64 by a channel delta of 2 on 0.14 to 0.37 % of the pixels (see the README).
 //!
 //! The comparison needs a GPU adapter, so it is `#[ignore]`d and run with `--ignored` by
 //! `scripts/ui-golden.sh` and the CI job `ui`; with no adapter it fails, it never skips. With no
 //! golden set for the OS it renders everything (so CI can upload the frames) and then fails, saying
-//! how to seed the set. The Linux set is generated in the reference image only
+//! how to seed the set. A Linux set is generated in the reference image only
 //! (`scripts/ui-golden.sh --docker --write`, which sets `LUNEPACK_WRITE_GOLDENS=1`, the same
-//! convention as the fuzz seeds); the other two come from the frames CI uploads (README). A plain
-//! `cargo test --workspace` stays adapter-free: it runs the checks that need no GPU (the comparison
-//! instrument, and that the Linux set holds a golden for every screen the reducer can reach and for
-//! nothing else).
+//! convention as the fuzz seeds, on a machine of that CPU), or seeded from the frames CI uploads; the
+//! other two come from the frames CI uploads (README). A Linux CPU with no set fails closed like an OS
+//! with none. A plain `cargo test --workspace` stays adapter-free: it runs the checks that need no
+//! GPU (the comparison instrument, and that both Linux sets hold a golden for every screen the
+//! reducer can reach and for nothing else).
 //!
 //! Tolerance is per adapter class, chosen by `LUNEPACK_GOLDEN_CLASS` (`exact` or `cross`; the
 //! scripts and CI set it, the default is `cross`). The numbers come from the step 0 probe (notes.md
@@ -28,8 +31,10 @@ use lunepack_core::ui::{Flow, Screen};
 use lunepack_ui_luneui::render::{Player, RenderOptions, Renderer, RgbaImage, Timed};
 use lunepack_ui_luneui::{Env, Material, Os, icon, scenario};
 
-/// Same-image Linux (lavapipe in `scripts/ui-golden.Dockerfile`): exact. Measured (notes.md "M6 step 0"
-/// (iii)): repeated renders are byte-identical, and arm64 equals amd64.
+/// Same-image Linux (lavapipe in `scripts/ui-golden.Dockerfile`): exact, against the set of the same
+/// CPU. Measured (notes.md "M6 step 0" (iii)): repeated renders are byte-identical. arm64 does not
+/// equal amd64 (CI, run 44164339009: channel delta 2 on 0.14 to 0.37 % of the pixels), which is why
+/// the Linux set is split by CPU.
 const EXACT_MAX_DELTA: u8 = 0;
 const EXACT_MAX_FRACTION: f64 = 0.0;
 /// Cross-adapter (Metal, WARP): at most this channel delta, on at most this fraction of the pixels
@@ -329,17 +334,25 @@ fn options(scene: &Scene) -> RenderOptions {
     }
 }
 
-/// The golden set of the OS this test runs on.
+/// The golden set of the OS (and, on Linux, the CPU) this test runs on. A Linux CPU with no set
+/// here is `linux-unsupported`, which never exists, so its golden run fails closed.
 const SET: &str = if cfg!(target_os = "macos") {
     "macos"
 } else if cfg!(windows) {
     "windows"
+} else if cfg!(target_arch = "aarch64") {
+    "linux-aarch64"
+} else if cfg!(target_arch = "x86_64") {
+    "linux-x86_64"
 } else {
-    "linux"
+    "linux-unsupported"
 };
 
-/// The sets a golden directory can hold, one per OS.
-const SETS: [&str; 3] = ["linux", "macos", "windows"];
+/// The sets a golden directory can hold: one per OS, and two on Linux (one per CPU).
+const SETS: [&str; 4] = ["linux-aarch64", "linux-x86_64", "macos", "windows"];
+
+/// The Linux sets: the reference ones, always there.
+const LINUX_SETS: [&str; 2] = ["linux-aarch64", "linux-x86_64"];
 
 fn golden_set_dir(set: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -507,14 +520,15 @@ fn every_screen_the_reducer_can_reach_has_a_golden_and_nothing_else_does() {
         }
     }
     let expected = expected_names();
-    // The Linux set is the reference and always there. A set of another OS is checked when it has
+    // The Linux sets are the reference and always there. A set of another OS is checked when it has
     // been seeded; a half seeded one (or one with a stale file) fails here, so the plain test run
     // of every OS notices it. A set that does not exist yet is the ignored test's to refuse.
-    let on_disk = names_on_disk("linux");
-    assert!(
-        !on_disk.is_empty(),
-        "the Linux golden set (tests/golden/linux) is missing"
-    );
+    for set in LINUX_SETS {
+        assert!(
+            !names_on_disk(set).is_empty(),
+            "the Linux golden set (tests/golden/{set}) is missing"
+        );
+    }
     for set in SETS {
         let on_disk = names_on_disk(set);
         if on_disk.is_empty() {

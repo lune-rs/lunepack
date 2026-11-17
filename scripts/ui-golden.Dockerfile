@@ -5,7 +5,7 @@
 # installs is printed by every run and recorded in crates/lunepack-ui-luneui/tests/golden/README.md.
 # Base: the same digest as scripts/gate.Dockerfile (rust:1.99.1-slim-trixie, resolved 2026-11-12
 # with `docker pull` + `docker inspect`; a multi-platform index, so it serves amd64 and arm64, whose
-# lavapipe output was found byte-identical).
+# lavapipe output differs slightly, so the golden sets are per CPU).
 FROM rust:1.99.1-slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7
 LABEL org.lunepack-rs.purpose="ui-golden"
 RUN apt-get update -qq \

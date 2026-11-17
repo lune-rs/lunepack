@@ -14,35 +14,47 @@ pixels, over the 10 % the cross-adapter bound allows. The bound was not loosened
 
 | set | made by | compared by | class |
 |---|---|---|---|
-| `linux/` | the reference image (below) | the reference image: `scripts/ui-golden.sh --docker`, and the CI leg `linux-golden` | `exact` |
+| `linux-aarch64/` | the reference image on an arm64 machine (below) | the reference image on arm64: `scripts/ui-golden.sh --docker` on an arm64 Mac | `exact` |
+| `linux-x86_64/` | the frames of the CI leg `linux-golden` (the reference image on x86-64) | the CI leg `linux-golden`, and the reference image on any x86-64 machine | `exact` |
 | `macos/` | the CI leg `macos` (Metal) | the CI leg `macos`, and a developer's Mac | `cross` |
 | `windows/` | the CI leg `windows` (WARP) | the CI leg `windows` | `cross` |
 
-`linux/` is committed. `macos/` and `windows/` do not exist until they are seeded from the frames CI
-uploads (below). Until one exists, that OS's golden run fails with "no golden set for `<os>`; seed it
+The Linux set is split by CPU because lavapipe renders arm64 and x86-64 slightly differently (a channel
+delta of 2 on 0.14 to 0.37 % of the pixels in 82 of the 88 frames, found when the arm64 set met CI's
+x86-64 runner; repeats on one CPU are byte-identical). Same-image Linux stays `exact` against the set
+of its own CPU. A Linux CPU with neither set fails closed like an OS with none.
+
+Both `linux-*/` sets are committed. `macos/` and `windows/` are seeded from the frames CI uploads
+(below). Until a set exists, that OS's golden run fails with "no golden set for `<os>`; seed it
 from the frames ..." after rendering every frame and saving it, so CI has the frames to upload; it
 never skips and never compares against another OS's set. The plain `cargo test` still passes on every
-OS: it checks the Linux set and any other set that exists (a half seeded set, or one with a file no
+OS: it checks both Linux sets and any other set that exists (a half seeded set, or one with a file no
 scene names, fails it).
 
-## Reference image (the Linux set)
+## Reference image (the Linux sets)
 
-The Linux set is generated and compared in one pinned image, `scripts/ui-golden.Dockerfile`: the
+The Linux sets are generated and compared in one pinned image, `scripts/ui-golden.Dockerfile`: the
 gate's base image plus `mesa-vulkan-drivers`.
 
 - Mesa (lavapipe): `25.0.7-2+deb13u1` (`dpkg-query` in the image; every run of `scripts/ui-golden.sh`
   prints it).
-- Rewrite it (only ever from that image): `scripts/ui-golden.sh --docker --write`.
-- Compare: `scripts/ui-golden.sh --docker` (the same image on any machine).
+- Rewrite the set of the CPU Docker runs the image on (only ever from that image):
+  `scripts/ui-golden.sh --docker --write` (`linux-aarch64` on an arm64 Mac, `linux-x86_64` on an
+  x86-64 host).
+- Compare: `scripts/ui-golden.sh --docker` (the same image, against the set of its CPU).
+- `linux-x86_64` is seeded and refreshed like the macOS and Windows sets, from the frames of the CI
+  leg `linux-golden` (the artifact `ui-golden-renders-linux-golden`), when no x86-64 machine with
+  Docker is at hand; the Mesa version is the same, so the comparison stays exact.
 
-## Seeding and refreshing the macOS and Windows sets
+## Seeding and refreshing the macOS, Windows and Linux x86-64 sets
 
 The renders of a golden run are left in `target/ui-golden-out` (`LUNEPACK_GOLDEN_OUT`), and the CI job
-`ui` uploads them as the artifacts `ui-golden-renders-macos` and `ui-golden-renders-windows`, whether
-the run passed or not. To seed a set, or to refresh it after a screen changed on purpose:
+`ui` uploads them as the artifacts `ui-golden-renders-macos`, `ui-golden-renders-windows` and
+`ui-golden-renders-linux-golden` (the last one is the `linux-x86_64` set), whether the run passed or
+not. To seed a set, or to refresh it after a screen changed on purpose:
 
 1. Find the run of the job `ui` on the commit that should become the reference, and download the
-   artifact of the OS: `gh run download <run id> -n ui-golden-renders-<macos|windows> -D <scratch dir>`.
+   artifact of the OS: `gh run download <run id> -n ui-golden-renders-<macos|windows|linux-golden> -D <scratch dir>`.
 2. Replace the set with the frames: remove `tests/golden/<os>/*.png`, create the directory if need be
    and copy the artifact's `*.png` into it. The artifact holds exactly the 88 frames and nothing else.
 3. Run `cargo test -p lunepack-ui-luneui --locked --test golden` (the plain test checks the names), look
