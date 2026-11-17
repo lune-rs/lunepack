@@ -172,7 +172,7 @@ and none of the runtime, the stub or the `lunepack` facade, links or initialises
   never speaks, stops reading, hangs, exits at each typed code, sends garbage, is killed); the screens
   are checked by headless golden frames (one set per OS, M6-D9), an accessibility tree replay and a
   keyboard script per prompt in `lunepack-ui-luneui`; the real binary by a smoke test against a
-  scripted engine in `lunepack-ui`; and the Linux end-to-end suite installs through a setup file with
+  scripted engine in `lunepack-ui`; these run on developers' machines, not in CI (M6-D13); and the Linux end-to-end suite installs through a setup file with
   a stand-in UI that speaks the protocol with no window, with the UI killed and with none.
 
 ## Composition roots
