@@ -271,17 +271,25 @@ fn uninstall(
         events.emit(&Event::warning(Warning::IntegrationKept, None));
     }
 
-    // `R` leaves its path in one rename (F18), under the lock; the tombstone is beside it in the
-    // data home, so on the same filesystem. Its removal can then be cut off without leaving a
-    // half-removed `R`.
+    // `R` leaves its path in one rename (F18), under the lock (on Windows right after it, M7-D21
+    // below); the tombstone is beside it in the data home, so on the same filesystem. Its removal
+    // can then be cut off without leaving a half-removed `R`.
     let mut random = [0u8; TOMBSTONE_RANDOM_BYTES];
     ad.rng.fill(&mut random).map_err(|e| Kind::of(&e.into()))?;
     let tombstone = data_home.join(lunepack_core::tombstone_name(inst.app_id(), &random));
+    // M7-D21: on Windows a directory with an open file under it cannot be renamed, and the lock is
+    // a file in `R`, so the lock is released right before the rename (after the record check, the
+    // in-use scan and the integration removal). Every lunepack operation holds that lock file open,
+    // so the rename succeeds only while none runs; one that locks after it finds no `R` there. A
+    // failed rename returns the error with nothing deleted.
+    #[cfg(windows)]
+    drop(guard);
     ad.fs
         .rename(root, &tombstone)
         .map_err(|e| Kind::of(&e.into()))?;
     let _ = ad.fs.sync_dir(data_home);
     let removed = ad.fs.remove_dir_all_nofollow(&tombstone);
+    #[cfg(not(windows))]
     drop(guard);
     // A failure is one only while the tombstone is still there (another run's tombstone cleanup
     // may have removed it under this one).
