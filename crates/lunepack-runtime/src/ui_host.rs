@@ -177,7 +177,7 @@ struct Conv {
     /// The UI's hello was accepted.
     hello: bool,
     stop: Option<Stopped>,
-    /// The stop was logged (or needs no log: a stop while closing).
+    /// The stop was logged (or needs no log: the normal end after `Close`).
     reported: bool,
     /// `Close` was sent: an exit is now the normal end.
     closing: bool,
@@ -223,14 +223,27 @@ impl Shared {
 
     /// Stops the UI once: records why, ends the writer's channel and kills the own child.
     fn stop(&self, reason: UiStop, exit_code: Option<i32>) {
+        self.stop_as(reason, exit_code, false);
+    }
+
+    /// Stops a UI that was seen to have exited with `code` (`None`: ended by a signal).
+    fn stop_exited(&self, code: Option<i32>) {
+        self.stop_as(UiStop::of_exit_code(code), code, code != Some(0));
+    }
+
+    /// [`Shared::stop`]. `died` says the UI was seen to end on its own, with a failure or by a
+    /// signal. The engine cannot tell whether that came before or after it sent `Close` (the UI
+    /// may have been killed on the first frame it read, while `Close` was already queued), so a
+    /// stop while closing is left out of the log only when it is not a death.
+    fn stop_as(&self, reason: UiStop, exit_code: Option<i32>, died: bool) {
         {
             let mut conv = self.conv();
             if conv.stop.is_some() {
                 return;
             }
             conv.stop = Some(Stopped { reason, exit_code });
-            // An exit after `Close` is the normal end, not worth a log line.
-            if conv.closing {
+            // A clean exit after `Close` is the normal end, not worth a log line.
+            if conv.closing && !died {
                 conv.reported = true;
             }
         }
@@ -274,7 +287,7 @@ impl Shared {
     /// why.
     fn stop_gone(&self) {
         match self.exit_status(EXIT_PEEK) {
-            Some(code) => self.stop(UiStop::of_exit_code(code), code),
+            Some(code) => self.stop_exited(code),
             None => self.stop(UiStop::Exited, None),
         }
     }
@@ -411,8 +424,7 @@ fn watchdog(shared: Arc<Shared>) {
         }
         let exited = guard(&shared.child).try_wait();
         if let Ok(Some(kind)) = exited {
-            let code = exit_code(kind);
-            shared.stop(UiStop::of_exit_code(code), code);
+            shared.stop_exited(exit_code(kind));
             return;
         }
     }
@@ -733,9 +745,14 @@ impl UiHost {
             }
             // The writer writes what it holds, then ends, which closes the UI's input.
             guard(&shared.tx).take();
-            let exited = shared.exit_status(shared.bounds.close_wait).is_some();
-            if !exited {
-                let _ = guard(&shared.child).terminate(KILL_GRACE);
+            // A UI that ended by itself on a failure or a signal did not end normally, whatever
+            // the engine was doing when it did; the stop is then logged (a clean exit is not).
+            match shared.exit_status(shared.bounds.close_wait) {
+                Some(code) if code != Some(0) => shared.stop_exited(code),
+                Some(_) => {}
+                None => {
+                    let _ = guard(&shared.child).terminate(KILL_GRACE);
+                }
             }
             shared.done.store(true, Ordering::Release);
         }
@@ -862,7 +879,7 @@ pub fn card(name: &str, version: &str, from: Option<&str>) -> AppCard {
 mod tests {
     use super::*;
 
-    use lunepack_testkit::{ChildScript, FakeProcess};
+    use lunepack_testkit::{ChildScript, FakeChildPipes, FakeProcess};
 
     fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
         move |name| {
@@ -996,6 +1013,116 @@ mod tests {
             lost_answer(PromptKind::RolledBack, Flow::Update),
             C::Acknowledge
         );
+    }
+
+    /// Collects the lines the events become.
+    struct Capture(Arc<Mutex<Vec<String>>>);
+
+    impl Sink for Capture {
+        fn name(&self) -> &'static str {
+            "capture"
+        }
+
+        fn deliver(&mut self, event: &Event) -> Result<(), SinkFailed> {
+            guard(&self.0).push(crate::events::to_json_line(event));
+            Ok(())
+        }
+    }
+
+    /// A host whose UI child follows `script`, with its pipes held open by the test (so only the
+    /// child's exit says it is gone) and a watchdog that never looks.
+    fn host_with(script: ChildScript) -> (World, UiHost, FakeChildPipes) {
+        let w = world(true);
+        w.process.script_child(script);
+        let display = env_of(&[("DISPLAY", ":0")]);
+        let process: Arc<dyn Process> = Arc::new(w.process.clone());
+        let bounds = Bounds {
+            watch_tick: Duration::from_secs(3600),
+            close_wait: Duration::from_millis(500),
+            ..Bounds::default()
+        };
+        let host = UiHost::start_with(
+            bounds,
+            &Start {
+                process,
+                fs: &w.fs,
+                runtime_exe: &w.exe,
+                env: &display,
+                quiet: false,
+            },
+            Flow::Update,
+            card("App", "2.0.0", Some("1.0.0")),
+            Details {
+                location: None,
+                size_bytes: None,
+            },
+        );
+        let id = host.child_id().expect("the UI was started");
+        let pipes = w.process.take_child_pipes(id).expect("piped child");
+        (w, host, pipes)
+    }
+
+    /// The log lines a run's end (`close`, after the UI exited as `script` says) produces.
+    fn lines_after_close(script: ChildScript) -> Vec<String> {
+        let (_w, host, _pipes) = host_with(script);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = Events::new(Some(Box::new(Capture(Arc::clone(&seen)))), None);
+        host.close(&events);
+        events.finish(Duration::from_secs(2));
+        guard(&seen).clone()
+    }
+
+    #[test]
+    fn a_ui_that_died_is_logged_even_when_the_run_was_already_closing() {
+        // The UI is killed on the first frame it reads; the engine had already sent `Close` and
+        // only sees the exit while it waits for it (row 10 of the end-to-end suite flaked on this).
+        for (script, code) in [
+            (ChildScript::exits(3, ExitKind::Signal(6)), None),
+            (ChildScript::exits(3, ExitKind::Failure(1)), Some(1)),
+        ] {
+            let lines = lines_after_close(script);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("\"code\":\"ui_stopped\""), "{lines:?}");
+            assert!(lines[0].contains("\"reason\":\"exited\""), "{lines:?}");
+            assert_eq!(
+                lines[0].contains(&format!("\"ui_exit_code\":{}", code.unwrap_or(0))),
+                code.is_some(),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ui_that_exits_cleanly_after_close_is_not_logged() {
+        let lines = lines_after_close(ChildScript::exits(3, ExitKind::Success));
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn a_ui_that_must_be_killed_after_close_is_not_logged() {
+        // Our own kill is not a stop to report.
+        let lines = lines_after_close(ChildScript::runs());
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn the_exit_seen_by_the_channel_while_closing_is_logged_only_for_a_death() {
+        // The reader (or the writer) finds the channel ended after `Close` was queued.
+        for (kind, logged) in [
+            (ExitKind::Signal(6), true),
+            (ExitKind::Failure(3), true),
+            (ExitKind::Success, false),
+        ] {
+            let (_w, host, _pipes) = host_with(ChildScript::exits(0, kind));
+            let shared = Arc::clone(host.shared.as_ref().expect("a UI"));
+            shared.conv().closing = true;
+            shared.stop_gone();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let events = Events::new(Some(Box::new(Capture(Arc::clone(&seen)))), None);
+            host.report(&events);
+            events.finish(Duration::from_secs(2));
+            assert_eq!(guard(&seen).len(), usize::from(logged), "{kind:?}");
+        }
     }
 
     #[test]
