@@ -25,6 +25,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
 
+# The Windows process and per-user integration adapters, and the process's app user model id (M7).
+[target.'cfg(windows)'.dependencies]
+lunepack-os-windows.workspace = true
+
 [dev-dependencies]
 lunepack-testkit.workspace = true
 # The default-adapter build test uses a real temporary directory.

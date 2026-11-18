@@ -4,9 +4,9 @@
 //! (M5-D2).
 //!
 //! The adapters the lifecycle calls use are a [`Platform`]: the native one wires the default
-//! filesystem, crypto and randomness everywhere, and the Linux process and desktop integration
-//! adapters on Linux. On other platforms the process and integration calls are
-//! [`Error::Unsupported`] until their adapters exist.
+//! filesystem, crypto and randomness everywhere, the Linux process and desktop integration
+//! adapters on Linux and the Windows ones (per-user, M7) on Windows. On other platforms the
+//! process and integration calls are [`Error::Unsupported`] until their adapters exist.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -130,8 +130,9 @@ impl Platform {
     }
 
     /// The data home, instead of the environment's (`XDG_DATA_HOME`, else
-    /// `$HOME/.local/share`): a not-installed tree installs into the root the layout scheme
-    /// resolves there (`<data home>/<app id>` under [`LayoutScheme::XDG`]).
+    /// `$HOME/.local/share` on Linux; the user's program files folder on Windows): a
+    /// not-installed tree installs into the root the layout scheme resolves there
+    /// (`<data home>/<app id>` under [`LayoutScheme::XDG`]).
     pub fn with_data_home(mut self, data_home: PathBuf) -> Platform {
         self.data_home = Some(data_home);
         self
@@ -156,7 +157,7 @@ impl Platform {
         self
     }
 
-    /// The per-user data home: the override, else the environment's (Linux).
+    /// The per-user data home: the override, else the native one (Linux, Windows).
     fn data_home(&self) -> Result<PathBuf, Error> {
         if let Some(home) = &self.data_home {
             return Ok(home.clone());
@@ -165,10 +166,14 @@ impl Platform {
     }
 }
 
-/// The native layout scheme: [`LayoutScheme::XDG`] (the Windows scheme becomes Windows' default
-/// with its adapters, M7 step 9).
+/// The native layout scheme: [`LayoutScheme::WINDOWS`] on Windows (M7-D2), [`LayoutScheme::XDG`]
+/// everywhere else.
 fn native_layout_scheme() -> LayoutScheme {
-    LayoutScheme::XDG
+    if cfg!(windows) {
+        LayoutScheme::WINDOWS
+    } else {
+        LayoutScheme::XDG
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -187,23 +192,40 @@ fn native_data_home() -> Result<PathBuf, Error> {
     Ok(dirs.data_home().to_path_buf())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn default_process() -> Arc<dyn Process> {
+    Arc::new(lunepack_os_windows::WindowsProcess::new())
+}
+
+#[cfg(windows)]
+pub(crate) fn default_integration() -> Arc<dyn OsIntegration> {
+    Arc::new(lunepack_os_windows::WindowsIntegration::current_user())
+}
+
+/// The per-user program files folder, the parent of an install root (M7-D2).
+#[cfg(windows)]
+fn native_data_home() -> Result<PathBuf, Error> {
+    lunepack_os_windows::user_program_files()
+        .map_err(|_| Error::Config("the per-user program files folder is not available"))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn default_process() -> Arc<dyn Process> {
     Arc::new(unsupported::Unsupported)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub(crate) fn default_integration() -> Arc<dyn OsIntegration> {
     Arc::new(unsupported::Unsupported)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn native_data_home() -> Result<PathBuf, Error> {
     Err(Error::Unsupported)
 }
 
 /// The stand-in adapters of a platform without its own yet: every call is unsupported.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 mod unsupported {
     use core::time::Duration;
     use std::path::{Path, PathBuf};
@@ -379,8 +401,9 @@ impl Installation {
     ///   config's entry directory is [`Error::UpdateConfig`], and no directory further up is
     ///   tried.
     /// - No directory holds one: [`Error::NoUpdateConfig`].
-    /// - An installed tree (`R/versions/<its version>`) also has its install state at `R/state`
-    ///   loaded, which must carry the config's app id.
+    /// - An installed tree (`R/versions/<its version>` under [`LayoutScheme::XDG`],
+    ///   `R\app\<its version>` under [`LayoutScheme::WINDOWS`], whatever `R` is named) also has
+    ///   its install state under `R` loaded, which must carry the config's app id.
     pub fn from_exe_with(exe: &Path, platform: Platform) -> Result<Installation, Error> {
         // The native filesystem refuses symlinked components: resolve the exe (a launch through
         // `R/current` or a command link lands in its real tree).
