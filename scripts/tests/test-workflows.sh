@@ -193,6 +193,51 @@ if [ -f "$ci" ]; then
   t_check "a file with no os-trust job fails" rc_nonzero
 fi
 
+# --- the Windows end-to-end jobs (M7 step 14) ---------------------------------------------
+# Both must be required (no continue-on-error), time-bounded and on a Windows runner; the
+# Defender job turns Defender on first and reports detections whatever the suite did.
+e2e_windows_jobs_ok() {
+  local block bad=0 job
+  for job in e2e-windows e2e-windows-defender; do
+    block=$(job_block "$1" "$job")
+    if [ -z "$block" ]; then echo "no $job job"; bad=1; continue; fi
+    if ! printf '%s\n' "$block" | grep -q 'timeout-minutes:'; then echo "$job has no timeout-minutes"; bad=1; fi
+    if printf '%s\n' "$block" | grep -q 'continue-on-error'; then echo "$job must not be continue-on-error"; bad=1; fi
+    if ! printf '%s\n' "$block" | grep -q 'runs-on: windows-latest'; then echo "$job does not run on windows-latest"; bad=1; fi
+    if ! printf '%s\n' "$block" | grep -q 'scripts/e2e-windows.ps1'; then echo "$job does not run e2e-windows.ps1"; bad=1; fi
+  done
+  block=$(job_block "$1" e2e-windows-defender)
+  if ! printf '%s\n' "$block" | grep -q 'scripts/ci/defender-on.ps1'; then echo "the Defender job does not run defender-on.ps1"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'defender-on.ps1 -Report'; then echo "the Defender job does not report detections"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'if: always()'; then echo "the Defender job's report does not run after a failure"; bad=1; fi
+  return "$bad"
+}
+
+if [ -f "$ci" ]; then
+  RC=0
+  e2e_windows_jobs_ok "$ci" >"$OUT" 2>&1 || RC=$?
+  t_check "ci.yml has the e2e-windows and e2e-windows-defender jobs, required and time-bounded" rc_is 0
+  if [ "$RC" -ne 0 ]; then sed 's/^/    /' "$OUT" >&2; fi
+  sed 's|^  e2e-windows-defender:|  e2e-windows-defender:\n    continue-on-error: true|' "$ci" >"$T_TMP/e2e-coe.yml"
+  RC=0
+  e2e_windows_jobs_ok "$T_TMP/e2e-coe.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded continue-on-error on the Defender job fails" rc_nonzero
+  t_check "seeded continue-on-error reports why" out_has "continue-on-error"
+  grep -v 'defender-on.ps1 -Report' "$ci" >"$T_TMP/e2e-noreport.yml" || true
+  RC=0
+  e2e_windows_jobs_ok "$T_TMP/e2e-noreport.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded Defender job without its report fails" rc_nonzero
+  RC=0
+  e2e_windows_jobs_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "a file with no Windows e2e jobs fails" rc_nonzero
+fi
+t_check "defender-on.ps1 refuses off GitHub Actions" grep -q "GITHUB_ACTIONS -ne 'true'" "$repo/scripts/ci/defender-on.ps1"
+if command -v pwsh >/dev/null 2>&1; then
+  RC=0
+  env -u CI -u GITHUB_ACTIONS pwsh -NoProfile -File "$repo/scripts/ci/defender-on.ps1" >"$OUT" 2>&1 || RC=$?
+  t_check "defender-on.ps1 refuses off CI: exit 3" rc_is 3
+fi
+
 # The scripts refuse off CI (exit 3) before touching anything: no scratch directory appears.
 guard_tmp=$T_TMP/guard-tmp
 mkdir -p "$guard_tmp"
