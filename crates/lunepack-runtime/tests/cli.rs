@@ -56,6 +56,7 @@ const APP_FILE: &str = "bin/app.exe";
 #[cfg(not(windows))]
 const APP_FILE: &str = "bin/app";
 /// The golden lines of `apply-and-restart`: its result, `nothing_staged`, `unexpected_version`.
+#[cfg(target_os = "linux")]
 const GOLDEN_SCHEDULED: usize = 38;
 const GOLDEN_NOTHING_STAGED: usize = 39;
 const GOLDEN_UNEXPECTED: usize = 40;
