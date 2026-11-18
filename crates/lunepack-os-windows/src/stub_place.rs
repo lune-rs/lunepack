@@ -139,12 +139,12 @@ fn transient(e: &io::Error) -> bool {
     })
 }
 
-/// `r.rename` retried on a transient lock until [`RETRY_BUDGET`] is spent.
-fn rename_retry(r: &mut dyn Renamer, from: &Path, to: &Path) -> io::Result<()> {
+/// `op` retried on a transient lock until [`RETRY_BUDGET`] is spent.
+fn retry_transient(mut op: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     let deadline = Instant::now() + RETRY_BUDGET;
     let mut pause = Duration::from_millis(10);
     loop {
-        match r.rename(from, to) {
+        match op() {
             Ok(()) => return Ok(()),
             Err(e) if transient(&e) && Instant::now() + pause < deadline => {
                 std::thread::sleep(pause);
@@ -153,6 +153,30 @@ fn rename_retry(r: &mut dyn Renamer, from: &Path, to: &Path) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     }
+}
+
+/// `r.rename` retried on a transient lock until [`RETRY_BUDGET`] is spent.
+fn rename_retry(r: &mut dyn Renamer, from: &Path, to: &Path) -> io::Result<()> {
+    retry_transient(|| r.rename(from, to))
+}
+
+/// Renames `from` over `to` (replacing a file there), retrying a transient lock (a scan, the
+/// indexer): for the Start-menu shortcut's write-then-rename.
+pub(crate) fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    rename_retry(&mut StdRenamer, from, to)
+}
+
+/// Removes the file `path` (an absent file is fine), retrying a transient lock.
+pub(crate) fn remove_file_retrying(path: &Path) -> io::Result<()> {
+    retry_transient(|| match fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    })
+}
+
+/// 16 lowercase hex digits for a temporary name (see [`random_hex`]).
+pub(crate) fn temp_hex() -> String {
+    random_hex()
 }
 
 /// Whether the placement changed the destination.

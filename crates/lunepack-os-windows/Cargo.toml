@@ -26,6 +26,8 @@ lunepack-core.workspace = true
 # SystemParametersInfoW for the client-area animation setting (M6-D8); the DLL search hardening, the
 # known folders, the message box and the app user model id (M7).
 windows-sys = { workspace = true }
+# The Start-menu shortcut's COM interfaces (M7-D4).
+windows = { workspace = true }
 
 [dev-dependencies]
 lunepack-testkit.workspace = true

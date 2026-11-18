@@ -89,6 +89,21 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# COM for the Windows Start-menu shortcut (M7-D4): IShellLinkW, IPersistFile and IPropertyStore,
+# used only by lunepack-os-windows. The version is the one the UI stack already pulls in, so the
+# lock gains no package. `REACH_ONLY_THROUGH` in the boundary check holds it to that crate and to
+# the UI adapter (D17).
+windows = { version = "0.62", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
 # The window stack the UI binary needs, named through lunepack-ui-luneui's re-exports so the
 # boundary check still sees it reachable only through that crate (the version LuneUI uses).
 winit = "0.30"

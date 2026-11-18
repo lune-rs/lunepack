@@ -5,12 +5,15 @@
 //! small Windows helpers of M7: the DLL search hardening ([`harden_dll_search`]) and the shell
 //! helpers of [`shell`] (known folders, a message box, the app user model id, the foreground right),
 //! and, on Windows only, [`WindowsProcess`] (M7 step 5): the core's `Process` over the Win32 process
-//! APIs, and [`WindowsIntegration`] (M7 step 6): the core's `OsIntegration` (the launcher stub at
-//! the install root, the uninstall entry, the hidden `.lunepack` directory) with
-//! [`remove_stub_leftovers`] for the GC.
+//! APIs, and [`WindowsIntegration`] (M7 steps 6 and 7): the core's `OsIntegration` (the launcher
+//! stub at the install root, the uninstall entry, the hidden `.lunepack` directory, the Start-menu
+//! shortcut with its app user model id, and the file types, URL schemes and autostart the app
+//! declares) with [`remove_stub_leftovers`] for the GC.
 //! The public API is safe and builds on every OS; off Windows the helpers are no-ops or
 //! `Unsupported`.
 
+#[cfg(windows)]
+mod classes;
 mod harden;
 #[cfg(windows)]
 mod integration;
@@ -19,6 +22,8 @@ mod process;
 #[cfg(windows)]
 mod registry;
 mod shell;
+#[cfg(windows)]
+mod shortcut;
 #[cfg(windows)]
 mod stub_place;
 
