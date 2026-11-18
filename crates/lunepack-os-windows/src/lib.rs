@@ -8,7 +8,8 @@
 //! APIs, and [`WindowsIntegration`] (M7 steps 6 and 7): the core's `OsIntegration` (the launcher
 //! stub at the install root, the uninstall entry, the hidden `.lunepack` directory, the Start-menu
 //! shortcut with its app user model id, and the file types, URL schemes and autostart the app
-//! declares) with [`remove_stub_leftovers`] for the GC.
+//! declares) with [`remove_stub_leftovers`] for the GC; and the launcher stub's two helpers
+//! ([`raw_command_line`], [`ignore_console_interrupts`]).
 //! The public API is safe and builds on every OS; off Windows the helpers are no-ops or
 //! `Unsupported`.
 
@@ -17,6 +18,7 @@ mod classes;
 mod harden;
 #[cfg(windows)]
 mod integration;
+mod launcher;
 #[cfg(windows)]
 mod process;
 #[cfg(windows)]
@@ -30,6 +32,7 @@ mod stub_place;
 pub use harden::harden_dll_search;
 #[cfg(windows)]
 pub use integration::{MARKER_VALUE, UNINSTALL_KEY, WinScope, WindowsIntegration};
+pub use launcher::{ignore_console_interrupts, raw_command_line};
 #[cfg(windows)]
 pub use process::WindowsProcess;
 pub use shell::{

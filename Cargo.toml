@@ -75,13 +75,16 @@ png = "0.18"
 # OS adapters (M6 step 9, M6-D8; M7 step 5): the Windows reduce-motion reader calls user32 through
 # windows-sys, already in the lock for other crates; no window stack. The process adapter adds the
 # process snapshot and process-handle APIs (kernel32). The integration (M7 step 6) adds the
-# registry (advapi32; `RegCreateKeyExW` is behind `Win32_Security`) and file attributes.
+# registry (advapi32; `RegCreateKeyExW` is behind `Win32_Security`) and file attributes. The launcher
+# stub (M7 step 8) adds the raw command line and the console control handler.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_Threading",

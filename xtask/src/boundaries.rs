@@ -42,6 +42,7 @@ pub const ROLES: &[(&str, Role)] = &[
     ("lunepack-runtime", Role::Binary),
     ("lunepack-cli", Role::Binary),
     ("lunepack-ui", Role::Binary),
+    ("lunepack-stub", Role::Binary),
     ("xtask", Role::Tool),
 ];
 
@@ -82,6 +83,21 @@ pub const ONLY_DEPENDED_ON_BY: &[(&str, &[&str])] = &[
     ("lunepack-ui-luneui", &["lunepack-ui"]),
     ("lunepack-ui", &[]),
 ];
+
+/// Closed dependency lists (M7-D7, M7-D20): `(package, the only crates it may depend on)`. Every
+/// normal and build dependency of the package, workspace member or external, must be named here;
+/// dev-dependencies are not held. The launcher stub's contract is frozen across versions, so it
+/// links the core's read path, the filesystem, the record's hash and the Windows helpers, and no
+/// facade, network, codec or UI code.
+pub const DEPENDS_ONLY_ON: &[(&str, &[&str])] = &[(
+    "lunepack-stub",
+    &[
+        "lunepack-core",
+        "lunepack-fs",
+        "lunepack-crypto",
+        "lunepack-os-windows",
+    ],
+)];
 
 /// Reach-only-through crates (M4-D16): `(crate, vias)`. In the lock graph of the workspace and of
 /// `fuzz/`, no workspace member may reach `crate` except through one of the members in `vias`.
@@ -1104,6 +1120,20 @@ fn check_dependency(
             return;
         }
     };
+
+    if dep.kind != DependencyKind::Development
+        && let Some((_, only)) = DEPENDS_ONLY_ON.iter().find(|(p, _)| *p == package)
+        && !only.contains(&dname)
+    {
+        out.push(v(
+            package,
+            "depends-only-on",
+            format!(
+                "{kind} dependency on `{dname}`: {package} may depend only on {}",
+                only.join(", ")
+            ),
+        ));
+    }
 
     if let Some(dir) = member_dirs.get(dname) {
         // Workspace edge: must be a path dependency on that exact member.

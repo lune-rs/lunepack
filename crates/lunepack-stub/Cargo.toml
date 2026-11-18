@@ -1,0 +1,43 @@
+[package]
+name = "lunepack-stub"
+description = "The Windows launcher stub: starts an installed app's current version (launch contract v1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Two launchers over one library (M7-D7): the GUI one, placed at the install root as the app's
+# entry name, and a console one for console apps.
+[[bin]]
+name = "lunepack-stub"
+path = "src/bin/lunepack-stub.rs"
+doc = false
+
+[[bin]]
+name = "lunepack-stub-console"
+path = "src/bin/lunepack-stub-console.rs"
+doc = false
+
+# The launch contract's read path (core), the filesystem and the record's hash (M7-D20), and the
+# Windows helpers. Nothing else: no facade, network, codec or UI code in the frozen launcher. The
+# boundary check holds this list (DEPENDS_ONLY_ON).
+[dependencies]
+lunepack-core.workspace = true
+lunepack-fs.workspace = true
+lunepack-crypto.workspace = true
+lunepack-os-windows.workspace = true
+
+[dev-dependencies]
+lunepack-testkit.workspace = true
+tempfile = { workspace = true }
+
+# Own main: the test binary is also the app and the runtime the stub starts (an environment
+# variable names the helper mode), and the cases run one after another.
+[[test]]
+name = "launch"
+harness = false

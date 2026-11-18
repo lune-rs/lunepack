@@ -1373,7 +1373,7 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         );
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            "boundaries: ok (15 packages)"
+            "boundaries: ok (16 packages)"
         );
     }
 
@@ -1737,5 +1737,56 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         .unwrap();
         let (_, vs) = check_workspace(dir.path()).expect("check");
         assert_has(&vs, "lune-ui", "lock-source");
+    }
+
+    /// The clean fixture plus the launcher stub on its allowed list (two of its four crates exist
+    /// in the fixture).
+    fn with_stub() -> Fx {
+        let mut fx = Fx::clean();
+        fx.crates.insert(
+            "lunepack-stub".into(),
+            manifest(
+                "lunepack-stub",
+                INHERIT,
+                "lunepack-core = { path = \"../lunepack-core\" }\n\
+                 lunepack-fs = { path = \"../lunepack-fs\" }",
+            ),
+        );
+        fx
+    }
+
+    #[test]
+    fn x_the_stub_depends_only_on_its_closed_list() {
+        assert_clean(&with_stub().run().1);
+        // The facade is allowed for a binary by role, but not for the stub.
+        let mut fx = with_stub();
+        fx.add_dep("lunepack-stub", r#"lunepack = { path = "../lunepack" }"#);
+        assert_has(&fx.run().1, "lunepack-stub", "depends-only-on");
+        let mut fx = with_stub();
+        fx.add_dep(
+            "lunepack-stub",
+            r#"lunepack-http = { path = "../lunepack-http" }"#,
+        );
+        assert_has(&fx.run().1, "lunepack-stub", "depends-only-on");
+        // Build dependencies count; dev-dependencies do not.
+        let mut fx = with_stub();
+        fx.append(
+            "lunepack-stub",
+            "[build-dependencies]\nlunepack-http = { path = \"../lunepack-http\" }",
+        );
+        assert_has(&fx.run().1, "lunepack-stub", "depends-only-on");
+        let mut fx = with_stub();
+        fx.append(
+            "lunepack-stub",
+            "[dev-dependencies]\nlunepack-testkit = { path = \"../lunepack-testkit\" }",
+        );
+        assert_clean(&fx.run().1);
+        // Another binary is not held by the stub's list.
+        let mut fx = with_stub();
+        fx.add_dep("lunepack-cli", r#"lunepack = { path = "../lunepack" }"#);
+        assert!(
+            !has(&fx.run().1, "lunepack-cli", "depends-only-on"),
+            "the list is the stub's only"
+        );
     }
 }
