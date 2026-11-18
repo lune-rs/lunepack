@@ -29,6 +29,7 @@ pub mod root;
 pub mod setup;
 pub mod stage;
 pub mod state;
+pub mod stub;
 pub mod target;
 pub mod traits;
 pub mod transport;
@@ -97,6 +98,7 @@ pub use state::{
     MachineScope, PendingRef, PreviousRef, Record, RootParts, Scope, StagedIssued, StagedRef,
     UserScope,
 };
+pub use stub::{LaunchTarget, STUB_CONTRACT_VERSION, STUB_FILE, StubError, launch_target};
 pub use target::Target;
 pub use traits::{
     Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,
