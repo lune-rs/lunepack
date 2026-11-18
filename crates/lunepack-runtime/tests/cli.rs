@@ -183,6 +183,9 @@ impl Lab {
                 bin: Some(BIN.to_owned()),
                 terminal: false,
                 publisher: None,
+                file_types: Vec::new(),
+                url_schemes: Vec::new(),
+                autostart: false,
             };
             let config = UpdateConfig::new(
                 &root,

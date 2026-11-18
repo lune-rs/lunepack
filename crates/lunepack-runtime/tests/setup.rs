@@ -227,6 +227,9 @@ mod linux {
                 bin: Some(BIN.to_owned()),
                 terminal: false,
                 publisher: Some("Example Org".to_owned()),
+                file_types: Vec::new(),
+                url_schemes: Vec::new(),
+                autostart: false,
             };
             let config = UpdateConfig::new(
                 &config_root,

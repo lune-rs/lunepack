@@ -110,7 +110,8 @@ pub use transport::{
 };
 pub use trust::{ClockReading, KeyEntry, KeyRing, PublicKey, RollbackFloor};
 pub use update_config::{
-    FeedKind, InstallMeta, UPDATE_CONFIG_FILE, UpdateConfig, check_feed, desktop_safe_path,
+    FeedKind, FileType, InstallMeta, UPDATE_CONFIG_FILE, UpdateConfig, check_feed,
+    desktop_safe_path,
 };
 pub use version::Version;
 pub use write::{

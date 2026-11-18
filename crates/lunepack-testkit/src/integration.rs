@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lunepack_core::{
-    AppId, InstallMeta, IntegrationError, IntegrationItem, IntegrationReport, IntegrationRequest,
-    OsIntegration, RelPath, Scope,
+    AppId, FileType, InstallMeta, IntegrationError, IntegrationItem, IntegrationReport,
+    IntegrationRequest, OsIntegration, RelPath, Scope, Version,
 };
 
 /// Which operation a [`IntegrationCall`] was.
@@ -31,8 +31,12 @@ pub struct IntegrationCall {
     pub app_id: String,
     /// The install root.
     pub install_root: PathBuf,
+    /// The version the request named.
+    pub version: Version,
     /// The metadata.
     pub meta: InstallMeta,
+    /// The outgoing version's metadata the request carried.
+    pub previous: Option<InstallMeta>,
     /// The stale command-link names the request carried.
     pub stale_bins: Vec<String>,
 }
@@ -100,7 +104,9 @@ impl FakeIntegration {
             scope,
             app_id: req.app_id.as_str().to_owned(),
             install_root: req.install_root.clone(),
+            version: req.version.clone(),
             meta: req.meta.clone(),
+            previous: req.previous.clone(),
             stale_bins: req.stale_bins.clone(),
         });
         if scope != Scope::User {
@@ -187,6 +193,7 @@ fn suite_request(sandbox: &Path, id: &str, name: &str, bin: &str) -> Integration
     IntegrationRequest {
         app_id: AppId::parse(id).expect("suite app id"),
         install_root: sandbox.join(format!("suite-install-{id}")),
+        version: Version::parse("1.0.0").expect("suite version"),
         meta: InstallMeta {
             entry: RelPath::parse("bin/app").expect("suite entry"),
             name: name.to_owned(),
@@ -196,7 +203,22 @@ fn suite_request(sandbox: &Path, id: &str, name: &str, bin: &str) -> Integration
             bin: Some(bin.to_owned()),
             terminal: false,
             publisher: None,
+            file_types: vec![
+                FileType {
+                    ext: "suite".to_owned(),
+                    mime: "application/x-suite".to_owned(),
+                    name: "Suite document".to_owned(),
+                },
+                FileType {
+                    ext: "suiteb".to_owned(),
+                    mime: "application/x-suite-b".to_owned(),
+                    name: "Suite B document".to_owned(),
+                },
+            ],
+            url_schemes: vec![format!("suite-{bin}")],
+            autostart: true,
         },
+        previous: None,
         stale_bins: Vec::new(),
     }
 }
@@ -270,6 +292,38 @@ pub fn run_integration_suite(integration: &dyn OsIntegration, sandbox: &Path) {
         "refreshing back did not restore"
     );
 
+    // Dropping the declarations (file types, URL schemes, autostart) in a later version takes
+    // their entries away without a leftover; declaring them again brings the same state back.
+    let mut bare = a.clone();
+    bare.meta.file_types.clear();
+    bare.meta.url_schemes.clear();
+    bare.meta.autostart = false;
+    bare.previous = Some(a.meta.clone());
+    let report = integration.apply(Scope::User, &bare).expect("apply bare");
+    assert!(
+        report.kept.is_empty(),
+        "dropping declarations kept something"
+    );
+    let dropped = snapshot(sandbox);
+    assert!(
+        dropped.len() < applied.len(),
+        "dropping autostart left its entry"
+    );
+    integration
+        .apply(Scope::User, &bare)
+        .expect("apply bare again");
+    assert_eq!(
+        snapshot(sandbox),
+        dropped,
+        "a second bare apply changed something"
+    );
+    integration.apply(Scope::User, &a).expect("declare again");
+    assert_eq!(
+        snapshot(sandbox),
+        applied,
+        "declaring again did not restore"
+    );
+
     // remove takes it all away.
     let report = integration.remove(Scope::User, &a).expect("remove");
     assert!(report.kept.is_empty(), "remove kept what it made");
@@ -339,6 +393,33 @@ fn unsafe_cases(
     });
     with("dot dot in bin", &|r| {
         r.meta.bin = Some(format!("../{MARK}"));
+    });
+    with("a semicolon in a mime type", &|r| {
+        r.meta.file_types[0].mime = format!("text/{MARK};x-evil/x");
+    });
+    with("a newline in a mime type", &|r| {
+        r.meta.file_types[0].mime = format!("text/{MARK}\nExec=evil");
+    });
+    with("a dot in an extension", &|r| {
+        r.meta.file_types[0].ext = format!("{MARK}.exe");
+    });
+    with("an uppercase extension", &|r| {
+        r.meta.file_types[0].ext = "SUITE".to_owned();
+    });
+    with("a newline in a file type name", &|r| {
+        r.meta.file_types[0].name = format!("{MARK}\nExec=evil");
+    });
+    with("the same extension twice", &|r| {
+        r.meta.file_types[1].ext = r.meta.file_types[0].ext.clone();
+    });
+    with("a denied URL scheme", &|r| {
+        r.meta.url_schemes = vec!["https".to_owned()];
+    });
+    with("a denied ms- URL scheme", &|r| {
+        r.meta.url_schemes = vec!["ms-settings".to_owned()];
+    });
+    with("a semicolon in a URL scheme", &|r| {
+        r.meta.url_schemes = vec![format!("{MARK};x")];
     });
     with("a quote in the install root", &|r| {
         r.install_root = sandbox.join(format!("{MARK}\"quoted"));

@@ -1127,6 +1127,9 @@ mod linux {
                 bin: Some(BIN.to_owned()),
                 terminal: false,
                 publisher: None,
+                file_types: Vec::new(),
+                url_schemes: Vec::new(),
+                autostart: false,
             };
             let config = UpdateConfig::new(
                 &root,
@@ -1589,6 +1592,9 @@ mod linux {
                 bin: None,
                 terminal: false,
                 publisher: None,
+                file_types: Vec::new(),
+                url_schemes: Vec::new(),
+                autostart: false,
             };
             write_file(
                 &dir.join("lunepack-update.json"),

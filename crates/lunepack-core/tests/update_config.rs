@@ -9,11 +9,11 @@ use std::path::Path;
 
 use lunepack_core::error::JsonError;
 use lunepack_core::update_config::{
-    MAX_UPDATE_CONFIG_BYTES, RUNTIME_FILE, RUNTIME_FILE_WINDOWS, UPDATE_CONFIG_PATH_MACOS,
-    config_path, runtime_file,
+    DENIED_URL_SCHEMES, MAX_UPDATE_CONFIG_BYTES, RUNTIME_FILE, RUNTIME_FILE_WINDOWS,
+    UPDATE_CONFIG_PATH_MACOS, config_path, runtime_file,
 };
 use lunepack_core::{
-    AppId, DesktopPathError, FeedKind, FeedRule, Target, TrustedRoot, UPDATE_CONFIG_FILE,
+    AppId, DesktopPathError, FeedKind, FeedRule, FileType, Target, TrustedRoot, UPDATE_CONFIG_FILE,
     UpdateConfig, UpdateConfigError, check_feed, desktop_safe_path,
 };
 use lunepack_testkit::{FakeHasher, FakeKeyPair, FakeVerifier, fuzz_seeds, sample_update_config};
@@ -443,6 +443,292 @@ fn the_writer_refuses_a_bad_publisher() {
     assert!(c.to_bytes().is_err());
 }
 
+fn ft(ext: &str, mime: &str, name: &str) -> Value {
+    json!({"ext": ext, "mime": mime, "name": name})
+}
+
+#[test]
+fn the_declaration_members_are_optional_and_absent_stays_absent() {
+    // The sample (M5/M6 shape) holds none of them, and still parses, to the empty values.
+    let plain = sample().to_bytes().unwrap();
+    let text = String::from_utf8_lossy(&plain).into_owned();
+    for key in ["file_types", "url_schemes", "autostart"] {
+        assert!(!text.contains(key), "{key}");
+    }
+    let read = parse(&plain).unwrap();
+    assert!(read.install.file_types.is_empty());
+    assert!(read.install.url_schemes.is_empty());
+    assert!(!read.install.autostart);
+    // Empty and false are left out of the written bytes, never written: the bytes are unchanged.
+    assert_eq!(read.to_bytes().unwrap(), plain);
+    // A reader accepts the explicit empty forms and the writer drops them again.
+    let explicit = edited(|m| {
+        let install = m["install"].as_object_mut().unwrap();
+        install.insert("file_types".to_owned(), json!([]));
+        install.insert("url_schemes".to_owned(), json!([]));
+        install.insert("autostart".to_owned(), json!(false));
+    });
+    assert_eq!(parse(&explicit).unwrap().to_bytes().unwrap(), plain);
+}
+
+#[test]
+fn the_declaration_members_round_trip_in_byte_order() {
+    let mut with = sample();
+    with.install.file_types = vec![
+        FileType {
+            ext: "ex".to_owned(),
+            mime: "application/x-example".to_owned(),
+            name: "Example file".to_owned(),
+        },
+        FileType {
+            ext: "png".to_owned(),
+            mime: "image/png".to_owned(),
+            name: "PNG image".to_owned(),
+        },
+    ];
+    with.install.url_schemes = vec!["example".to_owned(), "ex+tra.v-2".to_owned()];
+    with.install.autostart = true;
+    let bytes = with.to_bytes().unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    let back = parse(&bytes).unwrap();
+    assert_eq!(back, with);
+    assert_eq!(
+        back.to_bytes().unwrap(),
+        bytes,
+        "canonical bytes round-trip"
+    );
+    // `autostart` < `bin` ... `entry` < `file_types` < `icon` ... `terminal` < `url_schemes`.
+    let at = |key: &str| text.find(&format!("\"{key}\"")).unwrap();
+    assert!(at("autostart") < at("bin"));
+    assert!(at("entry") < at("file_types") && at("file_types") < at("icon"));
+    assert!(at("terminal") < at("url_schemes"));
+    // Each file type's members are in byte order, and the declaration order is kept.
+    assert!(text.find("\"ext\"").unwrap() < text.find("\"mime\"").unwrap());
+    assert!(text.find("application/x-example").unwrap() < text.find("image/png").unwrap());
+}
+
+#[test]
+fn file_type_rules() {
+    let ok = |types: Vec<Value>| parse(&with_install("file_types", Value::Array(types))).unwrap();
+    ok(vec![ft("a", "a/b", "N")]);
+    ok(vec![ft(&"z9".repeat(8), "text/plain", &"é".repeat(128))]);
+    ok(vec![ft(
+        "ex",
+        &format!("{0}/{0}", "A0!#$&^_.+-".repeat(11) + "a"),
+        "n",
+    )]);
+    let types32: Vec<Value> = (0..32).map(|i| ft(&format!("e{i}"), "a/b", "n")).collect();
+    assert_eq!(ok(types32.clone()).install.file_types.len(), 32);
+    let mut types33 = types32;
+    types33.push(ft("e32", "a/b", "n"));
+    assert_eq!(
+        invalid_field(&with_install("file_types", Value::Array(types33))),
+        "install.file_types"
+    );
+    for bad in [
+        ft("", "a/b", "n"),
+        ft("EX", "a/b", "n"),
+        ft(".ex", "a/b", "n"),
+        ft("e x", "a/b", "n"),
+        ft("é", "a/b", "n"),
+        ft(&"e".repeat(17), "a/b", "n"),
+        ft("ex", "ab", "n"),
+        ft("ex", "a/", "n"),
+        ft("ex", "/b", "n"),
+        ft("ex", "a/b/c", "n"),
+        ft("ex", "a/b;c/d", "n"),
+        ft("ex", "a/b; charset=x", "n"),
+        ft("ex", "a /b", "n"),
+        ft("ex", "a/b\n", "n"),
+        ft("ex", "a/é", "n"),
+        ft("ex", "a/b,c", "n"),
+        ft("ex", &format!("{}/b", "a".repeat(128)), "n"),
+        ft("ex", &format!("a/{}", "b".repeat(128)), "n"),
+        ft("ex", "a/b", ""),
+        ft("ex", "a/b", &"é".repeat(129)),
+        ft("ex", "a/b", " n"),
+        ft("ex", "a/b", "n\nExec=x"),
+        ft("ex", "a/b", "n\\"),
+    ] {
+        assert_eq!(
+            invalid_field(&with_install("file_types", json!([bad.clone()]))),
+            "install.file_types",
+            "{bad}"
+        );
+    }
+    // The same extension twice, with different mime types.
+    assert_eq!(
+        invalid_field(&with_install(
+            "file_types",
+            json!([ft("ex", "a/b", "n"), ft("ex", "c/d", "n")])
+        )),
+        "install.file_types"
+    );
+    // The same mime type under two extensions is fine (`jpg` and `jpeg`).
+    ok(vec![
+        ft("jpg", "image/jpeg", "n"),
+        ft("jpeg", "image/jpeg", "n"),
+    ]);
+    // Shapes: not an array, an item that is not an object, a missing, unknown or mistyped member.
+    assert!(matches!(
+        parse(&with_install("file_types", json!("x"))),
+        Err(UpdateConfigError::WrongType("install.file_types"))
+    ));
+    assert!(matches!(
+        parse(&with_install("file_types", json!(null))),
+        Err(UpdateConfigError::WrongType("install.file_types"))
+    ));
+    assert!(matches!(
+        parse(&with_install("file_types", json!(["ex"]))),
+        Err(UpdateConfigError::WrongType("install.file_types"))
+    ));
+    assert!(matches!(
+        parse(&with_install(
+            "file_types",
+            json!([{"ext": "ex", "mime": "a/b"}])
+        )),
+        Err(UpdateConfigError::Missing("install.file_types.name"))
+    ));
+    assert!(matches!(
+        parse(&with_install(
+            "file_types",
+            json!([{"ext": "ex", "mime": "a/b", "name": "n", "icon": "x"}])
+        )),
+        Err(UpdateConfigError::Unknown("install.file_types"))
+    ));
+    assert!(matches!(
+        parse(&with_install(
+            "file_types",
+            json!([{"ext": 1, "mime": "a/b", "name": "n"}])
+        )),
+        Err(UpdateConfigError::WrongType("install.file_types"))
+    ));
+}
+
+#[test]
+fn url_scheme_rules() {
+    let read = |schemes: Vec<String>| parse(&with_install("url_schemes", json!(schemes)));
+    for ok in ["a", "example", "x-1.2+3", &format!("a{}", "b".repeat(31))] {
+        read(vec![ok.to_owned()]).unwrap();
+    }
+    let eight: Vec<String> = (0..8).map(|i| format!("app{i}")).collect();
+    assert_eq!(read(eight.clone()).unwrap().install.url_schemes.len(), 8);
+    let mut nine = eight;
+    nine.push("app8".to_owned());
+    assert!(matches!(
+        read(nine),
+        Err(UpdateConfigError::Invalid {
+            field: "install.url_schemes",
+            ..
+        })
+    ));
+    for bad in [
+        "",
+        "1app",
+        "-app",
+        "+app",
+        "App",
+        "a_b",
+        "a b",
+        "a:b",
+        "a/b",
+        "a;b",
+        "é",
+        &format!("a{}", "b".repeat(32)),
+    ] {
+        assert!(
+            matches!(
+                read(vec![bad.to_owned()]),
+                Err(UpdateConfigError::Invalid {
+                    field: "install.url_schemes",
+                    ..
+                })
+            ),
+            "{bad:?}"
+        );
+    }
+    assert!(matches!(
+        read(vec!["app".to_owned(), "app".to_owned()]),
+        Err(UpdateConfigError::Invalid {
+            field: "install.url_schemes",
+            ..
+        })
+    ));
+    // The deny-list, every entry, in either case, and the `ms-` prefix.
+    let mut denied: Vec<String> = DENIED_URL_SCHEMES.iter().map(|s| (*s).to_owned()).collect();
+    denied.extend(["ms-settings", "ms-", "ms-x"].map(str::to_owned));
+    for scheme in denied {
+        for text in [scheme.clone(), scheme.to_ascii_uppercase()] {
+            assert!(
+                matches!(
+                    read(vec![text.clone()]),
+                    Err(UpdateConfigError::Invalid {
+                        field: "install.url_schemes",
+                        ..
+                    })
+                ),
+                "{text}"
+            );
+        }
+    }
+    assert!(lunepack_core::update_config::is_denied_url_scheme(
+        "MS-Settings"
+    ));
+    assert!(!lunepack_core::update_config::is_denied_url_scheme("mss-x"));
+    // The well-known ones the plan names.
+    for name in [
+        "http",
+        "https",
+        "file",
+        "ftp",
+        "mailto",
+        "data",
+        "javascript",
+        "about",
+    ] {
+        assert!(DENIED_URL_SCHEMES.contains(&name), "{name}");
+    }
+    assert!(matches!(
+        parse(&with_install("url_schemes", json!("x"))),
+        Err(UpdateConfigError::WrongType("install.url_schemes"))
+    ));
+    assert!(matches!(
+        parse(&with_install("url_schemes", json!([1]))),
+        Err(UpdateConfigError::WrongType("install.url_schemes"))
+    ));
+}
+
+#[test]
+fn autostart_must_be_a_boolean() {
+    assert!(
+        parse(&with_install("autostart", json!(true)))
+            .unwrap()
+            .install
+            .autostart
+    );
+    for bad in [json!(null), json!(1), json!("true")] {
+        assert!(matches!(
+            parse(&with_install("autostart", bad)),
+            Err(UpdateConfigError::WrongType("install.autostart"))
+        ));
+    }
+}
+
+#[test]
+fn the_writer_refuses_bad_declarations() {
+    let bad_type = FileType {
+        ext: "EX".to_owned(),
+        mime: "a/b".to_owned(),
+        name: "n".to_owned(),
+    };
+    let mut c = sample();
+    c.install.file_types = vec![bad_type];
+    assert!(c.to_bytes().is_err());
+    let mut c = sample();
+    c.install.url_schemes = vec!["https".to_owned()];
+    assert!(c.to_bytes().is_err());
+}
+
 #[test]
 fn category_boundaries() {
     let cats = |v: Vec<String>| with_install("categories", json!(v));
@@ -616,6 +902,21 @@ fn errors_never_echo_the_value() {
         with_install("entry", json!(format!("../{marker}"))),
         with_install("bin", json!(format!("-{marker}"))),
         with_install("categories", json!([format!("{marker};")])),
+        with_install("file_types", json!([ft(&format!("{marker};"), "a/b", "n")])),
+        with_install(
+            "file_types",
+            json!([ft("ex", &format!("{marker};x/y"), "n")]),
+        ),
+        with_install(
+            "file_types",
+            json!([ft("ex", "a/b", &format!("{marker}\n"))]),
+        ),
+        with_install(
+            "file_types",
+            json!([{"ext": "ex", "mime": "a/b", "name": "n", marker: 1}]),
+        ),
+        with_install("url_schemes", json!([format!("{marker};")])),
+        with_install("url_schemes", json!([format!("ms-{marker}")])),
         with_install(marker, json!(1)),
         with_top("feed", json!(format!("http://{marker}.example/"))),
         with_top("app_id", json!(format!("{marker} x"))),
