@@ -144,7 +144,7 @@ fn refresh_integration(
 }
 
 fn reconcile(ad: &Adapters, layout: &UserLayout, record: &InstallState, events: &Events) {
-    if lunepack_core::reconcile_current(&*ad.fs, layout.root(), record).is_err() {
+    if layout.reconcile(&*ad.fs, record).is_err() {
         events.emit(&Event::warning(Warning::ReconcileFailed, None));
     }
 }

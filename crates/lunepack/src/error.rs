@@ -87,6 +87,11 @@ pub enum Error {
     /// is not empty and holds neither this app's install state nor only what a run cut off
     /// before its first record leaves. Uninstall removes the root whole, so the install takes
     /// over nothing it did not make; nothing was written.
+    ///
+    /// Under the Windows layout (M7-D16, M7-D17) also: more than one folder holds this app's
+    /// install, the app's folder holds a state that cannot be read, every folder name the install
+    /// may use is taken, the data home has too many entries, or the root's state holds another
+    /// app's record (found under the lock).
     #[error("the install root holds files lunepack did not make")]
     ForeignInstallRoot,
     /// The first install found no release for this install: the channel offers none, none whose
@@ -122,6 +127,21 @@ impl From<lunepack_core::Error> for Error {
             lunepack_core::Error::Integration(e) => Error::from(e),
             lunepack_core::Error::Lifecycle(e) => Error::from(e),
             lunepack_core::Error::Layout(LayoutError::Fs(e)) => Error::Fs(e),
+            // M7-D15: the display name cannot be the install folder's name (exit `config`).
+            lunepack_core::Error::Layout(LayoutError::NameNotAllowed(_)) => {
+                Error::UpdateConfig(UpdateConfigError::Invalid {
+                    field: "name",
+                    rule: "is not a valid Windows folder name",
+                })
+            }
+            // M7-D16, M7-D17: no folder can be taken over for this install.
+            lunepack_core::Error::Layout(
+                LayoutError::InstallAmbiguous
+                | LayoutError::InstallUnreadable
+                | LayoutError::FolderTaken
+                | LayoutError::TooManyEntries
+                | LayoutError::ForeignRecord,
+            ) => Error::ForeignInstallRoot,
             other => Error::Verify(other),
         }
     }

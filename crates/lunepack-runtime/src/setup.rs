@@ -165,7 +165,18 @@ pub fn prepare(
         &*ad.verifier,
     )
     .map_err(|e| Kind::of(&lunepack::Error::from(e)))?;
-    let install_root = data_home.join(found.trailer.root.app_id().as_str());
+    // M7-D16: `R` is found by record (or named) under the platform's layout scheme;
+    // `<data home>/<app id>` under XDG.
+    let install_root = lunepack_core::resolve_root(
+        &*ad.fs,
+        &*ad.hasher,
+        data_home,
+        found.trailer.root.app_id(),
+        &verified.config.install.name,
+        ad.platform.layout_scheme(),
+    )
+    .map_err(|e| Kind::of(&lunepack::Error::from(lunepack_core::Error::Layout(e))))?
+    .into_path();
     let mut prepared = Prepared {
         found,
         verified,
@@ -418,7 +429,10 @@ fn install(ad: &Adapters, prepared: &Prepared, events: &Events) -> Result<Versio
         root.clone(),
         &config.feed,
         config.channel.clone(),
-        Layout::user(&UserLayout::from_root(prepared.install_root.clone())),
+        Layout::user(&UserLayout::from_root(
+            prepared.install_root.clone(),
+            ad.platform.layout_scheme(),
+        )),
     )
     .fs(Arc::clone(&ad.fs))
     .hasher(Arc::clone(&ad.hasher))
@@ -470,7 +484,8 @@ fn install(ad: &Adapters, prepared: &Prepared, events: &Events) -> Result<Versio
 /// Starts the installed version's entry, detached, with no arguments and without a health token;
 /// a failure is a warning.
 fn launch(ad: &Adapters, prepared: &Prepared, version: &Version, events: &Events) {
-    let tree = UserLayout::from_root(prepared.install_root.clone()).version_dir(version);
+    let tree = UserLayout::from_root(prepared.install_root.clone(), ad.platform.layout_scheme())
+        .version_dir(version);
     let entry = prepared
         .verified
         .config

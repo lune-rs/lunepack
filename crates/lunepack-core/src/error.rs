@@ -470,6 +470,28 @@ pub enum LayoutError {
     /// `current` under the install root is a file or a directory, not a link.
     #[error("the current link is not a symlink")]
     CurrentNotALink,
+    /// The app's display name is not a valid Windows folder name (M7-D15); the error names the
+    /// rule broken, never the name.
+    #[error("the app's name is not a valid folder name: {0}")]
+    NameNotAllowed(crate::layout::NameRule),
+    /// More than one folder of the data home holds an install of this app id (M7-D16): the user
+    /// has copies of the install, and neither is picked.
+    #[error("more than one folder holds an install of this app")]
+    InstallAmbiguous,
+    /// A folder this app installs into by name holds an install state that cannot be read; it may
+    /// be this app's, so nothing is installed beside it (M7-D16).
+    #[error("the app's folder holds an install state that cannot be read")]
+    InstallUnreadable,
+    /// Every folder name a first install may use is taken by something that is not an install of
+    /// this app (M7-D17).
+    #[error("a folder with this app's name already exists")]
+    FolderTaken,
+    /// The data home has more entries than discovery reads (M7-D16, fail closed).
+    #[error("the data home has too many entries")]
+    TooManyEntries,
+    /// The install root's state directory holds a record of another app id (M7-D16 rule 3).
+    #[error("the install folder belongs to another app")]
+    ForeignRecord,
     /// A filesystem operation failed.
     #[error("{0}")]
     Fs(#[from] FsError),

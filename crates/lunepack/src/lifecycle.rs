@@ -15,7 +15,7 @@ use std::fmt;
 use lunepack_core::state::{InstallState, Loaded, UserScope};
 use lunepack_core::{
     AttemptOutcome, ChildStdio, ConfirmOutcome, FileKind, IntegrationRequest, LifecycleEvent,
-    ProcessId, Scope, SpawnSpec, TokenCheck, UserLayout, Version, reconcile_current,
+    ProcessId, Scope, SpawnSpec, TokenCheck, UserLayout, Version,
 };
 
 use crate::Error;
@@ -159,7 +159,8 @@ fn commit_if_changed(
 }
 
 fn reconcile(inst: &Installation, layout: &UserLayout, record: &InstallState) -> Result<(), Error> {
-    reconcile_current(&*inst.platform.fs, layout.root(), record)
+    layout
+        .reconcile(&*inst.platform.fs, record)
         .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))
 }
 

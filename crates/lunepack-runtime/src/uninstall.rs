@@ -184,8 +184,16 @@ fn uninstall(
 ) -> Result<Vec<Kept>, Kind> {
     let layout = inst.layout().ok_or(Kind::NotInstalled)?;
     let root = layout.root();
-    // M5-D10: the root this runtime stands in must be the one this environment derives.
-    if root != data_home.join(inst.app_id().as_str()) || !real_canonical_dir(ad, root) {
+    // M5-D10, M7-D16: the root this runtime stands in must be one this environment's data home
+    // holds under the layout's scheme (`<data home>/<app id>` under XDG).
+    if !lunepack_core::root_valid_for_uninstall(
+        &*ad.fs,
+        data_home,
+        root,
+        inst.app_id(),
+        layout.scheme(),
+    ) || !real_canonical_dir(ad, root)
+    {
         return Err(Kind::InstallMismatch);
     }
     // Best effort: a tombstone is never `R`, so one that stays changes nothing here.
