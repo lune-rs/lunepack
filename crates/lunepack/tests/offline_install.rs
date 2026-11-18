@@ -360,6 +360,55 @@ fn an_installed_record_is_already_installed_and_unchanged() {
 }
 
 #[test]
+fn a_rerun_applies_the_installed_versions_integration_again() {
+    let _serial = common::serial();
+    const V110: &str = "1.1.0";
+    let lab = Lab::new();
+    let first = lab.parts(V100, &lab.root());
+    install(&lab, payload(&first, V100), DownloadOptions::default()).expect("first");
+    let before = lab.record();
+    let calls_before = lab.integration.calls().len();
+    // A newer Setup over the installed app: the repair is of what is installed, not of the payload.
+    let newer = lab.parts(V110, &lab.root());
+    let got = install(&lab, payload(&newer, V110), DownloadOptions::default());
+    assert!(matches!(got, Err(Error::AlreadyInstalled)), "{got:?}");
+    let calls = lab.integration.calls();
+    let ops: Vec<IntegrationOp> = calls[calls_before..].iter().map(|c| c.op).collect();
+    assert_eq!(ops, vec![IntegrationOp::Apply]);
+    let applied = calls.last().expect("apply");
+    assert_eq!(applied.install_root, root_dir());
+    assert_eq!(applied.version, version(V100));
+    assert_eq!(applied.meta.name, "App 1.0.0");
+    assert!(applied.previous.is_none());
+    assert_eq!(lab.record(), before);
+    common::workers_stopped();
+}
+
+#[test]
+fn a_rerun_leaves_a_foreign_entry_alone_and_reports_a_failed_repair() {
+    let _serial = common::serial();
+    let lab = Lab::new();
+    let parts = lab.parts(V100, &lab.root());
+    install(&lab, payload(&parts, V100), DownloadOptions::default()).expect("first");
+    let before = lab.record();
+    // What is not lunepack's stays; the answer is still "already installed".
+    lab.integration
+        .script_conflict(Some(lunepack_core::IntegrationItem::Shortcut));
+    let got = install(&lab, payload(&parts, V100), DownloadOptions::default());
+    assert!(matches!(got, Err(Error::AlreadyInstalled)), "{got:?}");
+    lab.integration.script_conflict(None);
+    // A repair that fails is that error, so another rerun can try again.
+    lab.integration.script_failure(Some("stub missing"));
+    let got = install(&lab, payload(&parts, V100), DownloadOptions::default());
+    assert!(matches!(got, Err(Error::Integration(_))), "{got:?}");
+    lab.integration.script_failure(None);
+    let got = install(&lab, payload(&parts, V100), DownloadOptions::default());
+    assert!(matches!(got, Err(Error::AlreadyInstalled)), "{got:?}");
+    assert_eq!(lab.record(), before);
+    common::workers_stopped();
+}
+
+#[test]
 fn a_cancel_at_every_phase_installs_nothing_and_a_rerun_completes() {
     let _serial = common::serial();
     // `None`: cancelled before the call; else at the first progress event of that phase.

@@ -1213,6 +1213,34 @@ mod cases {
         lab.assert_installed();
     }
 
+    /// M7-D8: a rerun on an installed app applies the integration again and still answers
+    /// "already installed" (exit 23). A launcher stub (Windows) or a desktop entry (Linux) a cut-off
+    /// run or the user lost is back after it, and the install's record is untouched.
+    fn a_rerun_repairs_a_missing_entry() {
+        let lab = Lab::new(Twist::default());
+        let run = lab.run(&["--silent"], None);
+        assert_eq!(run.code, EXIT_OK, "{run:?}");
+        let before = lab.record_at(&lab.root).expect("record");
+        #[cfg(windows)]
+        let (entry, wanted) = (lab.root.join("app.exe"), b"lunepack test stub".to_vec());
+        #[cfg(target_os = "linux")]
+        let entry = lab
+            .home
+            .join(".local/share/applications")
+            .join(format!("{SUITE_APP_ID}.desktop"));
+        #[cfg(target_os = "linux")]
+        let wanted = std::fs::read(&entry).expect("the entry");
+        std::fs::remove_file(&entry).expect("remove the entry");
+        let again = lab.run(&["--silent"], None);
+        assert_eq!(again.code, EXIT_ALREADY_INSTALLED, "{again:?}");
+        assert_eq!(
+            std::fs::read(&entry).expect("the entry is back after the rerun"),
+            wanted
+        );
+        assert_eq!(lab.record_at(&lab.root).expect("record"), before);
+        lab.assert_installed();
+    }
+
     /// M7-D5, M7-D13: a later run removes a stale directory under the temp dir (its owner gone,
     /// of any app) and keeps one whose owner runs, one with no marker and one of another name.
     #[cfg(windows)]
@@ -1331,6 +1359,10 @@ mod cases {
             (
                 "a_rerun_under_another_display_name_uses_the_existing_folder",
                 a_rerun_under_another_display_name_uses_the_existing_folder,
+            ),
+            (
+                "a_rerun_repairs_a_missing_entry",
+                a_rerun_repairs_a_missing_entry,
             ),
             #[cfg(windows)]
             (

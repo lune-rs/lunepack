@@ -29,12 +29,12 @@ use lunepack_core::state::{
 use lunepack_core::update_config::MAX_UPDATE_CONFIG_BYTES;
 use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, CancelToken, Channel, ClockReading, Codec,
-    FileKind, Fs, Hasher, IntegrationRequest, Limits, OsIntegration, Phase, Progress, ReadAt,
-    RelPath, Request, Rng, RootNaming, Sha256Digest, SourceFor, StageEnv, StageError, StageInput,
-    Target, Transport, TransportError, TrustedRoot, UPDATE_CONFIG_FILE, UpdateConfig,
-    UpdateConfigError, UserLayout, VerifiedEntry, VerifiedManifest, Verifier, Version,
-    advance_root, read_entry, select_candidate, verify_feed, verify_key_set, verify_manifest,
-    verify_payload_manifest,
+    FileKind, Fs, Hasher, IntegrationError, IntegrationRequest, Limits, OsIntegration, Phase,
+    Progress, ReadAt, RelPath, Request, Rng, RootNaming, Sha256Digest, SourceFor, StageEnv,
+    StageError, StageInput, Target, Transport, TransportError, TrustedRoot, UPDATE_CONFIG_FILE,
+    UpdateConfig, UpdateConfigError, UserLayout, VerifiedEntry, VerifiedManifest, Verifier,
+    Version, advance_root, read_entry, select_candidate, verify_feed, verify_key_set,
+    verify_manifest, verify_payload_manifest,
 };
 
 use crate::cache::{Cache, CacheKind, PartTools};
@@ -2152,13 +2152,46 @@ async fn refuse_installed(
             app_id: inner.app_id.clone(),
         };
         match store.load(&*inner.fs, &*inner.hasher)?.record {
-            Some(record) if record.current.is_some() => {
-                Err(already_installed(&*inner.fs, &root, &record))
-            }
+            Some(record) if record.current.is_some() => Err(rerun_installed(inner, &root, &record)),
             _ => Ok(()),
         }
     })
     .await
+}
+
+/// What a Setup rerun on an installed app returns (M7-D8: a setup rerun is an integration apply).
+/// [`already_installed`] first, then the integration of the *installed* current version is
+/// applied again under the same lock (the stub at `R`, the shortcut, the uninstall entry and the
+/// declarations), so a run cut off between the two renames of a stub self-replace, or an entry
+/// the user deleted, is repaired by running Setup again. The payload's own config is not used:
+/// the rerun changes nothing about which version is installed. It still ends as
+/// [`Error::AlreadyInstalled`]; a failure of the repair is that error, so another rerun can try
+/// again. An entry that is not lunepack's is left alone ([`IntegrationError::Conflict`]): nothing
+/// was asked of the rerun beyond the repair, so that leaves the answer as it was.
+fn rerun_installed(inner: &Inner, root: &UserLayout, record: &InstallState) -> Error {
+    let outcome = already_installed(&*inner.fs, root, record);
+    if !matches!(outcome, Error::AlreadyInstalled) {
+        return outcome;
+    }
+    let Some(current) = record.current.as_ref() else {
+        return outcome;
+    };
+    let repaired = tree_config(
+        &*inner.fs,
+        &inner.app_id,
+        &root.version_dir(&current.version),
+    )
+    .and_then(|config| {
+        let request = integration_request(&inner.app_id, root.root(), &config);
+        match inner.integration.apply(Scope::User, &request) {
+            Ok(_) | Err(IntegrationError::Conflict(_)) => Ok(()),
+            Err(e) => Err(Error::from(e)),
+        }
+    });
+    match repaired {
+        Ok(()) => outcome,
+        Err(e) => e,
+    }
 }
 
 async fn install_from_payload(
