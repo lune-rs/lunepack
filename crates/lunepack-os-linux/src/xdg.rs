@@ -1,6 +1,7 @@
 //! XDG desktop integration for a per-user install: a `.desktop` entry in
-//! `<data home>/applications` and, when the app declares one, a command link in
-//! `$HOME/.local/bin` (M5-D2, M5-D10 as amended).
+//! `<data home>/applications`, when the app declares one a command link in `$HOME/.local/bin`
+//! (M5-D2, M5-D10 as amended) and, when it declares file types, URL schemes or autostart, a
+//! `MimeType=` line in the entry and an autostart entry in `<config home>/autostart` (M7-D3).
 //!
 //! Safety rules, in order of importance:
 //!
@@ -12,7 +13,8 @@
 //!   not trust its caller.
 //! - **Only what lunepack made is replaced or removed.** The desktop entry is ours when it is a
 //!   regular file carrying the line `X-Lunepack-App-Id=<app id>`; a command link is ours when it
-//!   is a symlink whose target lies under `<install root>/current/` and has no `..` component.
+//!   is a symlink whose target lies under `<install root>/current/` and has no `..` component;
+//!   the autostart entry is ours under the same marker as the desktop entry.
 //!   Anything else at those paths is a `Conflict` on `check` and `apply`, and is left (and
 //!   reported) by `remove` and for stale links. Nothing here deletes a directory.
 //! - **Entries go through `<install root>/current`**, so a version flip needs no rewrite.
@@ -28,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use lunepack_core::{
     InstallMeta, IntegrationError, IntegrationItem, IntegrationReport, IntegrationRequest,
-    OsIntegration, Scope, desktop_safe_path,
+    OsIntegration, Scope, desktop_safe_path, update_config::is_denied_url_scheme,
 };
 
 /// The most bytes of an existing desktop entry that are read to look for the marker.
@@ -45,6 +47,8 @@ pub struct XdgEnv {
     pub home: Option<OsString>,
     /// `XDG_DATA_HOME`.
     pub xdg_data_home: Option<OsString>,
+    /// `XDG_CONFIG_HOME` (where the autostart directory is).
+    pub xdg_config_home: Option<OsString>,
 }
 
 impl XdgEnv {
@@ -53,6 +57,7 @@ impl XdgEnv {
         XdgEnv {
             home: std::env::var_os("HOME"),
             xdg_data_home: std::env::var_os("XDG_DATA_HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
         }
     }
 }
@@ -65,6 +70,7 @@ pub struct XdgDirs {
     data_home: PathBuf,
     applications: PathBuf,
     bin: PathBuf,
+    autostart: PathBuf,
 }
 
 impl XdgDirs {
@@ -87,6 +93,12 @@ impl XdgDirs {
     /// `$HOME/.local/bin`, where command links go.
     pub fn bin(&self) -> &Path {
         &self.bin
+    }
+
+    /// `<config home>/autostart`, where the start-at-sign-in entry goes (`XDG_CONFIG_HOME` when it
+    /// is set, non-empty, absolute and UTF-8, else `$HOME/.config`).
+    pub fn autostart(&self) -> &Path {
+        &self.autostart
     }
 }
 
@@ -118,11 +130,22 @@ pub fn xdg_dirs(env: &XdgEnv) -> Result<XdgDirs, IntegrationError> {
     };
     let applications = resolve(&data_home.join("applications"))?;
     let bin = resolve(&home.join(".local").join("bin"))?;
+    let config_home = match env
+        .xdg_config_home
+        .as_ref()
+        .and_then(|v| v.to_str())
+        .filter(|v| !v.is_empty() && Path::new(v).is_absolute())
+    {
+        Some(v) => resolve(Path::new(v))?,
+        None => resolve(&home.join(".config"))?,
+    };
+    let autostart = resolve(&config_home.join("autostart"))?;
     Ok(XdgDirs {
         home,
         data_home,
         applications,
         bin,
+        autostart,
     })
 }
 
@@ -153,8 +176,8 @@ fn resolve(path: &Path) -> Result<PathBuf, IntegrationError> {
     }
 }
 
-/// The Linux per-user [`OsIntegration`]: an XDG desktop entry and a command link. Per-machine
-/// scope is `Unsupported` in M5.
+/// The Linux per-user [`OsIntegration`]: an XDG desktop entry, a command link and an autostart
+/// entry. Per-machine scope is `Unsupported` in M5.
 #[derive(Debug, Clone)]
 pub struct XdgIntegration {
     env: XdgEnv,
@@ -182,6 +205,9 @@ struct Prepared {
     bin: Option<(PathBuf, String)>,
     /// Links of names the previous version used.
     stale: Vec<PathBuf>,
+    /// The autostart entry's path and, when the app declares autostart, its content (else the
+    /// entry is removed when it is ours).
+    autostart: (PathBuf, Option<String>),
 }
 
 impl OsIntegration for XdgIntegration {
@@ -224,6 +250,26 @@ impl OsIntegration for XdgIntegration {
         }
 
         let mut report = IntegrationReport::default();
+        let (autostart_path, autostart_content) = &p.autostart;
+        match autostart_content {
+            Some(content) => {
+                ensure_dir(p.dirs.autostart())?;
+                let unchanged = match probe(autostart_path)? {
+                    Slot::File => {
+                        read_capped(autostart_path).is_ok_and(|bytes| bytes == content.as_bytes())
+                    }
+                    _ => false,
+                };
+                if !unchanged {
+                    write_atomic(
+                        p.dirs.autostart(),
+                        file_name(autostart_path)?,
+                        content.as_bytes(),
+                    )?;
+                }
+            }
+            None => remove_autostart(autostart_path, req.app_id.as_str(), &mut report)?,
+        }
         for link in &p.stale {
             match probe(link)? {
                 Slot::Absent => {}
@@ -236,6 +282,7 @@ impl OsIntegration for XdgIntegration {
             }
         }
         sync_dir(p.dirs.bin());
+        sync_dir(p.dirs.autostart());
         Ok(report)
     }
 
@@ -278,10 +325,33 @@ impl OsIntegration for XdgIntegration {
                 _ => report.kept.push(IntegrationItem::BinLink),
             }
         }
+        let autostart_path = dirs
+            .autostart()
+            .join(format!("{}.desktop", req.app_id.as_str()));
+        remove_autostart(&autostart_path, req.app_id.as_str(), &mut report)?;
         sync_dir(dirs.applications());
         sync_dir(dirs.bin());
+        sync_dir(dirs.autostart());
         Ok(report)
     }
+}
+
+/// Removes the autostart entry when it is ours (a regular file with the marker); reports a foreign
+/// one as kept; an absent one is fine.
+fn remove_autostart(
+    path: &Path,
+    app_id: &str,
+    report: &mut IntegrationReport,
+) -> Result<(), IntegrationError> {
+    match probe(path)? {
+        Slot::Absent => {}
+        Slot::File if has_marker(path, app_id) => {
+            fs::remove_file(path)
+                .map_err(|_| IntegrationError::Failed("the autostart entry was not removed"))?;
+        }
+        _ => report.kept.push(IntegrationItem::Autostart),
+    }
+    Ok(())
 }
 
 impl XdgIntegration {
@@ -317,7 +387,7 @@ impl XdgIntegration {
             }
         }
 
-        let content = entry_bytes(req.app_id.as_str(), meta, exec, icon.as_deref());
+        let content = entry_bytes(req.app_id.as_str(), meta, exec, icon.as_deref(), false);
         let desktop_path = dirs
             .applications()
             .join(format!("{}.desktop", req.app_id.as_str()));
@@ -326,6 +396,25 @@ impl XdgIntegration {
             Slot::File if has_marker(&desktop_path, req.app_id.as_str()) => {}
             _ => return Err(IntegrationError::Conflict(IntegrationItem::DesktopEntry)),
         }
+        let autostart_path = dirs
+            .autostart()
+            .join(format!("{}.desktop", req.app_id.as_str()));
+        let autostart_content = if meta.autostart {
+            match probe(&autostart_path)? {
+                Slot::Absent => {}
+                Slot::File if has_marker(&autostart_path, req.app_id.as_str()) => {}
+                _ => return Err(IntegrationError::Conflict(IntegrationItem::Autostart)),
+            }
+            Some(entry_bytes(
+                req.app_id.as_str(),
+                meta,
+                exec,
+                icon.as_deref(),
+                true,
+            ))
+        } else {
+            None
+        };
 
         let bin = match &meta.bin {
             Some(name) => {
@@ -353,6 +442,7 @@ impl XdgIntegration {
             content,
             bin,
             stale,
+            autostart: (autostart_path, autostart_content),
         })
     }
 }
@@ -431,20 +521,84 @@ fn check_fields(meta: &InstallMeta) -> Result<(), IntegrationError> {
     if meta.bin.as_deref().is_some_and(|b| !bin_ok(b)) {
         return Err(IntegrationError::UnsafeField("bin"));
     }
+    let mut exts = std::collections::BTreeSet::new();
+    if meta.file_types.len() > 32
+        || meta.file_types.iter().any(|t| {
+            !ext_ok(&t.ext)
+                || !mime_ok(&t.mime)
+                || !text_ok(&t.name, 1, 128)
+                || !exts.insert(t.ext.as_str())
+        })
+    {
+        return Err(IntegrationError::UnsafeField("file_types"));
+    }
+    let mut schemes = std::collections::BTreeSet::new();
+    if meta.url_schemes.len() > 8
+        || meta
+            .url_schemes
+            .iter()
+            .any(|s| !scheme_ok(s) || !schemes.insert(s.as_str()))
+    {
+        return Err(IntegrationError::UnsafeField("url_schemes"));
+    }
     Ok(())
+}
+
+fn ext_ok(text: &str) -> bool {
+    (1..=16).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// `type/subtype`, each side `[A-Za-z0-9!#$&^_.+-]{1,127}`: no `;`, so a value cannot add an item
+/// to the `MimeType=` list.
+fn mime_ok(text: &str) -> bool {
+    let side = |s: &str| {
+        (1..=127).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&b))
+    };
+    text.split_once('/')
+        .is_some_and(|(kind, sub)| side(kind) && side(sub))
+}
+
+fn scheme_ok(text: &str) -> bool {
+    (1..=32).contains(&text.len())
+        && text.as_bytes()[0].is_ascii_lowercase()
+        && text.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'+' | b'.' | b'-')
+        })
+        && !is_denied_url_scheme(text)
 }
 
 // ---- the entry ----
 
 /// The entry's bytes (Desktop Entry Specification 1.5), exactly as in the step contract. Every
 /// value here has been checked by the caller, so none is escaped.
-fn entry_bytes(app_id: &str, meta: &InstallMeta, exec: &str, icon: Option<&str>) -> String {
+///
+/// The menu entry (`autostart` false) carries `MimeType=` when the app declares file types or URL
+/// schemes, and then `%U` after the command so the file manager or browser can pass what it opens;
+/// the autostart entry never does (nothing is passed at sign-in).
+fn entry_bytes(
+    app_id: &str,
+    meta: &InstallMeta,
+    exec: &str,
+    icon: Option<&str>,
+    autostart: bool,
+) -> String {
+    let mimes = if autostart {
+        Vec::new()
+    } else {
+        mime_list(meta)
+    };
     let mut out = String::from("[Desktop Entry]\nType=Application\nVersion=1.5\n");
     out.push_str(&format!("Name={}\n", meta.name));
     if let Some(comment) = &meta.comment {
         out.push_str(&format!("Comment={comment}\n"));
     }
-    out.push_str(&format!("Exec=\"{exec}\"\n"));
+    let args = if mimes.is_empty() { "" } else { " %U" };
+    out.push_str(&format!("Exec=\"{exec}\"{args}\n"));
     if let Some(icon) = icon {
         out.push_str(&format!("Icon={icon}\n"));
     }
@@ -457,7 +611,32 @@ fn entry_bytes(app_id: &str, meta: &InstallMeta, exec: &str, icon: Option<&str>)
         }
         out.push('\n');
     }
+    if !mimes.is_empty() {
+        out.push_str("MimeType=");
+        for m in &mimes {
+            out.push_str(m);
+            out.push(';');
+        }
+        out.push('\n');
+    }
     out.push_str(&format!("{MARKER_KEY}{app_id}\n"));
+    out
+}
+
+/// The `MimeType=` items: each file type's mime (once, in declaration order), then
+/// `x-scheme-handler/<scheme>` for each URL scheme. No default handler is claimed (M7-D3).
+fn mime_list(meta: &InstallMeta) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in &meta.file_types {
+        if !out.contains(&t.mime) {
+            out.push(t.mime.clone());
+        }
+    }
+    out.extend(
+        meta.url_schemes
+            .iter()
+            .map(|s| format!("x-scheme-handler/{s}")),
+    );
     out
 }
 

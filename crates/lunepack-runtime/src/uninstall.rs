@@ -240,7 +240,9 @@ fn uninstall(
         let request = IntegrationRequest {
             app_id: inst.app_id().clone(),
             install_root: root.to_path_buf(),
+            version: owner.tree_version().clone(),
             meta: owner.meta().clone(),
+            previous: None,
             stale_bins: Vec::new(),
         };
         let report = ad

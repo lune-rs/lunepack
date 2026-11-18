@@ -55,6 +55,55 @@ pub const MAX_COMMENT_CHARS: usize = 512;
 pub const MAX_CATEGORIES: usize = 16;
 /// Longest category, and longest `install.bin`, in bytes.
 pub const MAX_TOKEN_BYTES: usize = 64;
+/// Most `install.file_types` (M7-D3).
+pub const MAX_FILE_TYPES: usize = 32;
+/// Most `install.url_schemes` (M7-D3).
+pub const MAX_URL_SCHEMES: usize = 8;
+/// Longest `install.file_types[].ext`, in bytes.
+pub const MAX_EXT_BYTES: usize = 16;
+/// Longest `install.url_schemes[]`, in bytes.
+pub const MAX_SCHEME_BYTES: usize = 32;
+/// Longest side of an `install.file_types[].mime`, in bytes.
+pub const MAX_MIME_SIDE_BYTES: usize = 127;
+/// Longest `install.file_types[].name`, in Unicode scalar values (as `install.name`).
+pub const MAX_FILE_TYPE_NAME_CHARS: usize = MAX_NAME_CHARS;
+/// URL schemes an app may not claim (M7-D3, FORMAT.md 13.4), compared ignoring ASCII case; every
+/// scheme starting with `ms-` is refused as well ([`MS_SCHEME_PREFIX`]).
+pub const DENIED_URL_SCHEMES: [&str; 31] = [
+    "about",
+    "blob",
+    "chrome",
+    "cid",
+    "data",
+    "file",
+    "ftp",
+    "ftps",
+    "gopher",
+    "http",
+    "https",
+    "irc",
+    "javascript",
+    "ldap",
+    "ldaps",
+    "mailto",
+    "microsoft-edge",
+    "mid",
+    "news",
+    "nntp",
+    "res",
+    "search-ms",
+    "sftp",
+    "shell",
+    "sms",
+    "ssh",
+    "tel",
+    "telnet",
+    "urn",
+    "view-source",
+    "vbscript",
+];
+/// Every scheme with this prefix is on the deny-list too (the Windows shell's own).
+pub const MS_SCHEME_PREFIX: &str = "ms-";
 
 const KIND: &str = "update-config";
 const TOP_KEYS: [&str; 11] = [
@@ -71,16 +120,20 @@ const TOP_KEYS: [&str; 11] = [
     "version",
 ];
 const ROOT_KEYS: [&str; 3] = ["keys", "threshold", "version"];
-const INSTALL_KEYS: [&str; 8] = [
+const INSTALL_KEYS: [&str; 11] = [
+    "autostart",
     "bin",
     "categories",
     "comment",
     "entry",
+    "file_types",
     "icon",
     "name",
     "publisher",
     "terminal",
+    "url_schemes",
 ];
+const FILE_TYPE_KEYS: [&str; 3] = ["ext", "mime", "name"];
 
 /// The config's path relative to a version tree of `target`.
 pub fn config_path(target: Target) -> &'static str {
@@ -130,6 +183,25 @@ pub struct InstallMeta {
     /// The publisher's display name, shown by the installer beside "verified" (M6-D3). Optional;
     /// absent stays absent in the canonical bytes (FORMAT.md 13.4).
     pub publisher: Option<String>,
+    /// File types the app can open (M7-D3): each is an "Open with" candidate on Windows and a
+    /// `MimeType=` entry on Linux; never a default handler. Left out of the canonical bytes when
+    /// empty.
+    pub file_types: Vec<FileType>,
+    /// URL schemes the app handles (M7-D3), none of [`DENIED_URL_SCHEMES`]. Left out when empty.
+    pub url_schemes: Vec<String>,
+    /// Whether the app starts when the user signs in (M7-D3). Left out when false.
+    pub autostart: bool,
+}
+
+/// One `install.file_types` item (FORMAT.md 13.4, M7-D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileType {
+    /// The extension without its dot: `[a-z0-9]{1,16}`.
+    pub ext: String,
+    /// The MIME type, `type/subtype` with no parameters.
+    pub mime: String,
+    /// A display name for the file type, as `install.name`'s rule (1 to 128).
+    pub name: String,
 }
 
 /// What kind of feed a feed string passed [`check_feed`] as.
@@ -249,10 +321,31 @@ impl UpdateConfig {
             ("name", Value::String(i.name.clone())),
             ("terminal", Value::Bool(i.terminal)),
         ]);
-        // Left out when absent, so the bytes of a config without a publisher are the M5 bytes.
-        if let (Some(p), Value::Object(members)) = (&i.publisher, &mut install) {
-            members.insert("publisher".to_owned(), Value::String(p.clone()));
+        // Optional members are left out when absent, empty or false, so the bytes of a config
+        // without them are the M5 bytes.
+        if let Value::Object(members) = &mut install {
+            if let Some(p) = &i.publisher {
+                members.insert("publisher".to_owned(), Value::String(p.clone()));
+            }
+            if !i.file_types.is_empty() {
+                let items = i.file_types.iter().map(|t| {
+                    obj([
+                        ("ext", Value::String(t.ext.clone())),
+                        ("mime", Value::String(t.mime.clone())),
+                        ("name", Value::String(t.name.clone())),
+                    ])
+                });
+                members.insert("file_types".to_owned(), Value::Array(items.collect()));
+            }
+            if !i.url_schemes.is_empty() {
+                let items = i.url_schemes.iter().cloned().map(Value::String);
+                members.insert("url_schemes".to_owned(), Value::Array(items.collect()));
+            }
+            if i.autostart {
+                members.insert("autostart".to_owned(), Value::Bool(true));
+            }
         }
+        let install = sorted(install);
         let defined = [
             ("app_id", Value::String(self.app_id.as_str().to_owned())),
             ("channel", Value::String(self.channel.as_str().to_owned())),
@@ -427,6 +520,19 @@ fn read_install(value: Value) -> Result<InstallMeta, UpdateConfigError> {
     let Value::Bool(terminal) = take(&mut map, "install.terminal")? else {
         return Err(UpdateConfigError::WrongType("install.terminal"));
     };
+    let file_types = match map.remove("file_types") {
+        None => Vec::new(),
+        Some(v) => read_file_types(v)?,
+    };
+    let url_schemes = match map.remove("url_schemes") {
+        None => Vec::new(),
+        Some(v) => read_url_schemes(v)?,
+    };
+    let autostart = match map.remove("autostart") {
+        None => false,
+        Some(Value::Bool(b)) => b,
+        Some(_) => return Err(UpdateConfigError::WrongType("install.autostart")),
+    };
     Ok(InstallMeta {
         entry,
         name,
@@ -436,7 +542,97 @@ fn read_install(value: Value) -> Result<InstallMeta, UpdateConfigError> {
         bin,
         terminal,
         publisher,
+        file_types,
+        url_schemes,
+        autostart,
     })
+}
+
+/// `install.file_types`: at most 32 `{ext, mime, name}` objects; `ext` unique.
+fn read_file_types(value: Value) -> Result<Vec<FileType>, UpdateConfigError> {
+    const FIELD: &str = "install.file_types";
+    let Value::Array(items) = value else {
+        return Err(UpdateConfigError::WrongType(FIELD));
+    };
+    if items.len() > MAX_FILE_TYPES {
+        return Err(invalid(FIELD, "holds more than 32 file types"));
+    }
+    let mut out: Vec<FileType> = Vec::with_capacity(items.len());
+    for item in items {
+        let mut map = object(item, FIELD, &FILE_TYPE_KEYS)?;
+        let ext = string(take(&mut map, "install.file_types.ext")?, FIELD)?;
+        let mime = string(take(&mut map, "install.file_types.mime")?, FIELD)?;
+        let name = string(take(&mut map, "install.file_types.name")?, FIELD)?;
+        let ext_ok = (1..=MAX_EXT_BYTES).contains(&ext.len())
+            && ext
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        if !ext_ok {
+            return Err(invalid(FIELD, "an ext is not [a-z0-9]{1,16}"));
+        }
+        if out.iter().any(|t| t.ext == ext) {
+            return Err(invalid(FIELD, "an ext is listed twice"));
+        }
+        check_mime(&mime)?;
+        check_text(&name, FIELD, 1, MAX_FILE_TYPE_NAME_CHARS)?;
+        out.push(FileType { ext, mime, name });
+    }
+    Ok(out)
+}
+
+/// `type/subtype`, each side `[A-Za-z0-9!#$&^_.+-]{1,127}`, no parameters.
+fn check_mime(text: &str) -> Result<(), UpdateConfigError> {
+    let side_ok = |side: &str| {
+        (1..=MAX_MIME_SIDE_BYTES).contains(&side.len())
+            && side
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&b))
+    };
+    match text.split_once('/') {
+        Some((kind, sub)) if side_ok(kind) && side_ok(sub) => Ok(()),
+        _ => Err(invalid(
+            "install.file_types",
+            "a mime is not type/subtype of [A-Za-z0-9!#$&^_.+-]{1,127}",
+        )),
+    }
+}
+
+/// `install.url_schemes`: at most 8 unique `[a-z][a-z0-9+.-]{0,31}`, none on the deny-list.
+fn read_url_schemes(value: Value) -> Result<Vec<String>, UpdateConfigError> {
+    const FIELD: &str = "install.url_schemes";
+    let Value::Array(items) = value else {
+        return Err(UpdateConfigError::WrongType(FIELD));
+    };
+    if items.len() > MAX_URL_SCHEMES {
+        return Err(invalid(FIELD, "holds more than 8 schemes"));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        let scheme = string(item, FIELD)?;
+        if is_denied_url_scheme(&scheme) {
+            return Err(invalid(FIELD, "a scheme is on the deny-list"));
+        }
+        let ok = (1..=MAX_SCHEME_BYTES).contains(&scheme.len())
+            && scheme.as_bytes()[0].is_ascii_lowercase()
+            && scheme.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'+' | b'.' | b'-')
+            });
+        if !ok {
+            return Err(invalid(FIELD, "a scheme is not [a-z][a-z0-9+.-]{0,31}"));
+        }
+        if out.contains(&scheme) {
+            return Err(invalid(FIELD, "a scheme is listed twice"));
+        }
+        out.push(scheme);
+    }
+    Ok(out)
+}
+
+/// Whether `scheme` is on the deny-list ([`DENIED_URL_SCHEMES`] or an `ms-` scheme), ignoring
+/// ASCII case.
+pub fn is_denied_url_scheme(scheme: &str) -> bool {
+    let lower = scheme.to_ascii_lowercase();
+    lower.starts_with(MS_SCHEME_PREFIX) || DENIED_URL_SCHEMES.contains(&lower.as_str())
 }
 
 /// `install.entry`: a path (10.1) whose file name is not the runtime's or the UI's (either target's

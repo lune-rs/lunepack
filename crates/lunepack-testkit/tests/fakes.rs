@@ -17,7 +17,7 @@ use lunepack_core::{
     Head, InstallMeta, IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration,
     Process, ProcessError, ProcessErrorKind, ProcessId, RangeError, RelPath, Request, ResponseInfo,
     Rng, Scope, Sha256Digest, SignatureAlg, Signer, SpawnSpec, StreamView, Transport,
-    TransportError, TransportErrorKind, Validator, Verifier, WaitOutcome,
+    TransportError, TransportErrorKind, Validator, Verifier, Version, WaitOutcome,
 };
 use lunepack_testkit::*;
 
@@ -1914,6 +1914,7 @@ fn integration_request(id: &str, root: &str) -> IntegrationRequest {
     IntegrationRequest {
         app_id: AppId::parse(id).unwrap(),
         install_root: PathBuf::from(root),
+        version: Version::parse("1.0.0").unwrap(),
         meta: InstallMeta {
             entry: RelPath::parse("bin/app").unwrap(),
             name: "App".to_owned(),
@@ -1923,7 +1924,11 @@ fn integration_request(id: &str, root: &str) -> IntegrationRequest {
             bin: None,
             terminal: false,
             publisher: None,
+            file_types: Vec::new(),
+            url_schemes: Vec::new(),
+            autostart: false,
         },
+        previous: None,
         stale_bins: vec![],
     }
 }
@@ -2008,6 +2013,34 @@ mod suite_probe {
             {
                 return Err(IntegrationError::UnsafeField("bin"));
             }
+            let mut exts = std::collections::BTreeSet::new();
+            for t in &m.file_types {
+                let ext_ok = (1..=16).contains(&t.ext.len())
+                    && t.ext
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+                let mime_ok = t.mime.matches('/').count() == 1
+                    && !t
+                        .mime
+                        .chars()
+                        .any(|c| c.is_control() || c == ';' || c == ' ');
+                if !ext_ok || !mime_ok || Self::unsafe_text(&t.name) || !exts.insert(&t.ext) {
+                    return Err(IntegrationError::UnsafeField("file_types"));
+                }
+            }
+            for scheme in &m.url_schemes {
+                let ok = scheme
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_lowercase)
+                    && scheme.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b"+.-".contains(&b)
+                    })
+                    && !lunepack_core::update_config::is_denied_url_scheme(scheme);
+                if !ok {
+                    return Err(IntegrationError::UnsafeField("url_schemes"));
+                }
+            }
             lunepack_core::desktop_safe_path(&req.install_root.to_string_lossy()).map_err(
                 |reason| IntegrationError::UnsafePath {
                     what: "install root",
@@ -2019,6 +2052,11 @@ mod suite_probe {
         fn entry(&self, req: &IntegrationRequest) -> PathBuf {
             self.home
                 .join(format!("applications/{}.desktop", req.app_id.as_str()))
+        }
+
+        fn autostart(&self, req: &IntegrationRequest) -> PathBuf {
+            self.home
+                .join(format!("autostart/{}.desktop", req.app_id.as_str()))
         }
     }
 
@@ -2049,6 +2087,20 @@ mod suite_probe {
                 ),
             )
             .unwrap();
+            if req.meta.autostart {
+                fs::create_dir_all(self.home.join("autostart")).unwrap();
+                fs::write(
+                    self.autostart(req),
+                    format!(
+                        "[Desktop Entry]\nName={}\nX-Lunepack-App-Id={}\n",
+                        req.meta.name,
+                        req.app_id.as_str()
+                    ),
+                )
+                .unwrap();
+            } else {
+                let _ = fs::remove_file(self.autostart(req));
+            }
             if let Some(bin) = &req.meta.bin {
                 let path = self.home.join("bin").join(bin);
                 let _ = fs::remove_file(&path);
@@ -2066,6 +2118,7 @@ mod suite_probe {
                 return Err(IntegrationError::Unsupported);
             }
             let _ = fs::remove_file(self.entry(req));
+            let _ = fs::remove_file(self.autostart(req));
             if !self.leave_bin_on_remove
                 && let Some(bin) = &req.meta.bin
             {

@@ -986,6 +986,64 @@ fn update_pack_writes_the_publisher() {
     assert!(err.contains("[install] publisher"), "{err:?}");
 }
 
+/// `[install] file_types`, `url_schemes` and `autostart` (M7-D3) are written into the signed
+/// config; absent stays absent; a refused value is named by member, never shown.
+#[cfg(unix)]
+#[test]
+fn update_pack_writes_the_declarations() {
+    let pack_with = |toml: &str| {
+        let w = World::new(1, 1);
+        w.append_config(toml);
+        let dir = w.release_dir("rel", &[]);
+        let input = tempfile::tempdir().unwrap();
+        app_tree(input.path(), "bin/app");
+        let runtime = w.dir.path().join("runtime");
+        fs::write(&runtime, runtime_elf(62, false)).unwrap();
+        let out = pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&runtime),
+            "1.0.0",
+            "linux-x86_64",
+        );
+        (w, dir, out)
+    };
+    let declared = |extra: &str| {
+        UPDATE_TOML.replace("bin = \"hello\"\n", &format!("bin = \"hello\"\n{extra}"))
+    };
+    let (w, dir, out) = pack_with(&declared(
+        "url_schemes = [\"hello\", \"hello-x\"]\nautostart = true\n\n\
+         [[install.file_types]]\next = \"hello\"\nmime = \"application/x-hello\"\nname = \"Hello file\"\n",
+    ));
+    assert_ok(&out, "pack with declarations");
+    let (_, files) = w.verify(&dir, "1.0.0", Target::LinuxX86_64);
+    let doc = lunepack_core::UpdateConfig::parse(&files["lunepack-update.json"]).unwrap();
+    assert_eq!(doc.install.url_schemes, ["hello", "hello-x"]);
+    assert!(doc.install.autostart);
+    assert_eq!(doc.install.file_types.len(), 1);
+    assert_eq!(doc.install.file_types[0].mime, "application/x-hello");
+
+    let (w, dir, out) = pack_with(UPDATE_TOML);
+    assert_ok(&out, "pack without declarations");
+    let (_, files) = w.verify(&dir, "1.0.0", Target::LinuxX86_64);
+    let text = String::from_utf8_lossy(&files["lunepack-update.json"]).into_owned();
+    for key in ["file_types", "url_schemes", "autostart"] {
+        assert!(!text.contains(key), "{key}");
+    }
+    drop(w);
+
+    let (_w, _dir, out) = pack_with(&declared("url_schemes = [\"https\"]\n"));
+    let err = assert_fails(&out, 1, "a denied scheme");
+    assert!(err.contains("[install] url_schemes"), "{err:?}");
+    assert!(!err.contains("https"), "{err:?}");
+    let (_w, _dir, out) = pack_with(&declared(
+        "\n[[install.file_types]]\next = \"hello\"\nmime = \"a/b;c/d\"\nname = \"n\"\n",
+    ));
+    let err = assert_fails(&out, 1, "a mime with a semicolon");
+    assert!(err.contains("[install] file_types"), "{err:?}");
+}
+
 /// C2: the same inputs (the runtime's bytes included), keys and clock give identical bytes; a
 /// different runtime gives a different pack.
 #[cfg(unix)]

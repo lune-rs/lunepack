@@ -1762,16 +1762,19 @@ fn is_record_name(name: &str) -> bool {
         .is_some_and(|digits| digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// The integration request for `meta` of the install at `root`.
+/// The integration request for the first install of `config`'s tree at `root` (no outgoing
+/// version).
 fn integration_request(
     app_id: &AppId,
     root: &Path,
-    meta: lunepack_core::InstallMeta,
+    config: &lunepack_core::UpdateConfig,
 ) -> IntegrationRequest {
     IntegrationRequest {
         app_id: app_id.clone(),
         install_root: root.to_path_buf(),
-        meta,
+        version: config.version.clone(),
+        meta: config.install.clone(),
+        previous: None,
         stale_bins: Vec::new(),
     }
 }
@@ -1814,7 +1817,7 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
     let boot_root = root.clone();
     let (target, boot_version) = on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
         let config = tree_config(&*inner.fs, &inner.app_id, &bootstrap)?;
-        let request = integration_request(&inner.app_id, boot_root.root(), config.install.clone());
+        let request = integration_request(&inner.app_id, boot_root.root(), &config);
         inner.integration.check(Scope::User, &request)?;
         clear_tombstones(inner, &boot_root);
         adoptable(inner, &boot_root)?;
@@ -1933,7 +1936,7 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
                     rule: "is not the version of its directory",
                 }));
             }
-            let request = integration_request(&inner.app_id, root.root(), config.install);
+            let request = integration_request(&inner.app_id, root.root(), &config);
             inner.integration.check(Scope::User, &request)?;
             let next =
                 lunepack_core::install_first(&record, version.clone(), issued, record.install_id)?;
@@ -2090,7 +2093,7 @@ fn verify_payload(
         manifest.version(),
         manifest.target(),
     )?;
-    let request = integration_request(&inner.app_id, install_root, config.install);
+    let request = integration_request(&inner.app_id, install_root, &config);
     inner.integration.check(Scope::User, &request)?;
 
     Ok(VerifiedPayload {
@@ -2412,8 +2415,7 @@ async fn install_from_payload(
                 }
                 let tree = staged.tree;
                 let config = tree_config(&*inner.fs, &inner.app_id, &tree)?;
-                let request =
-                    integration_request(&inner.app_id, install_root.root(), config.install);
+                let request = integration_request(&inner.app_id, install_root.root(), &config);
                 inner.integration.check(Scope::User, &request)?;
                 let next = lunepack_core::install_first(
                     &record.raise_floors(&floors),

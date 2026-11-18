@@ -64,6 +64,9 @@ fn meta(entry: &str, bin: Option<&str>, name: &str) -> InstallMeta {
         bin: bin.map(str::to_owned),
         terminal: false,
         publisher: None,
+        file_types: Vec::new(),
+        url_schemes: Vec::new(),
+        autostart: false,
     }
 }
 
@@ -627,6 +630,10 @@ fn unsupervised_starts_count_attempts_and_the_fourth_rolls_back() {
     assert_eq!(applied[0].meta.name, "App 1.0.0");
     assert_eq!(applied[0].install_root, root_dir());
     assert_eq!(applied[0].stale_bins, vec!["app2".to_owned()]);
+    // The request names the version it applies and carries the outgoing version's metadata.
+    assert_eq!(applied[0].version, version(V100));
+    let previous = applied[0].previous.as_ref().expect("previous metadata");
+    assert_eq!(previous.name, "App 1.1.0");
 }
 
 /// Three unsupervised starts of 1.1.0, so the next one rolls back.

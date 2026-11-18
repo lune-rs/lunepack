@@ -364,6 +364,9 @@ mod linux {
                 bin: Some("lp-apply-test".to_owned()),
                 terminal: false,
                 publisher: None,
+                file_types: Vec::new(),
+                url_schemes: Vec::new(),
+                autostart: false,
             };
             cfg
         }

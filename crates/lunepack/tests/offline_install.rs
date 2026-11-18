@@ -76,6 +76,9 @@ fn meta(name: &str) -> InstallMeta {
         bin: Some("app".to_owned()),
         terminal: false,
         publisher: None,
+        file_types: Vec::new(),
+        url_schemes: Vec::new(),
+        autostart: false,
     }
 }
 

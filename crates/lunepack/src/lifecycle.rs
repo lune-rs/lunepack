@@ -278,7 +278,9 @@ fn roll_back(
     let request = IntegrationRequest {
         app_id: inst.app_id().clone(),
         install_root: layout.root().to_path_buf(),
+        version: previous.tree_version().clone(),
         meta: previous.meta().clone(),
+        previous: Some(inst.meta().clone()),
         stale_bins,
     };
     let _ = p.integration.apply(Scope::User, &request);

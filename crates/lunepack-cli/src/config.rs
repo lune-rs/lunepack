@@ -15,7 +15,7 @@ use lunepack_core::encoding::hex_decode_array;
 use lunepack_core::limits::MAX_JSON_INT;
 use lunepack_core::update_config::{DEFAULT_HEALTH_TIMEOUT_SECS, HEALTH_TIMEOUT_SECS};
 use lunepack_core::{
-    AppId, Channel, Clock, Hasher, InstallMeta, RelPath, Signer, TrustedRoot, Verifier,
+    AppId, Channel, Clock, FileType, Hasher, InstallMeta, RelPath, Signer, TrustedRoot, Verifier,
 };
 use lunepack_crypto::{CommandSigner, Ed25519Signer};
 use serde::Deserialize;
@@ -38,6 +38,16 @@ struct RawConfig {
     update: Option<RawUpdate>,
     /// How the packed tree is installed (M5-D4); required with `update`.
     install: Option<RawInstall>,
+    /// Windows-only packager inputs (M7-D14).
+    windows: Option<RawWindows>,
+}
+
+/// `[windows]`: inputs for stamping a Windows stub and setup file; not part of any signed document.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWindows {
+    /// An `.ico` file, relative to the config's directory.
+    icon: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +71,23 @@ struct RawInstall {
     bin: Option<String>,
     #[serde(default)]
     terminal: bool,
+    /// `[[install.file_types]]` (M7-D3).
+    #[serde(default)]
+    file_types: Vec<RawFileType>,
+    /// Handled URL schemes (M7-D3).
+    #[serde(default)]
+    url_schemes: Vec<String>,
+    /// Start at sign-in (M7-D3).
+    #[serde(default)]
+    autostart: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFileType {
+    ext: String,
+    mime: String,
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +161,13 @@ pub struct Config {
     pub state_path: PathBuf,
     /// `[update]` with `[install]`, when the config has them.
     pub update: Option<UpdateSettings>,
+    /// `[windows] icon`, resolved against the config's directory (M7-D14); checked as an ICO by the
+    /// packager when it stamps (M7 step 12 reads it; until then nothing does).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the stamping step (M7 step 12)")
+    )]
+    pub windows_icon: Option<PathBuf>,
     signers: BTreeMap<String, SignerSpec>,
 }
 
@@ -156,6 +190,17 @@ fn update_settings(file: &str, u: RawUpdate, i: RawInstall) -> Result<UpdateSett
         bin: i.bin,
         terminal: i.terminal,
         publisher: i.publisher,
+        file_types: i
+            .file_types
+            .into_iter()
+            .map(|t| FileType {
+                ext: t.ext,
+                mime: t.mime,
+                name: t.name,
+            })
+            .collect(),
+        url_schemes: i.url_schemes,
+        autostart: i.autostart,
     };
     Ok(UpdateSettings {
         feed: u.feed,
@@ -263,6 +308,11 @@ impl Config {
             Some(s) => dir.join(s),
             None => dir.join(crate::state::DEFAULT_STATE),
         };
+        let windows_icon = match raw.windows.and_then(|w| w.icon) {
+            Some(i) if i.is_empty() => bail!("{}: windows.icon is empty", ctx()),
+            Some(i) => Some(dir.join(i)),
+            None => None,
+        };
         let update = match (raw.update, raw.install) {
             (None, None) => None,
             (None, Some(_)) => bail!("{}: [install] needs [update]", ctx()),
@@ -276,6 +326,7 @@ impl Config {
             root_keys,
             state_path,
             update,
+            windows_icon,
             signers,
         })
     }
@@ -352,6 +403,47 @@ pub fn writer_clock() -> Result<Box<dyn Clock>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BASE: &str = "app_id = \"org.example.app\"\n[root]\nthreshold = 1\nkeys = [\"0000000000000000000000000000000000000000000000000000000000000001\"]\n";
+
+    fn parse(extra: &str) -> Result<Config> {
+        Config::parse(Path::new("/cfg/lunepack.toml"), &format!("{BASE}{extra}"))
+    }
+
+    #[test]
+    fn windows_icon_is_resolved_against_the_configs_directory() {
+        assert!(parse("").unwrap().windows_icon.is_none());
+        let c = parse("[windows]\nicon = \"art/app.ico\"\n").unwrap();
+        assert_eq!(c.windows_icon, Some(PathBuf::from("/cfg/art/app.ico")));
+        assert!(parse("[windows]\nicon = \"\"\n").is_err());
+        let e = parse("[windows]\nmanifest = \"x\"\n").unwrap_err();
+        assert!(format!("{e:#}").contains("unknown field"), "{e:#}");
+    }
+
+    #[test]
+    fn install_declarations_are_parsed() {
+        let update = "[update]\nfeed = \"https://updates.example.com/app\"\n";
+        let install = "[install]\nentry = \"bin/app\"\nname = \"App\"\nurl_schemes = [\"app\"]\nautostart = true\n\
+            [[install.file_types]]\next = \"app\"\nmime = \"application/x-app\"\nname = \"App file\"\n";
+        let c = parse(&format!("{update}{install}")).unwrap();
+        let i = c.update.unwrap().install;
+        assert_eq!(i.url_schemes, ["app"]);
+        assert!(i.autostart);
+        assert_eq!(i.file_types.len(), 1);
+        assert_eq!(i.file_types[0].ext, "app");
+        let bare = "[install]\nentry = \"bin/app\"\nname = \"App\"\n";
+        let i = parse(&format!("{update}{bare}"))
+            .unwrap()
+            .update
+            .unwrap()
+            .install;
+        assert!(i.file_types.is_empty() && i.url_schemes.is_empty() && !i.autostart);
+        let unknown = format!("{update}{install}icon = \"x\"\n");
+        // A key in a file type table that does not exist is refused, naming the key.
+        let bad = unknown.replace("name = \"App file\"", "name = \"App file\"\nglob = \"*\"");
+        let e = parse(&bad).unwrap_err();
+        assert!(format!("{e:#}").contains("unknown field"), "{e:#}");
+    }
 
     #[test]
     fn a_directory_is_not_a_regular_file() {

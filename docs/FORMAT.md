@@ -1101,10 +1101,11 @@ only a feed read from an update configuration.
 
 ### 13.4 Install metadata
 
-`install` is `{entry, name, comment, icon, categories, bin, terminal}` (M5-D4) and the optional
-`publisher` (M6-D3), with exactly these members; an unknown member makes the document invalid (13.7).
-A format-1 reader from before `publisher` was added refuses a document that holds it; nothing was
-released with that reader.
+`install` is `{entry, name, comment, icon, categories, bin, terminal}` (M5-D4), the optional
+`publisher` (M6-D3) and the optional `file_types`, `url_schemes` and `autostart` (M7-D3), with exactly
+these members; an unknown member makes the document invalid (13.7). A format-1 reader from before
+`publisher`, or from before the three declarations, refuses a document that holds one of them;
+nothing was released with such a reader.
 
 | Member | Type | Rule |
 |---|---|---|
@@ -1116,11 +1117,27 @@ released with that reader.
 | `bin` | string or null | the name of the command-line link (`~/.local/bin/<bin>` on Linux): `[A-Za-z0-9._-]{1,64}`, not starting with `-` or `.` |
 | `terminal` | boolean | whether the app runs in a terminal |
 | `publisher` | string, optional | the publisher's display name, shown by the installer beside "verified": 1 to 128 Unicode scalar values. The member is left out when there is no publisher (never `null`), so the bytes of a document without one are the same as before the member existed |
+| `file_types` | array of objects, optional | file types the app can open: at most 32 objects `{ext, mime, name}`. `ext`: `[a-z0-9]{1,16}`, no dot, no `ext` twice. `mime`: `type/subtype`, each side `[A-Za-z0-9!#$&^_.+-]{1,127}`, no parameters (the same `mime` under two `ext` values is allowed). `name`: a display name, with the rule of `name` below (1 to 128). The member is left out when the array is empty (never `[]`) |
+| `url_schemes` | array of strings, optional | URL schemes the app handles: at most 8, each `[a-z][a-z0-9+.-]{0,31}`, none twice, none on the deny-list below. Left out when empty |
+| `autostart` | boolean, optional | whether the app starts when the user signs in. Left out when `false` (never written as `false`) |
 
-`name`, `comment` and `publisher` hold no C0 or C1 control character, no DEL, no U+2028 or U+2029, no `\`, and
-no leading or trailing whitespace, so neither can break a line of a desktop entry or start an escape.
-File associations, URL schemes and autostart are not in format 1's first revision; they arrive as new
-optional members under 13.7.
+A reader accepts the explicit empty forms (`[]`, `false`) of the three optional declarations as the absent
+form; the writer never writes them, so a document without declarations has the same bytes as before
+the members existed. Every violation names the member and the rule, never the value.
+
+The deny-list of `url_schemes`, compared ignoring ASCII case: `about`, `blob`, `chrome`, `cid`, `data`,
+`file`, `ftp`, `ftps`, `gopher`, `http`, `https`, `irc`, `javascript`, `ldap`, `ldaps`, `mailto`,
+`microsoft-edge`, `mid`, `news`, `nntp`, `res`, `search-ms`, `sftp`, `shell`, `sms`, `ssh`, `tel`,
+`telnet`, `urn`, `view-source`, `vbscript`, and every scheme starting with `ms-`.
+
+The declarations are requests, not claims on the system: an integration offers the app as a handler
+(Linux: `MimeType=` entries in the desktop entry, `x-scheme-handler/<scheme>` for a scheme, and an XDG
+autostart entry; the Linux desktop entry then ends its `Exec` with `%U`) and never sets a default
+handler. `name` in a file type is shown where the OS has a place for it and is otherwise unused.
+
+`name`, `comment`, `publisher` and a file type's `name` hold no C0 or C1 control character, no DEL, no U+2028
+or U+2029, no `\`, and no leading or trailing whitespace, so none can break a line of a desktop entry or
+start an escape.
 
 ### 13.5 Desktop-entry paths
 

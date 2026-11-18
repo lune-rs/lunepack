@@ -127,7 +127,9 @@ fn refresh_integration(
     let request = IntegrationRequest {
         app_id: to.app_id().clone(),
         install_root: layout.root().to_path_buf(),
+        version: to.tree_version().clone(),
         meta: to.meta().clone(),
+        previous: from.map(|f| f.meta().clone()),
         stale_bins: stale_bins(from, to),
     };
     match ad.integration.apply(Scope::User, &request) {

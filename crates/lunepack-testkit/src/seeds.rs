@@ -1011,6 +1011,9 @@ pub fn sample_update_config() -> UpdateConfig {
             bin: Some("hello".to_owned()),
             terminal: false,
             publisher: None,
+            file_types: Vec::new(),
+            url_schemes: Vec::new(),
+            autostart: false,
         },
         extra: Default::default(),
     }
@@ -1050,6 +1053,9 @@ fn update_config_seeds(out: &mut Out) {
         bin: None,
         terminal: true,
         publisher: None,
+        file_types: Vec::new(),
+        url_schemes: Vec::new(),
+        autostart: false,
     };
     out.ok(
         "update_config",
@@ -1061,6 +1067,17 @@ fn update_config_seeds(out: &mut Out) {
         "publisher",
         install_with("publisher", json!("Acme, Inc.")),
     );
+    out.ok("update_config", "declarations", {
+        let mut declared = full.clone();
+        declared.install.file_types = vec![lunepack_core::FileType {
+            ext: "hello".to_owned(),
+            mime: "application/x-hello".to_owned(),
+            name: "Hello file".to_owned(),
+        }];
+        declared.install.url_schemes = vec!["hello".to_owned()];
+        declared.install.autostart = true;
+        declared.to_bytes().expect("declarations")
+    });
     out.ok(
         "update_config",
         "unknown-top-level",
@@ -1105,6 +1122,24 @@ fn update_config_seeds(out: &mut Out) {
         "update_config",
         "publisher-null",
         install_with("publisher", json!(null)),
+    );
+    out.bad(
+        "update_config",
+        "url-scheme-denied",
+        install_with("url_schemes", json!(["MS-settings"])),
+    );
+    out.bad(
+        "update_config",
+        "file-type-mime-semicolon",
+        install_with(
+            "file_types",
+            json!([{"ext": "x", "mime": "a/b;c/d", "name": "n"}]),
+        ),
+    );
+    out.bad(
+        "update_config",
+        "autostart-null",
+        install_with("autostart", json!(null)),
     );
     out.bad(
         "update_config",
