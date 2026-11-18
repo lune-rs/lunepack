@@ -116,8 +116,10 @@ fn main() -> ExitCode {
             let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
             ui.report(&events);
             let (kind, last) = install::run_install(ad, &boot, &events, &ui);
+            let seen = ui.outcome_acknowledged();
             ui.close(&events);
             conclude(events, &last);
+            notice(silent, seen, &boot.meta().name, Operation::Install, kind);
             kind
         }),
         // The log lives in R, which this mode removes: events go to stderr.
@@ -140,8 +142,10 @@ fn main() -> ExitCode {
             let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
             ui.report(&events);
             let (kind, last) = uninstall::run_uninstall(ad, &inst, &data_home, &events, &ui);
+            let seen = ui.outcome_acknowledged();
             ui.close(&events);
             conclude(events, &last);
+            notice(silent, seen, &inst.meta().name, Operation::Uninstall, kind);
             kind
         }),
     };
@@ -161,6 +165,64 @@ fn conclude(events: Events, last: &Event) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(line.as_bytes());
     let _ = out.flush();
+}
+
+/// The interactive modes whose end may need a native notice.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum Operation {
+    Install,
+    Uninstall,
+}
+
+/// The fixed text of a native notice: the app's validated display name, what happened and the
+/// closed result code (D36). Never a path, a value or an error's own text.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn notice_text(name: &str, operation: Operation, kind: Kind) -> String {
+    let (done, failed) = match operation {
+        Operation::Install => ("was installed.", "could not be installed"),
+        Operation::Uninstall => ("was uninstalled.", "could not be uninstalled"),
+    };
+    if kind == Kind::Ok {
+        format!("{name} {done}")
+    } else {
+        format!("{name} {failed} (code {}).", kind.code())
+    }
+}
+
+/// Windows: an interactive install or uninstall that ended without a UI that showed its outcome
+/// (no UI binary, one that failed to start or was lost) shows one native message box, because a
+/// Windows-subsystem process has no console to say it on (D36, M7-D6). Only after the outcome
+/// is committed; never under `--silent`, `--no-ui` or `LUNEPACK_NO_UI`, and never for a
+/// cancellation the user chose. `seen`: the UI itself answered the prompt after the outcome.
+#[cfg(windows)]
+fn notice(quiet: bool, seen: bool, name: &str, operation: Operation, kind: Kind) {
+    let env = |var: &str| std::env::var_os(var);
+    if seen || kind == Kind::Cancelled || !ui_host::ui_wanted(quiet, &env) {
+        return;
+    }
+    let level = if kind == Kind::Ok {
+        lunepack_os_windows::MessageKind::Info
+    } else {
+        lunepack_os_windows::MessageKind::Error
+    };
+    let _ = lunepack_os_windows::message_box(name, &notice_text(name, operation, kind), level);
+}
+
+/// Other platforms print their outcome on the terminal; no native notice.
+#[cfg(not(windows))]
+fn notice(_quiet: bool, _seen: bool, _name: &str, _operation: Operation, _kind: Kind) {}
+
+/// A path as the UI shows it: Windows' `\\?\X:\` prefix of a canonical path is dropped.
+fn shown_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(text) = path.to_str()
+        && let Some(rest) = text.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return PathBuf::from(rest);
+    }
+    path
 }
 
 /// A headless mode that failed before its tree was known.
@@ -186,7 +248,15 @@ fn data_home() -> Result<PathBuf, Kind> {
     Ok(dirs.data_home().to_path_buf())
 }
 
-#[cfg(not(target_os = "linux"))]
+/// The per-user program files folder (M7-D2), canonical when it exists: the executable's path is
+/// canonical too, so the parent of an install root compares equal to it (M7-D16).
+#[cfg(windows)]
+fn data_home() -> Result<PathBuf, Kind> {
+    let dir = lunepack_os_windows::user_program_files().map_err(|_| Kind::Fs)?;
+    Ok(std::fs::canonicalize(&dir).unwrap_or(dir))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn data_home() -> Result<PathBuf, Kind> {
     Err(Kind::Unsupported)
 }
@@ -202,7 +272,16 @@ fn initial_parent() -> cli::WaitTarget {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn initial_parent() -> cli::WaitTarget {
+    use lunepack::Process as _;
+    match lunepack_os_windows::WindowsProcess::new().parent() {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) | Err(_) => Err(Kind::Process),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn initial_parent() -> cli::WaitTarget {
     Err(Kind::Unsupported)
 }
@@ -220,7 +299,18 @@ fn wait_target(wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarge
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn wait_target(wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarget {
+    let Some(pid) = wait_pid else {
+        return parent;
+    };
+    match lunepack_os_windows::WindowsProcess::new().process_id(pid) {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) | Err(_) => Err(Kind::Process),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn wait_target(_wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarget {
     parent
 }
@@ -260,6 +350,7 @@ fn ui_for(
     let env = |name: &str| std::env::var_os(name);
     let details = Details {
         location: location
+            .map(shown_path)
             .and_then(|p| p.to_str().map(str::to_owned))
             .and_then(|t| ui_host::within(t, MAX_LOCATION)),
         size_bytes: None,
@@ -382,15 +473,13 @@ fn setup_mode(_args: &[std::ffi::OsString]) -> Option<Kind> {
 }
 
 /// Runs `body` on the native adapters.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn run(body: impl FnOnce(&modes::Adapters) -> Kind) -> Kind {
     use std::sync::Arc;
 
     let fs: Arc<dyn lunepack::Fs> = Arc::new(lunepack_fs::StdFs::new());
     let hasher: Arc<dyn lunepack::Hasher> = Arc::new(lunepack_crypto::Sha256Hasher);
-    let process: Arc<dyn lunepack::Process> = Arc::new(lunepack_os_linux::LinuxProcess::new());
-    let integration: Arc<dyn lunepack::OsIntegration> =
-        Arc::new(lunepack_os_linux::XdgIntegration::from_process_env());
+    let (process, integration) = native_adapters();
     let rng: Arc<dyn lunepack::Rng> = Arc::new(lunepack_crypto::OsRng);
     let verifier: Arc<dyn lunepack::Verifier> = Arc::new(lunepack_crypto::Ed25519Verifier);
     let codec: Arc<dyn lunepack::Codec> = Arc::new(lunepack_codec_lzma::LzmaCodec);
@@ -415,8 +504,70 @@ fn run(body: impl FnOnce(&modes::Adapters) -> Kind) -> Kind {
     })
 }
 
-/// Processes and the desktop integration have no adapter here yet (M7, M8).
-#[cfg(not(target_os = "linux"))]
+/// The process and desktop-integration adapters of this OS.
+#[cfg(target_os = "linux")]
+fn native_adapters() -> (
+    std::sync::Arc<dyn lunepack::Process>,
+    std::sync::Arc<dyn lunepack::OsIntegration>,
+) {
+    (
+        std::sync::Arc::new(lunepack_os_linux::LinuxProcess::new()),
+        std::sync::Arc::new(lunepack_os_linux::XdgIntegration::from_process_env()),
+    )
+}
+
+/// The process and desktop-integration adapters of this OS (per-user scope, M7).
+#[cfg(windows)]
+fn native_adapters() -> (
+    std::sync::Arc<dyn lunepack::Process>,
+    std::sync::Arc<dyn lunepack::OsIntegration>,
+) {
+    (
+        std::sync::Arc::new(lunepack_os_windows::WindowsProcess::new()),
+        std::sync::Arc::new(lunepack_os_windows::WindowsIntegration::current_user()),
+    )
+}
+
+/// Processes and the desktop integration have no adapter here yet (M8).
+#[cfg(not(any(target_os = "linux", windows)))]
 fn run(_body: impl FnOnce(&modes::Adapters) -> Kind) -> Kind {
     fail("runtime", Kind::Unsupported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The native notice's text is fixed: the name, what happened and the closed code.
+    #[test]
+    fn the_notice_text_names_the_app_the_result_and_the_code_only() {
+        assert_eq!(
+            notice_text("My App", Operation::Install, Kind::Ok),
+            "My App was installed."
+        );
+        assert_eq!(
+            notice_text("My App", Operation::Install, Kind::Fs),
+            "My App could not be installed (code 9)."
+        );
+        assert_eq!(
+            notice_text("My App", Operation::Uninstall, Kind::Ok),
+            "My App was uninstalled."
+        );
+        assert_eq!(
+            notice_text("My App", Operation::Uninstall, Kind::InUse),
+            "My App could not be uninstalled (code 25)."
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_canonical_path_is_shown_without_its_verbatim_prefix() {
+        assert_eq!(
+            shown_path(PathBuf::from(r"\\?\C:\Users\a b\Programs\App")),
+            PathBuf::from(r"C:\Users\a b\Programs\App")
+        );
+        // A UNC path keeps its prefix.
+        let unc = PathBuf::from(r"\\?\UNC\host\share\App");
+        assert_eq!(shown_path(unc.clone()), unc);
+    }
 }

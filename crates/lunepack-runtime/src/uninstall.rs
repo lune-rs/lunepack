@@ -216,6 +216,19 @@ fn uninstall(
         return Err(Kind::InstallMismatch);
     }
 
+    // Windows cannot delete a running image: an uninstall that runs from inside `R` would leave
+    // `R` renamed away but not removed. The hand-off that runs it from a copy outside `R` is
+    // M7 step 11; until then this refuses before anything changes.
+    #[cfg(windows)]
+    if ad
+        .process
+        .current_exe()
+        .map_err(|e| Kind::of(&e.into()))?
+        .starts_with(root)
+    {
+        return Err(Kind::Unsupported);
+    }
+
     let me: ProcessId = ad.process.current().map_err(|e| Kind::of(&e.into()))?;
     let mut exclude = vec![me];
     exclude.extend(ui);

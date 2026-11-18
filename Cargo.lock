@@ -2237,6 +2237,7 @@ dependencies = [
  "lunepack-os-windows",
  "lunepack-testkit",
  "tempfile",
+ "url",
 ]
 
 [[package]]
