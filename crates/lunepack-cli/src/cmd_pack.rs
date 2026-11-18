@@ -17,10 +17,10 @@ use lunepack_codec_lzma::LzmaCodec;
 use lunepack_core::digest::U53;
 use lunepack_core::error::UpdateConfigError;
 use lunepack_core::{
-    AppId, ArtifactRef, Channel, ClockReading, CodeSign, Hasher, InstallMeta, PayloadKind,
+    AppId, ArtifactRef, Channel, ClockReading, CodeSign, Hasher, InstallMeta, PayloadKind, RelPath,
     ReleaseDoc, ReleaseLayout, RollbackFloor, Signer, Target, UpdateConfig, VerifiedEntry,
-    VerifiedKeySet, Version, check_runtime_image, check_ui_image, decode_verified, next_feed,
-    sign_envelope, verify_feed, verify_manifest,
+    VerifiedKeySet, Version, check_pe_stub, check_runtime_image, check_ui_image, decode_verified,
+    next_feed, sign_envelope, verify_feed, verify_manifest, windows_name_ok,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
@@ -28,6 +28,7 @@ use crate::config::{Config, resolve_signer, writer_clock};
 use crate::pipeline::{self, Settings, UpdatePlan};
 use crate::place;
 use crate::release_dir;
+use crate::stamp;
 
 /// Prefix of the work dir under the system temp dir.
 pub const WORK_PREFIX: &str = "lunepack-pack-";
@@ -35,6 +36,8 @@ pub const WORK_PREFIX: &str = "lunepack-pack-";
 const MAX_RUNTIME_BYTES: u64 = 256 * 1024 * 1024;
 /// Largest `--ui` file read, in bytes.
 const MAX_UI_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest `--stub` file read, in bytes.
+const MAX_STUB_BYTES: u64 = 32 * 1024 * 1024;
 /// Default memory budget of the pack stage, in MiB.
 const DEFAULT_BUDGET_MIB: u64 = 2048;
 /// The channel of the throwaway feed the self-check signs; never written anywhere.
@@ -77,6 +80,11 @@ pub struct PackArgs {
     /// without them. Optional: without it the UI is absent and the app runs headless.
     #[arg(long)]
     ui: Option<PathBuf>,
+    /// The Windows launcher stub (M7-D7) to stamp and place beside the entry as
+    /// `lunepack-stub.exe`: required for a `windows-*` target when the config has `[update]`, and
+    /// refused for any other target. The console stub for a terminal app, the GUI stub otherwise.
+    #[arg(long)]
+    stub: Option<PathBuf>,
 }
 
 fn say(line: &str) -> Result<()> {
@@ -241,6 +249,8 @@ struct Prepared {
     install: InstallMeta,
     runtime: Vec<u8>,
     ui: Option<Vec<u8>>,
+    /// The stamped Windows stub (M7-D14); `Some` exactly for a `windows-*` target.
+    stub: Option<Vec<u8>>,
     config: Vec<u8>,
 }
 
@@ -277,31 +287,134 @@ fn read_capped(path: &Path, flag: &str, cap: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The inputs of [`prepare_update`] that are not the config.
+struct UpdateInputs<'a> {
+    runtime: Option<&'a Path>,
+    ui: Option<&'a Path>,
+    stub: Option<&'a Path>,
+    /// The `--input` directory, where a PNG `install.icon` is read from.
+    input: &'a Path,
+    /// The `--version` text, written into a stamped stub's version info.
+    version_text: &'a str,
+}
+
+/// M7-D15, M7-D14 for a `windows-*` target: the install `name` is the install folder's name, the
+/// entry is an `.exe`, and the numeric version fits the stub's 16-bit fields. Errors name the
+/// field and the rule, never the value.
+fn check_windows_install(install: &InstallMeta, version: &Version) -> Result<()> {
+    if let Err(rule) = windows_name_ok(&install.name) {
+        bail!("[install] name: not a valid Windows folder and shortcut name: {rule}");
+    }
+    let file = install.entry.components().last().unwrap_or_default();
+    if !file.to_ascii_lowercase().ends_with(".exe") {
+        bail!("[install] entry: a Windows target's entry must be an .exe file");
+    }
+    stamp::version_numbers(version)?;
+    Ok(())
+}
+
+/// The icon bytes a Windows stub or setup file is stamped with (M7-D14): `[windows] icon` when
+/// given, else a PNG `install.icon` read through `read_icon`, else none (an SVG or no icon).
+pub(crate) fn pick_icon(
+    config: &Config,
+    install: &InstallMeta,
+    read_icon: impl FnOnce(&RelPath) -> Result<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(path) = &config.windows_icon {
+        return stamp::windows_icon_file(path).map(Some);
+    }
+    match &install.icon {
+        Some(icon) => stamp::install_icon(icon, || read_icon(icon)),
+        None => Ok(None),
+    }
+}
+
+/// Reads a PNG `install.icon` from the input tree, through real directories only.
+fn read_input_icon(input: &Path, icon: &RelPath) -> Result<Vec<u8>> {
+    pipeline::regular_file_in(input, icon, "install.icon")?;
+    read_capped(
+        &input.join(icon.as_str()),
+        "install.icon",
+        stamp::MAX_ICON_BYTES,
+    )
+}
+
+/// Checks `--stub`, stamps it (M7-D14), checks the stamped bytes again and returns them.
+fn prepare_stub(
+    config: &Config,
+    install: &InstallMeta,
+    path: &Path,
+    inputs: &UpdateInputs<'_>,
+    version: &Version,
+    target: Target,
+) -> Result<Vec<u8>> {
+    let console = install.terminal;
+    let kind = if console { "console" } else { "GUI" };
+    let bytes = read_capped(path, "--stub", MAX_STUB_BYTES)?;
+    check_pe_stub(&bytes, target, console)
+        .map_err(|e| anyhow!("--stub is not a {kind} stub for {}: {e}", target.as_str()))?;
+    // The input tree is read only when it is one: a bad `--input` fails in `assemble`.
+    let icon = pick_icon(config, install, |icon| read_input_icon(inputs.input, icon))?;
+    let file = install.entry.components().last().unwrap_or_default();
+    let fields = stamp::Fields {
+        description: &install.name,
+        product: &install.name,
+        company: install.publisher.as_deref(),
+        version_text: inputs.version_text,
+        numbers: stamp::version_numbers(version)?,
+        original_filename: file,
+        icon: icon.as_deref(),
+    };
+    let stamped = stamp::stamp(&bytes, &fields).context("--stub cannot be stamped")?;
+    check_pe_stub(&stamped, target, console).map_err(|e| {
+        anyhow!(
+            "the stamped --stub is not a {kind} stub for {}: {e}",
+            target.as_str()
+        )
+    })?;
+    Ok(stamped)
+}
+
 /// M5-D7: with `[update]` the runtime is required and the update config is written for this
 /// version and target; without it `--runtime` is refused. `--ui` (M6) needs both and is refused
-/// without them. Every check that needs no tree runs here.
+/// without them. `--stub` (M7) is required for a `windows-*` target and refused for any other.
+/// Every check that needs no tree runs here.
 fn prepare_update(
     config: &Config,
-    runtime: Option<&Path>,
-    ui: Option<&Path>,
+    inputs: &UpdateInputs<'_>,
     version: &Version,
     target: Target,
 ) -> Result<Option<Prepared>> {
     let Some(settings) = &config.update else {
-        if runtime.is_some() {
+        if inputs.runtime.is_some() {
             bail!("--runtime needs [update] and [install] in the config");
         }
-        if ui.is_some() {
+        if inputs.ui.is_some() {
             bail!("--ui needs [update] and [install] in the config");
+        }
+        if inputs.stub.is_some() {
+            bail!("--stub needs [update] and [install] in the config");
         }
         return Ok(None);
     };
-    let Some(runtime) = runtime else {
-        if ui.is_some() {
+    let Some(runtime) = inputs.runtime else {
+        if inputs.ui.is_some() {
             bail!("--ui needs --runtime");
+        }
+        if inputs.stub.is_some() {
+            bail!("--stub needs --runtime");
         }
         bail!("--runtime is required when the config has [update]");
     };
+    if inputs.stub.is_some() && !target.is_windows() {
+        bail!("--stub is only for windows-* targets");
+    }
+    if target.is_windows() {
+        if inputs.stub.is_none() {
+            bail!("--stub is required for a windows-* target when the config has [update]");
+        }
+        check_windows_install(&settings.install, version)?;
+    }
     let root = config.trusted_root(&Sha256Hasher, &Ed25519Verifier)?;
     let document = UpdateConfig::new(
         &root,
@@ -318,7 +431,8 @@ fn prepare_update(
     let bytes = read_capped(runtime, "--runtime", MAX_RUNTIME_BYTES)?;
     check_runtime_image(&bytes, target)
         .map_err(|e| anyhow!("--runtime is not a runtime for {}: {e}", target.as_str()))?;
-    let ui = ui
+    let ui = inputs
+        .ui
         .map(|path| {
             let bytes = read_capped(path, "--ui", MAX_UI_BYTES)?;
             check_ui_image(&bytes, target)
@@ -326,11 +440,16 @@ fn prepare_update(
             Ok::<_, anyhow::Error>(bytes)
         })
         .transpose()?;
+    let stub = inputs
+        .stub
+        .map(|path| prepare_stub(config, &document.install, path, inputs, version, target))
+        .transpose()?;
     Ok(Some(Prepared {
         install: document.install.clone(),
         config: document.to_bytes().map_err(config_error)?,
         runtime: bytes,
         ui,
+        stub,
     }))
 }
 
@@ -357,8 +476,13 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
 
     let prepared = prepare_update(
         &config,
-        args.runtime.as_deref(),
-        args.ui.as_deref(),
+        &UpdateInputs {
+            runtime: args.runtime.as_deref(),
+            ui: args.ui.as_deref(),
+            stub: args.stub.as_deref(),
+            input: &args.input,
+            version_text: &args.version,
+        },
         &version,
         target,
     )?;
@@ -410,6 +534,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
             install: &p.install,
             runtime: &p.runtime,
             ui: p.ui.as_deref(),
+            stub: p.stub.as_deref(),
             config: &p.config,
         }),
     };

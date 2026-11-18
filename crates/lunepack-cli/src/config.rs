@@ -161,12 +161,8 @@ pub struct Config {
     pub state_path: PathBuf,
     /// `[update]` with `[install]`, when the config has them.
     pub update: Option<UpdateSettings>,
-    /// `[windows] icon`, resolved against the config's directory (M7-D14); checked as an ICO by the
-    /// packager when it stamps (M7 step 12 reads it; until then nothing does).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the stamping step (M7 step 12)")
-    )]
+    /// `[windows] icon`, resolved against the config's directory (M7-D14); checked as an ICO when
+    /// the packager stamps a Windows stub or setup file.
     pub windows_icon: Option<PathBuf>,
     signers: BTreeMap<String, SignerSpec>,
 }

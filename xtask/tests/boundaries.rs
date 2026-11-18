@@ -95,9 +95,14 @@ undocumented_unsafe_blocks = "deny"
                     &format!("{core}\nlunepack-http = {{ path = \"../lunepack-http\" }}"),
                 ),
             );
+            // The packager pins its PE stamper exactly (M7-D22, `EXACT_PINS`).
             crates.insert(
                 "lunepack-cli".into(),
-                manifest("lunepack-cli", INHERIT, core),
+                manifest(
+                    "lunepack-cli",
+                    INHERIT,
+                    &format!("{core}\neditpe = \"=0.2.4\""),
+                ),
             );
             Fx {
                 root: ROOT.to_string(),
@@ -1788,5 +1793,29 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
             !has(&fx.run().1, "lunepack-cli", "depends-only-on"),
             "the list is the stub's only"
         );
+    }
+
+    // M7-D22: editpe is confined to the packager CLI and pinned there --------------------------------
+
+    #[test]
+    fn y_editpe_is_confined_to_the_cli_and_pinned_exactly() {
+        let editpe = r#"editpe = "=0.2.4""#;
+        // The clean fixture's CLI holds the pin.
+        assert_clean(&Fx::clean().run().1);
+        // Another member naming it is rejected.
+        let mut fx = Fx::clean();
+        fx.add_dep("lunepack", editpe);
+        assert_has(&fx.run().1, "lunepack", "confined");
+        // A loose requirement, or none, in the CLI is not the pin.
+        for loose in ["0.2", "^0.2.4", "=0.2.5"] {
+            let mut fx = Fx::clean();
+            fx.edit("lunepack-cli", |m| {
+                *m = m.replace(editpe, &format!("editpe = \"{loose}\""))
+            });
+            assert_has(&fx.run().1, "lunepack-cli", "exact-pin");
+        }
+        let mut fx = Fx::clean();
+        fx.edit("lunepack-cli", |m| *m = m.replace(editpe, ""));
+        assert_has(&fx.run().1, "lunepack-cli", "exact-pin");
     }
 }
