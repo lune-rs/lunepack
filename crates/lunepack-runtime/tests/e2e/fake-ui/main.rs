@@ -12,6 +12,12 @@
 //!   the choice that lets the operation go on (proceed at the welcome and confirm screens, finish
 //!   without launching, close, acknowledge); `die` does the same until the operation reports
 //!   progress, a finished step or its outcome, and then aborts the process (SIGABRT).
+//!
+//! On Windows it is a GUI-subsystem program with the build's hardening (the runtime's `build.rs`
+//! links examples too), because `pack --ui` holds a `windows-*` UI to the runtime's own image
+//! rules (subsystem, `DependentLoadFlags`, manifest, no static `advapi32`).
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::io::Write as _;
 use std::path::Path;
@@ -47,6 +53,8 @@ fn choice(kind: PromptKind, flow: Option<Flow>) -> ChoiceValue {
 }
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    lunepack_os_windows::harden_dll_search();
     if std::env::args_os().nth(1).as_deref() != Some("--engine".as_ref())
         || std::env::args_os().count() != 2
     {

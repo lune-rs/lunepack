@@ -1,7 +1,8 @@
 //! Windows hardening for this binary (M7-D10): a load-config `DependentLoadFlags` of
 //! `LOAD_LIBRARY_SEARCH_SYSTEM32` for its static imports, and the one shared manifest
 //! (`asInvoker`, `longPathAware`, Windows 10/11 `supportedOS`) embedded. Only the MSVC linker on
-//! Windows, and only the binaries: nothing is added for other targets, tests or examples.
+//! Windows, and only the binaries and the examples (the end-to-end stand-in UI, which a `windows-*`
+//! pack holds to the runtime's own image rules): nothing is added for other targets or tests.
 //!
 //! `advapi32.dll` is delay-loaded. Its `SystemFunction036` (`RtlGenRandom`, imported by
 //! `getrandom` 0.2 through `ring`) is a forwarder to `cryptbase.dll`, which is not a KnownDLL, and
@@ -27,12 +28,14 @@ fn main() {
     if !windows_msvc {
         return;
     }
-    println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
-    println!("cargo:rustc-link-arg-bins=/DELAYLOAD:advapi32.dll");
-    println!("cargo:rustc-link-arg-bins=delayimp.lib");
-    println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-    println!(
-        "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
-        manifest.display()
-    );
+    for kind in ["bins", "examples"] {
+        println!("cargo:rustc-link-arg-{kind}=/DEPENDENTLOADFLAG:0x800");
+        println!("cargo:rustc-link-arg-{kind}=/DELAYLOAD:advapi32.dll");
+        println!("cargo:rustc-link-arg-{kind}=delayimp.lib");
+        println!("cargo:rustc-link-arg-{kind}=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg-{kind}=/MANIFESTINPUT:{}",
+            manifest.display()
+        );
+    }
 }
