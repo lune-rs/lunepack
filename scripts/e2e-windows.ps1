@@ -300,7 +300,7 @@ function New-App([string]$tag, [string]$idSuffix, [string]$nameSuffix, [string]$
         Tag = $tag; Id = "org.example.lpe2e$hex$idSuffix"; BaseName = "Lunepack E2E $([char]0xC4) $hex$nameSuffix"
         EntryRel = $entryRel; EntryFile = ($entryRel -split '/')[-1]; EntrySource = $entrySource
         Terminal = $terminal; Ui = $ui; Dir = $dir; Cfg = $cfg; Rel = (Join-Path $dir 'rel'); RelKey = (Join-Path $dir 'rel0.key')
-        Root = $null
+        Root = $null; Declare = $false; Ext = ''
     }
     $app.Name = $app.BaseName
     $app.Feed = FileFeed $app.Rel
@@ -328,6 +328,10 @@ function Publish-Version($app, [string]$version, [hashtable]$options = @{}) {
     if ($flags.Count -gt 0) { [IO.File]::WriteAllText((Join-Path $in 'e2e-flags'), (($flags -join "`n") + "`n"), $utf8) }
     $toml = "`n[update]`nfeed = `"$($app.Feed)`"`nchannel = `"stable`"`nhealth_timeout_secs = $timeout`n`n[install]`nentry = `"$($app.EntryRel)`"`nname = `"$($app.Name)`"`npublisher = `"Lunepack E2E`"`n"
     if ($app.Terminal) { $toml += "terminal = true`n" }
+    if ($app.Declare) {
+        # M7-D3: a file type ("Open with"), a URL scheme and autostart; each name is unique to this run.
+        $toml += "url_schemes = [`"$($app.Ext)`"]`nautostart = true`n`n[[install.file_types]]`next = `"$($app.Ext)`"`nmime = `"application/x-$($app.Ext)`"`nname = `"Lunepack E2E file`"`n"
+    }
     [IO.File]::WriteAllText($app.Cfg, $app.Base + $toml, $utf8)
     $stubFile = $stub
     if ($app.Terminal) { $stubFile = $stubConsole }
@@ -352,6 +356,61 @@ function Install-Silent($app, [string]$setupExe) {
     SameV 'setup exit code' $r.Code 0
     $app.Root = Join-Path $programs $app.BaseName
     return $r
+}
+
+$classesKey = 'HKCU:\Software\Classes'
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+
+# A `Run` value's data (null when the key or the value is absent).
+function Run-Value([string]$name) {
+    if (-not (Test-Path -LiteralPath $runKey)) { return $null }
+    return (Get-Item -LiteralPath $runKey).GetValue($name)
+}
+
+# A registry key's default value (null when the key or the value is absent); never printed.
+function Reg-Default([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    return (Get-Item -LiteralPath $path).GetValue('')
+}
+
+# `System.AppUserModel.ID` of a shortcut, read through the shell's property system.
+function Get-LinkAumid([string]$lnk) {
+    $shell = New-Object -ComObject Shell.Application
+    $folder = $shell.Namespace((Split-Path $lnk -Parent))
+    $item = $folder.ParseName((Split-Path $lnk -Leaf))
+    return "$($item.ExtendedProperty('System.AppUserModel.ID'))"
+}
+
+# The declarations of M7-D3 an app with `Declare` carries: the ProgID and the "Open with" entry of
+# its file type (never the extension's default value), the URL-scheme class and the Run value; each
+# one carries the marker and runs the stub.
+function Assert-Declarations($app) {
+    $stubPath = Stub-Path $app
+    $openCommand = "`"$stubPath`" `"%1`""
+    $progid = "$($app.Id).$($app.Ext)"
+    $pk = Join-Path $classesKey $progid
+    Require (Test-Path -LiteralPath $pk) 'the ProgID key exists'
+    Same 'ProgID marker' (Get-Item -LiteralPath $pk).GetValue('LunepackAppId') $app.Id
+    Same 'ProgID open command' (Reg-Default (Join-Path $pk 'shell\open\command')) $openCommand
+    $extKey = Join-Path $classesKey ".$($app.Ext)"
+    $with = Join-Path $extKey 'OpenWithProgids'
+    Require (Test-Path -LiteralPath $with) 'the OpenWithProgids key exists'
+    Require (@((Get-Item -LiteralPath $with).GetValueNames()) -contains $progid) 'OpenWithProgids lists the ProgID'
+    Require ($null -eq (Reg-Default $extKey)) 'the extension key has no default value (no default handler)'
+    $sk = Join-Path $classesKey $app.Ext
+    Require (Test-Path -LiteralPath $sk) 'the URL-scheme key exists'
+    Same 'scheme marker' (Get-Item -LiteralPath $sk).GetValue('LunepackAppId') $app.Id
+    Require (@((Get-Item -LiteralPath $sk).GetValueNames()) -contains 'URL Protocol') 'the scheme key has URL Protocol'
+    Same 'scheme open command' (Reg-Default (Join-Path $sk 'shell\open\command')) $openCommand
+    Same 'Run value' (Run-Value $app.Id) "`"$stubPath`""
+}
+
+# Everything Assert-Declarations looked at is gone.
+function Assert-NoDeclarations($app) {
+    Require (-not (Test-Path -LiteralPath (Join-Path $classesKey "$($app.Id).$($app.Ext)"))) 'the ProgID is gone'
+    Require (-not (Test-Path -LiteralPath (Join-Path $classesKey ".$($app.Ext)"))) 'the extension key is gone'
+    Require (-not (Test-Path -LiteralPath (Join-Path $classesKey $app.Ext))) 'the URL-scheme key is gone'
+    Require ($null -eq (Run-Value $app.Id)) 'the Run value is gone'
 }
 
 # What a first install of $version leaves in $app.Root, in the registry and in the Start menu.
@@ -380,6 +439,8 @@ function Assert-Installed($app, [string]$version) {
     Require (Test-Path -LiteralPath $lnk) 'the Start-menu shortcut exists'
     $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
     Same 'shortcut target' $sc.TargetPath (Stub-Path $app)
+    Same 'shortcut AUMID' (Get-LinkAumid $lnk) $app.Id
+    if ($app.Declare) { Assert-Declarations $app }
 }
 
 # Uninstalls through the Uninstall entry's own quiet command, split by the documented rule (a
@@ -397,6 +458,7 @@ function Invoke-Uninstall($app) {
     Wait-Until { -not (Test-Path -LiteralPath (Long $root)) } 90 'R to go'
     Wait-Until { -not (Test-Path $key) } 30 'the Uninstall key to go'
     Require (-not (Test-Path -LiteralPath (Join-Path $startMenu "$($app.Name).lnk"))) 'the shortcut is gone'
+    if ($app.Declare) { Assert-NoDeclarations $app }
 }
 
 # Removes a tree however long its paths are.
@@ -428,6 +490,13 @@ function Cleanup {
         Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
     }
     foreach ($app in $apps) { Remove-Item -Path (Join-Path $uninstallKeyRoot $app.Id) -Recurse -Force -ErrorAction SilentlyContinue }
+    foreach ($app in @($apps | Where-Object { $_.Declare })) {
+        # The declarations of M7-D3, when the uninstall did not remove them (all names are unique to this run).
+        foreach ($k in "$($app.Id).$($app.Ext)", ".$($app.Ext)", $app.Ext) {
+            Remove-Item -LiteralPath (Join-Path $classesKey $k) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-ItemProperty -LiteralPath $runKey -Name $app.Id -ErrorAction SilentlyContinue
+    }
     foreach ($d in Get-ChildItem $tempRoot -Directory -ErrorAction SilentlyContinue) {
         # Only what this run created: uninstall copies and UI dirs that were not there at the start.
         if ($tempBefore -notcontains $d.Name -and $d.Name -match '^lunepack-(uninstall|setup-ui)-[0-9a-f]{16}$') {
@@ -444,6 +513,12 @@ function Leftovers {
     foreach ($d in Get-ChildItem $programs -Directory -Force -ErrorAction SilentlyContinue) { if ($d.Name -like "Lunepack E2E*$hex*") { $left += 'folder' } }
     foreach ($f in Get-ChildItem $startMenu -Filter '*.lnk' -ErrorAction SilentlyContinue) { if ($f.Name -like "Lunepack E2E*$hex*") { $left += 'shortcut' } }
     foreach ($app in $apps) { if (Test-Path (Join-Path $uninstallKeyRoot $app.Id)) { $left += 'uninstall key' } }
+    foreach ($app in @($apps | Where-Object { $_.Declare })) {
+        foreach ($k in "$($app.Id).$($app.Ext)", ".$($app.Ext)", $app.Ext) {
+            if (Test-Path -LiteralPath (Join-Path $classesKey $k)) { $left += 'class key' }
+        }
+        if ($null -ne (Run-Value $app.Id)) { $left += 'Run value' }
+    }
     return $left
 }
 
@@ -515,6 +590,8 @@ try {
 
     # ---- the releases ------------------------------------------------------------------------------------------
     $A = New-App 'a' '' '' "lpe2e$hex.exe" $appExe $false $fakeUi
+    $A.Declare = $true
+    $A.Ext = "lpe$hex"
     $B = New-App 'b' '-b' ' Console' "lpe2e${hex}b.exe" $appExe $true $null
     $D = New-App 'd' '-d' ' Ctl' "ctl$hex.exe" $ctlExe $true $null
     # A path of well over 260 characters from R to the entry (row 7): four directories of 50 characters.
@@ -584,8 +661,10 @@ try {
             SameV 'UI starts under /S' (@(Ui-Notes 'ui-spawns')).Count 0
             SameV 'UI directories left in temp' (@(New-TempDirs 'lunepack-setup-ui-')).Count 0
             # The app, started through the stub, writes its marker lines.
-            $null = Start-Proc (Stub-Path $A)
-            Expect-Lines $o @('1.0.0 start', '1.0.0 event installed', '1.0.0 event first_run', '1.0.0 nothing-pending')
+            # `--aumid`: the app reports its process's explicit app user model id, which is the
+            # shortcut's (M7-D9; Assert-Installed read the shortcut's and compared it with the app id).
+            $null = Start-Proc (Stub-Path $A) @('--aumid')
+            Expect-Lines $o @('1.0.0 start', '1.0.0 event installed', '1.0.0 event first_run', '1.0.0 nothing-pending', ('1.0.0 aumid ' + $A.Id))
             Assert-Record $A '1.0.0' $null @()
         }
 
