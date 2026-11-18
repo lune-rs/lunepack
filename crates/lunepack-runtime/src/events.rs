@@ -122,6 +122,17 @@ pub enum Event {
         /// The version it is about, when one.
         version: Option<Version>,
     },
+    /// The UI process was stopped (M6): the run goes on headless. `reason` is from the closed set
+    /// of `ui_host::UiStop` (`stalled`, `hung`, `exited`, `protocol`, `build_mismatch`,
+    /// `hello_timeout`, `spawn_failed`); `exit_code` is the UI's own, when it exited with one. A
+    /// `warning` with code `ui_stopped` on the wire.
+    #[allow(dead_code)] // emitted by the UI host
+    UiStopped {
+        /// Why.
+        reason: &'static str,
+        /// The UI's exit code.
+        exit_code: Option<i32>,
+    },
     /// The mode ended well (or with a decided outcome such as a rollback).
     Result {
         /// The mode or command.
@@ -283,6 +294,14 @@ fn to_json(event: &Event, time_ms: Option<u64>) -> String {
             json_str(&mut out, warning.code());
             out.push_str(",\"version\":");
             json_version(&mut out, version.as_ref());
+        }
+        Event::UiStopped { reason, exit_code } => {
+            head(&mut out, "warning");
+            out.push_str(",\"code\":\"ui_stopped\",\"version\":null,\"reason\":");
+            json_str(&mut out, reason);
+            if let Some(code) = exit_code {
+                let _ = write!(out, ",\"ui_exit_code\":{code}");
+            }
         }
         Event::Result {
             command,

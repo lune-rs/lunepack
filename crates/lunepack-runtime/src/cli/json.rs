@@ -321,6 +321,14 @@ mod tests {
         }
         events.push(Event::warning(Warning::GcInUse, Some(&v("1.0.0"))));
         events.push(Event::warning(Warning::SinkDropped, None));
+        events.push(Event::UiStopped {
+            reason: "stalled",
+            exit_code: None,
+        });
+        events.push(Event::UiStopped {
+            reason: "exited",
+            exit_code: Some(11),
+        });
         events.push(Event::Result {
             command: "apply",
             tree_version: Some(v("1.0.0")),

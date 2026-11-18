@@ -25,12 +25,14 @@ pub mod policy;
 pub mod process;
 pub mod progress;
 pub mod root;
+pub mod setup;
 pub mod stage;
 pub mod state;
 pub mod target;
 pub mod traits;
 pub mod transport;
 pub mod trust;
+pub mod ui;
 pub mod update_config;
 pub mod version;
 pub mod write;
@@ -70,15 +72,19 @@ pub use lifecycle::{
     gc_keep, install_first, rollback,
 };
 pub use limits::Limits;
-pub use manifest::{EntryDoc, ManifestDocument, VerifiedEntry, VerifiedManifest, verify_manifest};
+pub use manifest::{
+    EntryDoc, ManifestDocument, VerifiedEntry, VerifiedManifest, read_entry, verify_manifest,
+    verify_payload_manifest,
+};
 pub use pack::{
     FileClass, PackedFile, ReleaseLayout, RuntimeImageError, candidates, check_runtime_image,
-    classify, pack_file,
+    check_ui_image, classify, pack_file,
 };
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
 pub use process::{
-    Child, ExitKind, Process, ProcessError, ProcessErrorKind, ProcessId, SpawnSpec, WaitOutcome,
+    Child, ChildStdio, ExitKind, Process, ProcessError, ProcessErrorKind, ProcessId, SpawnSpec,
+    WaitOutcome,
 };
 pub use progress::{FileProgress, Phase, Progress, Source};
 pub use root::{RootDocument, TrustedRoot, advance_root};

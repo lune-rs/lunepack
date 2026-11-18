@@ -373,6 +373,77 @@ fn name_and_comment_boundaries() {
 }
 
 #[test]
+fn publisher_is_optional_and_absent_stays_absent() {
+    // An M5-shaped document (no `publisher` member) still parses, to `None`.
+    let m5 = sample().to_bytes().unwrap();
+    assert!(!String::from_utf8_lossy(&m5).contains("publisher"));
+    let read = parse(&m5).unwrap();
+    assert_eq!(read.install.publisher, None);
+    // None is left out of the written bytes, never written as null: the bytes are unchanged.
+    assert_eq!(read.to_bytes().unwrap(), m5);
+
+    let mut with = sample();
+    with.install.publisher = Some("Acme, Inc.".to_owned());
+    let bytes = with.to_bytes().unwrap();
+    assert_ne!(bytes, m5);
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(text.contains("\"publisher\": \"Acme, Inc.\""), "{text}");
+    let back = parse(&bytes).unwrap();
+    assert_eq!(back, with);
+    assert_eq!(
+        back.to_bytes().unwrap(),
+        bytes,
+        "canonical bytes round-trip"
+    );
+    // Members stay in byte order: `name` < `publisher` < `terminal`.
+    let (n, p, t) = (
+        text.find("\"name\"").unwrap(),
+        text.find("\"publisher\"").unwrap(),
+        text.find("\"terminal\"").unwrap(),
+    );
+    assert!(n < p && p < t);
+}
+
+#[test]
+fn publisher_boundaries() {
+    parse(&with_install("publisher", json!("é".repeat(128)))).unwrap();
+    parse(&with_install("publisher", json!("P"))).unwrap();
+    for bad in [
+        "".to_owned(),
+        "é".repeat(129),
+        "Ac\\me".to_owned(),
+        "Ac\nme".to_owned(),
+        "Ac\u{85}me".to_owned(),
+        "Ac\u{7f}me".to_owned(),
+        "Ac\u{2028}me".to_owned(),
+        " Acme".to_owned(),
+        "Acme ".to_owned(),
+    ] {
+        assert_eq!(
+            invalid_field(&with_install("publisher", json!(bad))),
+            "install.publisher",
+            "{bad:?}"
+        );
+    }
+    // A written `null` is not the absent form: the writer never writes it.
+    assert!(matches!(
+        parse(&with_install("publisher", json!(null))),
+        Err(UpdateConfigError::WrongType("install.publisher"))
+    ));
+    assert!(matches!(
+        parse(&with_install("publisher", json!(7))),
+        Err(UpdateConfigError::WrongType("install.publisher"))
+    ));
+}
+
+#[test]
+fn the_writer_refuses_a_bad_publisher() {
+    let mut c = sample();
+    c.install.publisher = Some("Ac\nme".to_owned());
+    assert!(c.to_bytes().is_err());
+}
+
+#[test]
 fn category_boundaries() {
     let cats = |v: Vec<String>| with_install("categories", json!(v));
     parse(&cats(vec![])).unwrap();
@@ -439,6 +510,10 @@ fn entry_and_icon_rules() {
         "lunepack-runtime",
         "bin/LUNEPACK-RUNTIME",
         "lunepack-runtime.exe",
+        "lunepack-ui",
+        "bin/LUNEPACK-UI",
+        "lunepack-ui.exe",
+        "bin/Lunepack-UI.EXE",
         "lunepack-update.json/app",
         "bin/Lunepack-Update.JSON",
     ] {
@@ -537,6 +612,7 @@ fn errors_never_echo_the_value() {
     let marker = "SECRETMARKER";
     let cases = [
         with_install("name", json!(format!("{marker}\n"))),
+        with_install("publisher", json!(format!("{marker}\n"))),
         with_install("entry", json!(format!("../{marker}"))),
         with_install("bin", json!(format!("-{marker}"))),
         with_install("categories", json!([format!("{marker};")])),

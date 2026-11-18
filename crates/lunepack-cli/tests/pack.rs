@@ -805,9 +805,26 @@ fn pack_update(
     version: &'static str,
     target: &'static str,
 ) -> Output {
+    pack_update_ui(w, input, dir, runtime, None, version, target)
+}
+
+/// `pack` with `--runtime` and, when given, `--ui` (M6).
+#[cfg(unix)]
+fn pack_update_ui(
+    w: &World,
+    input: &Path,
+    dir: &Path,
+    runtime: Option<&Path>,
+    ui: Option<&Path>,
+    version: &'static str,
+    target: &'static str,
+) -> Output {
     let mut extra = Vec::new();
     if let Some(r) = runtime {
         extra.extend_from_slice(&["--runtime", s(r)]);
+    }
+    if let Some(u) = ui {
+        extra.extend_from_slice(&["--ui", s(u)]);
     }
     w.pack(&Pack {
         input,
@@ -923,6 +940,52 @@ fn update_pack_places_runtime_and_config() {
     }
 }
 
+/// `[install] publisher` (M6-D3) is written into the signed config; absent stays absent; a bad
+/// value is refused naming the field.
+#[cfg(unix)]
+#[test]
+fn update_pack_writes_the_publisher() {
+    let pack_with = |toml: &str| {
+        let w = World::new(1, 1);
+        w.append_config(toml);
+        let dir = w.release_dir("rel", &[]);
+        let input = tempfile::tempdir().unwrap();
+        app_tree(input.path(), "bin/app");
+        let runtime = w.dir.path().join("runtime");
+        fs::write(&runtime, runtime_elf(62, false)).unwrap();
+        let out = pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&runtime),
+            "1.0.0",
+            "linux-x86_64",
+        );
+        (w, dir, out)
+    };
+    let (w, dir, out) = pack_with(&UPDATE_TOML.replace(
+        "comment = \"Says hello\"",
+        "comment = \"Says hello\"\npublisher = \"Acme\"",
+    ));
+    assert_ok(&out, "pack with a publisher");
+    let (_, files) = w.verify(&dir, "1.0.0", Target::LinuxX86_64);
+    let doc = lunepack_core::UpdateConfig::parse(&files["lunepack-update.json"]).unwrap();
+    assert_eq!(doc.install.publisher.as_deref(), Some("Acme"));
+
+    let (w, dir, out) = pack_with(UPDATE_TOML);
+    assert_ok(&out, "pack without a publisher");
+    let (_, files) = w.verify(&dir, "1.0.0", Target::LinuxX86_64);
+    let bytes = &files["lunepack-update.json"];
+    assert!(!String::from_utf8_lossy(bytes).contains("publisher"));
+    let doc = lunepack_core::UpdateConfig::parse(bytes).unwrap();
+    assert_eq!(doc.install.publisher, None);
+
+    let (_w, _dir, out) =
+        pack_with(&UPDATE_TOML.replace("comment = \"Says hello\"", "publisher = \"Ac\\\\me\""));
+    let err = assert_fails(&out, 1, "a publisher with a backslash");
+    assert!(err.contains("[install] publisher"), "{err:?}");
+}
+
 /// C2: the same inputs (the runtime's bytes included), keys and clock give identical bytes; a
 /// different runtime gives a different pack.
 #[cfg(unix)]
@@ -1027,8 +1090,8 @@ fn update_pack_refusals() {
         "not an executable",
     );
 
-    // Reserved names: the root config, one deeper, a directory of that name, and the runtime
-    // beside the entry (either form, any case).
+    // Reserved names: the root config, one deeper, a directory of that name, and the runtime and
+    // the UI beside the entry (either form, any case), with or without `--ui`.
     for (rel, is_dir) in [
         ("lunepack-update.json", false),
         ("assets/lunepack-update.json", false),
@@ -1037,6 +1100,9 @@ fn update_pack_refusals() {
         ("bin/lunepack-runtime", false),
         ("bin/lunepack-runtime.exe", false),
         ("bin/LUNEPACK-RUNTIME", false),
+        ("bin/lunepack-ui", false),
+        ("bin/lunepack-ui.exe", false),
+        ("bin/LUNEPACK-UI", false),
     ] {
         let input = tempfile::tempdir().unwrap();
         app_tree(input.path(), "bin/app");
@@ -1149,6 +1215,158 @@ fn update_pack_feed_rule() {
             assert_eq!(w.work_dirs(), 0);
         }
     }
+}
+
+/// `--ui` (M6) places the UI beside the runtime, exec, hashed and packed like any file. A
+/// dynamic (glibc) ELF is accepted for the UI; the release verifies.
+#[cfg(unix)]
+#[test]
+fn ui_pack_places_ui_beside_runtime() {
+    for (entry, ui_at) in [("bin/app", "bin/lunepack-ui"), ("app", "lunepack-ui")] {
+        let w = World::new(1, 1);
+        w.append_config(&UPDATE_TOML.replace("bin/app", entry));
+        let dir = w.release_dir("rel", &[]);
+        let input = tempfile::tempdir().unwrap();
+        app_tree(input.path(), entry);
+        let runtime = w.dir.path().join("runtime");
+        fs::write(&runtime, runtime_elf(62, false)).unwrap();
+        let ui = w.dir.path().join("ui");
+        let ui_bytes = runtime_elf(62, true);
+        fs::write(&ui, &ui_bytes).unwrap();
+
+        let out = pack_update_ui(
+            &w,
+            input.path(),
+            &dir,
+            Some(&runtime),
+            Some(&ui),
+            "1.2.3",
+            "linux-x86_64",
+        );
+        assert_ok(&out, "pack with --ui");
+        assert!(!input.path().join(ui_at).exists());
+
+        let (m, files) = w.verify(&dir, "1.2.3", Target::LinuxX86_64);
+        assert_eq!(files[ui_at], ui_bytes, "{entry}: the UI");
+        assert!(exec_of(&m, ui_at), "{entry}: the UI is exec");
+        assert_eq!(sha_of(&m, ui_at), Sha256Hasher.sha256(&ui_bytes));
+        assert!(files.contains_key("lunepack-update.json"));
+    }
+}
+
+/// C2 with `--ui`: the same inputs give identical bytes, and the UI changes the manifest.
+#[cfg(unix)]
+#[test]
+fn ui_pack_is_deterministic() {
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let ui = w.dir.path().join("ui");
+    fs::write(&ui, runtime_elf(62, true)).unwrap();
+    let (a, b, plain) = (
+        w.release_dir("a", &[]),
+        w.release_dir("b", &[]),
+        w.release_dir("plain", &[]),
+    );
+    for dir in [&a, &b] {
+        assert_ok(
+            &pack_update_ui(
+                &w,
+                input.path(),
+                dir,
+                Some(&runtime),
+                Some(&ui),
+                "1.0.0",
+                "linux-x86_64",
+            ),
+            "pack with --ui",
+        );
+    }
+    assert_ok(
+        &pack_update(
+            &w,
+            input.path(),
+            &plain,
+            Some(&runtime),
+            "1.0.0",
+            "linux-x86_64",
+        ),
+        "pack without --ui",
+    );
+    for name in [
+        "1.0.0/linux-x86_64.pack",
+        "1.0.0/linux-x86_64.manifest.json",
+    ] {
+        assert_eq!(
+            fs::read(a.join(name)).unwrap(),
+            fs::read(b.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+    assert_ne!(
+        fs::read(a.join("1.0.0/linux-x86_64.manifest.json")).unwrap(),
+        fs::read(plain.join("1.0.0/linux-x86_64.manifest.json")).unwrap()
+    );
+}
+
+/// `--ui` refusals: without `--runtime`, without `[update]`, a non-regular file, a file over the
+/// cap, a wrong architecture and a non-executable. Each exits 1, writes nothing, leaves no work dir.
+#[cfg(unix)]
+#[test]
+fn ui_pack_refusals() {
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    let dir = w.release_dir("rel", &[]);
+    let good = tempfile::tempdir().unwrap();
+    app_tree(good.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let refused = |rt: Option<&Path>, ui: &Path, needle: &str| {
+        let out = pack_update_ui(&w, good.path(), &dir, rt, Some(ui), "1.0.0", "linux-x86_64");
+        let err = assert_fails(&out, 1, needle);
+        assert!(err.contains(needle), "{err:?} lacks {needle:?}");
+        assert!(!dir.join("1.0.0").exists());
+        assert_eq!(w.work_dirs(), 0, "{needle}: no work dir is left");
+    };
+    let ui = w.dir.path().join("ui");
+    fs::write(&ui, runtime_elf(62, true)).unwrap();
+    refused(None, &ui, "--ui needs --runtime");
+
+    let arm = w.dir.path().join("ui-arm");
+    fs::write(&arm, runtime_elf(183, true)).unwrap();
+    refused(Some(&runtime), &arm, "another architecture");
+    let junk = w.dir.path().join("ui-junk");
+    fs::write(&junk, b"not an executable").unwrap();
+    refused(Some(&runtime), &junk, "not an executable");
+    let dir_ui = w.dir.path().join("ui-dir");
+    fs::create_dir(&dir_ui).unwrap();
+    refused(Some(&runtime), &dir_ui, "is not a regular file");
+    let big = w.dir.path().join("ui-big");
+    fs::File::create(&big)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    refused(Some(&runtime), &big, "is over");
+
+    // Without [update] the flag is refused, and the tree is packed as in M3 when it is left out.
+    let plain = World::new(1, 1);
+    let plain_dir = plain.release_dir("rel", &[]);
+    let out = pack_update_ui(
+        &plain,
+        good.path(),
+        &plain_dir,
+        None,
+        Some(&ui),
+        "1.0.0",
+        "linux-x86_64",
+    );
+    let err = assert_fails(&out, 1, "--ui without [update]");
+    assert!(err.contains("--ui needs [update]"), "{err:?}");
+    assert!(!plain_dir.join("1.0.0").exists());
+    assert_eq!(plain.work_dirs(), 0);
 }
 
 /// The config tables: `--runtime` without `[update]`, `[update]` without `[install]`, and the

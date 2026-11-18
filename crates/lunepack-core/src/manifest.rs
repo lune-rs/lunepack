@@ -5,15 +5,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::digest::{Sha256Digest, U53};
 use crate::envelope::{OpenedEnvelope, PayloadKind};
-use crate::error::{Error, Result};
+use crate::error::{Error, FrameError, Result};
 use crate::feed::{ArtifactRef, CheckedRef, FeedTargetEntry};
-use crate::frame::{CheckedFrame, FrameDesc, check_file_frame};
+use crate::frame::{CheckedFrame, FrameDesc, check_file_frame, decode_verified};
+use crate::fs::ReadAt;
 use crate::ident::AppId;
 use crate::keyset::VerifiedKeySet;
 use crate::limits::Limits;
 use crate::path::{EntryKind, RelPath, validate_tree};
 use crate::target::Target;
-use crate::traits::{Hasher, Verifier};
+use crate::traits::{Codec, Hasher, Verifier};
 use crate::trust::{from_checked, parse_payload, present};
 use crate::version::Version;
 
@@ -278,6 +279,77 @@ pub fn verify_manifest(
     entry.reference().check_bytes(bytes, hasher)?;
     let envelope = OpenedEnvelope::open(bytes, PayloadKind::Manifest, &Limits::V1)?;
     let payload = envelope.authenticate(keys.keys(), keys.threshold(), verifier)?;
+    check_payload(
+        payload,
+        Expected {
+            app_ids: [keys.app_id(), entry.app_id()],
+            version_text: entry.version_text(),
+            version: entry.version(),
+            target: entry.target(),
+        },
+        hasher,
+    )
+}
+
+/// Verifies a manifest carried in an offline payload, with no feed (M6-D4): the release this
+/// installer was built for is `expect`, and the manifest's signatures stand in for the feed's
+/// hash binding. Order (FORMAT.md 2.6, then 8): the size cap, strict JSON and the envelope; the
+/// signatures meet the key set's release threshold counting only release keys whose window holds
+/// `now` (Unix seconds; an offline first install has no floor time, so the windows always apply);
+/// only then the payload is parsed (format, kind, critical, fields; reserved `install` and
+/// `deltas` rejected); then exactly as [`verify_manifest`]: at most 200,000 entries, app id equal
+/// to the key set's, version byte-equal to `expect`'s text (and so precedence-equal), target
+/// equal, the pack reference, every entry and frame, the tree rules.
+///
+/// The key set's own expiry is [`verify_key_set`](crate::verify_key_set)'s check: a payload stops
+/// installing at the key set's `expires` or at the end of its release keys' windows.
+pub fn verify_payload_manifest(
+    keys: &VerifiedKeySet,
+    expect: (&Version, Target),
+    bytes: &[u8],
+    now: u64,
+    hasher: &dyn Hasher,
+    verifier: &dyn Verifier,
+) -> Result<VerifiedManifest> {
+    let envelope = OpenedEnvelope::open(bytes, PayloadKind::Manifest, &Limits::V1)?;
+    let windows = keys.windows();
+    let ring = keys
+        .keys()
+        .subset(|i| windows.get(i).is_some_and(|w| w.contains(now)));
+    let payload = envelope.authenticate(&ring, keys.threshold(), verifier)?;
+    let (version, target) = expect;
+    let version_text = version.to_string();
+    check_payload(
+        payload,
+        Expected {
+            app_ids: [keys.app_id(), keys.app_id()],
+            version_text: &version_text,
+            version,
+            target,
+        },
+        hasher,
+    )
+}
+
+/// What an authenticated manifest payload must name.
+struct Expected<'a> {
+    /// Every app id it must equal.
+    app_ids: [&'a AppId; 2],
+    /// The version text it must equal byte for byte.
+    version_text: &'a str,
+    /// The version it must equal in precedence.
+    version: &'a Version,
+    /// The target it must equal.
+    target: Target,
+}
+
+/// The checks after authentication, shared by [`verify_manifest`] and
+/// [`verify_payload_manifest`].
+fn check_payload(
+    payload: &[u8],
+    expect: Expected<'_>,
+    hasher: &dyn Hasher,
+) -> Result<VerifiedManifest> {
     let doc: ManifestDocument = parse_payload(payload, PayloadKind::Manifest)?;
     let reserved: Reserved = from_checked(payload)?;
     if reserved.install.is_some() || reserved.deltas.is_some() {
@@ -292,17 +364,17 @@ pub fn verify_manifest(
             max,
         });
     }
-    if doc.app_id != *keys.app_id() || doc.app_id != *entry.app_id() {
+    if expect.app_ids.iter().any(|id| doc.app_id != **id) {
         return Err(Error::AppIdMismatch);
     }
     let version = Version::parse(&doc.version)?;
-    if doc.version.as_bytes() != entry.version_text().as_bytes() || version != *entry.version() {
+    if doc.version.as_bytes() != expect.version_text.as_bytes() || version != *expect.version {
         return Err(Error::VersionMismatch);
     }
     let target = Target::parse(&doc.target)?;
-    if target != entry.target() {
+    if target != expect.target {
         return Err(Error::TargetMismatch {
-            expected: entry.target().as_str(),
+            expected: expect.target.as_str(),
             found: target.as_str(),
         });
     }
@@ -324,4 +396,60 @@ pub fn verify_manifest(
         pack,
         entries,
     })
+}
+
+/// Reads one file entry of a verified manifest out of its pack and decodes it (FORMAT.md 13.6
+/// steps 2–3), for a client that needs a file before any tree exists (the installer's update
+/// config and icon).
+///
+/// - `entry_path` must name a file entry; an absent path, a directory or a symlink is
+///   [`Error::Field`]. An empty file is no bytes, read from nothing.
+/// - `max` caps the decoded size: an entry whose signed size is above it is [`Error::TooLarge`]
+///   before any byte is read.
+/// - The frame must lie inside `pack` as it is now (`pack.size()`), else
+///   [`FrameError::OutOfPack`](crate::error::FrameError::OutOfPack); exactly `frame.length` bytes are read
+///   at `frame.offset`, and a short read is an error.
+/// - Then [`decode_verified`](crate::decode_verified): the frame's hash before the codec sees a
+///   byte, then the decoded size and hash against the entry.
+pub fn read_entry(
+    manifest: &VerifiedManifest,
+    entry_path: &RelPath,
+    pack: &dyn ReadAt,
+    codec: &dyn Codec,
+    hasher: &dyn Hasher,
+    max: u64,
+) -> Result<Vec<u8>> {
+    let entry = manifest
+        .entries()
+        .iter()
+        .find(|e| e.path() == entry_path)
+        .ok_or(Error::Field("no manifest entry at the path"))?;
+    let VerifiedEntry::File { size, frame, .. } = entry else {
+        return Err(Error::Field("the manifest entry is not a file"));
+    };
+    if *size > max {
+        return Err(Error::TooLarge {
+            what: "manifest entry",
+            size: *size,
+            cap: max,
+        });
+    }
+    let Some(frame) = frame else {
+        // `check_entry` bound an empty file to the hash of no bytes.
+        return Ok(Vec::new());
+    };
+    let end = frame
+        .offset()
+        .checked_add(frame.length())
+        .ok_or(FrameError::OutOfPack)?;
+    if end > pack.size()? {
+        return Err(FrameError::OutOfPack.into());
+    }
+    let length = usize::try_from(frame.length()).map_err(|_| FrameError::OutOfPack)?;
+    let mut bytes = vec![0u8; length];
+    pack.read_exact_at(frame.offset(), &mut bytes)?;
+    let capacity = usize::try_from(*size).unwrap_or(0);
+    let mut out = Vec::with_capacity(capacity);
+    decode_verified(frame, &bytes, hasher, codec, &mut out)?;
+    Ok(out)
 }

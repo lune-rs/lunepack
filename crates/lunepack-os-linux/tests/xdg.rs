@@ -55,6 +55,7 @@ fn meta(entry: &str, bin: Option<&str>) -> InstallMeta {
         categories: vec![],
         bin: bin.map(str::to_owned),
         terminal: false,
+        publisher: None,
     }
 }
 

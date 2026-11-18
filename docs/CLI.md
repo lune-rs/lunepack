@@ -69,6 +69,7 @@ health_timeout_secs = 60                      # default 60, 5..=3600
 entry = "bin/hello"          # the executable, relative to the tree (required, must be exec)
 name = "Hello"               # the display name (required)
 comment = "Says hello"       # optional
+publisher = "Acme"           # optional: shown beside "verified" by the installer; left out when unset
 icon = "assets/hello.svg"    # optional: a .png or .svg file of the tree
 categories = ["Utility"]     # optional: freedesktop category names
 bin = "hello"                # optional: the name of the command-line link
@@ -262,7 +263,7 @@ in the release directory.
 ```
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
-    [--runtime <RUNTIME>] [--config <CONFIG>]
+    [--runtime <RUNTIME>] [--ui <UI>] [--config <CONFIG>]
 ```
 
 - `--version`: SemVer 2.0.0, used verbatim as the directory name. A directory of equal precedence with
@@ -275,6 +276,8 @@ lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-di
 - `--app-id`: when given, it must equal the config's.
 - `--runtime`: the static runtime to place beside the entry. Required when the config has `[update]`,
   refused without it (see "Self-updating apps").
+- `--ui`: the `lunepack-ui` binary to place beside the runtime. Needs `--runtime` and `[update]`, and
+  is refused without them. Without it no UI is placed. A file over 64 MiB is refused.
 
 Pre-checks run before any encoding: `keys.json` verifies; every `--sign` key is in the key set and
 inside its window; the signers reach the threshold; the manifest and pack do not exist yet; the target
@@ -309,7 +312,10 @@ With `[update]` (and then `[install]`, which is required; `[install]` without `[
   (a header check only, until those runtimes exist). Anything else is refused.
 - After the input is copied and before code signing and hashing, `pack` copies the runtime to
   `<directory of install.entry>/lunepack-runtime` (`lunepack-runtime.exe` for `windows-*`), marked
-  executable, and writes the update configuration at the tree's root, `lunepack-update.json`
+  executable, and, with `--ui`, the UI to `<directory of install.entry>/lunepack-ui` (`lunepack-ui.exe`
+  for `windows-*`), also marked executable. A `linux-*` UI may be dynamically linked (glibc); the
+  runtime may not. The UI's bytes are checked against the target's format and machine, like the
+  runtime's. Then it writes the update configuration at the tree's root, `lunepack-update.json`
   (`Contents/Resources/lunepack-update.json` for `macos-*`, assumed until M8). The configuration holds
   the app id and root from `lunepack.toml`, the `--version` and `--target` of this pack, the feed, the
   channel, the health timeout and the install metadata. It holds no timestamp. Stdout gets one
@@ -322,7 +328,9 @@ Reserved names, each an error before anything is written:
 
 - a file or directory named `lunepack-update.json` (any case) at any depth of the input, so nothing
   can shadow the root configuration when an executable looks for the nearest one above itself;
-- a file named `lunepack-runtime` or `lunepack-runtime.exe` (any case) in the entry's directory.
+- a file named `lunepack-runtime` or `lunepack-runtime.exe` (any case) in the entry's directory, or a
+  file named `lunepack-ui` or `lunepack-ui.exe` there, with or without `--ui`: the runtime starts a
+  UI from its own directory, so the name is never left to an app file.
 
 The feed (`[update] feed`) must pass the feed rule of FORMAT.md 13.3, which `pack` checks with the same
 function a client runs before its first request: `https://` with a lowercase DNS name or an IPv4
@@ -408,6 +416,33 @@ the key set (version, threshold, key ids, windows), each feed (seq, issued, expi
 targets, rollout) and each manifest (entry counts, input and pack bytes, files per codec, ratio).
 `--channel`, `--version` and `--target` narrow the output. `--entries` lists every entry: path, type,
 size, exec, codec and frame length. It reads the config for the root only and never resolves a signer.
+
+### `lunepack setup`
+
+```
+lunepack setup <DIR> --version <VERSION> --target <TARGET> [--out <FILE>] [--at <AT>]
+    [--config <CONFIG>]
+```
+
+Builds a Linux setup file (FORMAT.md 14): the release's own runtime, then `keys.json`, the manifest
+and the pack of `<VERSION>` for `<TARGET>`, then the trailer naming them and the root the release's
+update configuration trusts. Run, the file installs exactly that version with no network, with the
+window or `--silent` (RUNTIME.md, "Setup files").
+
+Before anything is written it checks the release the way the runtime will: the root walk and
+`keys.json` from the config's root, the manifest with no feed (release keys valid at the reader's
+time), the pack against the manifest, then the update configuration and the runtime read out of the
+pack through their signed frames. The release must have been packed with `[update]` and `--runtime`
+(and `--ui` for a window). The written bytes are then parsed back and verified as the runtime
+parses them, so `keys.json` must be signed under the root the update configuration names.
+
+`<VERSION>` is the text as written in the release (canonical). Only `linux-x86_64` and
+`linux-aarch64` are accepted in this release. The file goes to `--out`, or to
+`<app_id>-<VERSION>-<TARGET>-setup` in the current directory; an existing file is not replaced.
+It is made executable (mode 0755). The output depends on the release directory only: two runs give
+the same bytes. `--at` verifies at that Unix time instead of the system clock. A setup file stops
+installing when its key set expires or its release keys' windows end: build it from a current
+release.
 
 ## The release directory
 

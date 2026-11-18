@@ -1,0 +1,29 @@
+[package]
+name = "lunepack-ui-luneui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lunepack-core.workspace = true
+# LuneUI at the pinned commit (D39 (b)); only this crate may depend on it (the boundary check).
+lune-ui.workspace = true
+# Headless render (the texture format of the offscreen target) and the icon decoder (M6-D11).
+wgpu.workspace = true
+# Re-exported for the binary's event loop (the boundary check allows no other crate to name it).
+winit.workspace = true
+png.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+accesskit_consumer.workspace = true
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"

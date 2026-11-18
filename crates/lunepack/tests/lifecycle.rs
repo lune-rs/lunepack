@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use common::{INSTALL_ID, TARGET, World, app_id, channel, files, sha, version};
 use lunepack::{
     ApplyOptions, ConfirmOutcome, DownloadOptions, Error, HEALTH_TOKEN_VAR, Installation, Layout,
-    LifecycleEvent, Platform, StartupAction, UpdateConfigError, apply_and_restart_for, block_on,
-    confirm_for, startup_for,
+    LifecycleEvent, Platform, StartupAction, UiChoice, UpdateConfigError, apply_and_restart_for,
+    block_on, confirm_for, startup_for,
 };
 use lunepack_core::state::{InstallState, Scope, StagedIssued, StagedRef, UserScope};
 use lunepack_core::{
@@ -63,6 +63,7 @@ fn meta(entry: &str, bin: Option<&str>, name: &str) -> InstallMeta {
         categories: Vec::new(),
         bin: bin.map(str::to_owned),
         terminal: false,
+        publisher: None,
     }
 }
 
@@ -884,6 +885,7 @@ fn a_staged_version_starts_the_own_runtime_detached_with_exactly_this_argv() {
             expect_version: Some(version(V110)),
             wait_for: None,
             restart_args: vec!["--flag".into(), "two words".into()],
+            ui: UiChoice::Auto,
         },
     )
     .expect("scheduled");
@@ -931,6 +933,21 @@ fn a_staged_version_starts_the_own_runtime_detached_with_exactly_this_argv() {
     assert_eq!(
         &args[1..5],
         &["--wait-pid", "7", "--wait-start", "77"].map(OsString::from)
+    );
+    // No update window: `--no-ui` before the separator, the restart arguments after it.
+    apply_and_restart_for(
+        &inst,
+        ApplyOptions {
+            restart_args: vec!["--no-ui".into()],
+            ui: UiChoice::Never,
+            ..ApplyOptions::default()
+        },
+    )
+    .expect("scheduled");
+    let args = &lab.process.spawns()[2].args;
+    assert_eq!(
+        &args[7..],
+        &["--no-ui", "--", "--no-ui"].map(OsString::from)
     );
 }
 

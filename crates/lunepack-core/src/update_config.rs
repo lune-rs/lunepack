@@ -33,6 +33,10 @@ pub const UPDATE_CONFIG_PATH_MACOS: &str = "Contents/Resources/lunepack-update.j
 pub const RUNTIME_FILE: &str = "lunepack-runtime";
 /// The runtime's file name on Windows targets.
 pub const RUNTIME_FILE_WINDOWS: &str = "lunepack-runtime.exe";
+/// The UI binary's file name on Linux and macOS targets, beside the runtime (M6-D1).
+pub const UI_FILE: &str = "lunepack-ui";
+/// The UI binary's file name on Windows targets.
+pub const UI_FILE_WINDOWS: &str = "lunepack-ui.exe";
 /// Largest config document in bytes.
 pub const MAX_UPDATE_CONFIG_BYTES: u64 = 64 * 1024;
 /// Longest feed string in bytes.
@@ -43,6 +47,8 @@ pub const HEALTH_TIMEOUT_SECS: std::ops::RangeInclusive<u64> = 5..=3600;
 pub const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 60;
 /// Longest `install.name`, in Unicode scalar values.
 pub const MAX_NAME_CHARS: usize = 128;
+/// Longest `install.publisher`, in Unicode scalar values (as `install.name`).
+pub const MAX_PUBLISHER_CHARS: usize = MAX_NAME_CHARS;
 /// Longest `install.comment`, in Unicode scalar values.
 pub const MAX_COMMENT_CHARS: usize = 512;
 /// Most `install.categories`.
@@ -65,13 +71,14 @@ const TOP_KEYS: [&str; 11] = [
     "version",
 ];
 const ROOT_KEYS: [&str; 3] = ["keys", "threshold", "version"];
-const INSTALL_KEYS: [&str; 7] = [
+const INSTALL_KEYS: [&str; 8] = [
     "bin",
     "categories",
     "comment",
     "entry",
     "icon",
     "name",
+    "publisher",
     "terminal",
 ];
 
@@ -94,6 +101,15 @@ pub fn runtime_file(target: Target) -> &'static str {
     }
 }
 
+/// The UI binary's file name on `target`.
+pub fn ui_file(target: Target) -> &'static str {
+    if target.is_windows() {
+        UI_FILE_WINDOWS
+    } else {
+        UI_FILE
+    }
+}
+
 /// How the app is installed (FORMAT.md 13.4, M5-D4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallMeta {
@@ -111,6 +127,9 @@ pub struct InstallMeta {
     pub bin: Option<String>,
     /// Whether the app runs in a terminal.
     pub terminal: bool,
+    /// The publisher's display name, shown by the installer beside "verified" (M6-D3). Optional;
+    /// absent stays absent in the canonical bytes (FORMAT.md 13.4).
+    pub publisher: Option<String>,
 }
 
 /// What kind of feed a feed string passed [`check_feed`] as.
@@ -218,7 +237,7 @@ impl UpdateConfig {
             ("version", Value::from(self.root.version)),
         ]);
         let i = &self.install;
-        let install = obj([
+        let mut install = obj([
             ("bin", opt_string(i.bin.as_deref())),
             (
                 "categories",
@@ -230,6 +249,10 @@ impl UpdateConfig {
             ("name", Value::String(i.name.clone())),
             ("terminal", Value::Bool(i.terminal)),
         ]);
+        // Left out when absent, so the bytes of a config without a publisher are the M5 bytes.
+        if let (Some(p), Value::Object(members)) = (&i.publisher, &mut install) {
+            members.insert("publisher".to_owned(), Value::String(p.clone()));
+        }
         let defined = [
             ("app_id", Value::String(self.app_id.as_str().to_owned())),
             ("channel", Value::String(self.channel.as_str().to_owned())),
@@ -370,6 +393,15 @@ fn read_install(value: Value) -> Result<InstallMeta, UpdateConfigError> {
     if let Some(c) = &comment {
         check_text(c, "install.comment", 0, MAX_COMMENT_CHARS)?;
     }
+    let publisher = match map.remove("publisher") {
+        None => None,
+        Some(Value::Null) => return Err(UpdateConfigError::WrongType("install.publisher")),
+        Some(v) => {
+            let p = string(v, "install.publisher")?;
+            check_text(&p, "install.publisher", 1, MAX_PUBLISHER_CHARS)?;
+            Some(p)
+        }
+    };
     let icon = opt(take(&mut map, "install.icon")?, "install.icon")?
         .map(|i| check_icon(&i))
         .transpose()?;
@@ -403,19 +435,24 @@ fn read_install(value: Value) -> Result<InstallMeta, UpdateConfigError> {
         categories,
         bin,
         terminal,
+        publisher,
     })
 }
 
-/// `install.entry`: a path (10.1) whose file name is not the runtime's (either target's form) and
-/// with no component named like the config file. Names are compared ignoring ASCII case, since a
-/// case-insensitive file system would make them the same file.
+/// `install.entry`: a path (10.1) whose file name is not the runtime's or the UI's (either target's
+/// form) and with no component named like the config file. Names are compared ignoring ASCII case,
+/// since a case-insensitive file system would make them the same file.
 fn check_entry(text: &str) -> Result<RelPath, UpdateConfigError> {
     let path =
         validate_path(text).map_err(|_| invalid("install.entry", "is not a tree path (10.1)"))?;
     check_reserved(&path, "install.entry")?;
     let file = path.components().last().unwrap_or_default();
-    if file.eq_ignore_ascii_case(RUNTIME_FILE) || file.eq_ignore_ascii_case(RUNTIME_FILE_WINDOWS) {
-        return Err(invalid("install.entry", "is the runtime's file name"));
+    let reserved = [RUNTIME_FILE, RUNTIME_FILE_WINDOWS, UI_FILE, UI_FILE_WINDOWS];
+    if reserved.iter().any(|r| file.eq_ignore_ascii_case(r)) {
+        return Err(invalid(
+            "install.entry",
+            "is the runtime's or the UI's file name",
+        ));
     }
     Ok(path)
 }

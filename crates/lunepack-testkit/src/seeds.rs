@@ -1009,6 +1009,7 @@ pub fn sample_update_config() -> UpdateConfig {
             categories: vec!["Utility".to_owned(), "Development".to_owned()],
             bin: Some("hello".to_owned()),
             terminal: false,
+            publisher: None,
         },
         extra: Default::default(),
     }
@@ -1047,11 +1048,17 @@ fn update_config_seeds(out: &mut Out) {
         categories: Vec::new(),
         bin: None,
         terminal: true,
+        publisher: None,
     };
     out.ok(
         "update_config",
         "minimal",
         minimal.to_bytes().expect("minimal"),
+    );
+    out.ok(
+        "update_config",
+        "publisher",
+        install_with("publisher", json!("Acme, Inc.")),
     );
     out.ok(
         "update_config",
@@ -1087,6 +1094,16 @@ fn update_config_seeds(out: &mut Out) {
         "update_config",
         "unknown-install-member",
         install_with("x_future", json!(true)),
+    );
+    out.bad(
+        "update_config",
+        "publisher-newline",
+        install_with("publisher", json!("Acme\nExec=evil")),
+    );
+    out.bad(
+        "update_config",
+        "publisher-null",
+        install_with("publisher", json!(null)),
     );
     out.bad(
         "update_config",
