@@ -5,22 +5,34 @@
 //! small Windows helpers of M7: the DLL search hardening ([`harden_dll_search`]) and the shell
 //! helpers of [`shell`] (known folders, a message box, the app user model id, the foreground right),
 //! and, on Windows only, [`WindowsProcess`] (M7 step 5): the core's `Process` over the Win32 process
-//! APIs.
+//! APIs, and [`WindowsIntegration`] (M7 step 6): the core's `OsIntegration` (the launcher stub at
+//! the install root, the uninstall entry, the hidden `.lunepack` directory) with
+//! [`remove_stub_leftovers`] for the GC.
 //! The public API is safe and builds on every OS; off Windows the helpers are no-ops or
 //! `Unsupported`.
 
 mod harden;
 #[cfg(windows)]
+mod integration;
+#[cfg(windows)]
 mod process;
+#[cfg(windows)]
+mod registry;
 mod shell;
+#[cfg(windows)]
+mod stub_place;
 
 pub use harden::harden_dll_search;
+#[cfg(windows)]
+pub use integration::{MARKER_VALUE, UNINSTALL_KEY, WinScope, WindowsIntegration};
 #[cfg(windows)]
 pub use process::WindowsProcess;
 pub use shell::{
     MessageKind, allow_set_foreground, message_box, set_process_aumid, start_menu_programs,
     user_program_files,
 };
+#[cfg(windows)]
+pub use stub_place::remove_stub_leftovers;
 
 /// Whether the user asked for reduced motion: `Some(true)` when the "show animations in Windows"
 /// setting is off, `Some(false)` when it is on, `None` when it cannot be read (and always `None`
