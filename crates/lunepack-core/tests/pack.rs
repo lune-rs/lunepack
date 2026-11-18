@@ -998,10 +998,16 @@ fn runtime_image_check_for_linux() {
 #[test]
 fn runtime_image_check_for_windows_and_macos() {
     use RuntimeImageError as E;
-    let pe = |m| exe_headers::pe(m, 4096);
+    // A runtime with the Windows hardening (M7-D10); the full matrix is in tests/pe.rs.
+    let pe = |m| exe_headers::pe_image(m, &exe_headers::PeSpec::hardened(2));
     assert_eq!(
         check_runtime_image(&pe(0x8664), Target::WindowsX86_64),
         Ok(())
+    );
+    // The header-only image is refused now.
+    assert_eq!(
+        check_runtime_image(&exe_headers::pe(0x8664, 4096), Target::WindowsX86_64),
+        Err(E::PeMalformed)
     );
     assert_eq!(
         check_runtime_image(&pe(0xAA64), Target::WindowsAarch64),
