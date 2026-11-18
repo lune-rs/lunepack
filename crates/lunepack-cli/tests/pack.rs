@@ -1447,8 +1447,9 @@ fn update_config_tables() {
     assert!(err.contains("[install] name"), "{err:?}");
 }
 
-/// Windows and macOS targets: the runtime's name and the config's place follow the target (the
-/// header-class check only), and the exec bit of a Windows entry is not required.
+/// Windows and macOS targets: the runtime's name and the config's place follow the target (a
+/// Windows runtime must carry M7-D10's hardening; macOS: the header-class check only), and the exec
+/// bit of a Windows entry is not required.
 #[cfg(unix)]
 #[test]
 fn update_pack_other_targets() {
@@ -1460,7 +1461,11 @@ fn update_pack_other_targets() {
     write(input.path(), "assets/icon.svg", b"<svg/>");
 
     let pe = w.dir.path().join("runtime.exe");
-    fs::write(&pe, exe_headers::pe(0x8664, 4_096)).unwrap();
+    fs::write(
+        &pe,
+        exe_headers::pe_image(0x8664, &exe_headers::PeSpec::hardened(2)),
+    )
+    .unwrap();
     assert_ok(
         &pack_update(&w, input.path(), &dir, Some(&pe), "1.0.0", "windows-x86_64"),
         "windows-x86_64",
@@ -1482,7 +1487,11 @@ fn update_pack_other_targets() {
     );
     assert_fails(&out, 1, "an ELF for a Windows target");
     let arm = w.dir.path().join("arm.exe");
-    fs::write(&arm, exe_headers::pe(0xAA64, 4_096)).unwrap();
+    fs::write(
+        &arm,
+        exe_headers::pe_image(0xAA64, &exe_headers::PeSpec::hardened(2)),
+    )
+    .unwrap();
     let out = pack_update(
         &w,
         input.path(),
@@ -1493,6 +1502,36 @@ fn update_pack_other_targets() {
     );
     let err = assert_fails(&out, 1, "an arm64 PE for windows-x86_64");
     assert!(err.contains("another architecture"), "{err:?}");
+    // The header-only PE of earlier milestones, and a runtime without the hardening (M7-D10).
+    let bare = w.dir.path().join("bare.exe");
+    fs::write(&bare, exe_headers::pe(0x8664, 4_096)).unwrap();
+    let out = pack_update(
+        &w,
+        input.path(),
+        &dir,
+        Some(&bare),
+        "1.0.1",
+        "windows-x86_64",
+    );
+    let err = assert_fails(&out, 1, "a header-only PE");
+    assert!(
+        err.contains("PE headers or tables are malformed"),
+        "{err:?}"
+    );
+    let crt = w.dir.path().join("crt.exe");
+    let mut spec = exe_headers::PeSpec::hardened(2);
+    spec.imports.push("VCRUNTIME140.dll".to_owned());
+    fs::write(&crt, exe_headers::pe_image(0x8664, &spec)).unwrap();
+    let out = pack_update(
+        &w,
+        input.path(),
+        &dir,
+        Some(&crt),
+        "1.0.1",
+        "windows-x86_64",
+    );
+    let err = assert_fails(&out, 1, "a runtime importing the C runtime DLL");
+    assert!(err.contains("C runtime"), "{err:?}");
 
     // macOS: the config sits under Contents/Resources (assumed until M8).
     let w = World::new(1, 1);

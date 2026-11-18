@@ -21,6 +21,7 @@ pub mod limits;
 pub mod manifest;
 pub mod pack;
 pub mod path;
+pub mod pe;
 pub mod policy;
 pub mod process;
 pub mod progress;
@@ -77,8 +78,8 @@ pub use manifest::{
     verify_payload_manifest,
 };
 pub use pack::{
-    FileClass, PackedFile, ReleaseLayout, RuntimeImageError, candidates, check_runtime_image,
-    check_ui_image, classify, pack_file,
+    FileClass, PackedFile, ReleaseLayout, RuntimeImageError, candidates, check_pe_stub,
+    check_runtime_image, check_ui_image, classify, pack_file,
 };
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};

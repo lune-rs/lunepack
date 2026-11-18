@@ -143,3 +143,249 @@ pub fn fat(cputypes: &[u32], len: usize) -> Vec<u8> {
     let x86 = cputypes.iter().any(|&c| c == 7 || c == 0x0100_0007);
     with_filler(h, len, !x86)
 }
+
+/// The manifest [`PeSpec::hardened`] embeds: `asInvoker` and `longPathAware`, as the shipped
+/// binaries carry (M7-D10).
+pub const HARDENED_MANIFEST: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n",
+    "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">",
+    "<trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v3\"><security><requestedPrivileges>",
+    "<requestedExecutionLevel level='asInvoker' uiAccess='false'/>",
+    "</requestedPrivileges></security></trustInfo>",
+    "<application xmlns=\"urn:schemas-microsoft-com:asm.v3\"><windowsSettings>",
+    "<longPathAware xmlns=\"http://schemas.microsoft.com/SMI/2016/WindowsSettings\">true",
+    "</longPathAware></windowsSettings></application></assembly>\n",
+);
+
+/// What [`pe_image`] writes into its image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeSpec {
+    /// The optional header's subsystem (2 GUI, 3 console).
+    pub subsystem: u16,
+    /// DLL names of the import table, in order.
+    pub imports: Vec<String>,
+    /// DLL names of the delay-import table, in order.
+    pub delay_imports: Vec<String>,
+    /// The load config's `DependentLoadFlags`; `None` writes no load config.
+    pub dependent_load_flags: Option<u16>,
+    /// The `RT_MANIFEST` resource's bytes; `None` writes no resource section.
+    pub manifest: Option<Vec<u8>>,
+    /// The security directory entry (file offset, size); the caller appends the table itself.
+    pub security_dir: Option<(u32, u32)>,
+    /// A PE32 image (else PE32+).
+    pub pe32: bool,
+    /// Bytes of architecture-shaped filler in `.text`, rounded up to the file alignment.
+    pub code_len: usize,
+}
+
+impl PeSpec {
+    /// A shipped binary's shape (M7-D10): static CRT (imports `KERNEL32.dll` and `ntdll.dll`, a
+    /// delay import of `USER32.dll`), `DependentLoadFlags` 0x800, [`HARDENED_MANIFEST`].
+    pub fn hardened(subsystem: u16) -> PeSpec {
+        PeSpec {
+            subsystem,
+            imports: vec!["KERNEL32.dll".to_owned(), "ntdll.dll".to_owned()],
+            delay_imports: vec!["USER32.dll".to_owned()],
+            dependent_load_flags: Some(0x800),
+            manifest: Some(HARDENED_MANIFEST.as_bytes().to_vec()),
+            security_dir: None,
+            pe32: false,
+            code_len: 0x400,
+        }
+    }
+}
+
+const FILE_ALIGN: usize = 0x200;
+const SECTION_ALIGN: u32 = 0x1000;
+
+fn align(n: usize, to: usize) -> usize {
+    n.div_ceil(to) * to
+}
+
+fn put16(b: &mut [u8], at: usize, v: u16) {
+    b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put32(b: &mut [u8], at: usize, v: u32) {
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put64(b: &mut [u8], at: usize, v: u64) {
+    b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// `.rdata`'s content at section RVA `rva`: the import table, the delay-import table, the load
+/// config. Returns the bytes and the directories `(import, delay import, load config)`.
+fn rdata(spec: &PeSpec, rva: u32) -> (Vec<u8>, [(u32, u32); 3]) {
+    let mut b = Vec::new();
+    let at = |b: &Vec<u8>| rva + b.len() as u32;
+    let name_rvas = |b: &mut Vec<u8>, names: &[String]| -> Vec<u32> {
+        names
+            .iter()
+            .map(|n| {
+                let r = at(b);
+                b.extend_from_slice(n.as_bytes());
+                b.push(0);
+                b.resize(align(b.len(), 8), 0);
+                r
+            })
+            .collect()
+    };
+    let import_names = name_rvas(&mut b, &spec.imports);
+    let delay_names = name_rvas(&mut b, &spec.delay_imports);
+    // One shared empty thunk array (just its terminator) as every descriptor's IAT.
+    let thunk = at(&b);
+    b.extend_from_slice(&[0u8; 16]);
+
+    let mut dirs = [(0, 0); 3];
+    if !spec.imports.is_empty() {
+        let start = b.len();
+        dirs[0] = (at(&b), ((spec.imports.len() + 1) * 20) as u32);
+        b.resize(start + (spec.imports.len() + 1) * 20, 0);
+        for (i, name) in import_names.iter().enumerate() {
+            put32(&mut b, start + i * 20 + 12, *name);
+            put32(&mut b, start + i * 20 + 16, thunk);
+        }
+    }
+    if !spec.delay_imports.is_empty() {
+        b.resize(align(b.len(), 8), 0);
+        let start = b.len();
+        dirs[1] = (at(&b), ((spec.delay_imports.len() + 1) * 32) as u32);
+        b.resize(start + (spec.delay_imports.len() + 1) * 32, 0);
+        for (i, name) in delay_names.iter().enumerate() {
+            put32(&mut b, start + i * 32, 1); // RVA-based
+            put32(&mut b, start + i * 32 + 4, *name);
+            put32(&mut b, start + i * 32 + 12, thunk);
+        }
+    }
+    if let Some(flags) = spec.dependent_load_flags {
+        b.resize(align(b.len(), 8), 0);
+        let start = b.len();
+        let (size, at_flags) = if spec.pe32 { (0xC0, 54) } else { (0x140, 78) };
+        dirs[2] = (at(&b), size as u32);
+        b.resize(start + size, 0);
+        put32(&mut b, start, size as u32);
+        put16(&mut b, start + at_flags, flags);
+    }
+    (b, dirs)
+}
+
+/// `.rsrc`'s content at section RVA `rva`: type `RT_MANIFEST` (24), name 1, language 0x409.
+fn rsrc(manifest: &[u8], rva: u32) -> Vec<u8> {
+    // Three directories of one entry each (16 + 8 bytes), the data entry (16), the bytes.
+    let dir = |b: &mut Vec<u8>, id: u32, target: u32| {
+        let at = b.len();
+        b.resize(at + 24, 0);
+        put16(b, at + 14, 1);
+        put32(b, at + 16, id);
+        put32(b, at + 20, target);
+    };
+    let mut b = Vec::new();
+    dir(&mut b, 24, 0x8000_0000 | 24);
+    dir(&mut b, 1, 0x8000_0000 | 48);
+    dir(&mut b, 0x409, 72);
+    let data = 72 + 16;
+    b.resize(data, 0);
+    put32(&mut b, 72, rva + data as u32);
+    put32(&mut b, 76, manifest.len() as u32);
+    b.extend_from_slice(manifest);
+    b
+}
+
+/// A minimal valid PE image (PE32+ unless [`PeSpec::pe32`]) of `machine`, laid out as a linker
+/// does: DOS header, `PE\0\0`, COFF header, optional header with 16 data directories, a section
+/// table, then `.text` (architecture-shaped filler), `.rdata` (import and delay-import tables, the
+/// load config) and, with a manifest, `.rsrc` (an `RT_MANIFEST` resource), each aligned to 0x200
+/// in the file and 0x1000 in memory. Deterministic; the reader in `lunepack_core::pe` reads every
+/// field back.
+pub fn pe_image(machine: u16, spec: &PeSpec) -> Vec<u8> {
+    let nsections = if spec.manifest.is_some() { 3 } else { 2 };
+    let opt_size: usize = if spec.pe32 { 96 + 128 } else { 112 + 128 };
+    let coff = 0x84;
+    let opt = coff + 20;
+    let headers = align(opt + opt_size + 40 * nsections, FILE_ALIGN);
+
+    let code = align(spec.code_len.max(1), FILE_ALIGN);
+    let rdata_rva = SECTION_ALIGN * 2;
+    let (rdata_bytes, dirs) = rdata(spec, rdata_rva);
+    let rsrc_rva = rdata_rva + align(rdata_bytes.len().max(1), SECTION_ALIGN as usize) as u32;
+    let rsrc_bytes = spec.manifest.as_deref().map(|m| rsrc(m, rsrc_rva));
+
+    let mut sections: Vec<([u8; 8], u32, Vec<u8>)> = vec![
+        (
+            *b".text\0\0\0",
+            SECTION_ALIGN,
+            with_filler(Vec::new(), code, machine == 0xAA64),
+        ),
+        (*b".rdata\0\0", rdata_rva, rdata_bytes),
+    ];
+    if let Some(r) = rsrc_bytes {
+        sections.push((*b".rsrc\0\0\0", rsrc_rva, r));
+    }
+
+    let mut out = vec![0u8; headers];
+    out[..2].copy_from_slice(b"MZ");
+    put32(&mut out, 0x3C, 0x80);
+    out[0x80..0x84].copy_from_slice(b"PE\0\0");
+    put16(&mut out, coff, machine);
+    put16(&mut out, coff + 2, nsections as u16);
+    put16(&mut out, coff + 16, opt_size as u16);
+    put16(&mut out, coff + 18, if spec.pe32 { 0x0102 } else { 0x0022 });
+    put16(&mut out, opt, if spec.pe32 { 0x10b } else { 0x20b });
+    put32(&mut out, opt + 16, SECTION_ALIGN); // entry point
+    put32(&mut out, opt + 20, SECTION_ALIGN); // base of code
+    if spec.pe32 {
+        put32(&mut out, opt + 28, 0x0040_0000);
+    } else {
+        put64(&mut out, opt + 24, 0x1_4000_0000);
+    }
+    put32(&mut out, opt + 32, SECTION_ALIGN);
+    put32(&mut out, opt + 36, FILE_ALIGN as u32);
+    put16(&mut out, opt + 40, 6); // OS version
+    put16(&mut out, opt + 48, 6); // subsystem version
+    put32(&mut out, opt + 60, headers as u32);
+    put16(&mut out, opt + 68, spec.subsystem);
+    put16(&mut out, opt + 70, 0x8160);
+    let dirs_at = opt + if spec.pe32 { 96 } else { 112 };
+    put32(&mut out, dirs_at - 4, 16);
+    let mut dir = |i: usize, (addr, size): (u32, u32)| {
+        put32(&mut out, dirs_at + 8 * i, addr);
+        put32(&mut out, dirs_at + 8 * i + 4, size);
+    };
+    dir(1, dirs[0]);
+    dir(13, dirs[1]);
+    dir(10, dirs[2]);
+    if let Some((_, r)) = sections.get(2).map(|s| (s.1, s.2.len())) {
+        dir(2, (rsrc_rva, r as u32));
+    }
+    if let Some(sec) = spec.security_dir {
+        dir(4, sec);
+    }
+
+    let table = opt + opt_size;
+    let mut raw = headers;
+    let mut image_end = SECTION_ALIGN;
+    for (i, (name, rva, bytes)) in sections.iter().enumerate() {
+        let at = table + 40 * i;
+        let raw_size = align(bytes.len().max(1), FILE_ALIGN);
+        out[at..at + 8].copy_from_slice(name);
+        put32(&mut out, at + 8, bytes.len() as u32);
+        put32(&mut out, at + 12, *rva);
+        put32(&mut out, at + 16, raw_size as u32);
+        put32(&mut out, at + 20, raw as u32);
+        put32(
+            &mut out,
+            at + 36,
+            if i == 0 { 0x6000_0020 } else { 0x4000_0040 },
+        );
+        raw += raw_size;
+        image_end = rva + align(bytes.len().max(1), SECTION_ALIGN as usize) as u32;
+    }
+    put32(&mut out, opt + 56, image_end); // SizeOfImage
+    for (_, _, bytes) in &sections {
+        let start = out.len();
+        out.extend_from_slice(bytes);
+        out.resize(start + align(bytes.len().max(1), FILE_ALIGN), 0);
+    }
+    out
+}

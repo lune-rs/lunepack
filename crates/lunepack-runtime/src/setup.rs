@@ -2,8 +2,9 @@
 //! with one version's signed payload and a trailer appended (FORMAT.md 14), and it installs exactly
 //! that version with no network.
 //!
-//! At start, before the command line is read, the runtime reads at most [`TRAILER_SIZE`] bytes from
-//! the end of its resolved executable ([`detect`]). No magic there: the run is an ordinary runtime
+//! At start, before the command line is read, the runtime looks for the trailer in its resolved
+//! executable ([`detect`]): in the last [`TRAILER_SIZE`] bytes, or in the [`TRAILER_SIZE`] bytes
+//! before a signed PE's certificate table (M7-D11). No magic there: the run is an ordinary runtime
 //! run, unchanged. The magic and anything malformed after it: exit 7 `verify`, never a fall-through
 //! to the ordinary modes. A setup run takes no argument or `--silent` (D41); anything else is a
 //! usage error.
@@ -33,7 +34,7 @@ use lunepack::{
     Version,
 };
 use lunepack_core::setup::{
-    SetupPart, SetupTrailer, TRAILER_SIZE, VerifiedSetup, has_magic, verify_setup,
+    Located, SetupPart, SetupTrailer, TRAILER_SIZE, VerifiedSetup, locate_file, verify_setup,
 };
 use lunepack_core::ui::{ChoiceValue, Outcome, PromptKind, StepItem};
 use lunepack_core::{ClockReading, Hasher, Verifier};
@@ -71,23 +72,25 @@ pub enum Detect {
     Malformed,
 }
 
-/// Reads at most [`TRAILER_SIZE`] bytes from the end of `exe` (the resolved executable). A file
-/// that cannot be opened or read, or that is shorter than a trailer, is an ordinary runtime.
+/// Looks for a setup trailer in `exe` (the resolved executable) through the core's locator
+/// ([`locate_file`], M7-D11): at the end of the file, or before a signed PE's certificate table.
+/// A file that cannot be opened or read, that is shorter than a trailer or that carries no trailer
+/// magic is an ordinary runtime, whatever its headers say.
 pub fn detect(fs: &dyn Fs, exe: &Path, hasher: &dyn Hasher, verifier: &dyn Verifier) -> Detect {
     let Ok(file) = fs.open_read(exe) else {
         return Detect::None;
     };
-    let Ok(size) = file.size() else {
-        return Detect::None;
+    let end = match locate_file(file.as_ref()) {
+        Ok(Located::None) | Err(_) => return Detect::None,
+        Ok(Located::Malformed) => return Detect::Malformed,
+        Ok(Located::Setup { end }) => end,
     };
-    if size < TRAILER_SIZE {
-        return Detect::None;
-    }
     let mut tail = vec![0u8; TRAILER_SIZE as usize];
-    if file.read_exact_at(size - TRAILER_SIZE, &mut tail).is_err() || !has_magic(&tail) {
+    if file.read_exact_at(end - TRAILER_SIZE, &mut tail).is_err() {
         return Detect::None;
     }
-    match SetupTrailer::parse(&tail, size, hasher, verifier) {
+    // The trailer's parts lie before `end`: a certificate table after it is not setup data.
+    match SetupTrailer::parse(&tail, end, hasher, verifier) {
         Ok(trailer) => Detect::Setup(Found {
             trailer,
             file: Arc::from(file),

@@ -1,9 +1,16 @@
-//! M6 step 7: the setup file's trailer (FORMAT.md 14), parsed fail-closed.
+//! M6 step 7: the setup file's trailer (FORMAT.md 14), parsed fail-closed. M7 step 3: the
+//! locator (M7-D11), which finds the trailer at the end of the file or before a signed PE's
+//! certificate table and never refuses a file without the magic.
 
+use std::path::Path;
+
+use lunepack_core::pe::{SUBSYSTEM_CONSOLE, SUBSYSTEM_GUI};
 use lunepack_core::setup::{
-    FOOTER_SIZE, SetupPart, SetupTrailer, TRAILER_MAGIC, TRAILER_SIZE, has_magic,
+    FOOTER_SIZE, HEAD_SIZE, Located, SetupPart, SetupTrailer, TRAILER_MAGIC, TRAILER_SIZE,
+    has_magic, locate, locate_file, table_candidate,
 };
-use lunepack_core::{Error, Target, Version};
+use lunepack_core::{Error, FsError, FsErrorKind, ReadAt, Target, Version};
+use lunepack_testkit::exe_headers::{self, PeSpec, pe_image};
 use lunepack_testkit::{ChainFixture, FakeHasher, FakeVerifier};
 
 const FILE: u64 = 1 << 20;
@@ -160,4 +167,296 @@ fn parts_must_be_inside_aligned_capped_and_apart() {
     assert!(parse(&bytes, 3632 + 9000 + TRAILER_SIZE - 1).is_err());
     parse(&bytes, 3632 + 9000 + TRAILER_SIZE).unwrap();
     assert!(parse(&bytes, TRAILER_SIZE - 1).is_err());
+}
+
+// ---- the locator (M7-D11) ------------------------------------------------------------------------
+
+struct Bytes(Vec<u8>);
+
+impl ReadAt for Bytes {
+    fn size(&self) -> Result<u64, FsError> {
+        Ok(self.0.len() as u64)
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        let start = usize::try_from(offset).unwrap();
+        match self.0.get(start..start + buf.len()) {
+            Some(src) => {
+                buf.copy_from_slice(src);
+                Ok(())
+            }
+            None => Err(FsError::new(FsErrorKind::Other, Path::new("exe"), None)),
+        }
+    }
+}
+
+/// The locator over `file`, read through [`locate_file`]; checked against [`locate`] over slices.
+fn located(file: &[u8]) -> Located {
+    let through_file = locate_file(&Bytes(file.to_vec())).unwrap();
+    let len = file.len() as u64;
+    if len >= TRAILER_SIZE {
+        let head = &file[..file.len().min(HEAD_SIZE as usize)];
+        let tail = |end: u64| &file[(end - TRAILER_SIZE) as usize..end as usize];
+        let direct = locate(head, tail(len), table_candidate(head, len).map(tail), len);
+        assert_eq!(direct, through_file, "locate and locate_file disagree");
+    }
+    through_file
+}
+
+fn runtime(pe32: bool) -> Vec<u8> {
+    pe_image(
+        0x8664,
+        &PeSpec {
+            pe32,
+            ..PeSpec::hardened(SUBSYSTEM_GUI)
+        },
+    )
+}
+
+fn pad8(file: &mut Vec<u8>) {
+    file.resize(file.len().div_ceil(8) * 8, 0);
+}
+
+/// `exe` + an 8-aligned payload (zero bytes standing in for the key set, the manifest and the
+/// pack) + the trailer naming them, as the setup writer lays it out.
+fn setup_file(mut exe: Vec<u8>) -> (Vec<u8>, SetupTrailer) {
+    let mut t = trailer();
+    for (part, len) in [
+        (&mut t.keys, 600),
+        (&mut t.manifest, 2000),
+        (&mut t.pack, 9000),
+    ] {
+        pad8(&mut exe);
+        *part = SetupPart {
+            offset: exe.len() as u64,
+            length: len,
+        };
+        exe.resize(exe.len() + len as usize, 0);
+    }
+    exe.extend_from_slice(&t.encode().unwrap());
+    (exe, t)
+}
+
+/// The byte offset of the security directory entry in an image from `pe_image`.
+fn security_at(pe32: bool) -> usize {
+    0x84 + 20 + if pe32 { 96 } else { 112 } + 4 * 8
+}
+
+fn set_security(file: &mut [u8], pe32: bool, offset: u64, size: u64) {
+    let at = security_at(pe32);
+    file[at..at + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+    file[at + 4..at + 8].copy_from_slice(&(size as u32).to_le_bytes());
+}
+
+/// Signs `file` the way signtool lays it out: pads to 8, points the security directory at the
+/// end and appends a `len`-byte certificate table. Returns the table's offset.
+fn sign(file: &mut Vec<u8>, pe32: bool, len: usize) -> u64 {
+    pad8(file);
+    let offset = file.len() as u64;
+    set_security(file, pe32, offset, len as u64);
+    file.extend((0..len).map(|i| (i % 251) as u8));
+    offset
+}
+
+#[test]
+fn files_without_the_magic_are_ordinary_runtimes() {
+    // An ordinary runtime, and one with a well-formed certificate table at the end.
+    let plain = runtime(false);
+    assert_eq!(located(&plain), Located::None);
+    let mut signed = runtime(false);
+    sign(&mut signed, false, 1024);
+    assert_eq!(located(&signed), Located::None);
+    // Odd tables: never a refusal without the magic.
+    let base = || {
+        let mut f = runtime(false);
+        f.resize(f.len() + 8192, 0x5A);
+        f
+    };
+    let len = base().len() as u64;
+    for (offset, size) in [
+        (len - 1024 + 1, 1023),        // offset not 8-aligned
+        (len - 2048, 1024),            // table not at the end
+        (len - 1024, 1016),            // padding after the table
+        (0, 64),                       // offset 0 with a size
+        (len - 1024, 0),               // size 0
+        (len - 4, 4),                  // shorter than 8
+        (len - 1024, u32::MAX as u64), // past the end
+        (len + 8, 8),                  // starts past the end
+        (16, 8),                       // inside the headers
+    ] {
+        let mut f = base();
+        set_security(&mut f, false, offset, size);
+        assert_eq!(located(&f), Located::None, "table at {offset} size {size}");
+    }
+    // An ELF, a header-only PE, files shorter than a trailer, an empty file.
+    assert_eq!(located(&exe_headers::elf(62, false, 9000)), Located::None);
+    assert_eq!(located(&exe_headers::pe(0x8664, 9000)), Located::None);
+    assert_eq!(located(&plain[..100]), Located::None);
+    assert_eq!(located(b""), Located::None);
+    // `e_lfanew` past the head, and truncated headers: no magic, so ordinary.
+    let mut far = plain.clone();
+    far.resize(20_000, 0);
+    far[0x3C..0x40].copy_from_slice(&8000u32.to_le_bytes());
+    assert_eq!(located(&far), Located::None);
+    let mut cut = plain[..0x90].to_vec();
+    cut.resize(9000, 0);
+    assert_eq!(located(&cut), Located::None);
+}
+
+#[test]
+fn a_trailer_before_a_certificate_table_at_the_end_is_a_setup() {
+    for pe32 in [false, true] {
+        let (mut file, t) = setup_file(runtime(pe32));
+        let end = sign(&mut file, pe32, 1024);
+        assert_eq!(located(&file), Located::Setup { end }, "pe32 {pe32}");
+        let tail = &file[(end - TRAILER_SIZE) as usize..end as usize];
+        assert_eq!(parse(tail, end).unwrap(), t);
+    }
+    // The minimal table (8 bytes).
+    let (mut file, _) = setup_file(runtime(false));
+    let end = sign(&mut file, false, 8);
+    assert_eq!(located(&file), Located::Setup { end });
+}
+
+#[test]
+fn the_directory_is_read_at_the_offset_of_each_optional_header_kind() {
+    // A PE32 file whose table entry is written where PE32+ keeps it: the PE32 reader sees no
+    // security directory, so the magic (hidden before the table) is not found.
+    let (mut file, _) = setup_file(runtime(true));
+    pad8(&mut file);
+    let offset = file.len() as u64;
+    set_security(&mut file, false, offset, 1024);
+    file.resize(file.len() + 1024, 7);
+    assert_eq!(located(&file), Located::None);
+    // And the other way round.
+    let (mut file, _) = setup_file(runtime(false));
+    pad8(&mut file);
+    let offset = file.len() as u64;
+    set_security(&mut file, true, offset, 1024);
+    file.resize(file.len() + 1024, 7);
+    assert_eq!(located(&file), Located::None);
+}
+
+#[test]
+fn a_trailer_at_the_end_of_an_unsigned_file_is_a_setup() {
+    let (file, t) = setup_file(runtime(false));
+    let len = file.len() as u64;
+    assert_eq!(located(&file), Located::Setup { end: len });
+    assert_eq!(
+        parse(&file[file.len() - TRAILER_SIZE as usize..], len).unwrap(),
+        t
+    );
+    // A Linux runtime (today's rule).
+    let (file, _) = setup_file(exe_headers::elf(62, false, 8000));
+    assert_eq!(
+        located(&file),
+        Located::Setup {
+            end: file.len() as u64
+        }
+    );
+    // A console PE32 image too.
+    let console = pe_image(
+        0x8664,
+        &PeSpec {
+            pe32: true,
+            ..PeSpec::hardened(SUBSYSTEM_CONSOLE)
+        },
+    );
+    let (file, _) = setup_file(console);
+    assert_eq!(
+        located(&file),
+        Located::Setup {
+            end: file.len() as u64
+        }
+    );
+}
+
+#[test]
+fn malformed_layouts_with_the_magic_are_refused() {
+    // One byte after the certificate table.
+    let (mut file, _) = setup_file(runtime(false));
+    sign(&mut file, false, 1024);
+    file.push(0);
+    assert_eq!(located(&file), Located::Malformed);
+
+    // The table's size reaches past the end, or stops short of it.
+    for delta in [8i64, -8] {
+        let (mut file, _) = setup_file(runtime(false));
+        let offset = sign(&mut file, false, 1024);
+        set_security(&mut file, false, offset, (1024 + delta) as u64);
+        assert_eq!(located(&file), Located::Malformed, "size delta {delta}");
+    }
+
+    // A table offset that is not 8-aligned, with the trailer right before it.
+    let (mut odd, _) = setup_file(runtime(false));
+    let trailer_bytes = odd.split_off(odd.len() - TRAILER_SIZE as usize);
+    odd.push(0);
+    odd.extend_from_slice(&trailer_bytes);
+    let offset = odd.len() as u64;
+    assert!(!offset.is_multiple_of(8));
+    set_security(&mut odd, false, offset, 1024);
+    odd.resize(odd.len() + 1024, 3);
+    assert_eq!(located(&odd), Located::Malformed);
+
+    // A table shorter than 8 bytes.
+    let (mut file, _) = setup_file(runtime(false));
+    let offset = sign(&mut file, false, 8);
+    set_security(&mut file, false, offset, 4);
+    file.truncate(file.len() - 4);
+    assert_eq!(located(&file), Located::Malformed);
+
+    // A trailer overlapping the PE's headers and sections: the table right after the image.
+    let mut tiny = runtime(false);
+    assert!((tiny.len() as u64) < TRAILER_SIZE);
+    tiny.resize(TRAILER_SIZE as usize - TRAILER_MAGIC.len(), 0);
+    tiny.extend_from_slice(&TRAILER_MAGIC);
+    let end = tiny.len() as u64;
+    set_security(&mut tiny, false, end, 64);
+    tiny.resize(tiny.len() + 64, 1);
+    assert_eq!(located(&tiny), Located::Malformed);
+
+    // The magic at the end after a signature (a trailer appended to a signed file: unsigned
+    // bytes), including a table that overlaps that trailer.
+    let mut signed = runtime(false);
+    sign(&mut signed, false, 1024);
+    let (file, _) = setup_file(signed);
+    assert_eq!(located(&file), Located::Malformed);
+    let (mut file, _) = setup_file(runtime(false));
+    let len = file.len() as u64;
+    set_security(&mut file, false, len - 1024, 1024);
+    assert_eq!(located(&file), Located::Malformed);
+    // A security directory with offset 0 and a size, and the magic at the end.
+    let (mut file, _) = setup_file(runtime(false));
+    set_security(&mut file, false, 0, 64);
+    assert_eq!(located(&file), Located::Malformed);
+
+    // `e_lfanew` past the head, with the magic at the end.
+    let mut far = runtime(false);
+    far.resize(20_000, 0);
+    far[0x3C..0x40].copy_from_slice(&8000u32.to_le_bytes());
+    let (file, _) = setup_file(far);
+    assert_eq!(located(&file), Located::Malformed);
+    // Truncated headers (the optional header cut off), with the magic at the end.
+    let mut cut = runtime(false)[..0x90].to_vec();
+    cut.resize(4000, 0);
+    let (file, _) = setup_file(cut);
+    assert_eq!(located(&file), Located::Malformed);
+    // The header-only PE of earlier milestones, with the magic at the end.
+    let (file, _) = setup_file(exe_headers::pe(0x8664, 4000));
+    assert_eq!(located(&file), Located::Malformed);
+}
+
+/// Every truncation of a signed setup and of an unsigned one: a value, never a panic; and a
+/// truncated signed setup is never taken for one with its trailer elsewhere.
+#[test]
+fn truncated_setups_never_panic() {
+    let (mut signed, _) = setup_file(runtime(false));
+    let end = sign(&mut signed, false, 64);
+    for n in 0..signed.len() {
+        let got = located(&signed[..n]);
+        assert!(
+            got != Located::Setup { end } || n == signed.len(),
+            "truncated to {n}"
+        );
+    }
 }
