@@ -1,7 +1,20 @@
 //! Windows install, shortcut, autostart and process-restart adapter.
 //!
 //! Today it holds the reduce-motion reader (M6-D8): [`prefers_reduced_motion`] reads the OS's
-//! client-area animation setting through `SystemParametersInfoW` (user32, no window stack).
+//! client-area animation setting through `SystemParametersInfoW` (user32, no window stack), and the
+//! small Windows helpers of M7: the DLL search hardening ([`harden_dll_search`]) and the shell
+//! helpers of [`shell`] (known folders, a message box, the app user model id, the foreground right).
+//! The public API is safe and builds on every OS; off Windows the helpers are no-ops or
+//! `Unsupported`.
+
+mod harden;
+mod shell;
+
+pub use harden::harden_dll_search;
+pub use shell::{
+    MessageKind, allow_set_foreground, message_box, set_process_aumid, start_menu_programs,
+    user_program_files,
+};
 
 /// Whether the user asked for reduced motion: `Some(true)` when the "show animations in Windows"
 /// setting is off, `Some(false)` when it is on, `None` when it cannot be read (and always `None`

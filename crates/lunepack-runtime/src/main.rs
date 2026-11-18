@@ -11,6 +11,10 @@
 
 // Off Linux the modes are compiled (and checked) but not wired.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// A Windows-subsystem binary (M7-D6): no console window ever appears when an app starts it,
+// whatever spawn flags the app's language uses. Piped stdio works because the parent passes the
+// handles; typed in `cmd` it returns at once and prints nothing visible unless redirected.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod apply;
 mod cli;
@@ -36,6 +40,9 @@ use ui_host::UiHost;
 const SINK_DRAIN: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
+    // First, before any library load: only System32 from here on (M7-D10).
+    #[cfg(windows)]
+    lunepack_os_windows::harden_dll_search();
     // `apply-and-restart` waits for its parent by default (C4): named now, before anything else,
     // so the parent cannot have exited and had its pid reused by the time the target is read.
     let parent = initial_parent();
