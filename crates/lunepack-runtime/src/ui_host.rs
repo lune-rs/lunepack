@@ -439,6 +439,8 @@ pub struct UiHost {
     /// A stop before any thread existed (the spawn failed), still to be logged.
     early: Mutex<Option<Stopped>>,
     last_reveal: Mutex<Option<Instant>>,
+    /// The UI itself answered the prompt after the outcome (done or failed): the user saw it.
+    outcome_acknowledged: AtomicBool,
 }
 
 /// What a run starts the UI with.
@@ -464,6 +466,7 @@ impl UiHost {
             flow,
             early: Mutex::new(None),
             last_reveal: Mutex::new(None),
+            outcome_acknowledged: AtomicBool::new(false),
         }
     }
 
@@ -581,6 +584,13 @@ impl UiHost {
     /// The UI process, while it was started by this host (to exclude it from an in-use scan).
     pub fn child_id(&self) -> Option<ProcessId> {
         self.shared.as_ref().map(|s| s.child_id)
+    }
+
+    /// Whether the UI itself answered the prompt after the outcome (done or failed), so the user
+    /// saw how the run ended in the UI. `false` for a headless host, a UI that could not be
+    /// started and a UI lost before that prompt was answered.
+    pub fn outcome_acknowledged(&self) -> bool {
+        self.outcome_acknowledged.load(Ordering::Acquire)
     }
 
     /// Why the UI stopped, if it did (the binary reports it through the log; tests ask).
@@ -724,7 +734,12 @@ impl UiHost {
                         on_reveal(index);
                     }
                 }
-                Ok((_, value)) => return value,
+                Ok((_, value)) => {
+                    if matches!(kind, PromptKind::Done | PromptKind::Failed) {
+                        self.outcome_acknowledged.store(true, Ordering::Release);
+                    }
+                    return value;
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     shared.stop_gone();

@@ -2,7 +2,9 @@
 //! before the relaunch.
 //!
 //! Under the install's lock it keeps `gc_keep` of the record (current, previous, pending and
-//! staged) and removes only direct children of `R/versions` that are real directories (not
+//! staged) and removes only direct children of the layout's versions directory (`R/versions`,
+//! `R\app` under the Windows scheme; on Windows also the launcher stub's leftover copies in `R`)
+//! that are real directories (not
 //! followed when a symlink) whose name is a version's canonical text, that are not kept, and
 //! that no other process uses (`Process::tree_in_use`, this process excluded). Every error keeps
 //! the tree: a failed check, a failed removal, an unreadable directory.
@@ -52,6 +54,10 @@ pub fn gc(ad: &Adapters, inst: &Installation, me: Option<ProcessId>, events: &Ev
         drop(guard);
         return report;
     };
+    // Windows: the launcher stub's transient copies beside it in `R` (M7-D8); only exact leftover
+    // names, never a running copy, never `app` or `.lunepack`.
+    #[cfg(windows)]
+    let _ = lunepack_os_windows::remove_stub_leftovers(layout.root());
     let keep = gc_keep(&record);
     let versions = layout.versions_dir();
     let Ok(entries) = ad.fs.list_dir(&versions) else {
