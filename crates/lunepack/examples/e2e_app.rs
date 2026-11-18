@@ -8,7 +8,11 @@
 //! - `exit-without-confirm`: exit 0 without confirming;
 //! - `slow-confirm <secs>`: sleep that long before confirming.
 //!
-//! Then it confirms its health. With `--update` it checks the feed, downloads and stages what it
+//! Then it confirms its health. Two arguments serve the Windows suite (`scripts/e2e-windows.ps1`):
+//! `--hold <secs>` keeps the process alive that long (writing `hold` first), so a running image
+//! can be replaced or collected around it, and `--check <n>` runs the sibling runtime's
+//! `check --json` `n` times with default `std::process::Command` flags and writes `check-run
+//! <exit code>` after each, to see that the runtime opens no console of its own. With `--update` it checks the feed, downloads and stages what it
 //! finds and hands it to the runtime with [`lunepack::apply_and_restart`], passing
 //! `--after-update` as the restart argument; with `--no-ui` as well, the applier shows no
 //! window ([`lunepack::UiChoice::Never`]).
@@ -136,6 +140,13 @@ fn main() -> ExitCode {
         }
     }
 
+    if let Some(secs) = arg_value(&args, "--hold") {
+        out("hold");
+        std::thread::sleep(Duration::from_secs(secs));
+    }
+    if let Some(runs) = arg_value(&args, "--check") {
+        check_runs(&inst, runs, &out);
+    }
     if args.iter().any(|a| a == "--update") {
         let no_ui = args.iter().any(|a| a == "--no-ui");
         return match update(&inst, no_ui) {
@@ -150,6 +161,53 @@ fn main() -> ExitCode {
         };
     }
     ExitCode::SUCCESS
+}
+
+/// The number that follows `flag` among `args`.
+fn arg_value(args: &[OsString], flag: &str) -> Option<u64> {
+    let at = args.iter().position(|a| a == flag)?;
+    args.get(at + 1)?.to_str()?.parse().ok()
+}
+
+/// Runs the runtime beside the entry `runs` times with `check --json`, all default process flags
+/// (so a runtime that was a console program would open a console of its own when this app has
+/// none; the suite starts it with no console), and writes each exit code.
+fn check_runs(inst: &Installation, runs: u64, out: &dyn Fn(&str)) {
+    let name = if cfg!(windows) {
+        "lunepack-runtime.exe"
+    } else {
+        "lunepack-runtime"
+    };
+    let Some(dir) = inst.entry_path().parent().map(Path::to_path_buf) else {
+        out("error check-run");
+        return;
+    };
+    // The control of the Windows suite's console check: a console program started the same way
+    // by an app that has no console (a ping, a console program) gets a console host of its own, which the suite's sampler
+    // must see (else it proves nothing about the runtime).
+    #[cfg(windows)]
+    let control = std::process::Command::new("ping.exe")
+        .args(["-n", "4", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok();
+    for _ in 0..runs {
+        let code = std::process::Command::new(dir.join(name))
+            .args(["check", "--json"])
+            .output()
+            .ok()
+            .and_then(|output| output.status.code());
+        out(&format!(
+            "check-run {}",
+            code.map_or_else(|| "none".to_owned(), |c| c.to_string())
+        ));
+    }
+    #[cfg(windows)]
+    if let Some(mut control) = control {
+        let _ = control.wait();
+    }
 }
 
 /// Check, download, stage and hand over. Returns the last outcome line; the earlier ones are
