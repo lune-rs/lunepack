@@ -168,9 +168,14 @@ fn the_ui_image_is_hardened() {
     let manifest = pe.manifest.expect("an embedded RT_MANIFEST");
     assert!(manifest.contains("asInvoker"), "asInvoker");
     assert!(manifest.contains("longPathAware"), "longPathAware");
-    let after = manifest.split("longPathAware").nth(1).unwrap_or("");
+    // `<longPathAware xmlns="...">true</longPathAware>`: the text after the first tag's `>`.
+    let value = manifest
+        .split("longPathAware")
+        .nth(1)
+        .and_then(|rest| rest.split_once('>'))
+        .map(|(_, text)| text);
     assert!(
-        after.trim_start_matches('>').starts_with("true"),
+        value.is_some_and(|text| text.starts_with("true")),
         "longPathAware is true"
     );
 }
