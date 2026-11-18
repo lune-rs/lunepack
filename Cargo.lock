@@ -2218,6 +2218,7 @@ name = "lunepack-os-windows"
 version = "0.0.0"
 dependencies = [
  "lunepack-core",
+ "lunepack-testkit",
  "windows-sys 0.61.2",
 ]
 

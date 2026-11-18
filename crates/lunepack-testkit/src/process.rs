@@ -551,14 +551,17 @@ impl Process for FakeProcess {
 ///
 /// - `exit <code>`: exits with `code`.
 /// - `sleep <secs>`: sleeps, then exits 0.
-/// - `sleep-ignore-term <secs> <ready-file>`: ignores SIGTERM, creates `ready-file`, then sleeps.
+/// - `sleep-ignore-term <secs> <ready-file>`: ignores SIGTERM (on Windows it has no signal to
+///   ignore), creates `ready-file`, then sleeps.
 /// - `write <file> <text>`: creates `file` holding `text`, then exits 0.
 /// - `args <file> <arg>...`: creates `file` holding each `arg` followed by a newline.
 /// - `env <file> <name>...`: creates `file` holding, for each `name`, one line `NAME=value` (the
 ///   value as the helper's environment holds it, lossy UTF-8) or `NAME unset`.
-/// - `probe <file>`: creates `file` holding the lines `session leader` or `session member` (the
-///   helper is, or is not, the leader of its own session) and, for each of `stdin`, `stdout` and
-///   `stderr`, `<name> null` or `<name> other` (the descriptor is `/dev/null` or is not).
+/// - `probe <file>`: creates `file` holding a first line and, for each of `stdin`, `stdout` and
+///   `stderr`, `<name> null` or `<name> other` (the descriptor is `/dev/null` or `NUL`, or is not).
+///   The first line is `session leader` or `session member` on Unix (the helper is, or is not, the
+///   leader of its own session) and `no console` or `console` on Windows (the helper has no console
+///   at all, as a detached program has, or has one, possibly hidden).
 ///
 /// - `cat`: copies its standard input to its standard output until end of file, then exits 0.
 ///
@@ -569,7 +572,9 @@ impl Process for FakeProcess {
 /// at the end; it leaves no process behind. It checks: identity (`current_exe`, `current`,
 /// `parent`); `spawn_child` and its exit kinds; `wait_exit` on a running child, on a zombie, on
 /// an id with another start time (a reused pid) and on a pid that does not exist; `terminate`
-/// (SIGTERM, then escalation after `grace`); `spawn_detached` (arguments reach the program
+/// (a polite request, then escalation after `grace`: SIGTERM then SIGKILL on Unix; on Windows a
+/// child without a window cannot be asked, so it is ended when `grace` has passed, with exit code
+/// 1); `spawn_detached` (arguments reach the program
 /// verbatim without a shell, `env_set` and `env_remove`, a new session, null streams); piped
 /// children (`ChildStdio::Piped`: a round trip through `cat` that is large enough to need both
 /// directions at once, the end of file when the input is dropped, the error stream still null, the
@@ -605,6 +610,25 @@ impl Drop for Reaper {
 }
 
 const LIMIT: Duration = Duration::from_secs(20);
+
+/// The grace period for a `terminate` that the polite request alone should satisfy. On Windows
+/// the helper has no window to ask, so every terminate waits the whole grace period: keep it short.
+fn polite_grace() -> Duration {
+    if cfg!(windows) {
+        Duration::from_millis(300)
+    } else {
+        Duration::from_secs(10)
+    }
+}
+
+/// Whether `exit` is how a terminated child ends: a signal on Unix, a failure code on Windows.
+fn is_terminated(exit: Option<ExitKind>) -> bool {
+    if cfg!(windows) {
+        matches!(exit, Some(ExitKind::Failure(_)))
+    } else {
+        matches!(exit, Some(ExitKind::Signal(_)))
+    }
+}
 
 fn helper_spec(helper: &Path, args: &[&str]) -> SpawnSpec {
     let mut spec = SpawnSpec::new(helper);
@@ -730,17 +754,14 @@ fn process_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
         "a pid that does not exist"
     );
     let started = std::time::Instant::now();
-    sleeper
-        .0
-        .terminate(Duration::from_secs(10))
-        .expect("terminate");
+    sleeper.0.terminate(polite_grace()).expect("terminate");
     assert!(
         started.elapsed() < Duration::from_secs(5),
-        "SIGTERM alone should have ended a sleeper"
+        "the polite request alone should have ended a sleeper (Windows: the grace period)"
     );
     assert!(
-        matches!(sleeper.0.try_wait().unwrap(), Some(ExitKind::Signal(_))),
-        "a terminated child ends by a signal"
+        is_terminated(sleeper.0.try_wait().unwrap()),
+        "a terminated child ends by a signal (Windows: with a failure code)"
     );
     assert_eq!(
         process.wait_exit(&id, Duration::from_secs(10)).unwrap(),
@@ -792,7 +813,11 @@ fn process_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
     );
     assert_eq!(
         stubborn.0.try_wait().unwrap(),
-        Some(ExitKind::Signal(9)),
+        Some(if cfg!(windows) {
+            ExitKind::Failure(1)
+        } else {
+            ExitKind::Signal(9)
+        }),
         "the stubborn child is killed after the grace period"
     );
 
@@ -862,7 +887,14 @@ fn detached_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
         .expect("spawn_detached probe");
     assert_eq!(
         wait_for_file(&probe, "probe"),
-        "session leader\nstdin null\nstdout null\nstderr null\n",
+        format!(
+            "{}\nstdin null\nstdout null\nstderr null\n",
+            if cfg!(windows) {
+                "no console"
+            } else {
+                "session leader"
+            }
+        ),
         "a detached program"
     );
     let probe = scratch.join("probe-child");
@@ -982,7 +1014,7 @@ fn piped_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
     let mut stdout = sleeper.0.take_stdout().expect("the output pipe");
     sleeper
         .0
-        .terminate(Duration::from_secs(10))
+        .terminate(polite_grace())
         .expect("terminate the piped sleeper");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1084,10 +1116,7 @@ fn in_use_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
         !process.tree_in_use(&other, &[]).expect("tree_in_use"),
         "another directory is not in use"
     );
-    running
-        .0
-        .terminate(Duration::from_secs(10))
-        .expect("terminate");
+    running.0.terminate(polite_grace()).expect("terminate");
     assert!(
         !process.tree_in_use(&tree, &[]).expect("tree_in_use"),
         "the process ended"
