@@ -190,6 +190,20 @@ fn windows_runtime_and_ui_checks() {
             .push("api-ms-win-crt-heap-l1-1-0.dll".to_owned())),
         Err(E::CRuntime)
     );
+    // advapi32.dll statically (its forwarders load cryptbase.dll before main), in either case.
+    assert_eq!(
+        with(&|s| s.imports.push("ADVAPI32.dll".to_owned())),
+        Err(E::StaticAdvapi32)
+    );
+    assert_eq!(
+        with(&|s| s.imports.push("advapi32.dll".to_owned())),
+        Err(E::StaticAdvapi32)
+    );
+    // Delay-loaded, it is accepted.
+    assert_eq!(
+        with(&|s| s.delay_imports.push("ADVAPI32.dll".to_owned())),
+        Ok(())
+    );
     assert_eq!(
         with(&|s| s.dependent_load_flags = None),
         Err(E::DependentLoadFlags)
