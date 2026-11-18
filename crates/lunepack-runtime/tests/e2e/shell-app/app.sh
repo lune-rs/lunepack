@@ -5,8 +5,9 @@
 # At every start it runs `startup --json -- "$@"` first and exits when the action is "exit"; then
 # it acts on the marker file `e2e-flags` at its tree's root (crash-on-start, exit-without-confirm,
 # slow-confirm <secs>), confirms its health, and with `--update` runs check, download and
-# apply-and-restart. Outcomes go to the file LUNEPACK_E2E_OUT as `<tree version> <outcome>`, the
-# executable's real path to LUNEPACK_E2E_DETAIL (neither is written when its variable is unset).
+# apply-and-restart (with `--no-ui` as well, the call carries `--no-ui`: no update window).
+# Outcomes go to the file LUNEPACK_E2E_OUT as `<tree version> <outcome>`, the executable's real
+# path to LUNEPACK_E2E_DETAIL (neither is written when its variable is unset).
 #
 # Every runtime call is captured by a substitution of two commands (see `call`), so the caller of
 # the runtime is a subshell that exits at once: apply-and-restart therefore names this script's
@@ -59,10 +60,12 @@ detail "exe $self"
 out "start"
 
 update=
+noui=
 for arg in "$@"; do
     case $arg in
         --after-update) out "arg after-update" ;;
         --update) update=1 ;;
+        --no-ui) noui=--no-ui ;;
     esac
 done
 
@@ -173,7 +176,9 @@ if [ "$rc" != 0 ] || [ -z "$staged" ]; then
 fi
 out "staged $staged"
 
-call apply-and-restart --json --wait-pid $$ --expect-version "$staged" -- --after-update
+# $noui is empty or one word, so it is left unquoted on purpose.
+# shellcheck disable=SC2086
+call apply-and-restart --json --wait-pid $$ --expect-version "$staged" $noui -- --after-update
 if [ "$rc" != 0 ]; then
     out "error apply"
     exit 1

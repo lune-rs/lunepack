@@ -7,6 +7,7 @@
 mod cmd_feed;
 mod cmd_keys;
 mod cmd_pack;
+mod cmd_setup;
 mod cmd_verify;
 mod config;
 mod pipeline;
@@ -55,6 +56,9 @@ enum Command {
     Verify(cmd_verify::VerifyArgs),
     /// Verify a release directory, then show what it holds.
     Inspect(cmd_verify::InspectArgs),
+    /// Build a Linux setup file: the release's runtime with one version's key set, manifest and
+    /// pack, installable offline (`<app_id>-<version>-<target>-setup`).
+    Setup(cmd_setup::SetupArgs),
 }
 
 #[derive(Subcommand)]
@@ -102,6 +106,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Verify(args) => cmd_verify::verify(&cli.config, &args),
         Command::Inspect(args) => cmd_verify::inspect(&cli.config, &args),
+        Command::Setup(args) => cmd_setup::setup(&cli.config, &args),
     }
 }
 

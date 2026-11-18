@@ -33,7 +33,7 @@ mod linux {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use lunepack_core::{ExitKind, Process, ProcessId, SpawnSpec, WaitOutcome};
+    use lunepack_core::{ChildStdio, ExitKind, Process, ProcessId, SpawnSpec, WaitOutcome};
     use lunepack_os_linux::LinuxProcess;
 
     use crate::helper::stat_fields;
@@ -74,6 +74,10 @@ mod linux {
         (
             "terminate_kills_a_child_that_ignores_sigterm",
             terminate_stubborn,
+        ),
+        (
+            "a_sibling_started_after_a_piped_child_holds_none_of_its_pipes",
+            sibling_holds_no_pipe,
         ),
     ];
 
@@ -609,5 +613,93 @@ mod linux {
             os().wait_exit(&child.id(), Duration::from_secs(5)).unwrap(),
             WaitOutcome::Exited
         );
+    }
+
+    /// The `pipe:[inode]` targets in an `fds` helper file (`<fd> <target>` per line).
+    fn pipe_targets(text: &str) -> Vec<(u32, String)> {
+        text.lines()
+            .filter_map(|line| {
+                let (fd, target) = line.split_once(' ')?;
+                target
+                    .starts_with("pipe:[")
+                    .then(|| (fd.parse().expect("fd number"), target.to_owned()))
+            })
+            .collect()
+    }
+
+    /// The `pipe:[inode]` targets this test process already holds. A CI runner can hand the test
+    /// process pipes that are not close-on-exec (GitHub's did, as descriptors 142 and 145); every
+    /// child inherits those, so they are left out of the piped child's own pipes.
+    fn own_pipes() -> Vec<String> {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("read /proc/self/fd")
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .map(|target| target.to_string_lossy().into_owned())
+            .filter(|target| target.starts_with("pipe:["))
+            .collect()
+    }
+
+    /// P1: the parent's ends of a piped child's pipes are close-on-exec, so the app the runtime
+    /// relaunches (a sibling of the UI child, started by `spawn_detached`) or any other child
+    /// started later holds neither pipe. The piped child itself holds them as descriptors 0 and 1.
+    fn sibling_holds_no_pipe(scratch: &Path) {
+        let child_fds = scratch.join("child-fds");
+        let ready = scratch.join("ready");
+        let mut piped = spec(
+            &helper(),
+            &[
+                "fds",
+                &child_fds.to_string_lossy(),
+                &ready.to_string_lossy(),
+            ],
+        );
+        piped.stdio = ChildStdio::Piped;
+        let inherited = own_pipes();
+        let mut child = os().spawn_child(&piped).expect("spawn the piped child");
+        // Held until the end: the pipes live as long as this test holds its ends.
+        let _stdin = child.take_stdin().expect("input pipe");
+        let _stdout = child.take_stdout().expect("output pipe");
+        wait_for_file(&ready);
+        let child_text = wait_for_file(&child_fds);
+        let held: Vec<(u32, String)> = pipe_targets(&child_text)
+            .into_iter()
+            .filter(|(_, target)| !inherited.contains(target))
+            .collect();
+        // The instrument: the child holds exactly its two pipes, as descriptors 0 and 1.
+        let fds: Vec<u32> = held.iter().map(|(fd, _)| *fd).collect();
+        assert_eq!(fds, vec![0, 1], "the piped child's own pipes: {held:?}");
+        assert_ne!(held[0].1, held[1].1, "two different pipes");
+
+        // The matcher used on the siblings finds a pipe where one is held (positive control).
+        let holds = |text: &str, pipe: &str| {
+            text.lines()
+                .any(|l| l.split_once(' ').map(|x| x.1) == Some(pipe))
+        };
+        assert!(holds(&child_text, &held[0].1) && holds(&child_text, &held[1].1));
+
+        // Siblings: one detached (the relaunched app), one child with null streams.
+        let detached_fds = scratch.join("detached-fds");
+        os().spawn_detached(&spec(&helper(), &["fds", &detached_fds.to_string_lossy()]))
+            .expect("spawn_detached");
+        let null_fds = scratch.join("null-fds");
+        let mut null = os()
+            .spawn_child(&spec(&helper(), &["fds", &null_fds.to_string_lossy()]))
+            .expect("spawn_child with null streams");
+        let deadline = Instant::now() + LIMIT;
+        while null.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the null child did not end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for (name, file) in [("detached", &detached_fds), ("null child", &null_fds)] {
+            let text = wait_for_file(file);
+            assert!(
+                text.lines().any(|l| l.starts_with("0 ")),
+                "{name}: the listing holds descriptors at all: {text:?}"
+            );
+            for (_, pipe) in &held {
+                assert!(!holds(&text, pipe), "{name} holds {pipe}: {text:?}");
+            }
+        }
+        child.terminate(Duration::from_secs(5)).unwrap();
     }
 }

@@ -3,8 +3,8 @@
 //!
 //! Global options: `--json` (a flag) and `--expect-schema <N>`. `check` and `download` take
 //! `--channel <name>`; `download` and `apply-and-restart` take `--expect-version <version>`;
-//! `apply-and-restart` takes `--wait-pid <pid>` (a pid above 1); `startup` and `apply-and-restart`
-//! take `-- <args>`.
+//! `apply-and-restart` takes `--wait-pid <pid>` (a pid above 1) and the flag `--no-ui` (the
+//! applier shows no update window); `startup` and `apply-and-restart` take `-- <args>`.
 //! Each option is allowed once, and anything else (an unknown name, a repeat, a value that does not
 //! parse, a missing value, `=` forms, a stray word) is a [`UsageError`] that names nothing of
 //! the arguments. Nothing happens before the whole line has been parsed.
@@ -71,6 +71,8 @@ pub struct Parsed {
     pub expect_version: Option<Version>,
     /// The process `apply-and-restart` waits for instead of its parent: a pid above 1.
     pub wait_pid: Option<u32>,
+    /// `--no-ui`: the applier `apply-and-restart` starts shows no update window (D41).
+    pub no_ui: bool,
     /// The arguments after `--`: the app's own arguments (`startup`, which a rolled-back start
     /// passes on), or the arguments the new version is started with (`apply-and-restart`).
     pub passed_args: Vec<OsString>,
@@ -89,6 +91,7 @@ impl std::fmt::Debug for Parsed {
                 &self.expect_version.as_ref().map(ToString::to_string),
             )
             .field("wait_pid", &self.wait_pid)
+            .field("no_ui", &self.no_ui)
             .field("passed_args", &self.passed_args.len())
             .finish()
     }
@@ -110,6 +113,7 @@ pub fn parse(command: Command, rest: &[OsString]) -> Result<Parsed, UsageError> 
         channel: None,
         expect_version: None,
         wait_pid: None,
+        no_ui: false,
         passed_args: Vec::new(),
     };
     let mut i = 0;
@@ -127,6 +131,14 @@ pub fn parse(command: Command, rest: &[OsString]) -> Result<Parsed, UsageError> 
                 return Err(UsageError);
             }
             parsed.json = true;
+            i += 1;
+            continue;
+        }
+        if name == "--no-ui" {
+            if parsed.no_ui || command != Command::ApplyAndRestart {
+                return Err(UsageError);
+            }
+            parsed.no_ui = true;
             i += 1;
             continue;
         }
@@ -229,9 +241,18 @@ mod tests {
         assert_eq!(p.wait_pid, Some(4242));
         assert_eq!(p.expect_version.expect("version").to_string(), "1.2.3");
         assert_eq!(p.passed_args, os(&["--wait-pid", "x"]));
+        assert!(!p.no_ui);
         let p = parse(Command::ApplyAndRestart, &[]).expect("parse");
         assert_eq!(p.wait_pid, None);
         assert!(p.passed_args.is_empty());
+        assert!(!p.no_ui);
+        let p = parse(
+            Command::ApplyAndRestart,
+            &os(&["--no-ui", "--json", "--", "--no-ui"]),
+        )
+        .expect("parse");
+        assert!(p.no_ui);
+        assert_eq!(p.passed_args, os(&["--no-ui"]));
     }
 
     #[test]
@@ -287,6 +308,13 @@ mod tests {
             (Command::ApplyAndRestart, &["--expect-version", "v1.0.0"]),
             (Command::ApplyAndRestart, &["--channel", "stable"]),
             (Command::ApplyAndRestart, &["stray"]),
+            (Command::ApplyAndRestart, &["--no-ui", "--no-ui"]),
+            (Command::ApplyAndRestart, &["--no-ui=1"]),
+            (Command::ApplyAndRestart, &["--no-ui", "1"]),
+            (Command::Check, &["--no-ui"]),
+            (Command::Download, &["--no-ui"]),
+            (Command::Startup, &["--no-ui"]),
+            (Command::Confirm, &["--no-ui"]),
         ];
         for (command, args) in bad {
             assert_eq!(parse(*command, &os(args)), Err(UsageError), "{args:?}");

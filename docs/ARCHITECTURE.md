@@ -3,24 +3,26 @@
 How the workspace is split and how the split is enforced. Crate roles and the boundary rules
 are the current design; thirteen traits are defined (below). The wire
 format is `docs/FORMAT.md` and its threat model `docs/THREAT-MODEL.md`. Decisions behind this are in
-`docs/DECISIONS.md` (D1, D6, D14, D17, D23, D26, D28, D30, D31, D33, M2-D1 to M2-D9, M3-D1 to M3-D13,
-M4-D1 to M4-D23, M5-D2 to M5-D17).
+`docs/DECISIONS.md` (D1, D6, D14, D17, D23, D26, D28, D30, D31, D33, D35 to D41, M2-D1 to M2-D9,
+M3-D1 to M3-D13, M4-D1 to M4-D23, M5-D2 to M5-D20, M6-D1 to M6-D12).
 
 ## Crates
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `lunepack-core` | Types, rules, verification policy, planning, state machine, apply engine; owns every trait and the error enum. No I/O, clock, randomness or network of its own. Today: strict JSON, DSSE envelopes, root rotation, key sets, feeds, manifests, frame descriptors, the path, version and target rules, update policy, and the hidden `fuzz` harness module. Since M4 also the sans-IO client logic: the transport traits and the pure HTTP response rules (`Content-Range`, validators, encoding, fetch planning), the `Fs` trait, the install-state store (records, commit and load, scopes, transitions; FORMAT.md 12), the stage engine (scan for unchanged files, bounded parallel decode within a memory budget, resume, `NeedFetch`), the `CancelToken` and the progress event types. The one use of threads in the core is `std::thread::scope` (and `std::thread::panicking`) in the stage engine, because the worker count comes from the caller, so the output never depends on the machine; it uses no clock, environment, filesystem or network, the purity test allows exactly those two paths in `stage.rs`, and any other thread use in the core stays forbidden (M4-D12, user decision Q30, 2026-11-14). | nothing external beyond an explicit allowlist: `serde`, `serde_json`, `base64`, `semver`, `unicode-normalization`, `thiserror` (M2-D1) |
+| `lunepack-core` | Types, rules, verification policy, planning, state machine, apply engine; owns every trait and the error enum. No I/O, clock, randomness or network of its own. Today: strict JSON, DSSE envelopes, root rotation, key sets, feeds, manifests, frame descriptors, the path, version and target rules, update policy, and the hidden `fuzz` harness module. Since M4 also the sans-IO client logic: the transport traits and the pure HTTP response rules (`Content-Range`, validators, encoding, fetch planning), the `Fs` trait, the install-state store (records, commit and load, scopes, transitions; FORMAT.md 12), the stage engine (scan for unchanged files, bounded parallel decode within a memory budget, resume, `NeedFetch`), the `CancelToken` and the progress event types. Since M6 also the UI port (`ui`: the messages between the engine and the UI process, the capped and fail-closed frame codec, the build id and the flow reducers; below), the setup file's trailer (`setup`: FORMAT.md 14) and the offline payload verification (`verify_payload_manifest`, `read_entry`; M6-D4). The one use of threads in the core is `std::thread::scope` (and `std::thread::panicking`) in the stage engine, because the worker count comes from the caller, so the output never depends on the machine; it uses no clock, environment, filesystem or network, the purity test allows exactly those two paths in `stage.rs`, and any other thread use in the core stays forbidden (M4-D12, user decision Q30, 2026-11-14). | nothing external beyond an explicit allowlist: `serde`, `serde_json`, `base64`, `semver`, `unicode-normalization`, `thiserror` (M2-D1) |
 | `lunepack-testkit` | In-memory fakes and the contract suites. Today: a fake clock, hasher, signature scheme and codec (with fault knobs), the contract suites for the traits below, document builders over the core's real writer, and the fuzz seed writer; `MemFs`, an in-memory `Fs` that injects a crash at any operation and recovers under a chosen durability mode; `FakeTransport` and `FakeBlockingTransport` over a `FakeOrigin` (Range, `If-Range`, validators, redirects, a request log and fault knobs such as an ignored Range, a wrong `Content-Range`, a truncated, endless or one-byte-chunk body); and `LoopbackServer`, the same origin over a real `127.0.0.1` socket; and, since M5 step 3, `FakeRng`, `FakeProcess` and `FakeIntegration` with their suites. `publish = false`. | core |
 | `lunepack-crypto` | Hashing and signature verification adapters: SHA-256 and Ed25519 with strict verification; and the signers (M3): `Ed25519Signer` over PKCS#8 PEM from a file or an environment variable, `generate_key_file`, and `CommandSigner` (an external command whose signature is verified before use). Nothing it prints or returns in an error holds key material. | core |
 | `lunepack-codec-lzma` | Compression adapter over `lzma-rust2` (confined to this crate, M3-D11): the `Codec` decoder with limits from the signed descriptor, and the `Encoder` at the 9e settings for all five codec ids (stored, LZMA2, BCJ x86 and ARM64 + LZMA2, BCJ2). Delta coding comes later. | core |
 | `lunepack-fs` | Filesystem adapter: `StdFs`, the `Fs` implementation over `std::fs` (it refuses symlink components when it creates directories, and syncs files and directories), and the OS lock behind `Fs::try_lock` through `fs4` (released by the OS when its holder dies). May lift `unsafe_code`; documents that Windows directory durability is an unverified assumption. | core |
 | `lunepack-http` | Release source and network adapter: `UreqTransport`, the default `BlockingTransport` (ureq 3.5 with the OS platform verifier for TLS and the system proxy: environment first, then WinINET on Windows and the system proxy through hyper-util on macOS; no content decoding, `User-Agent: lunepack` only) and `DirSource`, which serves `file:` URLs under one root with Range support. The only crate that reaches `ring` (below). It also holds an `os_trust` example that CI runs through the real adapter. | core |
-| `lunepack-os-windows`, `lunepack-os-macos` | OS install, shortcut, autostart and process adapters (empty until M7 and M8). | core |
-| `lunepack-os-linux` | The Linux adapters (M5): `LinuxProcess` implements `Process` over `/proc` and `libc` (spawn without a shell, detach, wait by pid and start time so a reused pid is not mistaken for the original, terminate only its own child, the in-use scan of a tree), and `XdgIntegration` implements `OsIntegration` (the desktop entry `<data home>/applications/<app id>.desktop` built fail-closed from the update configuration, the command link in `~/.local/bin`, removal checked by a marker). One of the crates that may lift `unsafe_code`, each block with a `// SAFETY:` comment. | core |
-| `lunepack` | The app-facing facade and the composition root for apps that embed lunepack: `UpdaterBuilder` wires the default adapters (`WorkerTransport` over `UreqTransport` for `http(s)`, `DirSource` for `file:`, `StdFs`, the LZMA codec, SHA-256 and Ed25519 from `lunepack-crypto`, `SystemClock`), each swappable. `Updater` offers `check`, `download`, `stage` as `Send + 'static` futures that need no particular executor, the synchronous `installed` and `staged`, and `lunepack::blocking` for apps without a runtime. Under it, std-only task plumbing (worker jobs, bounded pipes, a built-in `block_on`, `WorkerTransport` that runs any `BlockingTransport` on worker threads, progress coalescing) and the fetch engine (documents, feed URLs, the cache, Range runs, pack resume, the full-pack fallback) (M4-D1 to M4-D3). Also `SystemClock` (M3-D5), the only wall-clock `Clock`. Since M5 it also finds an installed app from its own executable (`Installation`, which reads the update configuration of the tree and derives the install root `R`) and offers the lifecycle calls over the core's transitions: `startup`, `confirm_healthy`, `apply_and_restart` and `Updater::install` (M5-D2 to M5-D8); it wires the Linux process and integration adapters in `Platform::native`. | core, adapters |
-| `lunepack-runtime` | Binary, static musl on Linux, one per version tree and placed beside the app's entry by the packager (D28, M5-D7). Its composition root (`main.rs`) wires the Linux adapters and runs a mode named on its command line: `apply` (started detached by `apply_and_restart`: wait for the app to exit, commit the staged version, flip `current`, start it with a health token, supervise it, roll it back if it fails or does not confirm in time, then collect old trees), `install` (the first install from a bootstrap tree) and `uninstall`. Progress and results are schema-1 JSON events on its log (`R/logs/runtime.log`) or stderr; every outcome has a stable exit code. It does its work through the facade, and the same calls back the app-facing command line of D42 (`check`, `download`, `startup`, `confirm`: JSON Lines schema 1 and stable exit codes, `docs/RUNTIME.md`). Service and UI are later milestones. | core, adapters, facade |
-| `lunepack-cli` | Binary `lunepack` and the packager's composition root: `init`, `keys`, `pack`, `feed add` and `refresh`, `verify` and `inspect` (`docs/CLI.md`). It holds the I/O the core must not have: `lunepack.toml`, signer specs, the release-directory walk, the pack pipeline (assemble a temporary copy, code-sign, hash, pack on a worker pool within a memory budget, sign), self-verification of every output with the core verifiers, and placement by temp file and rename. Pure rules (codec choice, layout, manifest, signing, document writers) stay in the core (M3-D1). | core, adapters, facade |
+| `lunepack-os-windows`, `lunepack-os-macos` | OS install, shortcut, autostart and process adapters (empty until M7 and M8, except for the reduce-motion reader of M6-D8: `prefers_reduced_motion() -> Option<bool>`, through `windows-sys` on Windows and `defaults` on macOS). | core |
+| `lunepack-os-linux` | The Linux adapters (M5): `LinuxProcess` implements `Process` over `/proc` and `libc` (spawn without a shell, detach, wait by pid and start time so a reused pid is not mistaken for the original, terminate only its own child, the in-use scan of a tree), and `XdgIntegration` implements `OsIntegration` (the desktop entry `<data home>/applications/<app id>.desktop` built fail-closed from the update configuration, the command link in `~/.local/bin`, removal checked by a marker). `LinuxProcess` also starts a child with piped standard input and output for the UI channel (`ChildStdio::Piped`; the parent's ends are close-on-exec, M6-D1), and `prefers_reduced_motion` reads `gsettings` (M6-D8). One of the crates that may lift `unsafe_code`, each block with a `// SAFETY:` comment. | core |
+| `lunepack` | The app-facing facade and the composition root for apps that embed lunepack: `UpdaterBuilder` wires the default adapters (`WorkerTransport` over `UreqTransport` for `http(s)`, `DirSource` for `file:`, `StdFs`, the LZMA codec, SHA-256 and Ed25519 from `lunepack-crypto`, `SystemClock`), each swappable. `Updater` offers `check`, `download`, `stage` as `Send + 'static` futures that need no particular executor, the synchronous `installed` and `staged`, and `lunepack::blocking` for apps without a runtime. Under it, std-only task plumbing (worker jobs, bounded pipes, a built-in `block_on`, `WorkerTransport` that runs any `BlockingTransport` on worker threads, progress coalescing) and the fetch engine (documents, feed URLs, the cache, Range runs, pack resume, the full-pack fallback) (M4-D1 to M4-D3). Also `SystemClock` (M3-D5), the only wall-clock `Clock`. Since M5 it also finds an installed app from its own executable (`Installation`, which reads the update configuration of the tree and derives the install root `R`) and offers the lifecycle calls over the core's transitions: `startup`, `confirm_healthy`, `apply_and_restart` and `Updater::install` (M5-D2 to M5-D8), and since M6 `Updater::install_from_payload`, the first install from a setup file's own frames with no feed and no network (M6-D4), and the `UiChoice` of `apply_and_restart` (D41); it wires the Linux process and integration adapters in `Platform::native`. | core, adapters |
+| `lunepack-runtime` | Binary, static musl on Linux, one per version tree and placed beside the app's entry by the packager (D28, M5-D7). Its composition root (`main.rs`) wires the Linux adapters and runs a mode named on its command line: `apply` (started detached by `apply_and_restart`: wait for the app to exit, commit the staged version, flip `current`, start it with a health token, supervise it, roll it back if it fails or does not confirm in time, then collect old trees), `install` (the first install from a bootstrap tree) and `uninstall`. Progress and results are schema-1 JSON events on its log (`R/logs/runtime.log`) or stderr; every outcome has a stable exit code. It does its work through the facade, and the same calls back the app-facing command line of D42 (`check`, `download`, `startup`, `confirm`: JSON Lines schema 1 and stable exit codes, `docs/RUNTIME.md`). Since M6 it also owns the engine's side of the UI channel (`UiHost`, below) and the setup mode (a runtime that carries a setup trailer installs its own payload, `docs/RUNTIME.md`). The service is a later milestone. | core, adapters, facade |
+| `lunepack-cli` | Binary `lunepack` and the packager's composition root: `init`, `keys`, `pack`, `feed add` and `refresh`, `verify` and `inspect` (`docs/CLI.md`). It holds the I/O the core must not have: `lunepack.toml`, signer specs, the release-directory walk, the pack pipeline (assemble a temporary copy, code-sign, hash, pack on a worker pool within a memory budget, sign), self-verification of every output with the core verifiers, and placement by temp file and rename; since M6 also `pack --ui` and `setup`, which builds a Linux setup file. Pure rules (codec choice, layout, manifest, signing, document writers) stay in the core (M3-D1). | core, adapters, facade |
+| `lunepack-ui-luneui` | The UI adapter (M6): the screens of the install, update and uninstall flows, drawn with LuneUI (the "B revised" look with its motion, keyboard and accessibility tree, in opaque material on Linux). It holds a pure model over the core's reducers (`UiModel`; a frame is a pure function of the model and the time, so every screen and every animation step renders headless at a fixed time), the screens, the icon decoder (PNG only, capped, M6-D11), the bundled RznSans fonts, the headless renderer the golden tests use, and the demo example. It decides nothing, reads no file and starts no process; the engine does every one of those. The only crate that may depend on `lune-ui`, the one dependency from a git source (D39 (b)); the GPU and window stack under it (`wgpu`, `winit`, AccessKit) is reachable only through it (below). `publish = false`. | core |
+| `lunepack-ui` | Binary `lunepack-ui` (M6): the separate process the runtime spawns to show those screens (`--engine` is its only mode). It owns the winit event loop, the window and the GPU surface, the AccessKit bridge, and the two channel threads: a reader that decodes the frames on standard input and posts them to the loop, and a writer that sends the answers on standard output and writes nothing else. It reads the OS's reduce-motion setting (M6-D8) and ends with a typed exit code (below). The only crate that depends on `lunepack-ui-luneui`, and no crate depends on it. `publish = false`. | core, adapters |
 | `xtask` | Repository tooling: the boundary check, the key-container file check and the optional denylist scan. | nothing in the workspace |
 
 A language binding (a C ABI crate, later others) is one more adapter crate over the core and adds no logic.
@@ -72,7 +74,7 @@ Owned by the core, implemented by adapters, faked in the testkit. Defined today:
   fallback), implemented by `lunepack-crypto`'s `OsRng` over `getrandom`. Fake: `FakeRng`, a seeded
   deterministic sequence; suite: `run_rng_suite`, run by `OsRng` and the fake;
 - `Process` (the running executable and process id, the parent, `spawn_detached` and `spawn_child`
-  without a shell, `wait_exit` by pid and start time so a reused pid is not mistaken for the
+  without a shell (`spawn_child` with `ChildStdio::Piped` gives the parent the child's standard input and output, which only the UI channel uses, M6-D1; `spawn_detached` refuses it), `wait_exit` by pid and start time so a reused pid is not mistaken for the
   original, and `tree_in_use`; a `Child` is polled and terminated, only itself), implemented by
   `lunepack-os-linux` (M5 step 5). Fake: `FakeProcess` (records spawns, scripted exits, waits and
   in-use answers); suite: `run_process_suite`, which needs a helper executable the adapter's tests
@@ -130,6 +132,49 @@ An executable finds its own tree by walking up from its resolved path to the nea
 `lunepack-update.json`; the tree is installed when it is `R/versions/<its version>` with a record of
 the same app id at `R/state`. A tree anywhere else is a bootstrap (or a development run).
 
+## The installer UI (M6)
+
+Install, update and uninstall show their screens in a separate process, `lunepack-ui`, built on
+LuneUI (D35, D39). The engine (the runtime, in its install, uninstall, apply and setup modes) decides
+everything and does every file and process operation; the UI renders what the engine tells it and
+returns choices, and its failure never changes an outcome (M6-D5). No elevated or privileged process,
+and none of the runtime, the stub or the `lunepack` facade, links or initialises a GPU or window stack
+(D17); the boundary rules above enforce it.
+
+- **The port** is `lunepack_core::ui`: `EngineMsg` (hello with the flow, the app card and the install
+  details; progress; steps; prompts; the outcome; `Ping`; `Close`) and `UiMsg` (hello, choices,
+  `Pong`), the frame codec (`write_frame`, `read_frame`: M6-D2), the build id (`build_id`,
+  `check_hello`) and the reducers. `FlowState` is the engine's model of the conversation: it says which
+  engine message is valid next (`apply`) and whether a message from the UI is acceptable now
+  (`accepts`: a choice must answer the open prompt's id with a value of that prompt's set; `Pong` the
+  latest `Ping`). Every choice goes through it before anything acts on it.
+- **The channel** is the UI's standard input (engine to UI) and standard output (UI to engine), as
+  pipes created at spawn (M6-D1); its error stream is null. Frames are a little-endian `u32` length and
+  a strict JSON body of at most 1 MiB. The UI says hello first with its build id, and the engine
+  refuses a different one: UI and engine are from one build (D28), so the protocol carries no
+  cross-version promise.
+- **The host** is `lunepack-runtime`'s `UiHost`. It starts the UI only from the directory of the
+  runtime's own resolved path, never through `PATH`, `current` or a link (a setup file's UI comes from
+  its private directory, M6-D7), and not at all under `--silent` or `--no-ui`, with `LUNEPACK_NO_UI`,
+  with no display, or with no UI binary. Three threads belong to it and none is ever joined without a
+  bound: the writer (the only thread that writes to the UI, fed by a bounded channel, so the
+  operation never waits for a UI), the reader (checks each frame against the reducer) and the
+  watchdog. A frame that does not fit, a write in progress for more than 2 s, no hello within 20 s,
+  no `Pong` within 15 s of a `Ping` (sent when a question opens and every 5 s after), a protocol
+  error or an exit stops the UI: the host kills its own child, goes headless, and logs one
+  `ui_stopped` warning with a reason from a closed set (`docs/RUNTIME.md`).
+- **Exit codes** of `lunepack-ui`: 0 closed, 10 no display, 11 no adapter, 12 protocol error, 13 engine
+  gone, 14 build-id mismatch, 2 usage. The host maps 12 to `protocol` and 14 to `build_mismatch`; any
+  other exit is `exited` with the code logged beside it.
+- **Headless** is the default of every question (proceed, do not launch, close, acknowledge), so a
+  machine with no display, no adapter or no UI binary installs and updates as before (D36, D41).
+- **Tests.** The host runs against a fake UI in `crates/lunepack-runtime/tests/ui_host.rs` (a UI that
+  never speaks, stops reading, hangs, exits at each typed code, sends garbage, is killed); the screens
+  are checked by headless golden frames (one set per OS, M6-D9), an accessibility tree replay and a
+  keyboard script per prompt in `lunepack-ui-luneui`; the real binary by a smoke test against a
+  scripted engine in `lunepack-ui`; these run on developers' machines, not in CI (M6-D13); and the Linux end-to-end suite installs through a setup file with
+  a stand-in UI that speaks the protocol with no window, with the UI killed and with none.
+
 ## Composition roots
 
 Nothing constructs an adapter except a composition root: the `lunepack` facade for embedding
@@ -157,7 +202,8 @@ check does not recognise is a violation, and an internal error exits 2, never 0.
   neither from crates.io nor, without a source, one of that lock's own members by name and version
   (the workspace members, or the probe's own package); this catches git and other-registry sources
   and path dependencies, including those redirected by `[patch]`, `[replace]` or a
-  `.cargo/config.toml` patch, because the lock records what cargo actually resolved. A `[patch]` or
+  `.cargo/config.toml` patch, because the lock records what cargo actually resolved. The one
+  exception is the workspace lock's LuneUI source (D39 (b), below). A `[patch]` or
   `[replace]` section in the root or a probe manifest is flagged too. The check does not read
   `.cargo/config.toml` itself; it sees a config patch only through the lock it produced.
 - `fuzz/` (M2-D9): its `Cargo.lock` is held to the same rule, with the workspace's members (by name
@@ -183,6 +229,21 @@ check does not recognise is a violation, and an internal error exits 2, never 0.
   match, so `openssl-probe` is allowed). An edge that matches no entry or several, or a
   `dependencies` value that is not an array of strings, is a violation too, because the graph
   cannot be trusted. Probe locks are exempt: they are throwaway and outside the workspace.
+
+- LuneUI and its GPU and window stack (M6; D17, D39 (b)):
+  - the only git source is `https://github.com/lune-rs/luneui-rs` at one exact commit, set by
+    `LUNEUI_GIT_URL` and `LUNEUI_REV`. A dependency on any of LuneUI's own packages (`LUNEUI_CRATES`)
+    must carry exactly that source as `cargo metadata` reports it, so another URL, another commit,
+    a `branch` or a `tag`, or no `rev`, is a violation. In the workspace lock only that exact source
+    string (with the same commit after `#`) may be a git source, only LuneUI's own packages may come
+    from it, and they may come from nowhere else. Probe and fuzz locks get no such exception;
+  - `lune-ui` is confined (`CONFINED`) to `lunepack-ui-luneui`, and `lunepack-ui-luneui` is a
+    dependency of `lunepack-ui` alone, `lunepack-ui` of nothing (`ONLY_DEPENDED_ON_BY`; any kind,
+    and the fuzz project's path dependencies too);
+  - `lune-ui*`, `wgpu*`, `winit*` and `accesskit*` (a family is the name, or the name continued
+    with `-` or `_`) are reachable only through `lunepack-ui-luneui`
+    (`REACH_FAMILIES_ONLY_THROUGH`, the walk of M4-D16 over the lock graph). So the only crates
+    whose dependency closure holds `wgpu` or `winit` are `lunepack-ui-luneui` and `lunepack-ui`.
 
 Adding a crate is one line in `ROLES` in `xtask/src/boundaries.rs`.
 

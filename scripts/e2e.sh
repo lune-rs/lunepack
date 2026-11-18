@@ -8,11 +8,14 @@
 #                                           Refuses off Linux and outside a container or CI.
 #
 # Inside, it builds the static musl runtime (scripts/build-runtime.sh; or takes --runtime), the
-# `lunepack` command line and the Rust example app, then runs the test binary
-# crates/lunepack-runtime/tests/e2e with them and with the shell app (tests/e2e/shell-app/app.sh,
-# checked with shellcheck when that is installed). The scenario table runs once per app and the two
-# outcome logs must be equal; the command-line extras run after. LUNEPACK_E2E_REQUIRE=1 is set, so
-# a missing piece fails instead of skipping.
+# `lunepack` command line, the Rust example app, the stand-in UI (a small executable that speaks the
+# frame protocol with no window, tests/e2e/fake-ui) and the real `lunepack-ui`, then runs the test
+# binary crates/lunepack-runtime/tests/e2e with them and with the shell app
+# (tests/e2e/shell-app/app.sh, checked with shellcheck when that is installed). The scenario table
+# and the UI table (setup files, a UI that is absent or killed) run once per app and the two
+# outcome logs of each must be equal; the command-line and UI extras run after. No scenario needs a
+# GPU or a display: the real UI is only started with a DISPLAY that nothing serves, to see it exit
+# with its typed code. LUNEPACK_E2E_REQUIRE=1 is set, so a missing piece fails instead of skipping.
 #
 # The Docker mode builds the image `lunepack-rs-e2e:<hash>` from scripts/e2e.Dockerfile (once per
 # Dockerfile change), runs `docker run --rm --init` (a reaping PID 1, as on a desktop) with the
@@ -123,11 +126,15 @@ if [ -z "$runtime" ]; then
 fi
 [ -f "$runtime" ] || die "the runtime is not a file"
 
-echo "e2e: building the lunepack command line and the example app"
+echo "e2e: building the lunepack command line, the example app and the UIs"
 cargo build --locked --release -p lunepack-cli
 cargo build --locked --release -p lunepack --example e2e_app
-# A stripped copy: the app is packed once per release, and its size is the pack's.
+cargo build --locked --release -p lunepack-runtime --example e2e_fake_ui
+cargo build --locked --release -p lunepack-ui
+# A stripped copy: each is packed with the releases, and its size is the pack's.
 strip -o "$work/e2e_app" "$tdir/release/examples/e2e_app"
+strip -o "$work/e2e_fake_ui" "$tdir/release/examples/e2e_fake_ui"
+strip -o "$work/lunepack-ui" "$tdir/release/lunepack-ui"
 
 shell_app=$top/crates/lunepack-runtime/tests/e2e/shell-app/app.sh
 [ -f "$shell_app" ] || die "the shell app is missing"
@@ -139,5 +146,7 @@ LUNEPACK_E2E_RUNTIME=$runtime \
   LUNEPACK_E2E_CLI=$tdir/release/lunepack \
   LUNEPACK_E2E_APP=$work/e2e_app \
   LUNEPACK_E2E_SHELL_APP=$shell_app \
+  LUNEPACK_E2E_FAKE_UI=$work/e2e_fake_ui \
+  LUNEPACK_E2E_UI=$work/lunepack-ui \
   LUNEPACK_E2E_REQUIRE=1 \
   cargo test --locked -p lunepack-runtime --test e2e

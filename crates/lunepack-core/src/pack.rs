@@ -216,7 +216,9 @@ fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(raw))
 }
 
-fn check_elf_runtime(bytes: &[u8], machine: u16) -> Result<(), RuntimeImageError> {
+/// The ELF header and program headers of a `linux-*` image. `dynamic_ok` lets a `PT_INTERP` pass
+/// (the UI is glibc-dynamic; the runtime is static).
+fn check_elf_image(bytes: &[u8], machine: u16, dynamic_ok: bool) -> Result<(), RuntimeImageError> {
     use RuntimeImageError as E;
     // ELFCLASS64 and little-endian: both Linux targets.
     if !bytes.starts_with(&[0x7F, b'E', b'L', b'F']) || bytes.get(4) != Some(&2) {
@@ -250,7 +252,7 @@ fn check_elf_runtime(bytes: &[u8], machine: u16) -> Result<(), RuntimeImageError
     let mut loads = 0usize;
     for i in 0..phnum {
         match u32_at(bytes, phoff + i * ELF_PHENTSIZE, false).ok_or(E::Malformed)? {
-            PT_INTERP => return Err(E::Dynamic),
+            PT_INTERP if !dynamic_ok => return Err(E::Dynamic),
             PT_LOAD => loads += 1,
             _ => {}
         }
@@ -316,13 +318,24 @@ fn check_macho_runtime(bytes: &[u8], target: Target) -> Result<(), RuntimeImageE
 /// Windows and macOS runtimes exist). Bounds-checked; never panics.
 pub fn check_runtime_image(bytes: &[u8], target: Target) -> Result<(), RuntimeImageError> {
     match target {
-        Target::LinuxX86_64 => check_elf_runtime(bytes, 62),
-        Target::LinuxAarch64 => check_elf_runtime(bytes, 183),
+        Target::LinuxX86_64 => check_elf_image(bytes, 62, false),
+        Target::LinuxAarch64 => check_elf_image(bytes, 183, false),
         Target::WindowsX86_64 => check_pe_runtime(bytes, 0x8664),
         Target::WindowsAarch64 => check_pe_runtime(bytes, 0xAA64),
         Target::MacosX86_64 | Target::MacosAarch64 | Target::MacosUniversal => {
             check_macho_runtime(bytes, target)
         }
+    }
+}
+
+/// Checks that `bytes` can be the `lunepack-ui` binary of `target`, from the header alone, with the
+/// rules of [`check_runtime_image`] except one: a `linux-*` UI may name an interpreter, since it is
+/// glibc-dynamic. Bounds-checked; never panics.
+pub fn check_ui_image(bytes: &[u8], target: Target) -> Result<(), RuntimeImageError> {
+    match target {
+        Target::LinuxX86_64 => check_elf_image(bytes, 62, true),
+        Target::LinuxAarch64 => check_elf_image(bytes, 183, true),
+        _ => check_runtime_image(bytes, target),
     }
 }
 

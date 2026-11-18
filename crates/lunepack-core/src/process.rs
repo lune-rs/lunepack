@@ -15,7 +15,7 @@ use core::time::Duration;
 use std::error::Error as StdError;
 use std::ffi::OsString;
 use std::fmt;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, Untrusted};
@@ -31,6 +31,20 @@ pub struct ProcessId {
     pub start_ticks: u64,
 }
 
+/// What a child's standard input and output are connected to (M6-D1). Its error stream is always
+/// null.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChildStdio {
+    /// The null device: the child neither reads nor writes anything through them.
+    #[default]
+    Null,
+    /// Anonymous pipes to the parent, which the parent's [`Child`] hands out once
+    /// ([`Child::take_stdin`], [`Child::take_stdout`]). Only [`Process::spawn_child`] accepts this:
+    /// a detached process has no owner for its pipes. The parent's ends of the pipes are not
+    /// inherited by any process the parent starts later.
+    Piped,
+}
+
 /// A program to start. The program runs without a shell; each argument reaches it as one
 /// argument, as given.
 #[derive(Clone, PartialEq, Eq)]
@@ -43,16 +57,19 @@ pub struct SpawnSpec {
     pub env_set: Vec<(OsString, OsString)>,
     /// Environment variables to remove from the inherited environment.
     pub env_remove: Vec<OsString>,
+    /// What its standard input and output are connected to.
+    pub stdio: ChildStdio,
 }
 
 impl SpawnSpec {
-    /// A spec for `program` with no arguments and the inherited environment.
+    /// A spec for `program` with no arguments, the inherited environment and null streams.
     pub fn new(program: impl Into<PathBuf>) -> SpawnSpec {
         SpawnSpec {
             program: program.into(),
             args: Vec::new(),
             env_set: Vec::new(),
             env_remove: Vec::new(),
+            stdio: ChildStdio::Null,
         }
     }
 }
@@ -74,6 +91,7 @@ impl fmt::Debug for SpawnSpec {
             .field("args", &self.args.len())
             .field("env_set", &set)
             .field("env_remove", &removed)
+            .field("stdio", &self.stdio)
             .finish()
     }
 }
@@ -241,6 +259,16 @@ pub trait Child: Send {
     /// for it to exit, then kills it. Returns once the child is gone and reaped; a child that
     /// already ended is not an error. The exit is then reported by [`Child::try_wait`].
     fn terminate(&mut self, grace: Duration) -> Result<()>;
+
+    /// The write end of the child's standard input, once, when it was started with
+    /// [`ChildStdio::Piped`]; `None` for a null child and after the first call. Dropping it closes
+    /// the pipe, which is the child's end of file. Writing blocks while the child does not read.
+    fn take_stdin(&mut self) -> Option<Box<dyn Write + Send>>;
+
+    /// The read end of the child's standard output, once, when it was started with
+    /// [`ChildStdio::Piped`]; `None` for a null child and after the first call. A read blocks until
+    /// the child writes or ends, and then reports the end of file.
+    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>>;
 }
 
 /// Starting, watching and ending processes, and asking which ones use a directory. Object-safe
@@ -255,11 +283,14 @@ pub trait Process: Send + Sync {
     /// The parent process, or `None` when the parent is pid 1 or gone (the process was adopted).
     fn parent(&self) -> Result<Option<ProcessId>>;
 
-    /// Starts `spec` in a new session with its standard streams null, and does not wait for it. The program outlives this process.
+    /// Starts `spec` in a new session with its standard streams null, and does not wait for it. The
+    /// program outlives this process. A spec with [`ChildStdio::Piped`] is refused
+    /// ([`ProcessErrorKind::InvalidRequest`]): nobody would own the pipes.
     fn spawn_detached(&self, spec: &SpawnSpec) -> Result<()>;
 
-    /// Starts `spec` as a child of this process, standard streams null. The caller reaps it
-    /// through the returned [`Child`].
+    /// Starts `spec` as a child of this process. The standard error stream is null, and so are
+    /// the others unless the spec says [`ChildStdio::Piped`]. The caller reaps it through the
+    /// returned [`Child`].
     fn spawn_child(&self, spec: &SpawnSpec) -> Result<Box<dyn Child>>;
 
     /// Waits up to `timeout` for the process `id` to end. It only waits: it never signals, and

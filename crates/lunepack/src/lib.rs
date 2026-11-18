@@ -123,12 +123,12 @@ pub use executor::block_on;
 pub use feed_rule::check_config_feed;
 pub use installation::{HEALTH_TOKEN_VAR, Installation, Platform};
 pub use lifecycle::{
-    ApplyOptions, ApplyScheduled, Startup, StartupAction, apply_and_restart, apply_and_restart_for,
-    confirm_for, confirm_healthy, startup, startup_for,
+    ApplyOptions, ApplyScheduled, Startup, StartupAction, UiChoice, apply_and_restart,
+    apply_and_restart_for, confirm_for, confirm_healthy, startup, startup_for,
 };
 pub use updater::{
-    DownloadOptions, Downloaded, InstalledVersion, Layout, ProgressCallback, StagedVersion,
-    Timeouts, UpdateInfo, Updater, UpdaterBuilder,
+    DownloadOptions, Downloaded, InstalledVersion, Layout, OfflinePayload, PayloadPart,
+    ProgressCallback, StagedVersion, Timeouts, UpdateInfo, Updater, UpdaterBuilder,
 };
 pub use worker_transport::WorkerTransport;
 
@@ -140,13 +140,13 @@ pub use lunepack_core::Error as CoreError;
 pub use lunepack_core::fetch::FetchPolicy;
 pub use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, Body, BoxFuture, ByteRange, CancelToken, Channel,
-    Child, Clock, Codec, ConfirmOutcome, DirEntryInfo, ExitKind, FeedKind, FeedRule, FileKind,
-    FileProgress, FileWrite, Fs, FsError, FsErrorKind, Hasher, Head, InstallMeta, IntegrationError,
-    IntegrationItem, IntegrationReport, IntegrationRequest, LifecycleEvent, LockGuard, Meta,
-    OsIntegration, Phase, Process, ProcessError, ProcessErrorKind, ProcessId, Progress, RangeError,
-    ReadAt, RelPath, Request, Response, Rng, Sha256Digest, Source, SpawnSpec, StateError, Target,
-    Transport, TransportError, TransportErrorKind, TrustedRoot, UpdateConfig, UpdateConfigError,
-    UserLayout, Validator, Verifier, Version, WaitOutcome,
+    Child, ChildStdio, Clock, Codec, ConfirmOutcome, DirEntryInfo, ExitKind, FeedKind, FeedRule,
+    FileKind, FileProgress, FileWrite, Fs, FsError, FsErrorKind, Hasher, Head, InstallMeta,
+    IntegrationError, IntegrationItem, IntegrationReport, IntegrationRequest, LifecycleEvent,
+    LockGuard, Meta, OsIntegration, Phase, Process, ProcessError, ProcessErrorKind, ProcessId,
+    Progress, RangeError, ReadAt, RelPath, Request, Response, Rng, Sha256Digest, Source, SpawnSpec,
+    StateError, Target, Transport, TransportError, TransportErrorKind, TrustedRoot, UpdateConfig,
+    UpdateConfigError, UserLayout, Validator, Verifier, Version, WaitOutcome,
 };
 
 /// Plumbing that tests and sibling crates use; not part of the supported API and free to change in

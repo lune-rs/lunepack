@@ -39,7 +39,7 @@ undocumented_unsafe_blocks = "deny"
     fn manifest(name: &str, lints: &str, deps: &str) -> String {
         format!(
             "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
-             rust-version = \"1.88\"\nlicense = \"MIT OR Apache-2.0\"\npublish = false\n\n\
+             rust-version = \"1.90\"\nlicense = \"MIT OR Apache-2.0\"\npublish = false\n\n\
              {lints}\n[dependencies]\n{deps}"
         )
     }
@@ -1213,7 +1213,7 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         );
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            "boundaries: ok (13 packages)"
+            "boundaries: ok (15 packages)"
         );
     }
 
@@ -1226,7 +1226,7 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         assert_has(&fx.run().1, "lunepack-http", "edition");
         let mut fx = Fx::clean();
         fx.edit("lunepack-http", |m| {
-            *m = m.replace("rust-version = \"1.88\"", "rust-version = \"1.89\"")
+            *m = m.replace("rust-version = \"1.90\"", "rust-version = \"1.89\"")
         });
         assert_has(&fx.run().1, "lunepack-http", "rust-version");
         let mut fx = Fx::clean();
@@ -1274,5 +1274,308 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         fs::write(p.join("src/lib.rs"), "").unwrap();
         let (_, vs) = check_workspace(dir.path()).unwrap();
         assert_has(&vs, "p1", "probes");
+    }
+
+    // M6 step 1: LuneUI is the one git source; its GPU and window stack is confined to the UI adapter -
+
+    const LUNE_URL: &str = "https://github.com/lune-rs/luneui-rs";
+    const LUNE_REV: &str = "cbeae0109f970eaede7f1826414f139bb8eace65";
+
+    fn lune_dep_with(git_and_rev: &str) -> String {
+        format!("lune-ui = {{ {git_and_rev} }}")
+    }
+
+    fn lune_dep() -> String {
+        lune_dep_with(&format!("git = \"{LUNE_URL}\", rev = \"{LUNE_REV}\""))
+    }
+
+    fn lune_lock_source() -> String {
+        format!("git+{LUNE_URL}?rev={LUNE_REV}#{LUNE_REV}")
+    }
+
+    /// A lock entry from `source` (a full lock `source` string, not crates.io).
+    fn lock_from(name: &str, version: &str, source: &str, deps: Option<&str>) -> String {
+        let deps = deps
+            .map(|d| format!("dependencies = {d}\n"))
+            .unwrap_or_default();
+        format!(
+            "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"{source}\"\n{deps}"
+        )
+    }
+
+    /// The clean fixture plus the UI adapter (depending on `lune-ui` at the pin) and the `lunepack-ui`
+    /// binary, with a lock holding LuneUI's packages and a small `wgpu` / `winit` chain below them.
+    fn with_ui() -> Fx {
+        let mut fx = Fx::clean();
+        let core = r#"lunepack-core = { path = "../lunepack-core" }"#;
+        fx.crates.insert(
+            "lunepack-ui-luneui".into(),
+            manifest(
+                "lunepack-ui-luneui",
+                INHERIT,
+                &format!("{core}\n{}", lune_dep()),
+            ),
+        );
+        fx.crates.insert(
+            "lunepack-ui".into(),
+            manifest(
+                "lunepack-ui",
+                INHERIT,
+                &format!("{core}\nlunepack-ui-luneui = {{ path = \"../lunepack-ui-luneui\" }}"),
+            ),
+        );
+        let src = lune_lock_source();
+        fx.lock_member_extra.insert(
+            "lunepack-ui-luneui".into(),
+            format!("dependencies = [\n \"lune-ui 0.7.0 ({src})\",\n \"lunepack-core\",\n]\n"),
+        );
+        fx.lock_member_extra.insert(
+            "lunepack-ui".into(),
+            "dependencies = [\n \"lunepack-core\",\n \"lunepack-ui-luneui\",\n]\n".into(),
+        );
+        fx.lock_extra = Some(
+            [
+                lock_from(
+                    "lune-ui",
+                    "0.7.0",
+                    &src,
+                    Some(&format!(
+                        "[\"lune-ui-wgpu 0.7.0 ({src})\", \"winit 0.30.0\"]"
+                    )),
+                ),
+                lock_from("lune-ui-wgpu", "0.7.0", &src, Some("[\"wgpu 30.0.0\"]")),
+                lock_crate("wgpu", "30.0.0", None),
+                lock_crate("winit", "0.30.0", None),
+            ]
+            .concat(),
+        );
+        fx
+    }
+
+    #[test]
+    fn w_the_ui_crates_at_the_pinned_source_are_clean() {
+        let (n, vs) = with_ui().run();
+        assert_eq!(n, 8);
+        assert_clean(&vs);
+    }
+
+    #[test]
+    fn w_another_git_url_is_rejected() {
+        let mut fx = with_ui();
+        fx.edit("lunepack-ui-luneui", |m| {
+            *m = m.replace(
+                &lune_dep(),
+                &lune_dep_with(&format!(
+                    "git = \"https://example.invalid/luneui-rs\", rev = \"{LUNE_REV}\""
+                )),
+            )
+        });
+        assert_has(&fx.run().1, "lunepack-ui-luneui", "source");
+    }
+
+    #[test]
+    fn w_the_same_url_at_another_rev_is_rejected_in_the_manifest_and_in_the_lock() {
+        let other = "0123456789abcdef0123456789abcdef01234567";
+        let mut fx = with_ui();
+        fx.edit("lunepack-ui-luneui", |m| *m = m.replace(LUNE_REV, other));
+        assert_has(&fx.run().1, "lunepack-ui-luneui", "source");
+
+        // The manifest is clean but the lock resolved another commit.
+        let mut fx = with_ui();
+        fx.lock_extra = fx.lock_extra.map(|l| l.replace(LUNE_REV, other));
+        fx.lock_member_extra
+            .values_mut()
+            .for_each(|m| *m = m.replace(LUNE_REV, other));
+        assert_has(&fx.run().1, "lune-ui", "lock-source");
+    }
+
+    #[test]
+    fn w_a_git_source_with_a_branch_or_a_tag_instead_of_a_rev_is_rejected() {
+        for selector in ["branch = \"main\"", "tag = \"v0.7.0\"", ""] {
+            let mut fx = with_ui();
+            fx.edit("lunepack-ui-luneui", |m| {
+                *m = m.replace(
+                    &lune_dep(),
+                    &lune_dep_with(&format!("git = \"{LUNE_URL}\", {selector}")),
+                )
+            });
+            assert_has(&fx.run().1, "lunepack-ui-luneui", "source");
+        }
+    }
+
+    #[test]
+    fn w_lune_ui_in_the_runtime_is_rejected() {
+        let mut fx = with_ui();
+        fx.crates.insert(
+            "lunepack-runtime".into(),
+            manifest(
+                "lunepack-runtime",
+                INHERIT,
+                &format!(
+                    "lunepack-core = {{ path = \"../lunepack-core\" }}\n{}",
+                    lune_dep()
+                ),
+            ),
+        );
+        assert_has(&fx.run().1, "lunepack-runtime", "confined");
+    }
+
+    #[test]
+    fn w_lune_ui_in_the_lock_entry_of_another_member_is_rejected() {
+        let mut fx = with_ui();
+        fx.lock_member_extra.insert(
+            "lunepack".into(),
+            format!(
+                "dependencies = [\"lune-ui 0.7.0 ({})\"]\n",
+                lune_lock_source()
+            ),
+        );
+        assert_has(&fx.run().1, "lunepack", "confined");
+    }
+
+    #[test]
+    fn w_wgpu_added_directly_to_the_facade_is_rejected_and_names_the_path() {
+        let mut fx = with_ui();
+        fx.add_dep("lunepack", r#"wgpu = "30""#);
+        fx.lock_member_extra.insert(
+            "lunepack".into(),
+            "dependencies = [\"lunepack-core\", \"wgpu\"]\n".into(),
+        );
+        let vs = fx.run().1;
+        assert_has(&vs, "lunepack", "reach");
+        assert!(
+            detail_of(&vs, "lunepack", "reach").contains("lunepack -> wgpu"),
+            "{}",
+            render(&vs)
+        );
+        assert!(!has(&vs, "lunepack-ui", "reach"), "{}", render(&vs));
+        assert!(!has(&vs, "lunepack-ui-luneui", "reach"), "{}", render(&vs));
+    }
+
+    #[test]
+    fn w_the_stack_is_reached_by_family_name_not_only_by_wgpu() {
+        for (name, deps) in [
+            ("wgpu-hal", None),
+            ("winit", None),
+            ("accesskit_consumer", None),
+        ] {
+            let mut fx = with_ui();
+            fx.lock_member_extra.insert(
+                "lunepack-cli".into(),
+                format!("dependencies = [\"lunepack-core\", \"{name}\"]\n"),
+            );
+            fx.lock_extra = fx
+                .lock_extra
+                .map(|l| format!("{l}{}", lock_crate(name, "1.0.0", deps)));
+            assert_has(&fx.run().1, "lunepack-cli", "reach");
+        }
+        // A look-alike name is not in the family.
+        let mut fx = with_ui();
+        fx.lock_member_extra.insert(
+            "lunepack-cli".into(),
+            "dependencies = [\"lunepack-core\", \"winitx\"]\n".into(),
+        );
+        fx.lock_extra = fx
+            .lock_extra
+            .map(|l| format!("{l}{}", lock_crate("winitx", "1.0.0", None)));
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn w_the_ui_adapter_in_the_cli_is_rejected() {
+        let mut fx = with_ui();
+        fx.add_dep(
+            "lunepack-cli",
+            r#"lunepack-ui-luneui = { path = "../lunepack-ui-luneui" }"#,
+        );
+        assert_has(&fx.run().1, "lunepack-cli", "confined");
+        // Dev-dependencies count too.
+        let mut fx = with_ui();
+        fx.append(
+            "lunepack",
+            "[dev-dependencies]\nlunepack-ui-luneui = { path = \"../lunepack-ui-luneui\" }",
+        );
+        assert_has(&fx.run().1, "lunepack", "confined");
+    }
+
+    #[test]
+    fn w_no_crate_may_depend_on_the_ui_binary() {
+        let mut fx = with_ui();
+        fx.add_dep(
+            "lunepack-cli",
+            r#"lunepack-ui = { path = "../lunepack-ui" }"#,
+        );
+        assert_has(&fx.run().1, "lunepack-cli", "confined");
+    }
+
+    #[test]
+    fn w_the_fuzz_project_may_not_depend_on_the_ui_crates() {
+        let mut fx = with_ui();
+        fx.root = fx
+            .root
+            .replace("exclude = [\"probes\"]", "exclude = [\"probes\", \"fuzz\"]");
+        let dir = fx.write();
+        let manifest = FUZZ_MANIFEST.replace(
+            "lunepack-core = { path = \"../crates/lunepack-core\" }",
+            "lunepack-core = { path = \"../crates/lunepack-core\" }\n\
+             lunepack-ui-luneui = { path = \"../crates/lunepack-ui-luneui\" }",
+        );
+        fuzz_files(&dir, &manifest, Some(FUZZ_LOCK_HEAD));
+        let (_, vs) = check_workspace(dir.path()).expect("check");
+        assert_has(&vs, "lunepack-ui-luneui", "fuzz-dep");
+    }
+
+    #[test]
+    fn w_a_second_git_crate_from_an_unrelated_repo_in_the_lock_is_rejected() {
+        let mut fx = with_ui();
+        fx.lock_extra = fx.lock_extra.map(|l| {
+            format!(
+                "{l}{}",
+                lock_from(
+                    "other-crate",
+                    "1.0.0",
+                    "git+https://example.invalid/other?rev=abc#abc",
+                    None
+                )
+            )
+        });
+        assert_has(&fx.run().1, "other-crate", "lock-source");
+    }
+
+    #[test]
+    fn w_only_luneuis_own_packages_may_come_from_its_source() {
+        let mut fx = with_ui();
+        fx.lock_extra = fx.lock_extra.map(|l| {
+            format!(
+                "{l}{}",
+                lock_from("serde", "1.0.0", &lune_lock_source(), None)
+            )
+        });
+        assert_has(&fx.run().1, "serde", "lock-source");
+        // And LuneUI's own package from crates.io is a squatter.
+        let mut fx = with_ui();
+        fx.lock_extra = fx
+            .lock_extra
+            .map(|l| format!("{l}{}", lock_crate("lune-ui-core", "0.7.0", None)));
+        assert_has(&fx.run().1, "lune-ui-core", "lock-source");
+    }
+
+    #[test]
+    fn w_the_probe_and_fuzz_locks_get_no_luneui_exception() {
+        let dir = Fx::clean().write();
+        let probe = dir.path().join("probes").join("demo");
+        fs::create_dir_all(probe.join("src")).unwrap();
+        fs::write(probe.join("Cargo.toml"), manifest("demo", "", "")).unwrap();
+        fs::write(probe.join("src/lib.rs"), "").unwrap();
+        fs::write(
+            probe.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.0.0\"\n{}",
+                lock_from("lune-ui", "0.7.0", &lune_lock_source(), None)
+            ),
+        )
+        .unwrap();
+        let (_, vs) = check_workspace(dir.path()).expect("check");
+        assert_has(&vs, "lune-ui", "lock-source");
     }
 }

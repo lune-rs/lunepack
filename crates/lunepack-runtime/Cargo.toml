@@ -18,6 +18,8 @@ lunepack-os-linux.workspace = true
 # The filesystem and crypto adapters (wired in main.rs, the composition root).
 lunepack-fs.workspace = true
 lunepack-crypto.workspace = true
+# The frame decoder for the setup mode's single-entry reads (M6 step 7).
+lunepack-codec-lzma.workspace = true
 
 [dev-dependencies]
 lunepack-testkit.workspace = true
@@ -29,8 +31,24 @@ tempfile = { workspace = true }
 name = "apply"
 harness = false
 
+# The UI host against a fake UI (M6): own main, the test binary is also the fake UI and the app.
+[[test]]
+name = "ui_host"
+harness = false
+
+# A setup file run for real (M6 step 7): own main, the test binary is also the fake UI.
+[[test]]
+name = "setup"
+harness = false
+
 # The end-to-end suite (M5-D13): own main, run by scripts/e2e.sh, a SKIP without its environment.
 [[test]]
 name = "e2e"
 path = "tests/e2e/main.rs"
 harness = false
+
+# The stand-in UI of the end-to-end suite (M6 step 11): a small executable that speaks the frame
+# protocol with no window, packed beside the runtime by `pack --ui`.
+[[example]]
+name = "e2e_fake_ui"
+path = "tests/e2e/fake-ui/main.rs"

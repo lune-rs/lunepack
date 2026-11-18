@@ -2,6 +2,10 @@
 //!
 //! - Programs start through `std::process::Command` with an absolute path: no shell and no `PATH`
 //!   lookup. `env_remove` is applied before `env_set`, so a variable in both lists ends up set.
+//! - A piped child (`ChildStdio::Piped`, M6-D1) gets anonymous pipes from `std`, which creates the
+//!   parent's ends close-on-exec: no process this one starts afterwards inherits them (the app the
+//!   runtime relaunches must not hold the UI's channel). Its error stream stays null. A detached
+//!   spawn refuses pipes.
 //! - A detached program leads a new session (`setsid` between fork and exec) with its standard
 //!   streams on `/dev/null`, so neither a hangup of the caller's terminal or process group nor a
 //!   reader of the caller's pipes waits for it.
@@ -11,15 +15,15 @@
 //!   its pid cannot have been reused.
 
 use core::time::Duration;
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use lunepack_core::{
-    Child, Error, ExitKind, Process, ProcessError, ProcessErrorKind, ProcessId, SpawnSpec,
-    WaitOutcome,
+    Child, ChildStdio, Error, ExitKind, Process, ProcessError, ProcessErrorKind, ProcessId,
+    SpawnSpec, WaitOutcome,
 };
 
 use crate::procfs::{self, Probe};
@@ -73,7 +77,7 @@ fn spawn_error(err: io::Error, program: &Path) -> Error {
         .into()
 }
 
-/// The command for `spec`, standard streams null.
+/// The command for `spec`: the error stream null, the others null or piped as the spec says.
 fn command(spec: &SpawnSpec) -> Result<Command, Error> {
     if !spec.program.is_absolute() {
         return Err(ProcessError::new(ProcessErrorKind::InvalidRequest, "spawn")
@@ -88,9 +92,11 @@ fn command(spec: &SpawnSpec) -> Result<Command, Error> {
     for (name, value) in &spec.env_set {
         cmd.env(name, value);
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    let piped = || match spec.stdio {
+        ChildStdio::Piped => Stdio::piped(),
+        _ => Stdio::null(),
+    };
+    cmd.stdin(piped()).stdout(piped()).stderr(Stdio::null());
     Ok(cmd)
 }
 
@@ -170,6 +176,12 @@ impl Process for LinuxProcess {
     }
 
     fn spawn_detached(&self, spec: &SpawnSpec) -> Result<(), Error> {
+        if spec.stdio != ChildStdio::Null {
+            // Nobody would own the pipes of a program that outlives this process.
+            return Err(ProcessError::new(ProcessErrorKind::InvalidRequest, "spawn")
+                .about(&spec.program)
+                .into());
+        }
         let mut cmd = command(spec)?;
         new_session(&mut cmd);
         // The handle is dropped without waiting: the program outlives this process.
@@ -190,11 +202,17 @@ impl Process for LinuxProcess {
             Err(e) => Err(e),
         };
         match start {
-            Ok(start_ticks) => Ok(Box::new(LinuxChild {
-                child,
-                id: ProcessId { pid, start_ticks },
-                done: None,
-            })),
+            Ok(start_ticks) => {
+                let stdin = child.stdin.take();
+                let stdout = child.stdout.take();
+                Ok(Box::new(LinuxChild {
+                    child,
+                    id: ProcessId { pid, start_ticks },
+                    done: None,
+                    stdin,
+                    stdout,
+                }))
+            }
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -231,6 +249,10 @@ struct LinuxChild {
     child: std::process::Child,
     id: ProcessId,
     done: Option<ExitKind>,
+    /// The parent's end of the child's input pipe, until the caller takes it.
+    stdin: Option<std::process::ChildStdin>,
+    /// The parent's end of the child's output pipe, until the caller takes it.
+    stdout: Option<std::process::ChildStdout>,
 }
 
 fn exit_kind(status: std::process::ExitStatus) -> ExitKind {
@@ -257,6 +279,18 @@ impl Child for LinuxChild {
             self.done = status.map(exit_kind);
         }
         Ok(self.done)
+    }
+
+    fn take_stdin(&mut self) -> Option<Box<dyn Write + Send>> {
+        self.stdin
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Write + Send>)
+    }
+
+    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+        self.stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>)
     }
 
     fn terminate(&mut self, grace: Duration) -> Result<(), Error> {
