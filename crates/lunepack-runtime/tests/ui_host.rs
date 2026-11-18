@@ -1094,7 +1094,10 @@ mod native {
         let icon = vec![0x89u8; ui::MAX_ICON_BYTES];
         let t = Instant::now();
         let ui = lab.start_with(Flow::Install, Some(icon));
-        assert!(t.elapsed() < Duration::from_millis(500), "start waited");
+        // The start spawns the UI and returns; it does not wait for the write. On Windows the
+        // first launch of a fresh executable can take a second under real-time scanning.
+        let start_bound = Duration::from_millis(if cfg!(windows) { 3000 } else { 500 });
+        assert!(t.elapsed() < start_bound, "start waited");
         let events = lab.events(&ui);
         assert!(wait_until(FAST.stall + Duration::from_secs(1), || ui
             .stopped()
