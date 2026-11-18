@@ -19,6 +19,15 @@ The runtime is `lunepack-runtime` in the same directory as the app's entry execu
 the channel: no argument supplies any of them. The feed must pass the feed rule of `docs/FORMAT.md`
 13.3 (`https:`, `file:`, or `http:` to a loopback address only).
 
+Where the install root `R` is depends on the OS, and an app must never compute it: it takes it from the
+facade (`Installation`) or from its own resolved path, never by joining the data home with a name. On
+Linux `R` is `<data home>/<app id>` with the trees in `versions/<version>/`. On Windows `R` is a folder of
+the per-user programs folder (by default `%LOCALAPPDATA%\Programs`) named after the app's display name at
+its first install, kept for the life of the install, with the trees in `app\<version>\` and the runtime's
+state under a hidden `.lunepack\` (`docs/FORMAT.md` 16). An app on Windows finds its runtime as
+`lunepack-runtime.exe` beside its entry, from its own resolved executable path
+(`GetModuleFileNameW`), never from the stub's path at `R`: the stub is a launcher, not the app.
+
 A runtime speaks exactly one schema version, and a runtime belongs to one version tree (D28): every
 final object names that tree in `tree_version`, so an app can tell when it reached another version's
 runtime.
@@ -185,8 +194,8 @@ calls `apply-and-restart`, which starts `apply` itself.
 | `install [--silent]` | the first-install flow, from a bootstrap tree | Installs the newest release the tree's own channel offers (M5-D8): the root, feed and channel come only from that tree's update configuration. Exit codes 23, 24, 26 and 27 are its own. |
 | `uninstall [--silent]` | the uninstall flow, from a tree of the install | Removes the install this runtime stands in and the desktop integration lunepack made (M5-D10): the install root leaves its path in one rename before it is deleted, so a cut-off uninstall leaves it whole or gone, and the next install or uninstall deletes what is left. Exit codes 24, 25 and 26 are its own. |
 
-`install` and `uninstall` take one option, `--silent` (no window and no question), and nothing that
-names a place: the install root is derived from the runtime's own resolved path and the environment,
+`install` and `uninstall` take one option, `--silent` (no window and no question; on Windows also `/S`),
+and, for `uninstall` on Windows, the hand-off options below, and nothing else that names a place: the install root is derived from the runtime's own resolved path and the environment,
 never from an argument or the state. Every mode follows the
 closed grammar above (a refusal is exit code 2 and one fixed line). `apply` logs schema-1 events to
 `logs/runtime.log` under the install root (rotated at 1 MiB to `runtime.log.1`). `install` and
@@ -197,8 +206,9 @@ integration item that is not lunepack's was kept and reported).
 
 ## Setup files
 
-On Linux, `lunepack setup` (CLI.md) appends a release's signed payload and a trailer to that
-release's runtime (FORMAT.md 14). Before it reads its command line, every runtime reads at most the
+On Linux and Windows, `lunepack setup` (CLI.md) appends a release's signed payload and a trailer to that
+release's runtime (FORMAT.md 14); on Windows the file is `Setup.exe` by name, and the paragraphs on
+Windows below add to the rules here. Before it reads its command line, every runtime reads at most the
 trailer's 4096 bytes from the end of its own resolved executable. Without the trailer's magic there
 it runs as described above, unchanged. With the magic it is a setup file:
 
@@ -223,6 +233,71 @@ it runs as described above, unchanged. With the magic it is a setup file:
   entry.
 - Events go to stderr and the run ends with one `result` or `error` object on stdout, `command`
   `setup`.
+- Windows: the command line is empty, `--silent` or `/S` (the same thing). `R` is found after the payload
+  is verified and before anything is written, by the rule of `docs/FORMAT.md` 16: the folder of an existing
+  install of the app id, whatever its name, else a folder named after the display name. A refusal there
+  (a taken name, a name the Windows rule refuses, copies of the install, too many entries) is exit 26
+  `install_mismatch` or 14 `update_config` with nothing written under the programs folder. The window's
+  program is written to a new private directory directly under the temp directory,
+  `lunepack-setup-ui-<16 hex>`, with a marker, and removed when the run ends; a window is never started
+  under `/S`. A setup file that was signed with Authenticode after it was built is found by the rule of
+  `docs/FORMAT.md` 14.3; a byte added after its signature makes it exit 7 `verify`.
+- A rerun on an installed app (the same app id found by its record) installs nothing: it applies the
+  integration of the installed version again under the lock (the launcher stub at `R`, the shortcut, the
+  uninstall entry and the declarations), then exits 23 `already_installed`. A stub lost between the two
+  renames of a self-replace, or an entry the user deleted, is restored this way. An entry that is not
+  lunepack's is left alone, and the exit code stays 23; any other failure of the repair is that error. The
+  rerun never changes which version is installed, whatever version the Setup file carries.
+
+## Windows
+
+The Windows runtime is `lunepack-runtime.exe`, built for the Windows subsystem (M7-D6): it never opens a
+console window, whatever process flags the app that starts it uses, and piped standard handles (the
+documented use, `check --json` read by the app) work because the parent passes them. Typed in `cmd` it
+returns at once and prints nothing visible unless its output is redirected; use `start /wait` or a pipe.
+
+**The launcher stub.** The app's shortcuts, its uninstall entry and its declared file types and URL schemes
+start the stub at `R`, not the runtime. Its exit codes and its one reserved argument are part of the
+launch contract (`docs/FORMAT.md` 15): 90 not installed, 91 install state unreadable, 92 configuration
+unreadable, 93 the executable is missing, 94 a link where a file or folder belongs, 95 the app could not be
+started; `--lunepack-uninstall` (optionally with `/S`) runs the uninstall of the current version. An app that
+needs to know whether it was started by the stub need not: the stub passes its command line, environment and
+working directory through unchanged.
+
+**Uninstall.** A running executable cannot be deleted, so `uninstall`, started from inside `R`, is the first
+of two phases. Phase 1 derives `R` from its own path and checks it as `docs/FORMAT.md` 16 says, copies its own
+executable (and `lunepack-ui.exe` when that is a regular file beside it) into a new directory under the temp
+directory, `lunepack-uninstall-<16 hex>`, with a marker naming the app and the process, starts the copy
+detached as phase 2 and exits 0 without deleting anything. Phase 2 (`uninstall --install-root <R>
+--wait-pid <pid> --wait-start <ticks>`, same build only, accepted only when started from such a directory)
+waits up to 10 seconds for phase 1, checks the root it was given again (a real directory, not a reparse
+point, whose parent is the programs folder and which holds a record of the marker's app; the folder's name is
+not checked) and runs the uninstall of the Internal modes table. The copy stays in the temp directory until
+a later run of any lunepack app removes it (a directory named exactly `lunepack-(uninstall|setup-ui)-<16 hex>`
+whose marker names a process that no longer runs) or Windows' temp cleanup does; the install folder, the
+shortcut, the registry entries and the declarations are gone.
+
+On Windows the uninstall releases the install lock right before it renames `R` to its tombstone
+(M7-D21): every lunepack process that holds the lock keeps a file under `R` open, so the rename can succeed
+only while none does. A failed rename reports the error and deletes nothing.
+
+**Outcome notice.** An interactive install or uninstall that ends with no window that showed its outcome
+(no `lunepack-ui.exe`, one that failed to start or was lost) shows one native message box, because the
+process has no console to say it on. It appears only after the outcome is committed and never under
+`/S` or `--silent`, `--no-ui`, `LUNEPACK_NO_UI`, nor for a cancellation the user chose.
+
+**The application user model id.** The Start-menu shortcut carries the app id as its application user model
+id, so the taskbar groups the app's windows under it. The Rust facade's `startup()` sets it for the process
+(`SetCurrentProcessExplicitAppUserModelID`) before the app creates a window. An app in another language
+sets the same id itself, once, before it shows a window; its value is the app id of `lunepack.toml`.
+
+**Transient locks.** A rename or removal that fails because an antivirus scanner or an indexer briefly holds
+a file (access denied, sharing violation or lock violation) is retried for at most about two seconds in
+total; the last error is reported unchanged.
+
+**Renaming the install folder** is not supported (`docs/FORMAT.md` 16): the app still starts from the stub in
+the renamed folder, but its Start-menu shortcut no longer points at the install, and updates report the
+shortcut as a conflict until the app is reinstalled.
 
 ## The window
 
