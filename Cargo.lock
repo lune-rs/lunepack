@@ -2231,6 +2231,7 @@ dependencies = [
  "lunepack-crypto",
  "lunepack-fs",
  "lunepack-os-linux",
+ "lunepack-os-windows",
  "lunepack-testkit",
  "tempfile",
 ]

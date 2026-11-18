@@ -47,6 +47,9 @@ fn motion_tier() -> MotionTier {
 }
 
 fn main() -> ExitCode {
+    // First, before any library load: only System32 from here on (M7-D10).
+    #[cfg(windows)]
+    lunepack_os_windows::harden_dll_search();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if !is_engine_mode(&args) {
         eprintln!("{USAGE}");

@@ -23,5 +23,6 @@ undocumented_unsafe_blocks = "deny"
 lunepack-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# SystemParametersInfoW for the client-area animation setting (M6-D8); nothing else.
+# SystemParametersInfoW for the client-area animation setting (M6-D8); the DLL search hardening, the
+# known folders, the message box and the app user model id (M7).
 windows-sys = { workspace = true }
