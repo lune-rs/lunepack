@@ -12,7 +12,10 @@
 //! `--hold <secs>` keeps the process alive that long (writing `hold` first), so a running image
 //! can be replaced or collected around it, and `--check <n>` runs the sibling runtime's
 //! `check --json` `n` times with default `std::process::Command` flags and writes `check-run
-//! <exit code>` after each, to see that the runtime opens no console of its own. With `--update` it checks the feed, downloads and stages what it
+//! <exit code>` after each, to see that the runtime opens no console of its own; `--aumid`
+//! writes `aumid <id>` with the process's explicit app user model id (Windows; `aumid none` when
+//! it has none or off Windows), which the suite compares with the Start-menu shortcut's. With
+//! `--update` it checks the feed, downloads and stages what it
 //! finds and hands it to the runtime with [`lunepack::apply_and_restart`], passing
 //! `--after-update` as the restart argument; with `--no-ui` as well, the applier shows no
 //! window ([`lunepack::UiChoice::Never`]).
@@ -144,6 +147,9 @@ fn main() -> ExitCode {
         out("hold");
         std::thread::sleep(Duration::from_secs(secs));
     }
+    if args.iter().any(|a| a == "--aumid") {
+        out(&format!("aumid {}", process_aumid()));
+    }
     if let Some(runs) = arg_value(&args, "--check") {
         check_runs(&inst, runs, &out);
     }
@@ -161,6 +167,23 @@ fn main() -> ExitCode {
         };
     }
     ExitCode::SUCCESS
+}
+
+/// This process's explicit app user model id (set by [`lunepack::startup`]), `none` when it has
+/// none; `error` when the system cannot say.
+#[cfg(windows)]
+fn process_aumid() -> String {
+    match lunepack_os_windows::process_aumid() {
+        Ok(Some(id)) => id,
+        Ok(None) => "none".to_owned(),
+        Err(_) => "error".to_owned(),
+    }
+}
+
+/// Only Windows has an app user model id.
+#[cfg(not(windows))]
+fn process_aumid() -> String {
+    "none".to_owned()
 }
 
 /// The number that follows `flag` among `args`.
