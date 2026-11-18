@@ -17,6 +17,14 @@
 //!   the link;
 //! - errors name only the file name of the path (`lunepack_core::FsError`).
 //!
+//! Transient locks (M7-D12): on Windows a rename or a removal can fail because another process (a
+//! virus scanner, the search indexer, a backup) holds a handle for a moment. `rename`,
+//! `remove_file`, `remove_dir_all_nofollow` and `replace_symlink`'s rename retry
+//! `ERROR_ACCESS_DENIED` (5), `ERROR_SHARING_VIOLATION` (32) and `ERROR_LOCK_VIOLATION` (33) with a
+//! backoff from 10 ms to 500 ms, within one deadline of about 2 s per call that every inner
+//! removal shares. Nothing else is retried, and the error after the deadline is the last OS error
+//! unchanged. On other systems the retry is the identity: the operation runs once.
+//!
 //! Durability: [`Fs::sync_dir`] is `fsync` on the directory on Unix. On Windows it calls
 //! `FlushFileBuffers` on a directory handle (opened with `FILE_FLAG_BACKUP_SEMANTICS` and write
 //! access); if the OS or the file system refuses that (`ERROR_ACCESS_DENIED` or
@@ -28,6 +36,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use lunepack_core::{
     DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, ReadAt,
@@ -39,6 +48,12 @@ const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 /// `ERROR_ACCESS_DENIED` and `ERROR_INVALID_FUNCTION`.
 #[cfg(windows)]
 const WINDOWS_DIR_FLUSH_REFUSED: [i32; 2] = [5, 1];
+
+/// How long one top-level call keeps retrying a transient lock (M7-D12).
+const TRANSIENT_BUDGET: Duration = Duration::from_secs(2);
+/// The first pause between two tries of a transient lock; it doubles up to [`TRANSIENT_PAUSE_MAX`].
+const TRANSIENT_PAUSE_MIN: Duration = Duration::from_millis(10);
+const TRANSIENT_PAUSE_MAX: Duration = Duration::from_millis(500);
 
 /// Makes temporary link names unique within one process.
 static TEMP_LINK_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -57,6 +72,45 @@ impl StdFs {
 /// Maps an `io::Error` of operation `op` on `path` to an [`FsError`] that names both.
 /// How often `read_link` looks again after an EINVAL that a concurrent replace caused.
 const READ_LINK_RETRIES: u32 = 16;
+
+/// Whether `e` is a lock another process may release in a moment: on Windows `ERROR_ACCESS_DENIED`
+/// (5), `ERROR_SHARING_VIOLATION` (32) and `ERROR_LOCK_VIOLATION` (33); never on other systems.
+fn is_transient(e: &io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33))
+}
+
+/// The deadline of one top-level call, shared by every operation inside it.
+fn transient_deadline() -> Instant {
+    Instant::now() + TRANSIENT_BUDGET
+}
+
+/// Runs `op` (which must be safe to repeat after it failed) until it succeeds, fails with an error
+/// `transient` does not name, or `deadline` has passed; the last error is returned unchanged.
+fn retry_until<T>(
+    deadline: Instant,
+    transient: impl Fn(&io::Error) -> bool,
+    mut op: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let mut pause = TRANSIENT_PAUSE_MIN;
+    loop {
+        match op() {
+            Err(e) if transient(&e) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(e);
+                }
+                std::thread::sleep(pause.min(deadline - now));
+                pause = (pause * 2).min(TRANSIENT_PAUSE_MAX);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// [`retry_until`] with [`is_transient`]: the identity off Windows.
+fn retry_transient<T>(deadline: Instant, op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    retry_until(deadline, is_transient, op)
+}
 
 fn err<'a>(op: &'static str, path: &'a Path) -> impl Fn(io::Error) -> FsError + 'a {
     move |e| FsError::from_io(path, e).during(op)
@@ -214,7 +268,7 @@ impl Fs for StdFs {
         if lstat(to)?.is_some() {
             return Err(FsError::new(FsErrorKind::AlreadyExists, to, None));
         }
-        fs::rename(from, to).map_err(err("rename", from))
+        retry_transient(transient_deadline(), || fs::rename(from, to)).map_err(err("rename", from))
     }
 
     fn remove_file(&self, path: &Path) -> Result<(), FsError> {
@@ -224,21 +278,24 @@ impl Fs for StdFs {
         if meta.is_dir() {
             return Err(other(path, "is a directory"));
         }
-        remove_link_or_file(path, &meta)
+        remove_link_or_file(path, &meta, transient_deadline())
     }
 
     fn remove_dir_all_nofollow(&self, path: &Path) -> Result<(), FsError> {
         let Some(meta) = lstat(path)? else {
             return Err(FsError::new(FsErrorKind::NotFound, path, None));
         };
+        let deadline = transient_deadline();
         if meta.file_type().is_symlink() {
-            return remove_link_or_file(path, &meta);
+            return remove_link_or_file(path, &meta, deadline);
         }
         if !meta.is_dir() {
             return Err(FsError::new(FsErrorKind::NotADirectory, path, None));
         }
-        // std's `remove_dir_all` does not follow symlinks inside the tree: it unlinks them.
-        fs::remove_dir_all(path).map_err(err("remove_dir_all", path))
+        // std's `remove_dir_all` does not follow symlinks inside the tree: it unlinks them. A lock
+        // that fails it is retried as a whole: each try removes what it can and stops at the
+        // first entry that is still held, so the tries share the one deadline of this call.
+        retry_transient(deadline, || fs::remove_dir_all(path)).map_err(err("remove_dir_all", path))
     }
 
     fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
@@ -381,7 +438,7 @@ impl Fs for StdFs {
         let temp = temp.ok_or_else(|| {
             FsError::new(FsErrorKind::AlreadyExists, link, None).during("replace_symlink")
         })?;
-        fs::rename(&temp, link).map_err(|e| {
+        retry_transient(transient_deadline(), || fs::rename(&temp, link)).map_err(|e| {
             let _ = fs::remove_file(&temp);
             FsError::from_io(link, e).during("rename")
         })
@@ -404,17 +461,18 @@ impl Fs for StdFs {
     }
 }
 
-fn remove_link_or_file(path: &Path, meta: &fs::Metadata) -> Result<(), FsError> {
+fn remove_link_or_file(path: &Path, meta: &fs::Metadata, deadline: Instant) -> Result<(), FsError> {
     #[cfg(windows)]
     {
         // A symlink to a directory is removed with `remove_dir` on Windows.
         use std::os::windows::fs::FileTypeExt;
         if meta.file_type().is_symlink_dir() {
-            return fs::remove_dir(path).map_err(err("remove_dir", path));
+            return retry_transient(deadline, || fs::remove_dir(path))
+                .map_err(err("remove_dir", path));
         }
     }
     let _ = meta;
-    fs::remove_file(path).map_err(err("remove_file", path))
+    retry_transient(deadline, || fs::remove_file(path)).map_err(err("remove_file", path))
 }
 
 #[cfg(unix)]
@@ -475,4 +533,80 @@ fn symlink(target: &str, link: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn symlink(target: &str, link: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn transient_code(e: &io::Error) -> bool {
+        e.raw_os_error() == Some(7777)
+    }
+
+    #[test]
+    fn a_transient_error_is_retried_until_it_clears() {
+        let tries = Cell::new(0);
+        let started = Instant::now();
+        let out = retry_until(
+            Instant::now() + Duration::from_secs(5),
+            transient_code,
+            || {
+                tries.set(tries.get() + 1);
+                if tries.get() < 4 {
+                    Err(io::Error::from_raw_os_error(7777))
+                } else {
+                    Ok(tries.get())
+                }
+            },
+        );
+        assert_eq!(out.unwrap(), 4);
+        // 10 + 20 + 40 ms of backoff, well under a second.
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_last_error_is_returned_unchanged_at_the_deadline() {
+        let started = Instant::now();
+        let out: io::Result<()> = retry_until(
+            Instant::now() + Duration::from_millis(150),
+            transient_code,
+            || Err(io::Error::from_raw_os_error(7777)),
+        );
+        let e = out.unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(7777));
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn another_error_fails_at_once_with_one_try() {
+        let tries = Cell::new(0);
+        let started = Instant::now();
+        let out: io::Result<()> = retry_until(
+            Instant::now() + Duration::from_secs(5),
+            transient_code,
+            || {
+                tries.set(tries.get() + 1);
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            },
+        );
+        assert_eq!(out.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(tries.get(), 1);
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn the_codes_are_exactly_5_32_and_33_and_only_on_windows() {
+        for code in [2, 3, 4, 6, 31, 34, 145, 267] {
+            assert!(!is_transient(&io::Error::from_raw_os_error(code)), "{code}");
+        }
+        for code in [5, 32, 33] {
+            assert_eq!(
+                is_transient(&io::Error::from_raw_os_error(code)),
+                cfg!(windows),
+                "{code}"
+            );
+        }
+    }
 }
