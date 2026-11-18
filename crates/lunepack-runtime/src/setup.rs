@@ -1,4 +1,4 @@
-//! Setup mode (M6 step 7, M6-D4): this runtime is a Linux setup file, its own release's runtime
+//! Setup mode (M6 step 7, M6-D4, M7): this runtime is a setup file (Linux or Windows), its own release's runtime
 //! with one version's signed payload and a trailer appended (FORMAT.md 14), and it installs exactly
 //! that version with no network.
 //!
@@ -12,12 +12,19 @@
 //! Then, in order: the payload is verified under the trailer's root ([`verify_setup`]: the key set,
 //! the manifest with no feed, the whole pack, the update config read from the pack naming exactly
 //! that root); when a UI may start, `lunepack-ui` is read out of the pack through its signed frame
-//! ([`read_entry`](lunepack_core::read_entry)) into a fresh private directory under the app's cache (M6-D7) and started from
+//! ([`read_entry`](lunepack_core::read_entry)) into a fresh private directory, under the app's
+//! cache on Linux (M6-D7), directly under the user's temp dir on Windows (M7-D13), and started from
 //! there; the welcome prompt (name, version, publisher, location and size, all from the verified
 //! manifest and config); [`lunepack::Updater::install_from_payload`] (the commit and the desktop
 //! integration); the done prompt, whose `finish{launch:true}` starts the installed entry. The UI's
 //! directory is removed at exit; earlier runs' directories are removed only when they carry the
-//! setup marker naming this app and a process that no longer runs.
+//! setup marker naming a process that no longer runs (Linux: and this app; Windows: of any app,
+//! and no process runs from them, `crate::tempdirs`).
+//!
+//! `R` is found after verification and before anything is written ([`lunepack_core::resolve_root`]
+//! under the platform's layout scheme: `<data home>/<app id>` on Linux; on Windows the folder of an
+//! existing install of the app id, whatever its name, else one named after the display name,
+//! M7-D16, M7-D17); a refusal there ends the run with nothing written under the data home.
 //!
 //! Nothing from the payload runs, or is written anywhere, before its signature or hash checked.
 
@@ -99,7 +106,20 @@ pub fn detect(fs: &dyn Fs, exe: &Path, hasher: &dyn Hasher, verifier: &dyn Verif
     }
 }
 
+/// Where a setup's UI directory goes: Linux, the per-user cache home (the app's directory is
+/// made under it, M6-D7); Windows, the user's temp dir (M7-D13).
+pub fn ui_home(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let _ = env;
+        crate::tempdirs::temp_home()
+    }
+    #[cfg(not(windows))]
+    cache_home(env)
+}
+
 /// The per-user cache home (`XDG_CACHE_HOME` when absolute, else `$HOME/.cache`).
+#[cfg_attr(windows, allow(dead_code))]
 pub fn cache_home(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     if let Some(dir) = env("XDG_CACHE_HOME").map(PathBuf::from)
         && dir.is_absolute()
@@ -143,14 +163,14 @@ impl Prepared {
 /// The liveness test of an earlier run's marker: whether process `pid` started at `start` runs.
 pub type Alive<'a> = &'a dyn Fn(u32, u64) -> bool;
 
-/// Verifies the setup and, when `want_ui`, extracts the UI (M6-D7) with a marker naming `own`
-/// (this process). A verification failure is its exit kind; a UI that cannot be extracted means a
-/// headless run.
+/// Verifies the setup, finds `R`, and, when `want_ui`, extracts the UI under `ui_home` ([`ui_home`];
+/// M6-D7, M7-D13) with a marker naming `own` (this process). A verification failure or a refused
+/// root is its exit kind, with nothing written; a UI that cannot be extracted means a headless run.
 pub fn prepare(
     ad: &Adapters,
     found: Found,
     data_home: &Path,
-    cache_home: Option<&Path>,
+    ui_home: Option<&Path>,
     want_ui: bool,
     own: Option<lunepack::ProcessId>,
     alive: Alive<'_>,
@@ -184,9 +204,8 @@ pub fn prepare(
         data_home: data_home.to_path_buf(),
         ui_dir: None,
     };
-    if want_ui && let (Some(cache), Some(own)) = (cache_home, own) {
-        let app_cache = cache.join(prepared.found.trailer.root.app_id().as_str());
-        prepared.ui_dir = extract_ui(ad, &prepared, &app_cache, own, alive);
+    if want_ui && let (Some(home), Some(own)) = (ui_home, own) {
+        prepared.ui_dir = extract_ui(ad, &prepared, home, own, alive);
     }
     Ok(prepared)
 }
@@ -239,29 +258,16 @@ fn clear_stale(ad: &Adapters, app_cache: &Path, app: &str, alive: Alive<'_>) {
     }
 }
 
-/// Reads `lunepack-ui` out of the pack through its signed frame and writes it into a fresh 0700
-/// directory `<app cache>/setup-ui-<random>` this run creates (never an existing path), with the
-/// marker. `None` (a headless run) when the release has no UI or anything fails; a directory made
-/// before the failure is removed.
-#[cfg(unix)]
-fn extract_ui(
-    ad: &Adapters,
-    prepared: &Prepared,
-    app_cache: &Path,
-    own: lunepack::ProcessId,
-    alive: Alive<'_>,
-) -> Option<PathBuf> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-
+/// The release's `lunepack-ui`, read out of the verified pack through its signed frame; `None`
+/// when the release has none or it cannot be read.
+fn ui_bytes(ad: &Adapters, prepared: &Prepared) -> Option<Vec<u8>> {
     use lunepack_core::read_entry;
     use lunepack_core::setup::MAX_SETUP_UI_BYTES;
 
     let trailer = &prepared.found.trailer;
-    let app = trailer.root.app_id().as_str();
     let ui_at = prepared.verified.ui_path().ok()?;
     let pack = lunepack_core::setup::ReadAtWindow::new(&*prepared.found.file, trailer.pack).ok()?;
-    let bytes = read_entry(
+    read_entry(
         &prepared.verified.manifest,
         &ui_at,
         &pack,
@@ -269,7 +275,27 @@ fn extract_ui(
         &*ad.hasher,
         MAX_SETUP_UI_BYTES,
     )
-    .ok()?;
+    .ok()
+}
+
+/// Reads `lunepack-ui` out of the pack ([`ui_bytes`]) and writes it into a fresh 0700 directory
+/// `<cache home>/<app id>/setup-ui-<random>` this run creates (never an existing path), with the
+/// marker. `None` (a headless run) when the release has no UI or anything fails; a directory made
+/// before the failure is removed.
+#[cfg(unix)]
+fn extract_ui(
+    ad: &Adapters,
+    prepared: &Prepared,
+    cache_home: &Path,
+    own: lunepack::ProcessId,
+    alive: Alive<'_>,
+) -> Option<PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    let app = prepared.found.trailer.root.app_id().as_str();
+    let app_cache = &cache_home.join(app);
+    let bytes = ui_bytes(ad, prepared)?;
 
     // The app's cache directory: made 0700 when missing; an existing one must be a real directory.
     std::fs::DirBuilder::new()
@@ -312,7 +338,35 @@ fn extract_ui(
     Some(dir)
 }
 
-#[cfg(not(unix))]
+/// Windows (M7-D13): reads `lunepack-ui.exe` out of the pack ([`ui_bytes`]) into a fresh
+/// `<temp dir>\lunepack-setup-ui-<16 hex>` this run creates new, with a marker naming the app and
+/// `own`; earlier runs' stale directories were cleared before (`tempdirs::clear_stale`). `None` (a
+/// headless run) when the release has no UI or anything fails; a directory made before the failure
+/// is removed.
+#[cfg(windows)]
+fn extract_ui(
+    ad: &Adapters,
+    prepared: &Prepared,
+    temp: &Path,
+    own: lunepack::ProcessId,
+    _alive: Alive<'_>,
+) -> Option<PathBuf> {
+    use crate::tempdirs::{self, Marker};
+
+    let bytes = ui_bytes(ad, prepared)?;
+    let marker = Marker {
+        app_id: prepared.found.trailer.root.app_id().as_str().to_owned(),
+        owner: own,
+    };
+    let dir = tempdirs::create(&*ad.fs, &*ad.rng, temp, tempdirs::SETUP_UI_PREFIX, &marker).ok()?;
+    if tempdirs::write_new(&dir.join(ui_host::UI_FILE), &bytes).is_err() {
+        let _ = ad.fs.remove_dir_all_nofollow(&dir);
+        return None;
+    }
+    Some(dir)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn extract_ui(
     _: &Adapters,
     _: &Prepared,
