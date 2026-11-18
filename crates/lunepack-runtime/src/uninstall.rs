@@ -18,6 +18,17 @@
 //! it points to. A cut-off run so leaves `R` whole (rerun the uninstall) or gone (a reinstall works,
 //! and the next install or uninstall removes the tombstone), never half removed.
 //!
+//! Windows (M7-D5): a running image cannot be deleted, so `uninstall` started inside `R` is phase
+//! 1 of a hand-off ([`hand_off`]): it derives `R` from its own path and checks it as above, copies
+//! itself (and a regular-file `lunepack-ui.exe` beside it) into a new
+//! `%TEMP%\lunepack-uninstall-<16 hex>` directory with a marker naming the app id, starts the copy
+//! detached as phase 2 (`uninstall --install-root <R> --wait-pid <pid> --wait-start <start>`) and
+//! exits 0; it never deletes. Phase 2 is accepted only from such a directory ([`hand_off_copy`]),
+//! waits up to [`HAND_OFF_WAIT`] for phase 1, validates the root it was given again
+//! ([`hand_off_installation`]: a real canonical directory, not a reparse point, whose canonical
+//! parent is the data home and that holds a record of the marker's app id; its name is never
+//! checked) and then runs the uninstall above unchanged.
+//!
 //! With a UI (M6), the confirm prompt comes before anything else: `cancel` there, or the UI lost
 //! there, ends the mode with `cancelled` and nothing changed (M6-D5). The UI process, started from
 //! the tree being removed, is the one process besides this one the in-use scan excludes (by pid
@@ -216,19 +227,6 @@ fn uninstall(
         return Err(Kind::InstallMismatch);
     }
 
-    // Windows cannot delete a running image: an uninstall that runs from inside `R` would leave
-    // `R` renamed away but not removed. The hand-off that runs it from a copy outside `R` is
-    // M7 step 11; until then this refuses before anything changes.
-    #[cfg(windows)]
-    if ad
-        .process
-        .current_exe()
-        .map_err(|e| Kind::of(&e.into()))?
-        .starts_with(root)
-    {
-        return Err(Kind::Unsupported);
-    }
-
     let me: ProcessId = ad.process.current().map_err(|e| Kind::of(&e.into()))?;
     let mut exclude = vec![me];
     exclude.extend(ui);
@@ -299,4 +297,183 @@ fn uninstall(
 /// Text equality of two versions.
 fn same(a: &Version, b: &Version) -> bool {
     a == b && a.to_string() == b.to_string()
+}
+
+/// How long phase 2 waits for phase 1 to exit before it goes on (the in-use check then decides).
+#[cfg(windows)]
+pub const HAND_OFF_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The file name of the runtime's copy in the hand-off directory.
+#[cfg(windows)]
+const COPY_FILE: &str = "lunepack-runtime.exe";
+
+/// Phase 1 of the Windows uninstall (M7-D5): `inst` is the installed tree this runtime runs from;
+/// its `R` is checked as the uninstall checks it, then this runtime (and the UI beside it, when it
+/// is a regular file) is copied into a fresh hand-off directory under `temp`, created new with its
+/// marker, and the copy is started detached as phase 2. Nothing is deleted under `R`; this process
+/// keeps no handle into `R` (no log; its working directory moves to the copy's).
+#[cfg(windows)]
+pub fn hand_off(
+    ad: &Adapters,
+    inst: &Installation,
+    data_home: &Path,
+    temp: &Path,
+    silent: bool,
+) -> Result<(), Kind> {
+    use crate::tempdirs::{self, Marker};
+
+    let layout = inst.layout().ok_or(Kind::NotInstalled)?;
+    let root = layout.root();
+    if !lunepack_core::root_valid_for_uninstall(
+        &*ad.fs,
+        data_home,
+        root,
+        inst.app_id(),
+        layout.scheme(),
+    ) || !real_canonical_dir(ad, root)
+    {
+        return Err(Kind::InstallMismatch);
+    }
+    let exe = ad.process.current_exe().map_err(|e| Kind::of(&e.into()))?;
+    let me = ad.process.current().map_err(|e| Kind::of(&e.into()))?;
+    let marker = Marker {
+        app_id: inst.app_id().as_str().to_owned(),
+        owner: me,
+    };
+    let dir = tempdirs::create(&*ad.fs, &*ad.rng, temp, tempdirs::UNINSTALL_PREFIX, &marker)
+        .map_err(|_| Kind::Fs)?;
+    let started = (|| {
+        let copy = dir.join(COPY_FILE);
+        copy_new(&exe, &copy).map_err(|_| Kind::Fs)?;
+        let ui = exe.with_file_name(ui_host::UI_FILE);
+        if matches!(ad.fs.symlink_metadata(&ui), Ok(Some(m)) if m.kind == FileKind::File) {
+            // Best effort: without its UI, phase 2 runs headless.
+            let _ = copy_new(&ui, &dir.join(ui_host::UI_FILE));
+        }
+        // Phase 2 inherits this directory, not one inside `R`.
+        std::env::set_current_dir(&dir).map_err(|_| Kind::Fs)?;
+        let mut spec = lunepack::SpawnSpec::new(copy);
+        spec.args = vec![
+            "uninstall".into(),
+            "--install-root".into(),
+            root.as_os_str().to_owned(),
+            "--wait-pid".into(),
+            me.pid.to_string().into(),
+            "--wait-start".into(),
+            me.start_ticks.to_string().into(),
+        ];
+        if silent {
+            spec.args.push("--silent".into());
+        }
+        spec.env_remove = vec![std::ffi::OsString::from(lunepack::HEALTH_TOKEN_VAR)];
+        ad.process
+            .spawn_detached(&spec)
+            .map_err(|e| Kind::of(&e.into()))
+    })();
+    if started.is_err() {
+        let _ = std::env::set_current_dir(temp);
+        let _ = ad.fs.remove_dir_all_nofollow(&dir);
+    }
+    started
+}
+
+/// Copies the regular file `from` to the new file `to` (create-new, never an existing path).
+#[cfg(windows)]
+fn copy_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut src = std::fs::File::open(from)?;
+    let mut dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::io::copy(&mut src, &mut dst)?;
+    dst.sync_all()
+}
+
+/// Phase 2's own-directory rule (M7-D5): this runtime runs from directly inside a real directory
+/// named `lunepack-uninstall-<16 lowercase hex>` directly under `temp` (both canonical), holding a
+/// marker. `None` anywhere else: the caller refuses with a usage error before any action.
+#[cfg(windows)]
+pub fn hand_off_copy(
+    ad: &Adapters,
+    temp: &Path,
+) -> Option<(std::path::PathBuf, crate::tempdirs::Marker)> {
+    use crate::tempdirs;
+
+    let exe = ad.process.current_exe().ok()?;
+    let dir = exe.parent()?;
+    let name = dir.file_name()?.to_str()?;
+    if !tempdirs::is_dir_name(name, tempdirs::UNINSTALL_PREFIX) || dir.parent() != Some(temp) {
+        return None;
+    }
+    if !matches!(ad.fs.symlink_metadata(dir), Ok(Some(m)) if m.kind == FileKind::Dir) {
+        return None;
+    }
+    let marker = tempdirs::read_marker(&*ad.fs, dir)?;
+    Some((dir.to_path_buf(), marker))
+}
+
+/// Phase 2's installation (M7-D5, M7-D16): `given` must be a real directory (not a reparse
+/// point) whose canonical path is a real directory, with the canonical data home as its parent,
+/// holding a record of `app_id`; the installation is the record's current version's tree there.
+/// `R`'s name is never checked. Any mismatch is `install_mismatch`, with nothing changed.
+#[cfg(windows)]
+pub fn hand_off_installation(
+    ad: &Adapters,
+    data_home: &Path,
+    given: &Path,
+    app_id: &str,
+) -> Result<Installation, Kind> {
+    use lunepack::{AppId, UpdateConfig, UserLayout};
+    use lunepack_core::update_config::{MAX_UPDATE_CONFIG_BYTES, runtime_file};
+
+    let is_dir =
+        |p: &Path| matches!(ad.fs.symlink_metadata(p), Ok(Some(m)) if m.kind == FileKind::Dir);
+    let app = AppId::parse(app_id).map_err(|_| Kind::InstallMismatch)?;
+    if !is_dir(given) {
+        return Err(Kind::InstallMismatch);
+    }
+    let root = std::fs::canonicalize(given).map_err(|_| Kind::InstallMismatch)?;
+    let scheme = ad.platform.layout_scheme();
+    if !is_dir(&root)
+        || !lunepack_core::root_valid_for_uninstall(&*ad.fs, data_home, &root, &app, scheme)
+    {
+        return Err(Kind::InstallMismatch);
+    }
+    let layout = UserLayout::from_root(root.clone(), scheme);
+    let store = UserScope {
+        dir: layout.state_dir(),
+        app_id: app.clone(),
+    };
+    let record = match store.load(&*ad.fs, &*ad.hasher) {
+        Ok(loaded) => loaded.record.ok_or(Kind::InstallMismatch)?,
+        Err(_) => return Err(Kind::InstallMismatch),
+    };
+    if record.app_id != app {
+        return Err(Kind::InstallMismatch);
+    }
+    let current = record.current.ok_or(Kind::NotInstalled)?.version;
+    // The current version's runtime, beside its entry: the tree's config names both.
+    let config_path = layout.version_config_path(&current);
+    if !matches!(ad.fs.symlink_metadata(&config_path), Ok(Some(m)) if m.kind == FileKind::File) {
+        return Err(Kind::UpdateConfig);
+    }
+    let bytes = ad
+        .fs
+        .read_capped(&config_path, MAX_UPDATE_CONFIG_BYTES)
+        .map_err(|_| Kind::UpdateConfig)?;
+    let config = UpdateConfig::parse(&bytes).map_err(|_| Kind::UpdateConfig)?;
+    let mut runtime = layout.version_dir(&current);
+    for part in config.install.entry.components() {
+        runtime.push(part);
+    }
+    runtime.set_file_name(runtime_file(config.target));
+    let inst = Installation::from_exe_with(
+        &runtime,
+        ad.platform.clone().with_data_home(data_home.to_path_buf()),
+    )
+    .map_err(|e| Kind::of(&e))?;
+    match inst.layout() {
+        Some(l) if l.root() == root && inst.app_id() == &app => Ok(inst),
+        _ => Err(Kind::InstallMismatch),
+    }
 }

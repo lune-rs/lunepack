@@ -23,6 +23,7 @@ mod gc;
 mod install;
 mod modes;
 mod setup;
+mod tempdirs;
 mod ui_host;
 mod uninstall;
 
@@ -101,6 +102,7 @@ fn main() -> ExitCode {
                 Ok(dir) => dir,
                 Err(kind) => return headless_fail(install::COMMAND, kind),
             };
+            clear_temp_dirs(ad);
             let platform = ad.platform.clone().with_data_home(data_home);
             let boot = match lunepack::Installation::from_current_exe_with(platform) {
                 Ok(boot) => boot,
@@ -122,7 +124,8 @@ fn main() -> ExitCode {
             notice(silent, seen, &boot.meta().name, Operation::Install, kind);
             kind
         }),
-        // The log lives in R, which this mode removes: events go to stderr.
+        // The log lives in R, which this mode removes: events go to stderr. On Windows this is
+        // phase 1 of the hand-off (M7-D5).
         Mode::Uninstall { silent } => run(|ad| {
             let data_home = match data_home() {
                 Ok(dir) => dir,
@@ -132,25 +135,142 @@ fn main() -> ExitCode {
                 Ok(inst) => inst,
                 Err(e) => return headless_fail(uninstall::COMMAND, Kind::of(&e)),
             };
-            let ui = ui_for(
-                ad,
-                silent,
-                Flow::Uninstall,
-                ui_host::card(&inst.meta().name, &inst.tree_version().to_string(), None),
-                inst.layout().map(|l| l.root().to_path_buf()),
-            );
-            let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
-            ui.report(&events);
-            let (kind, last) = uninstall::run_uninstall(ad, &inst, &data_home, &events, &ui);
-            let seen = ui.outcome_acknowledged();
-            ui.close(&events);
-            conclude(events, &last);
-            notice(silent, seen, &inst.meta().name, Operation::Uninstall, kind);
-            kind
+            uninstall_mode(ad, &inst, &data_home, silent)
         }),
+        // Windows: phase 2, from the uninstaller's own temp copy only; anywhere else a usage
+        // error before any action (M7-D5).
+        Mode::UninstallHandOff(args) => run(|ad| hand_off_phase_2(ad, &args)),
     };
     ExitCode::from(kind.code())
 }
+
+/// Windows: phase 1 of the hand-off; it prints nothing when phase 2 was started (M7-D5).
+#[cfg(windows)]
+fn uninstall_mode(
+    ad: &modes::Adapters,
+    inst: &lunepack::Installation,
+    data_home: &std::path::Path,
+    silent: bool,
+) -> Kind {
+    let Some(temp) = tempdirs::temp_home() else {
+        return headless_fail(uninstall::COMMAND, Kind::Fs);
+    };
+    clear_temp_dirs(ad);
+    match uninstall::hand_off(ad, inst, data_home, &temp, silent) {
+        Ok(()) => Kind::Ok,
+        Err(kind) => headless_fail(uninstall::COMMAND, kind),
+    }
+}
+
+#[cfg(not(windows))]
+fn uninstall_mode(
+    ad: &modes::Adapters,
+    inst: &lunepack::Installation,
+    data_home: &std::path::Path,
+    silent: bool,
+) -> Kind {
+    uninstall_flow(ad, inst, data_home, silent)
+}
+
+/// The uninstall of `inst` with its UI and its outcome (M5-D10, M6): the confirm prompt, the
+/// removal, the done or failed prompt, the result line and a native notice where one is due.
+fn uninstall_flow(
+    ad: &modes::Adapters,
+    inst: &lunepack::Installation,
+    data_home: &std::path::Path,
+    silent: bool,
+) -> Kind {
+    let ui = ui_for(
+        ad,
+        silent,
+        Flow::Uninstall,
+        ui_host::card(&inst.meta().name, &inst.tree_version().to_string(), None),
+        inst.layout().map(|l| l.root().to_path_buf()),
+    );
+    let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
+    ui.report(&events);
+    let (kind, last) = uninstall::run_uninstall(ad, inst, data_home, &events, &ui);
+    let seen = ui.outcome_acknowledged();
+    ui.close(&events);
+    conclude(events, &last);
+    notice(silent, seen, &inst.meta().name, Operation::Uninstall, kind);
+    kind
+}
+
+/// Phase 2 of the Windows uninstall hand-off (M7-D5): the own-directory rule first (a usage error
+/// before any action), then the wait for phase 1, the root's validation and the uninstall. The
+/// UI's copy is removed after it exited; this runtime's copy and the marker stay for a later run's
+/// cleanup.
+#[cfg(windows)]
+fn hand_off_phase_2(ad: &modes::Adapters, args: &modes::HandOffArgs) -> Kind {
+    let Some((dir, marker)) =
+        tempdirs::temp_home().and_then(|temp| uninstall::hand_off_copy(ad, &temp))
+    else {
+        eprintln!("{USAGE_LINE}");
+        return Kind::Usage;
+    };
+    // Nothing of this process stays inside `R`.
+    let _ = std::env::set_current_dir(&dir);
+    // A timeout or an unreadable process is not an error here: the in-use check decides.
+    let _ = ad.process.wait_exit(&args.wait, uninstall::HAND_OFF_WAIT);
+    let data_home = match data_home() {
+        Ok(dir) => dir,
+        Err(kind) => return headless_fail(uninstall::COMMAND, kind),
+    };
+    let inst = match uninstall::hand_off_installation(
+        ad,
+        &data_home,
+        &args.install_root,
+        &marker.app_id,
+    ) {
+        Ok(inst) => inst,
+        Err(kind) => return headless_fail(uninstall::COMMAND, kind),
+    };
+    let kind = uninstall_flow(ad, &inst, &data_home, args.silent);
+    // The UI has exited (`close` waited for it): its copy goes, best effort.
+    let ui_copy = dir.join(ui_host::UI_FILE);
+    if matches!(ad.fs.symlink_metadata(&ui_copy), Ok(Some(m)) if m.kind == lunepack::FileKind::File)
+    {
+        let _ = ad.fs.remove_file(&ui_copy);
+    }
+    kind
+}
+
+/// `--install-root` exists only on Windows; the parser refuses it elsewhere.
+#[cfg(not(windows))]
+fn hand_off_phase_2(_ad: &modes::Adapters, _args: &modes::HandOffArgs) -> Kind {
+    eprintln!("{USAGE_LINE}");
+    Kind::Usage
+}
+
+/// Whether process `pid` started at `start` runs; a process that cannot be read counts as running.
+#[cfg(any(target_os = "linux", windows))]
+fn alive(pid: u32, start: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    let found = lunepack_os_linux::LinuxProcess::new().process_id(pid);
+    #[cfg(windows)]
+    let found = lunepack_os_windows::WindowsProcess::new().process_id(pid);
+    match found {
+        Ok(Some(id)) => id.start_ticks == start,
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+/// Windows: removes earlier runs' stale directories under the temp dir (M7-D5, M7-D13): a
+/// directory's owner must have exited and no process may run from it. Best effort.
+#[cfg(windows)]
+fn clear_temp_dirs(ad: &modes::Adapters) {
+    let Some(temp) = tempdirs::temp_home() else {
+        return;
+    };
+    let in_use = |dir: &std::path::Path| !matches!(ad.process.tree_in_use(dir, &[]), Ok(false));
+    tempdirs::clear_stale(&*ad.fs, &temp, &alive, &in_use);
+}
+
+/// Linux keeps its setup UI under the app's cache, cleared by the setup itself (M6-D7).
+#[cfg(not(windows))]
+fn clear_temp_dirs(_ad: &modes::Adapters) {}
 
 fn stderr_events() -> Events {
     Events::new(Some(Box::new(StderrSink)), None)
@@ -383,14 +503,17 @@ fn fail(command: &'static str, kind: Kind) -> Kind {
     kind
 }
 
-/// Setup mode (M6 step 7): `None` when this executable carries no setup trailer (the ordinary
+/// Setup mode (M6 step 7, M7): `None` when this executable carries no setup trailer (the ordinary
 /// runtime), else the run's exit kind. A trailer that is malformed is `verify`; a command line
-/// other than nothing or `--silent` is a usage error.
-#[cfg(target_os = "linux")]
+/// other than nothing or `--silent` (`/S` on Windows) is a usage error.
+#[cfg(any(target_os = "linux", windows))]
 fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
     use lunepack::Process as _;
 
+    #[cfg(target_os = "linux")]
     let process = lunepack_os_linux::LinuxProcess::new();
+    #[cfg(windows)]
+    let process = lunepack_os_windows::WindowsProcess::new();
     let exe = process.current_exe().ok()?;
     let found = match setup::detect(
         &lunepack_fs::StdFs::new(),
@@ -417,20 +540,13 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         let env = |name: &str| std::env::var_os(name);
         let want_ui = ui_host::ui_wanted(silent, &env);
         let own = process.process_id(std::process::id()).ok().flatten();
-        let alive = |pid: u32, start: u64| {
-            // A process that cannot be read counts as running: its directory is kept.
-            match process.process_id(pid) {
-                Ok(Some(id)) => id.start_ticks == start,
-                Ok(None) => false,
-                Err(_) => true,
-            }
-        };
-        let cache = setup::cache_home(&env);
+        clear_temp_dirs(ad);
+        let ui_home = setup::ui_home(&env);
         let prepared = match setup::prepare(
             ad,
             found,
             &data_home,
-            cache.as_deref(),
+            ui_home.as_deref(),
             want_ui,
             own,
             &alive,
@@ -466,8 +582,8 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
     }))
 }
 
-/// Setup files are Linux-only in this release (M7 and M8 take theirs).
-#[cfg(not(target_os = "linux"))]
+/// Setup files are Linux and Windows only in this release (M8 takes macOS's).
+#[cfg(not(any(target_os = "linux", windows)))]
 fn setup_mode(_args: &[std::ffi::OsString]) -> Option<Kind> {
     None
 }
