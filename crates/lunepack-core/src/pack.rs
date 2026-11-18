@@ -219,6 +219,12 @@ pub enum RuntimeImageError {
     /// A Windows binary that imports a C runtime DLL (it must link the CRT statically).
     #[error("imports a C runtime DLL; it must link the C runtime statically")]
     CRuntime,
+    /// A Windows binary that imports `advapi32.dll` statically. Some of its exports
+    /// (`SystemFunction036` and others) forward to `cryptbase.dll`, which is not a KnownDLL, and the
+    /// loader resolves a static import's forwarder from the application directory before `main`
+    /// runs, whatever the `DependentLoadFlags`; `advapi32.dll` must be delay-loaded.
+    #[error("imports advapi32.dll statically; it must be delay-loaded")]
+    StaticAdvapi32,
     /// A Windows binary whose `DependentLoadFlags` is not `LOAD_LIBRARY_SEARCH_SYSTEM32`.
     #[error("its DependentLoadFlags is not 0x800 (load imports from System32 only)")]
     DependentLoadFlags,
@@ -285,8 +291,9 @@ fn check_elf_image(bytes: &[u8], machine: u16, dynamic_ok: bool) -> Result<(), R
 }
 
 /// The PE checks of a shipped Windows binary (M7-D10): a PE of `machine` with the `subsystem`,
-/// no C-runtime DLL among its imports or delay imports, `DependentLoadFlags` of
-/// `LOAD_LIBRARY_SEARCH_SYSTEM32`, and an `RT_MANIFEST` with `asInvoker` and `longPathAware`.
+/// no C-runtime DLL among its imports or delay imports, no static import of `advapi32.dll` (only a
+/// delay import), `DependentLoadFlags` of `LOAD_LIBRARY_SEARCH_SYSTEM32`, and an `RT_MANIFEST` with
+/// `asInvoker` and `longPathAware`.
 fn check_pe_hardened(bytes: &[u8], machine: u16, subsystem: u16) -> Result<(), RuntimeImageError> {
     use RuntimeImageError as E;
     if !bytes.starts_with(b"MZ") {
@@ -314,6 +321,13 @@ fn check_pe_hardened(bytes: &[u8], machine: u16, subsystem: u16) -> Result<(), R
     }
     if image.all_imports().any(is_c_runtime) {
         return Err(E::CRuntime);
+    }
+    if image
+        .imports
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case("advapi32.dll"))
+    {
+        return Err(E::StaticAdvapi32);
     }
     if image.dependent_load_flags != Some(LOAD_LIBRARY_SEARCH_SYSTEM32) {
         return Err(E::DependentLoadFlags);
