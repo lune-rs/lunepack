@@ -8,8 +8,8 @@ use std::os::windows::ffi::OsStrExt as _;
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, KEY_WRITE, REG_DWORD,
-    REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW,
-    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW,
+    RegDeleteValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW, RegSetValueExW,
 };
 
 /// The most bytes of one value that are read; a longer value reads as [`Value::Other`].
@@ -202,6 +202,46 @@ impl Key {
         check(unsafe { RegSetValueExW(self.0, name.as_ptr(), 0, REG_DWORD, data.as_ptr(), 4) })
     }
 
+    /// Writes `name` as `REG_SZ` unless it already holds exactly `value`; whether it wrote.
+    pub(crate) fn ensure_str(&self, name: &str, value: &str) -> io::Result<bool> {
+        if self.get(name)? == Some(Value::Str(value.to_owned())) {
+            return Ok(false);
+        }
+        self.set_str(name, value)?;
+        Ok(true)
+    }
+
+    /// How many subkeys and values the key has.
+    #[allow(unsafe_code)]
+    pub(crate) fn counts(&self) -> io::Result<(u32, u32)> {
+        let mut subkeys: u32 = 0;
+        let mut values: u32 = 0;
+        // SAFETY: every pointer the call may write through is either null (an output not asked
+        // for) or a valid `u32` that outlives the call; the key handle is open.
+        check(unsafe {
+            RegQueryInfoKeyW(
+                self.0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut subkeys,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut values,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        Ok((subkeys, values))
+    }
+
+    /// Whether the key has no subkey and no value.
+    pub(crate) fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.counts()? == (0, 0))
+    }
+
     /// Deletes the value `name`; an absent value is fine.
     #[allow(unsafe_code)]
     pub(crate) fn delete_value(&self, name: &str) -> io::Result<()> {
@@ -257,6 +297,30 @@ pub(crate) fn delete_tree(hive: Hive, path: &str) -> io::Result<()> {
     match unsafe { RegDeleteTreeW(handle, leaf.as_ptr()) } {
         ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
         other => Err(io::Error::from_raw_os_error(other as i32)),
+    }
+}
+
+/// Deletes the key `hive\path` only when it has no subkey (`RegDeleteKeyW`); an absent key is
+/// fine.
+#[allow(unsafe_code)]
+pub(crate) fn delete_key(hive: Hive, path: &str) -> io::Result<()> {
+    let sub = wide(path);
+    // SAFETY: `sub` is NUL-terminated and outlives the call; the hive is a predefined handle.
+    match unsafe { RegDeleteKeyW(hive.handle(), sub.as_ptr()) } {
+        ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
+        other => Err(io::Error::from_raw_os_error(other as i32)),
+    }
+}
+
+/// Deletes the key `hive\path` when it has neither subkey nor value. For the keys an association
+/// made (`.ext\OpenWithProgids`, `.ext`).
+pub(crate) fn delete_if_empty(hive: Hive, path: &str) -> io::Result<()> {
+    match Key::open(hive, path, false)? {
+        Some(key) if key.is_empty()? => {
+            drop(key);
+            delete_key(hive, path)
+        }
+        _ => Ok(()),
     }
 }
 

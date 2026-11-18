@@ -6,6 +6,7 @@
 
 #[cfg(windows)]
 mod windows {
+    use std::collections::BTreeMap;
     use std::io::Read as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -14,6 +15,7 @@ mod windows {
         AppId, InstallMeta, IntegrationRequest, OsIntegration, RelPath, STUB_FILE, Scope, Version,
     };
     use lunepack_os_windows::{WinScope, WindowsIntegration, remove_stub_leftovers};
+    use lunepack_testkit::{SuiteHooks, run_integration_suite_with};
 
     /// The helper mode's switch: the copy of this test binary runs only the helper test.
     const HELPER_ENV: &str = "LUNEPACK_TEST_STUB_HELPER";
@@ -71,6 +73,159 @@ mod windows {
         out
     }
 
+    /// `reg.exe export` of `HKCU\<prefix>` as named lines, one per key that holds values (its
+    /// value lines sorted): an instrument independent of the adapter's own registry code. A prefix
+    /// that does not exist is an empty map.
+    fn registry_state(prefix: &str) -> BTreeMap<String, String> {
+        let out = std::env::temp_dir().join(format!("lp-export-{}.reg", tag()));
+        let status = Command::new("reg.exe")
+            .args(["export", &format!(r"HKCU\{prefix}")])
+            .arg(&out)
+            .arg("/y")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("reg.exe");
+        if !status.success() {
+            return BTreeMap::new();
+        }
+        let bytes = std::fs::read(&out).expect("export");
+        let _ = std::fs::remove_file(&out);
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
+            .collect();
+        let text = String::from_utf16_lossy(&units);
+        let mut keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut current: Option<String> = None;
+        for line in text.lines().map(|l| l.trim_start_matches('\u{feff}')) {
+            if line.starts_with('[') {
+                current = Some(line.to_owned());
+            } else if let Some(key) = &current
+                && !line.is_empty()
+            {
+                keys.entry(key.clone()).or_default().push(line.to_owned());
+            }
+        }
+        keys.into_iter()
+            .map(|(key, mut values)| {
+                values.sort();
+                (key, values.join("\n"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_integration_suite_passes() {
+        let t = tag();
+        let cleanup = Cleanup {
+            prefix: format!(r"Software\lunepack-test-{t}"),
+            dir: std::env::temp_dir().join(format!("lp-suite-{t}")),
+        };
+        let sandbox = cleanup.dir.join("home");
+        std::fs::create_dir_all(&sandbox).expect("sandbox");
+        let prefix = cleanup.prefix.clone();
+
+        // The instrument first: a key under the prefix must show up in the state, and must be
+        // gone again before the suite starts.
+        let probe = Command::new("reg.exe")
+            .args([
+                "add",
+                &format!(r"HKCU\{prefix}\probe"),
+                "/v",
+                "x",
+                "/d",
+                "1",
+                "/f",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("reg.exe");
+        assert!(probe.success());
+        assert_eq!(
+            registry_state(&prefix).len(),
+            1,
+            "INVALID: the state dump misses a key"
+        );
+        let gone = Command::new("reg.exe")
+            .args(["delete", &format!(r"HKCU\{prefix}"), "/f"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("reg.exe");
+        assert!(gone.success());
+        assert!(registry_state(&prefix).is_empty());
+
+        let scope = WinScope::with_registry_prefix(&prefix)
+            .expect("prefix")
+            .with_start_menu(sandbox.join("Programs"));
+        let w = WindowsIntegration::new(scope);
+
+        // What the Windows adapter reads from the install tree: the version's stub.
+        let stage = |req: &IntegrationRequest| {
+            let tree = req
+                .install_root
+                .join("app")
+                .join(req.version.to_string())
+                .join("bin");
+            std::fs::create_dir_all(&tree).expect("tree");
+            std::fs::create_dir_all(req.install_root.join(".lunepack").join("state"))
+                .expect("state");
+            std::fs::write(tree.join(STUB_FILE), b"the suite's stub").expect("stub");
+        };
+        // The staged version tree is not state; a `.lnk` records its target's file times, so its
+        // bytes differ whenever it is made again (its content is read back in the unit tests).
+        // The Start-menu folder's shortcut names are state, listed by `state`.
+        let ignore = |rel: &Path| {
+            rel.components()
+                .nth(1)
+                .is_some_and(|c| c.as_os_str() == "app")
+                || rel.extension().is_some_and(|e| e == "lnk")
+        };
+        let programs = sandbox.join("Programs");
+        let state = || {
+            let mut out = registry_state(&prefix);
+            if let Ok(entries) = std::fs::read_dir(&programs) {
+                for entry in entries {
+                    let name = entry.expect("entry").file_name();
+                    out.insert(
+                        format!("shortcut {}", name.to_string_lossy()),
+                        "present".to_owned(),
+                    );
+                }
+            }
+            out
+        };
+        let hooks = SuiteHooks {
+            entry: "bin/app.exe",
+            stage: Some(&stage),
+            ignore: Some(&ignore),
+            state: Some(&state),
+            // The shortcut is named after the app; `bin`, categories, comment and mime types are
+            // Linux's fields, which the Windows adapter never writes.
+            rename_moves_entries: true,
+            not_applicable: &[
+                "a newline in the comment",
+                "a semicolon in a category",
+                "a newline in a category",
+                "a slash in bin",
+                "dot dot in bin",
+                "a semicolon in a mime type",
+                "a newline in a mime type",
+            ],
+        };
+        run_integration_suite_with(&w, &sandbox, &hooks);
+
+        drop(cleanup);
+        assert!(
+            registry_state(&prefix).is_empty(),
+            "the test registry root is still there"
+        );
+    }
+
     #[test]
     fn running_stub_is_renamed_aside_and_collected_later() {
         let t = tag();
@@ -108,7 +263,9 @@ mod windows {
             "INVALID: a running image could be deleted, so the test proves nothing"
         );
 
-        let scope = WinScope::with_registry_prefix(&cleanup.prefix).expect("prefix");
+        let scope = WinScope::with_registry_prefix(&cleanup.prefix)
+            .expect("prefix")
+            .with_start_menu(cleanup.dir.join("Programs"));
         let w = WindowsIntegration::new(scope);
         let req = IntegrationRequest {
             app_id: AppId::parse("test.running").expect("id"),

@@ -156,28 +156,66 @@ impl OsIntegration for FakeIntegration {
 
 // ---- the contract suite ----
 
+/// What an adapter needs the suite to know that Linux's does not (M7): where the adapter keeps
+/// state outside the sandbox's files, what it reads from the install tree, and which of the suite's
+/// expectations are about fields it never writes. `SuiteHooks::default()` is the suite as the
+/// Linux adapter runs it.
+#[derive(Clone, Copy)]
+pub struct SuiteHooks<'a> {
+    /// The suite apps' `install.entry` (default `bin/app`); the Windows stub is named after it.
+    pub entry: &'a str,
+    /// Called once with each suite app's request before the adapter is first asked about it, to
+    /// stage what the adapter reads from the install tree (the Windows stub). Whatever it writes
+    /// inside the sandbox must be named by `ignore`.
+    pub stage: Option<&'a dyn Fn(&IntegrationRequest)>,
+    /// Sandbox-relative paths the snapshots leave out (a staged tree), with everything below.
+    pub ignore: Option<&'a dyn Fn(&Path) -> bool>,
+    /// State the adapter keeps outside the sandbox's files (the registry), as named lines, merged
+    /// into every snapshot. An empty map when it holds nothing.
+    pub state: Option<&'a dyn Fn() -> BTreeMap<String, String>>,
+    /// Whether the app's display name changes which entries exist (a Windows shortcut is named
+    /// after the app); the suite then does not expect the set of entries to stay across a rename.
+    pub rename_moves_entries: bool,
+    /// Labels of the unsafe-metadata cases whose field the adapter never writes (Linux-only
+    /// fields on Windows); those are not expected to be refused.
+    pub not_applicable: &'a [&'a str],
+}
+
+impl Default for SuiteHooks<'_> {
+    fn default() -> Self {
+        SuiteHooks {
+            entry: "bin/app",
+            stage: None,
+            ignore: None,
+            state: None,
+            rename_moves_entries: false,
+            not_applicable: &[],
+        }
+    }
+}
+
 /// What the sandbox holds, for comparing before and after: every file (its bytes) and symlink (its
-/// target) below `root`, by relative path. Directories are not listed, so an adapter may leave the
-/// empty directories it made.
-fn snapshot(root: &Path) -> BTreeMap<String, String> {
-    fn walk(dir: &Path, root: &Path, out: &mut BTreeMap<String, String>) {
+/// target) below `root`, by relative path, then the adapter's own state lines. Directories are not
+/// listed, so an adapter may leave the empty directories it made.
+fn snapshot(root: &Path, hooks: &SuiteHooks<'_>) -> BTreeMap<String, String> {
+    fn walk(dir: &Path, root: &Path, hooks: &SuiteHooks<'_>, out: &mut BTreeMap<String, String>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries {
             let entry = entry.expect("read the sandbox");
             let path = entry.path();
-            let rel = path
-                .strip_prefix(root)
-                .expect("inside the sandbox")
-                .to_string_lossy()
-                .into_owned();
+            let rel_path = path.strip_prefix(root).expect("inside the sandbox");
+            if hooks.ignore.is_some_and(|ignore| ignore(rel_path)) {
+                continue;
+            }
+            let rel = rel_path.to_string_lossy().into_owned();
             let kind = entry.file_type().expect("file type");
             if kind.is_symlink() {
                 let target = std::fs::read_link(&path).expect("read a link");
                 out.insert(rel, format!("-> {}", target.to_string_lossy()));
             } else if kind.is_dir() {
-                walk(&path, root, out);
+                walk(&path, root, hooks, out);
             } else {
                 let bytes = std::fs::read(&path).expect("read a file");
                 out.insert(rel, format!("file {}", String::from_utf8_lossy(&bytes)));
@@ -185,17 +223,28 @@ fn snapshot(root: &Path) -> BTreeMap<String, String> {
         }
     }
     let mut out = BTreeMap::new();
-    walk(root, root, &mut out);
+    walk(root, root, hooks, &mut out);
+    if let Some(state) = hooks.state {
+        for (name, value) in state() {
+            out.insert(format!("state: {name}"), value);
+        }
+    }
     out
 }
 
-fn suite_request(sandbox: &Path, id: &str, name: &str, bin: &str) -> IntegrationRequest {
+fn suite_request(
+    sandbox: &Path,
+    id: &str,
+    name: &str,
+    bin: &str,
+    entry: &str,
+) -> IntegrationRequest {
     IntegrationRequest {
         app_id: AppId::parse(id).expect("suite app id"),
         install_root: sandbox.join(format!("suite-install-{id}")),
         version: Version::parse("1.0.0").expect("suite version"),
         meta: InstallMeta {
-            entry: RelPath::parse("bin/app").expect("suite entry"),
+            entry: RelPath::parse(entry).expect("suite entry"),
             name: name.to_owned(),
             comment: Some("A suite app".to_owned()),
             icon: Some(RelPath::parse("share/icon.png").expect("suite icon")),
@@ -237,10 +286,37 @@ fn suite_request(sandbox: &Path, id: &str, name: &str, bin: &str) -> Integration
 /// value; `apply` and `remove` report nothing kept on a clean run. The install root of a request
 /// need not exist.
 pub fn run_integration_suite(integration: &dyn OsIntegration, sandbox: &Path) {
+    run_integration_suite_with(integration, sandbox, &SuiteHooks::default());
+}
+
+/// [`run_integration_suite`] for an adapter that needs [`SuiteHooks`] (the Windows one).
+pub fn run_integration_suite_with(
+    integration: &dyn OsIntegration,
+    sandbox: &Path,
+    hooks: &SuiteHooks<'_>,
+) {
+    let snapshot = |root: &Path| snapshot(root, hooks);
     let empty = snapshot(sandbox);
     assert!(empty.is_empty(), "the sandbox must start empty");
-    let a = suite_request(sandbox, "suite.app-a", "Suite App A", "suite-app-a");
-    let b = suite_request(sandbox, "suite.app-b", "Suite App B", "suite-app-b");
+    let a = suite_request(
+        sandbox,
+        "suite.app-a",
+        "Suite App A",
+        "suite-app-a",
+        hooks.entry,
+    );
+    let b = suite_request(
+        sandbox,
+        "suite.app-b",
+        "Suite App B",
+        "suite-app-b",
+        hooks.entry,
+    );
+    if let Some(stage) = hooks.stage {
+        stage(&a);
+        stage(&b);
+    }
+    assert_eq!(snapshot(sandbox), empty, "staging left something visible");
 
     // check writes nothing.
     integration.check(Scope::User, &a).expect("check");
@@ -273,19 +349,30 @@ pub fn run_integration_suite(integration: &dyn OsIntegration, sandbox: &Path) {
 
     // A refresh from changed metadata changes content, not the set of entries; refreshing back
     // restores the first state exactly.
-    let renamed = suite_request(sandbox, "suite.app-a", "Suite App Renamed", "suite-app-a");
+    let mut renamed = suite_request(
+        sandbox,
+        "suite.app-a",
+        "Suite App Renamed",
+        "suite-app-a",
+        hooks.entry,
+    );
+    renamed.previous = Some(a.meta.clone());
     integration.apply(Scope::User, &renamed).expect("refresh");
     let refreshed = snapshot(sandbox);
     assert_ne!(
         refreshed, applied,
         "a refresh with a new name changed nothing"
     );
-    assert_eq!(
-        refreshed.keys().collect::<Vec<_>>(),
-        applied.keys().collect::<Vec<_>>(),
-        "a refresh changed which entries exist"
-    );
-    integration.apply(Scope::User, &a).expect("refresh back");
+    if !hooks.rename_moves_entries {
+        assert_eq!(
+            refreshed.keys().collect::<Vec<_>>(),
+            applied.keys().collect::<Vec<_>>(),
+            "a refresh changed which entries exist"
+        );
+    }
+    let mut back = a.clone();
+    back.previous = Some(renamed.meta.clone());
+    integration.apply(Scope::User, &back).expect("refresh back");
     assert_eq!(
         snapshot(sandbox),
         applied,
@@ -360,7 +447,7 @@ pub fn run_integration_suite(integration: &dyn OsIntegration, sandbox: &Path) {
     }
     assert_eq!(snapshot(sandbox), empty, "machine scope wrote something");
 
-    unsafe_cases(integration, sandbox, &a, &empty);
+    unsafe_cases(integration, sandbox, &a, &empty, hooks);
 }
 
 fn unsafe_cases(
@@ -368,6 +455,7 @@ fn unsafe_cases(
     sandbox: &Path,
     good: &IntegrationRequest,
     empty: &BTreeMap<String, String>,
+    hooks: &SuiteHooks<'_>,
 ) {
     const MARK: &str = "SUITE-MARKER";
     let mut cases: Vec<(&str, IntegrationRequest)> = Vec::new();
@@ -427,7 +515,10 @@ fn unsafe_cases(
     with("a percent sign in the install root", &|r| {
         r.install_root = sandbox.join(format!("{MARK}%f"));
     });
-    for (what, req) in &cases {
+    for (what, req) in cases
+        .iter()
+        .filter(|(what, _)| !hooks.not_applicable.contains(what))
+    {
         for (op, result) in [
             ("check", integration.check(Scope::User, req)),
             ("apply", integration.apply(Scope::User, req).map(|_| ())),
@@ -438,7 +529,11 @@ fn unsafe_cases(
                 !shown.contains(MARK),
                 "{what}, {op}: shows the value: {shown}"
             );
-            assert_eq!(&snapshot(sandbox), empty, "{what}, {op}: wrote something");
+            assert_eq!(
+                &snapshot(sandbox, hooks),
+                empty,
+                "{what}, {op}: wrote something"
+            );
         }
     }
 }

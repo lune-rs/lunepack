@@ -1200,6 +1200,166 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         assert_clean(&vs);
     }
 
+    // M7-D4: `windows` only through the Windows OS adapter and the UI adapter ----------------------------
+
+    /// The clean fixture plus the Windows OS adapter (a member, so it can be a `via`).
+    fn with_windows_adapter() -> Fx {
+        let mut fx = Fx::clean();
+        fx.crates.insert(
+            "lunepack-os-windows".into(),
+            manifest(
+                "lunepack-os-windows",
+                OVERRIDE_LINTS,
+                r#"lunepack-core = { path = "../lunepack-core" }"#,
+            ),
+        );
+        fx
+    }
+
+    /// `windows` and the crates of its family that are other packages.
+    fn windows_crates() -> String {
+        [
+            lock_crate("windows", "0.62.2", Some("[\"windows-core 0.62.2\"]")),
+            lock_crate("windows-core", "0.62.2", None),
+            lock_crate("windows-sys", "0.61.2", None),
+            lock_crate("windows-targets", "0.53.5", None),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn x_windows_through_the_os_adapter_passes() {
+        let mut fx = with_windows_adapter();
+        fx.lock_member_extra.insert(
+            "lunepack-os-windows".into(),
+            "dependencies = [\"lunepack-core\", \"windows 0.62.2\"]\n".into(),
+        );
+        fx.lock_member_extra.insert(
+            "lunepack".into(),
+            "dependencies = [\"lunepack-core\", \"lunepack-os-windows\"]\n".into(),
+        );
+        fx.lock_extra = Some(windows_crates());
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn x_windows_reached_by_another_member_directly_fails_and_names_the_path() {
+        let mut fx = with_windows_adapter();
+        fx.lock_member_extra.insert(
+            "lunepack-os-windows".into(),
+            "dependencies = [\"lunepack-core\", \"windows 0.62.2\"]\n".into(),
+        );
+        fx.lock_member_extra.insert(
+            "lunepack".into(),
+            "dependencies = [\"lunepack-core\", \"windows 0.62.2\"]\n".into(),
+        );
+        fx.lock_extra = Some(windows_crates());
+        let vs = fx.run().1;
+        let detail = detail_of(&vs, "lunepack", "reach");
+        assert!(detail.contains("lunepack -> windows"), "{detail}");
+        assert!(
+            detail.contains("`lunepack-os-windows` or `lunepack-ui-luneui`"),
+            "both vias are named: {detail}"
+        );
+        assert!(!has(&vs, "lunepack-os-windows", "reach"), "{}", render(&vs));
+    }
+
+    #[test]
+    fn x_windows_reached_through_any_third_party_crate_fails() {
+        let mut fx = with_windows_adapter();
+        fx.lock_member_extra.insert(
+            "lunepack-cli".into(),
+            "dependencies = [\"lunepack-core\", \"shiny 1.0.0\"]\n".into(),
+        );
+        fx.lock_extra = Some(
+            [
+                windows_crates(),
+                lock_crate("shiny", "1.0.0", Some("[\"windows 0.62.2\"]")),
+            ]
+            .concat(),
+        );
+        let vs = fx.run().1;
+        let detail = detail_of(&vs, "lunepack-cli", "reach");
+        assert!(
+            detail.contains("lunepack-cli -> shiny -> windows"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn x_windows_through_the_ui_adapter_passes_and_a_crates_io_look_alike_does_not() {
+        let mut fx = with_ui();
+        fx.crates.insert(
+            "lunepack-os-windows".into(),
+            manifest(
+                "lunepack-os-windows",
+                OVERRIDE_LINTS,
+                r#"lunepack-core = { path = "../lunepack-core" }"#,
+            ),
+        );
+        let src = lune_lock_source();
+        fx.lock_member_extra.insert(
+            "lunepack-ui-luneui".into(),
+            format!(
+                "dependencies = [\n \"accesskit_windows 0.31.0\",\n \"lune-ui 0.7.0 ({src})\",\n \"lunepack-core\",\n]\n"
+            ),
+        );
+        let base = fx.lock_extra.clone().expect("lock");
+        fx.lock_extra = Some(
+            [
+                base.clone(),
+                windows_crates(),
+                lock_crate("accesskit_windows", "0.31.0", Some("[\"windows 0.62.2\"]")),
+            ]
+            .concat(),
+        );
+        assert_clean(&fx.run().1);
+
+        // A package from crates.io named like the adapter is not the member, so it is walked.
+        fx.lock_extra = Some(
+            [
+                base,
+                windows_crates(),
+                lock_crate("lunepack-os-windows", "9.9.9", Some("[\"windows 0.62.2\"]")),
+            ]
+            .concat(),
+        );
+        fx.lock_member_extra.insert(
+            "lunepack".into(),
+            "dependencies = [\"lunepack-core\", \"lunepack-os-windows 9.9.9\"]\n".into(),
+        );
+        assert_has(&fx.run().1, "lunepack", "reach");
+    }
+
+    #[test]
+    fn x_the_windows_row_matches_the_exact_name_only() {
+        let mut fx = with_windows_adapter();
+        fx.lock_member_extra.insert(
+            "lunepack".into(),
+            "dependencies = [\"lunepack-core\", \"windows-sys 0.61.2\", \"windows-core 0.62.2\", \"windows-targets 0.53.5\"]\n"
+                .into(),
+        );
+        fx.lock_extra = Some(windows_crates());
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn x_the_ring_row_still_names_its_one_via() {
+        let fx = with_graph(
+            &[
+                ("lunepack", "[\"lunepack-core\", \"rustls\"]"),
+                ("lunepack-http", "[\"lunepack-core\"]"),
+            ],
+            &tls_chain(),
+        );
+        let vs = fx.run().1;
+        let detail = detail_of(&vs, "lunepack", "reach");
+        assert!(
+            detail.contains("other than through `lunepack-http`:"),
+            "{detail}"
+        );
+    }
+
     #[test]
     fn p_real_workspace_passes() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
