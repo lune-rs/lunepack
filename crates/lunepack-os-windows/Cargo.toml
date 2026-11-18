@@ -26,3 +26,16 @@ lunepack-core.workspace = true
 # SystemParametersInfoW for the client-area animation setting (M6-D8); the DLL search hardening, the
 # known folders, the message box and the app user model id (M7).
 windows-sys = { workspace = true }
+
+[dev-dependencies]
+lunepack-testkit.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+# A job object without breakaway, for the detached-spawn fallback test.
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_Console", "Win32_System_JobObjects"] }
+
+# Own main: the test binary is also the helper program the process suite and the tests start (its
+# first argument names the helper mode), and the cases run one after another.
+[[test]]
+name = "process"
+harness = false

@@ -3,14 +3,20 @@
 //! Today it holds the reduce-motion reader (M6-D8): [`prefers_reduced_motion`] reads the OS's
 //! client-area animation setting through `SystemParametersInfoW` (user32, no window stack), and the
 //! small Windows helpers of M7: the DLL search hardening ([`harden_dll_search`]) and the shell
-//! helpers of [`shell`] (known folders, a message box, the app user model id, the foreground right).
+//! helpers of [`shell`] (known folders, a message box, the app user model id, the foreground right),
+//! and, on Windows only, [`WindowsProcess`] (M7 step 5): the core's `Process` over the Win32 process
+//! APIs.
 //! The public API is safe and builds on every OS; off Windows the helpers are no-ops or
 //! `Unsupported`.
 
 mod harden;
+#[cfg(windows)]
+mod process;
 mod shell;
 
 pub use harden::harden_dll_search;
+#[cfg(windows)]
+pub use process::WindowsProcess;
 pub use shell::{
     MessageKind, allow_set_foreground, message_box, set_process_aumid, start_menu_programs,
     user_program_files,
