@@ -1,14 +1,20 @@
 //! The per-user layout, the discovery rules and the `current` reconcile (M5-D2, M5-D17, P4).
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lunepack_core::layout::{MAX_TREE_DEPTH, current_target};
+use lunepack_core::state::commit_raw_payload;
 use lunepack_core::{
-    AppId, CurrentRef, Discovery, FileKind, Fs, FsErrorKind, InstallState, LayoutError, RelPath,
-    Scope, Target, UpdateConfig, UserLayout, Version, discover, is_tombstone_of, reconcile_current,
-    remove_tombstones, tombstone_name, tree_candidates, version_config_path,
+    AppId, CurrentRef, DirEntryInfo, Discovery, FileKind, FileWrite, Fs, FsError, FsErrorKind,
+    InstallState, LayoutError, LayoutScheme, LockGuard, Meta, NameRule, ReadAt, RelPath,
+    RootChoice, Scope, Target, UpdateConfig, UserLayout, UserScope, Version, discover,
+    ensure_no_foreign_record, is_tombstone_of, reconcile_current, remove_tombstones, resolve_root,
+    root_valid_for_uninstall, tombstone_name, tree_candidates, version_config_path,
+    windows_name_ok,
 };
-use lunepack_testkit::{MemFs, abs_path, sample_update_config};
+use lunepack_testkit::{FakeHasher, MemFs, abs_path, sample_update_config};
 
 fn v(text: &str) -> Version {
     Version::parse(text).unwrap()
@@ -40,19 +46,19 @@ fn find(exe: &str, tree: &str, config: &UpdateConfig) -> Result<Discovery, Layou
         .into_iter()
         .find(|(t, _)| *t == want)
         .unwrap_or_else(|| panic!("{} is not a candidate of {}", tree, exe.display()));
-    discover(&exe, &tree, k, config)
+    discover(&exe, &tree, k, config, LayoutScheme::XDG)
 }
 
 #[test]
 fn user_layout_names_the_directories_under_the_root() {
     let r = PathBuf::from("/home/u/.local/share/org.example.hello");
-    let l = UserLayout::from_root(r.clone());
+    let l = UserLayout::from_root(r.clone(), LayoutScheme::XDG);
     assert_eq!(l.root(), r);
     assert_eq!(l.versions_dir(), r.join("versions"));
     assert_eq!(l.state_dir(), r.join("state"));
     assert_eq!(l.cache_dir(), r.join("cache"));
     assert_eq!(l.logs_dir(), r.join("logs"));
-    assert_eq!(l.current_link(), r.join("current"));
+    assert_eq!(l.current_link(), Some(r.join("current")));
     assert_eq!(l.version_dir(&v("1.2.0")), r.join("versions/1.2.0"));
     assert_eq!(l.current_tree(), None);
     assert_eq!(
@@ -157,9 +163,21 @@ fn an_exe_outside_the_entry_directory_is_not_this_tree() {
 fn a_tree_that_is_not_the_exes_ancestor_is_not_this_tree() {
     let c = config("bin/app", "1.2.0");
     let exe = abs_path("/x/versions/1.2.0/bin/app");
-    let got = discover(&exe, &abs_path("/y/versions/1.2.0"), 1, &c);
+    let got = discover(
+        &exe,
+        &abs_path("/y/versions/1.2.0"),
+        1,
+        &c,
+        LayoutScheme::XDG,
+    );
     assert!(matches!(got, Err(LayoutError::NotThisTree)), "{got:?}");
-    let got = discover(Path::new("bin/app"), &abs_path("/x"), 1, &c);
+    let got = discover(
+        Path::new("bin/app"),
+        &abs_path("/x"),
+        1,
+        &c,
+        LayoutScheme::XDG,
+    );
     assert!(matches!(got, Err(LayoutError::NotThisTree)), "{got:?}");
 }
 
@@ -410,4 +428,569 @@ fn remove_tombstones_removes_only_real_tombstone_directories_without_following_l
     remove_tombstones(&fs, &home, &app()).unwrap();
     assert_eq!(kind(&theirs), Some(FileKind::Dir));
     remove_tombstones(&fs, Path::new("/nowhere"), &app()).unwrap();
+}
+
+// ---- layout schemes (M7-D2, M7-D18 (a)) -----------------------------------------------------------
+
+#[test]
+fn the_windows_scheme_names_app_and_dot_lunepack_and_no_current_link() {
+    let r = abs_path("/Programs/Hello App");
+    let l = UserLayout::from_root(r.clone(), LayoutScheme::WINDOWS);
+    assert_eq!(l.versions_dir(), r.join("app"));
+    assert_eq!(l.state_dir(), r.join(".lunepack").join("state"));
+    assert_eq!(l.cache_dir(), r.join(".lunepack").join("cache"));
+    assert_eq!(l.logs_dir(), r.join(".lunepack").join("logs"));
+    assert_eq!(l.current_link(), None);
+    assert_eq!(l.version_dir(&v("1.2.0")), r.join("app").join("1.2.0"));
+    assert_eq!(
+        l.version_config_path(&v("1.2.0")),
+        r.join("app").join("1.2.0").join("lunepack-update.json")
+    );
+    // The same root under XDG keeps M5-D2's names (M7-D18 (a)).
+    let x = UserLayout::from_root(r.clone(), LayoutScheme::XDG);
+    assert_eq!(
+        x.version_config_path(&v("1.2.0")),
+        version_config_path(&r, &v("1.2.0"))
+    );
+}
+
+#[test]
+fn from_dirs_recognises_each_scheme_and_nothing_else() {
+    let r = abs_path("/r");
+    for scheme in [LayoutScheme::XDG, LayoutScheme::WINDOWS] {
+        let l = UserLayout::from_root(r.clone(), scheme);
+        assert_eq!(
+            UserLayout::from_dirs(&l.state_dir(), &l.versions_dir()),
+            Some(l.clone())
+        );
+    }
+    // Mixed names, or two roots, are no layout.
+    assert_eq!(
+        UserLayout::from_dirs(&r.join("state"), &r.join("app")),
+        None
+    );
+    assert_eq!(
+        UserLayout::from_dirs(&abs_path("/a/state"), &abs_path("/b/versions")),
+        None
+    );
+}
+
+#[test]
+fn reconcile_under_the_windows_scheme_projects_nothing() {
+    let fs = MemFs::new();
+    let root = abs_path("/Programs/Hello App");
+    fs.create_dir_all(&root.join("app").join("1.0.0")).unwrap();
+    let l = UserLayout::from_root(root.clone(), LayoutScheme::WINDOWS);
+    l.reconcile(&fs, &record(Some("1.0.0"))).unwrap();
+    assert_eq!(fs.symlink_metadata(&root.join("current")).unwrap(), None);
+    // XDG's reconcile through the layout is reconcile_current's.
+    let x = UserLayout::from_root(root.clone(), LayoutScheme::XDG);
+    fs.create_dir_all(&root.join("versions").join("1.0.0"))
+        .unwrap();
+    x.reconcile(&fs, &record(Some("1.0.0"))).unwrap();
+    assert_eq!(
+        fs.read_link(&root.join("current")).unwrap(),
+        "versions/1.0.0"
+    );
+}
+
+/// `discover` under the Windows scheme: the tree's parent must be `app`, and the root is above it.
+#[test]
+fn discover_under_the_windows_scheme_finds_r_above_app() {
+    let c = config("bin/hello.exe", "1.2.0");
+    let exe = abs_path("/P/Hello App/app/1.2.0/bin/hello.exe");
+    let tree = abs_path("/P/Hello App/app/1.2.0");
+    assert_eq!(
+        discover(&exe, &tree, 1, &c, LayoutScheme::WINDOWS).unwrap(),
+        Discovery::Installed {
+            root: abs_path("/P/Hello App"),
+            version: v("1.2.0"),
+        }
+    );
+    // A tree under `versions` (XDG's name) is a bootstrap under WINDOWS, and the reverse.
+    let exe = abs_path("/P/Hello App/versions/1.2.0/bin/hello.exe");
+    let tree = abs_path("/P/Hello App/versions/1.2.0");
+    assert_eq!(
+        discover(&exe, &tree, 1, &c, LayoutScheme::WINDOWS).unwrap(),
+        Discovery::NotInstalled
+    );
+    let exe = abs_path("/P/Hello App/app/1.2.0/bin/hello.exe");
+    let tree = abs_path("/P/Hello App/app/1.2.0");
+    assert_eq!(
+        discover(&exe, &tree, 1, &c, LayoutScheme::XDG).unwrap(),
+        Discovery::NotInstalled
+    );
+}
+
+// ---- windows_name_ok (M7-D15) -----------------------------------------------------------------
+
+#[test]
+fn windows_name_ok_refuses_each_forbidden_character_and_controls() {
+    for c in [
+        '<', '>', ':', '"', '/', '\\', '|', '?', '*', '\u{1f}', '\u{0}', '\t',
+    ] {
+        let name = format!("My{c}App");
+        assert_eq!(
+            windows_name_ok(&name),
+            Err(NameRule::ForbiddenChar),
+            "{c:?}"
+        );
+    }
+}
+
+#[test]
+fn windows_name_ok_refuses_leading_and_trailing_dots_and_spaces() {
+    for name in [" Lunegit", ".Lunegit", "Lunegit.", "Lunegit "] {
+        assert_eq!(windows_name_ok(name), Err(NameRule::Edge), "{name:?}");
+    }
+    assert_eq!(windows_name_ok(""), Err(NameRule::Empty));
+}
+
+#[test]
+fn windows_name_ok_refuses_device_names_by_stem() {
+    for name in [
+        "con",
+        "Con.txt",
+        "COM\u{b9}",
+        "lpt9 .x",
+        "CONIN$",
+        "nul",
+        "Aux.tar.gz",
+        "COM0",
+    ] {
+        assert_eq!(windows_name_ok(name), Err(NameRule::DeviceName), "{name:?}");
+    }
+    for name in [
+        "COM10",
+        "CONSOLE",
+        "Lunegit",
+        "My App 2",
+        "Lunegit.app",
+        "x.con",
+    ] {
+        assert_eq!(windows_name_ok(name), Ok(()), "{name:?}");
+    }
+}
+
+#[test]
+fn windows_name_ok_counts_utf16_units_with_astral_characters_as_two() {
+    let at_64 = format!("{}\u{1f600}", "a".repeat(62));
+    assert_eq!(at_64.encode_utf16().count(), 64);
+    assert_eq!(windows_name_ok(&at_64), Ok(()));
+    let at_65 = format!("{}\u{1f600}", "a".repeat(63));
+    assert_eq!(at_65.encode_utf16().count(), 65);
+    assert_eq!(windows_name_ok(&at_65), Err(NameRule::TooLong));
+    // 64 BMP characters of 2 bytes in UTF-8 each are still 64 units.
+    assert_eq!(windows_name_ok(&"\u{e4}".repeat(64)), Ok(()));
+    assert_eq!(
+        windows_name_ok(&"\u{e4}".repeat(65)),
+        Err(NameRule::TooLong)
+    );
+}
+
+// ---- resolve_root (M7-D16, M7-D17 (a)) ---------------------------------------------------------
+
+const NAME: &str = "Hello App";
+
+fn dh() -> PathBuf {
+    abs_path("/home/u/AppData/Local/Programs")
+}
+
+fn other_app() -> AppId {
+    AppId::parse("com.other.app").unwrap()
+}
+
+/// A Windows-layout install of `app` at `root`: its state directory with one committed record.
+fn install_at(fs: &MemFs, root: &Path, app: &AppId) {
+    let l = UserLayout::from_root(root.to_path_buf(), LayoutScheme::WINDOWS);
+    fs.create_dir_all(&l.state_dir()).unwrap();
+    let store = UserScope {
+        dir: l.state_dir(),
+        app_id: app.clone(),
+    };
+    let loaded = store.load(fs, &FakeHasher).unwrap();
+    let rec = InstallState::new(1, app.clone(), Scope::User, [7; 16], Target::WindowsX86_64);
+    store.commit(fs, &loaded, &rec, &FakeHasher).unwrap();
+}
+
+/// A state directory at `root` whose only record is whole (its checksum passes) but invalid.
+fn unreadable_at(fs: &MemFs, root: &Path) {
+    let dir = UserLayout::from_root(root.to_path_buf(), LayoutScheme::WINDOWS).state_dir();
+    fs.create_dir_all(&dir).unwrap();
+    commit_raw_payload(fs, &dir, 1, b"{}", &FakeHasher).unwrap();
+}
+
+fn put_file(fs: &MemFs, path: &Path) {
+    let mut f = fs.create_new(path).unwrap();
+    f.write_all(b"x").unwrap();
+    f.sync().unwrap();
+}
+
+fn resolve(fs: &dyn Fs, name: &str) -> Result<RootChoice, LayoutError> {
+    resolve_root(fs, &FakeHasher, &dh(), &app(), name, LayoutScheme::WINDOWS)
+}
+
+fn fallback() -> PathBuf {
+    dh().join("Hello App (org.example.hello)")
+}
+
+#[test]
+fn resolve_root_in_an_empty_or_missing_data_home_is_a_new_folder_named_after_the_app() {
+    let fs = MemFs::new();
+    assert_eq!(
+        resolve(&fs, NAME).unwrap(),
+        RootChoice::New(dh().join(NAME))
+    );
+    fs.create_dir_all(&dh()).unwrap();
+    assert_eq!(
+        resolve(&fs, NAME).unwrap(),
+        RootChoice::New(dh().join(NAME))
+    );
+}
+
+#[test]
+fn resolve_root_finds_an_install_by_record_whatever_its_folder_is_named() {
+    // A display-name change: the folder keeps its first name.
+    let fs = MemFs::new();
+    install_at(&fs, &dh().join("Old Name"), &app());
+    assert_eq!(
+        resolve(&fs, NAME).unwrap(),
+        RootChoice::Existing(dh().join("Old Name"))
+    );
+    // A user-renamed folder.
+    let fs = MemFs::new();
+    install_at(&fs, &dh().join("Renamed by the user"), &app());
+    install_at(&fs, &dh().join(NAME), &other_app());
+    assert_eq!(
+        resolve(&fs, NAME).unwrap(),
+        RootChoice::Existing(dh().join("Renamed by the user"))
+    );
+}
+
+#[test]
+fn resolve_root_refuses_two_folders_with_this_apps_record() {
+    let fs = MemFs::new();
+    install_at(&fs, &dh().join(NAME), &app());
+    install_at(&fs, &dh().join("Copy of Hello App"), &app());
+    assert!(matches!(
+        resolve(&fs, NAME),
+        Err(LayoutError::InstallAmbiguous)
+    ));
+}
+
+#[test]
+fn resolve_root_moves_beside_a_foreign_install_and_refuses_when_both_names_are_taken() {
+    let fs = MemFs::new();
+    install_at(&fs, &dh().join(NAME), &other_app());
+    assert_eq!(resolve(&fs, NAME).unwrap(), RootChoice::New(fallback()));
+    install_at(&fs, &fallback(), &other_app());
+    let before = fs.op_count();
+    assert!(matches!(resolve(&fs, NAME), Err(LayoutError::FolderTaken)));
+    assert_eq!(fs.op_count(), before, "resolution writes nothing");
+}
+
+#[test]
+fn resolve_root_adopts_an_empty_folder_and_skips_a_non_empty_one() {
+    let fs = MemFs::new();
+    fs.create_dir_all(&dh().join(NAME)).unwrap();
+    assert_eq!(
+        resolve(&fs, NAME).unwrap(),
+        RootChoice::New(dh().join(NAME))
+    );
+    put_file(&fs, &dh().join(NAME).join("notes.txt"));
+    assert_eq!(resolve(&fs, NAME).unwrap(), RootChoice::New(fallback()));
+    // An empty folder at the second name is adopted too.
+    fs.create_dir_all(&fallback()).unwrap();
+    assert_eq!(resolve(&fs, NAME).unwrap(), RootChoice::New(fallback()));
+}
+
+#[test]
+fn resolve_root_takes_a_file_or_link_at_the_name_as_taken_and_never_follows_it() {
+    let fs = MemFs::new();
+    fs.create_dir_all(&dh()).unwrap();
+    put_file(&fs, &dh().join(NAME));
+    assert_eq!(resolve(&fs, NAME).unwrap(), RootChoice::New(fallback()));
+
+    // A link at the name pointing at a real install of this app: not followed, not found.
+    let fs = MemFs::new();
+    install_at(&fs, &abs_path("/elsewhere/real"), &app());
+    fs.create_dir_all(&dh()).unwrap();
+    let target = abs_path("/elsewhere/real");
+    fs.symlink(target.to_str().unwrap(), &dh().join(NAME))
+        .unwrap();
+    assert_eq!(resolve(&fs, NAME).unwrap(), RootChoice::New(fallback()));
+}
+
+#[test]
+fn resolve_root_refuses_an_unreadable_record_in_the_apps_own_folders_only() {
+    let fs = MemFs::new();
+    unreadable_at(&fs, &dh().join(NAME));
+    assert!(matches!(
+        resolve(&fs, NAME),
+        Err(LayoutError::InstallUnreadable)
+    ));
+    // Compared ignoring case (a case-insensitive filesystem has one folder for both).
+    let fs = MemFs::new();
+    unreadable_at(&fs, &dh().join("hello app"));
+    assert!(matches!(
+        resolve(&fs, NAME),
+        Err(LayoutError::InstallUnreadable)
+    ));
+    let fs = MemFs::new();
+    unreadable_at(&fs, &fallback());
+    assert!(matches!(
+        resolve(&fs, NAME),
+        Err(LayoutError::InstallUnreadable)
+    ));
+    // In an unrelated folder it is skipped.
+    let fs = MemFs::new();
+    unreadable_at(&fs, &dh().join("Something Else"));
+    assert_eq!(
+        resolve(&fs, NAME).unwrap(),
+        RootChoice::New(dh().join(NAME))
+    );
+}
+
+#[test]
+fn resolve_root_ignores_dot_entries() {
+    let fs = MemFs::new();
+    let tomb = dh().join(tombstone_name(&app(), &[1; 8]));
+    install_at(&fs, &tomb, &app());
+    install_at(&fs, &dh().join(".hidden"), &app());
+    assert_eq!(
+        resolve(&fs, NAME).unwrap(),
+        RootChoice::New(dh().join(NAME))
+    );
+}
+
+#[test]
+fn resolve_root_refuses_a_data_home_over_4096_entries() {
+    let fs = MemFs::new();
+    for i in 0..4096 {
+        fs.create_dir_all(&dh().join(format!("d{i}"))).unwrap();
+    }
+    assert_eq!(
+        resolve(&fs, NAME).unwrap(),
+        RootChoice::New(dh().join(NAME))
+    );
+    fs.create_dir_all(&dh().join("d4096")).unwrap();
+    assert!(matches!(
+        resolve(&fs, NAME),
+        Err(LayoutError::TooManyEntries)
+    ));
+}
+
+#[test]
+fn resolve_root_refuses_a_name_that_fails_the_windows_rule() {
+    let fs = MemFs::new();
+    assert!(matches!(
+        resolve(&fs, "CON"),
+        Err(LayoutError::NameNotAllowed(NameRule::DeviceName))
+    ));
+    assert!(matches!(
+        resolve(&fs, "a/b"),
+        Err(LayoutError::NameNotAllowed(NameRule::ForbiddenChar))
+    ));
+}
+
+/// Counts `list_dir` calls and passes everything to a [`MemFs`].
+struct CountingFs {
+    inner: MemFs,
+    lists: AtomicUsize,
+}
+
+impl Fs for CountingFs {
+    fn read_capped(&self, p: &Path, max: u64) -> Result<Vec<u8>, FsError> {
+        self.inner.read_capped(p, max)
+    }
+    fn open_read(&self, p: &Path) -> Result<Box<dyn ReadAt>, FsError> {
+        self.inner.open_read(p)
+    }
+    fn create_new(&self, p: &Path) -> Result<Box<dyn FileWrite>, FsError> {
+        self.inner.create_new(p)
+    }
+    fn open_append(&self, p: &Path) -> Result<Box<dyn FileWrite>, FsError> {
+        self.inner.open_append(p)
+    }
+    fn truncate(&self, p: &Path, len: u64) -> Result<(), FsError> {
+        self.inner.truncate(p, len)
+    }
+    fn rename(&self, a: &Path, b: &Path) -> Result<(), FsError> {
+        self.inner.rename(a, b)
+    }
+    fn remove_file(&self, p: &Path) -> Result<(), FsError> {
+        self.inner.remove_file(p)
+    }
+    fn remove_dir_all_nofollow(&self, p: &Path) -> Result<(), FsError> {
+        self.inner.remove_dir_all_nofollow(p)
+    }
+    fn create_dir_all(&self, p: &Path) -> Result<(), FsError> {
+        self.inner.create_dir_all(p)
+    }
+    fn list_dir(&self, p: &Path) -> Result<Vec<DirEntryInfo>, FsError> {
+        self.lists.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_dir(p)
+    }
+    fn symlink_metadata(&self, p: &Path) -> Result<Option<Meta>, FsError> {
+        self.inner.symlink_metadata(p)
+    }
+    fn sync_dir(&self, p: &Path) -> Result<(), FsError> {
+        self.inner.sync_dir(p)
+    }
+    fn copy_file(&self, a: &Path, b: &Path) -> Result<(), FsError> {
+        self.inner.copy_file(a, b)
+    }
+    fn set_exec(&self, p: &Path, exec: bool) -> Result<(), FsError> {
+        self.inner.set_exec(p, exec)
+    }
+    fn symlink(&self, target: &str, p: &Path) -> Result<(), FsError> {
+        self.inner.symlink(target, p)
+    }
+    fn read_link(&self, p: &Path) -> Result<String, FsError> {
+        self.inner.read_link(p)
+    }
+    fn replace_symlink(&self, target: &str, p: &Path) -> Result<(), FsError> {
+        self.inner.replace_symlink(target, p)
+    }
+    fn try_lock(&self, p: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {
+        self.inner.try_lock(p)
+    }
+}
+
+#[test]
+fn resolve_root_under_xdg_is_the_app_id_folder_with_no_listing() {
+    let fs = CountingFs {
+        inner: MemFs::new(),
+        lists: AtomicUsize::new(0),
+    };
+    let xdg = |fs: &CountingFs| {
+        resolve_root(fs, &FakeHasher, &dh(), &app(), NAME, LayoutScheme::XDG).unwrap()
+    };
+    assert_eq!(xdg(&fs), RootChoice::New(dh().join("org.example.hello")));
+    // Another app's install named like the display name changes nothing under XDG.
+    install_at(&fs.inner, &dh().join(NAME), &other_app());
+    fs.inner
+        .create_dir_all(&dh().join("org.example.hello").join("state"))
+        .unwrap();
+    fs.lists.store(0, Ordering::SeqCst);
+    assert_eq!(
+        xdg(&fs),
+        RootChoice::Existing(dh().join("org.example.hello"))
+    );
+    // Even a name the Windows rule refuses: XDG never names a folder after it.
+    assert_eq!(
+        resolve_root(&fs, &FakeHasher, &dh(), &app(), "CON", LayoutScheme::XDG)
+            .unwrap()
+            .into_path(),
+        dh().join("org.example.hello")
+    );
+    assert_eq!(fs.lists.load(Ordering::SeqCst), 0);
+}
+
+// ---- the uninstall root rule (M5-D10, M7-D16) ---------------------------------------------------
+
+#[test]
+fn the_uninstall_root_rule_under_windows_wants_a_real_folder_directly_in_the_data_home() {
+    let fs = MemFs::new();
+    let w = LayoutScheme::WINDOWS;
+    install_at(&fs, &dh().join(NAME), &app());
+    install_at(&fs, &dh().join("Copy of Hello App"), &app());
+    install_at(&fs, &abs_path("/elsewhere/Hello App"), &app());
+    assert!(root_valid_for_uninstall(
+        &fs,
+        &dh(),
+        &dh().join(NAME),
+        &app(),
+        w
+    ));
+    // A copied folder is uninstallable on its own.
+    assert!(root_valid_for_uninstall(
+        &fs,
+        &dh(),
+        &dh().join("Copy of Hello App"),
+        &app(),
+        w
+    ));
+    // Under another parent, the data home itself, a link (a junction's stand-in), a dot name.
+    assert!(!root_valid_for_uninstall(
+        &fs,
+        &dh(),
+        &abs_path("/elsewhere/Hello App"),
+        &app(),
+        w
+    ));
+    assert!(!root_valid_for_uninstall(&fs, &dh(), &dh(), &app(), w));
+    fs.symlink(
+        abs_path("/elsewhere/Hello App").to_str().unwrap(),
+        &dh().join("Linked"),
+    )
+    .unwrap();
+    assert!(!root_valid_for_uninstall(
+        &fs,
+        &dh(),
+        &dh().join("Linked"),
+        &app(),
+        w
+    ));
+    install_at(&fs, &dh().join(".Hidden"), &app());
+    assert!(!root_valid_for_uninstall(
+        &fs,
+        &dh(),
+        &dh().join(".Hidden"),
+        &app(),
+        w
+    ));
+}
+
+#[test]
+fn the_uninstall_root_rule_under_xdg_is_the_derived_root() {
+    let fs = MemFs::new();
+    let x = LayoutScheme::XDG;
+    let r = dh().join("org.example.hello");
+    fs.create_dir_all(&r).unwrap();
+    fs.create_dir_all(&dh().join("Hello App")).unwrap();
+    assert!(root_valid_for_uninstall(&fs, &dh(), &r, &app(), x));
+    assert!(!root_valid_for_uninstall(
+        &fs,
+        &dh(),
+        &dh().join("Hello App"),
+        &app(),
+        x
+    ));
+    assert!(!root_valid_for_uninstall(&fs, &dh(), &r, &other_app(), x));
+}
+
+// ---- the under-lock re-check (M7-D16 rule 3) -----------------------------------------------------
+
+/// Two apps with one display name both resolve the same new folder; the first to take the lock
+/// writes its record, and the second, re-checking under the lock, stops writing nothing.
+#[test]
+fn two_new_resolutions_for_one_name_let_only_the_first_writer_in() {
+    let fs = MemFs::new();
+    fs.create_dir_all(&dh()).unwrap();
+    let a = resolve_root(&fs, &FakeHasher, &dh(), &app(), NAME, LayoutScheme::WINDOWS).unwrap();
+    let b = resolve_root(
+        &fs,
+        &FakeHasher,
+        &dh(),
+        &other_app(),
+        NAME,
+        LayoutScheme::WINDOWS,
+    )
+    .unwrap();
+    assert_eq!(a, RootChoice::New(dh().join(NAME)));
+    assert_eq!(a, b);
+    let state = UserLayout::from_root(a.into_path(), LayoutScheme::WINDOWS).state_dir();
+    // The first writer, under the lock.
+    ensure_no_foreign_record(&fs, &FakeHasher, &state, &app()).unwrap();
+    install_at(&fs, &dh().join(NAME), &app());
+    // The second, under the lock.
+    let before = fs.op_count();
+    assert!(matches!(
+        ensure_no_foreign_record(&fs, &FakeHasher, &state, &other_app()),
+        Err(LayoutError::ForeignRecord)
+    ));
+    assert_eq!(fs.op_count(), before);
+    // Its own record (or none) passes.
+    ensure_no_foreign_record(&fs, &FakeHasher, &state, &app()).unwrap();
 }

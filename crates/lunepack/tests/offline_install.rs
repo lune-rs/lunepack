@@ -153,7 +153,10 @@ impl Lab {
             self.root(),
             &format!("{FAKE_BASE_URL}/feed-{SUITE_CHANNEL}.json"),
             channel(),
-            Layout::user(&UserLayout::from_root(root_dir())),
+            Layout::user(&UserLayout::from_root(
+                root_dir(),
+                lunepack_core::LayoutScheme::XDG,
+            )),
         )
         .transport(Arc::new(NoNetwork))
         .fs(Arc::new(self.fs.clone()))

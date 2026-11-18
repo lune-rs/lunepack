@@ -65,8 +65,10 @@ pub use integration::{
 };
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use layout::{
-    Discovery, UserLayout, discover, is_tombstone_of, reconcile_current, remove_tombstones,
-    tombstone_name, tree_candidates, version_config_path,
+    Discovery, LayoutScheme, NameRule, Projection, RootChoice, RootNaming, UserLayout, discover,
+    ensure_no_foreign_record, is_tombstone_of, reconcile_current, remove_tombstones, resolve_root,
+    root_valid_for_uninstall, tombstone_name, tree_candidates, version_config_path,
+    windows_name_ok,
 };
 pub use lifecycle::{
     AttemptOutcome, ConfirmOutcome, TokenCheck, apply, confirm, count_attempt, deliver_events,

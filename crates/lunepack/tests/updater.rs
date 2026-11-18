@@ -1503,7 +1503,10 @@ fn the_facade_names_the_api_types_and_builds_a_trusted_root_from_bytes() {
 #[test]
 fn a_user_layout_gives_the_facade_layout_under_its_root() {
     let root = PathBuf::from("/home/u/.local/share/org.example.hello");
-    let layout = Layout::user(&lunepack_core::UserLayout::from_root(root.clone()));
+    let layout = Layout::user(&lunepack_core::UserLayout::from_root(
+        root.clone(),
+        lunepack_core::LayoutScheme::XDG,
+    ));
     assert_eq!(
         layout,
         Layout::User {
