@@ -263,7 +263,7 @@ in the release directory.
 ```
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
-    [--runtime <RUNTIME>] [--ui <UI>] [--config <CONFIG>]
+    [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--config <CONFIG>]
 ```
 
 - `--version`: SemVer 2.0.0, used verbatim as the directory name. A directory of equal precedence with
@@ -278,6 +278,10 @@ lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-di
   refused without it (see "Self-updating apps").
 - `--ui`: the `lunepack-ui` binary to place beside the runtime. Needs `--runtime` and `[update]`, and
   is refused without them. Without it no UI is placed. A file over 64 MiB is refused.
+- `--stub`: the Windows launcher stub, stamped and placed beside the entry as `lunepack-stub.exe`.
+  Required for a `windows-*` target when the config has `[update]`; refused for any other target and
+  without `[update]`. The console stub is needed when `install.terminal` is set, the GUI stub
+  otherwise. A file over 32 MiB is refused.
 
 Pre-checks run before any encoding: `keys.json` verifies; every `--sign` key is in the key set and
 inside its window; the signers reach the threshold; the manifest and pack do not exist yet; the target
@@ -424,7 +428,7 @@ lunepack setup <DIR> --version <VERSION> --target <TARGET> [--out <FILE>] [--at 
     [--config <CONFIG>]
 ```
 
-Builds a Linux setup file (FORMAT.md 14): the release's own runtime, then `keys.json`, the manifest
+Builds a Linux or Windows setup file (FORMAT.md 14): the release's own runtime, then `keys.json`, the manifest
 and the pack of `<VERSION>` for `<TARGET>`, then the trailer naming them and the root the release's
 update configuration trusts. Run, the file installs exactly that version with no network, with the
 window or `--silent` (RUNTIME.md, "Setup files").
@@ -436,10 +440,10 @@ pack through their signed frames. The release must have been packed with `[updat
 (and `--ui` for a window). The written bytes are then parsed back and verified as the runtime
 parses them, so `keys.json` must be signed under the root the update configuration names.
 
-`<VERSION>` is the text as written in the release (canonical). Only `linux-x86_64` and
-`linux-aarch64` are accepted in this release. The file goes to `--out`, or to
-`<app_id>-<VERSION>-<TARGET>-setup` in the current directory; an existing file is not replaced.
-It is made executable (mode 0755). The output depends on the release directory only: two runs give
+`<VERSION>` is the text as written in the release (canonical). Only the `linux-*` and `windows-*`
+targets are accepted in this release. The file goes to `--out`, or to
+`<app_id>-<VERSION>-<TARGET>-setup` (with `.exe` for a `windows-*` target) in the current directory;
+an existing file is not replaced. It is made executable (mode 0755). The output depends on the release directory only: two runs give
 the same bytes. `--at` verifies at that Unix time instead of the system clock. A setup file stops
 installing when its key set expires or its release keys' windows end: build it from a current
 release.

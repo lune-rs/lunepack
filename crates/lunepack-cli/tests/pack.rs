@@ -1519,42 +1519,47 @@ fn update_pack_other_targets() {
     write(input.path(), "assets/icon.svg", b"<svg/>");
 
     let pe = w.dir.path().join("runtime.exe");
-    fs::write(
-        &pe,
-        exe_headers::pe_image(0x8664, &exe_headers::PeSpec::hardened(2)),
-    )
-    .unwrap();
+    fs::write(&pe, hardened_pe(0x8664, 2)).unwrap();
+    let stub = w.dir.path().join("stub.exe");
+    fs::write(&stub, hardened_pe(0x8664, 2)).unwrap();
     assert_ok(
-        &pack_update(&w, input.path(), &dir, Some(&pe), "1.0.0", "windows-x86_64"),
+        &pack_win(
+            &w,
+            input.path(),
+            &dir,
+            Some(&pe),
+            Some(&stub),
+            "1.0.0",
+            "windows-x86_64",
+        ),
         "windows-x86_64",
     );
     let (_, files) = w.verify(&dir, "1.0.0", Target::WindowsX86_64);
     assert!(files.contains_key("bin/lunepack-runtime.exe"));
+    assert!(files.contains_key("bin/lunepack-stub.exe"));
     assert!(files.contains_key("lunepack-update.json"));
 
     // A Linux runtime for a Windows target, and an arm64 PE for x86-64, are refused.
     let elf = w.dir.path().join("runtime.elf");
     fs::write(&elf, runtime_elf(62, false)).unwrap();
-    let out = pack_update(
+    let out = pack_win(
         &w,
         input.path(),
         &dir,
         Some(&elf),
+        Some(&stub),
         "1.0.1",
         "windows-x86_64",
     );
     assert_fails(&out, 1, "an ELF for a Windows target");
     let arm = w.dir.path().join("arm.exe");
-    fs::write(
-        &arm,
-        exe_headers::pe_image(0xAA64, &exe_headers::PeSpec::hardened(2)),
-    )
-    .unwrap();
-    let out = pack_update(
+    fs::write(&arm, hardened_pe(0xAA64, 2)).unwrap();
+    let out = pack_win(
         &w,
         input.path(),
         &dir,
         Some(&arm),
+        Some(&stub),
         "1.0.1",
         "windows-x86_64",
     );
@@ -1563,11 +1568,12 @@ fn update_pack_other_targets() {
     // The header-only PE of earlier milestones, and a runtime without the hardening (M7-D10).
     let bare = w.dir.path().join("bare.exe");
     fs::write(&bare, exe_headers::pe(0x8664, 4_096)).unwrap();
-    let out = pack_update(
+    let out = pack_win(
         &w,
         input.path(),
         &dir,
         Some(&bare),
+        Some(&stub),
         "1.0.1",
         "windows-x86_64",
     );
@@ -1580,11 +1586,12 @@ fn update_pack_other_targets() {
     let mut spec = exe_headers::PeSpec::hardened(2);
     spec.imports.push("VCRUNTIME140.dll".to_owned());
     fs::write(&crt, exe_headers::pe_image(0x8664, &spec)).unwrap();
-    let out = pack_update(
+    let out = pack_win(
         &w,
         input.path(),
         &dir,
         Some(&crt),
+        Some(&stub),
         "1.0.1",
         "windows-x86_64",
     );
@@ -1619,4 +1626,521 @@ fn update_pack_other_targets() {
     let (_, files) = w.verify(&dir, "1.0.0", Target::MacosAarch64);
     assert!(files.contains_key("App.app/Contents/MacOS/lunepack-runtime"));
     assert!(files.contains_key("Contents/Resources/lunepack-update.json"));
+}
+
+// ---- `--stub` and stamping for Windows targets (M7 step 12) -------------------------------------
+
+/// A hardened PE image (M7-D10) of `machine` with the GUI (2) or console (3) `subsystem`.
+#[cfg(unix)]
+fn hardened_pe(machine: u16, subsystem: u16) -> Vec<u8> {
+    exe_headers::pe_image(machine, &exe_headers::PeSpec::hardened(subsystem))
+}
+
+/// `pack` for a Windows target with `--runtime` and `--stub` as given.
+#[cfg(unix)]
+fn pack_win(
+    w: &World,
+    input: &Path,
+    dir: &Path,
+    runtime: Option<&Path>,
+    stub: Option<&Path>,
+    version: &'static str,
+    target: &'static str,
+) -> Output {
+    let mut extra = Vec::new();
+    if let Some(r) = runtime {
+        extra.extend_from_slice(&["--runtime", s(r)]);
+    }
+    if let Some(p) = stub {
+        extra.extend_from_slice(&["--stub", s(p)]);
+    }
+    w.pack(&Pack {
+        input,
+        version,
+        target,
+        release_dir: dir,
+        signers: w.all_signers(),
+        epoch: T0,
+        extra,
+    })
+}
+
+/// A header-only PNG of `side` by `side` pixels (the packager reads the header and no pixel).
+#[cfg(unix)]
+fn icon_png(side: u32) -> Vec<u8> {
+    let mut p = b"\x89PNG\r\n\x1a\n".to_vec();
+    p.extend_from_slice(&13u32.to_be_bytes());
+    p.extend_from_slice(b"IHDR");
+    p.extend_from_slice(&side.to_be_bytes());
+    p.extend_from_slice(&side.to_be_bytes());
+    p.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    p
+}
+
+/// A Windows app: an `.exe` entry, an SVG icon, some data; the config has `[update]`.
+#[cfg(unix)]
+struct WinApp {
+    w: World,
+    input: tempfile::TempDir,
+    runtime: PathBuf,
+    stub: PathBuf,
+}
+
+#[cfg(unix)]
+fn win_app(toml: &str) -> WinApp {
+    let w = World::new(1, 1);
+    w.append_config(toml);
+    let input = tempfile::tempdir().unwrap();
+    write(input.path(), "bin/app.exe", &exe_headers::pe(0x8664, 8_000));
+    write(input.path(), "assets/icon.svg", b"<svg/>");
+    write(input.path(), "data/readme.txt", &text(3_000));
+    let runtime = w.dir.path().join("runtime.exe");
+    fs::write(&runtime, hardened_pe(0x8664, 2)).unwrap();
+    let stub = w.dir.path().join("stub.exe");
+    fs::write(&stub, hardened_pe(0x8664, 2)).unwrap();
+    WinApp {
+        w,
+        input,
+        runtime,
+        stub,
+    }
+}
+
+#[cfg(unix)]
+const WIN_TOML: &str = r#"
+[update]
+feed = "https://updates.example.com/hello"
+channel = "stable"
+health_timeout_secs = 30
+
+[install]
+entry = "bin/app.exe"
+name = "Hello"
+publisher = "Example Org"
+icon = "assets/icon.svg"
+"#;
+
+#[cfg(unix)]
+impl WinApp {
+    fn pack(&self, dir: &Path, version: &'static str, stub: Option<&Path>) -> Output {
+        pack_win(
+            &self.w,
+            self.input.path(),
+            dir,
+            Some(&self.runtime),
+            stub,
+            version,
+            "windows-x86_64",
+        )
+    }
+
+    /// The stub as the pack holds it.
+    fn stub_in(&self, dir: &Path, version: &str) -> Vec<u8> {
+        let (_, mut files) = self.w.verify(dir, version, Target::WindowsX86_64);
+        files.remove("bin/lunepack-stub.exe").expect("a stub")
+    }
+}
+
+/// The VERSIONINFO strings of a PE, by key.
+#[cfg(unix)]
+fn version_strings(pe: &[u8]) -> BTreeMap<String, String> {
+    let image = editpe::Image::parse(pe.to_vec()).unwrap();
+    let info = image
+        .resource_directory()
+        .and_then(|r| r.get_version_info().ok().flatten())
+        .expect("a version info");
+    info.strings[0]
+        .strings
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// M7-D14: the stub is stamped (name, publisher, version, original file name, the icon) and placed
+/// beside the entry before hashing; the stamped bytes keep every hardening field of the input
+/// (P3) and pass the stub check again.
+#[cfg(unix)]
+#[test]
+fn windows_pack_stamps_and_places_the_stub() {
+    let app = win_app(WIN_TOML);
+    let dir = app.w.release_dir("rel", &[]);
+    assert_ok(&app.pack(&dir, "1.2.3-rc.1+b7", Some(&app.stub)), "pack");
+    let stamped = app.stub_in(&dir, "1.2.3-rc.1+b7");
+    let input = fs::read(&app.stub).unwrap();
+    assert_ne!(stamped, input);
+    lunepack_core::check_pe_stub(&stamped, Target::WindowsX86_64, false).expect("a GUI stub");
+    let (before, after) = (
+        lunepack_core::pe::PeImage::parse(&input).unwrap(),
+        lunepack_core::pe::PeImage::parse(&stamped).unwrap(),
+    );
+    assert_eq!(after.headers.machine, before.headers.machine);
+    assert_eq!(after.headers.subsystem, before.headers.subsystem);
+    assert_eq!(after.imports, before.imports);
+    assert_eq!(after.delay_imports, before.delay_imports);
+    assert_eq!(after.dependent_load_flags, Some(0x800));
+    assert_eq!(after.manifest, before.manifest);
+    let strings = version_strings(&stamped);
+    for (key, value) in [
+        ("CompanyName", "Example Org"),
+        ("FileDescription", "Hello"),
+        ("FileVersion", "1.2.3-rc.1+b7"),
+        ("OriginalFilename", "app.exe"),
+        ("ProductName", "Hello"),
+        ("ProductVersion", "1.2.3-rc.1+b7"),
+    ] {
+        assert_eq!(strings.get(key).map(String::as_str), Some(value), "{key}");
+    }
+    // An SVG `install.icon` stamps no icon.
+    let image = editpe::Image::parse(stamped.clone()).unwrap();
+    assert!(
+        image
+            .resource_directory()
+            .unwrap()
+            .get_main_icon()
+            .unwrap()
+            .is_none()
+    );
+
+    // No publisher: no CompanyName.
+    let app = win_app(&WIN_TOML.replace("publisher = \"Example Org\"\n", ""));
+    let dir = app.w.release_dir("rel", &[]);
+    assert_ok(&app.pack(&dir, "1.0.0", Some(&app.stub)), "pack");
+    let strings = version_strings(&app.stub_in(&dir, "1.0.0"));
+    assert!(!strings.contains_key("CompanyName"), "{strings:?}");
+}
+
+/// The icon: `[windows] icon` (an ICO) wins; else a square PNG `install.icon` (at most 256 px) is
+/// wrapped as a PNG-in-ICO entry; an SVG gives none; a PNG that breaks the rule is an error.
+#[cfg(unix)]
+#[test]
+fn windows_stub_icon_follows_m7_d14() {
+    let icon_bytes = |pe: &[u8]| {
+        let image = editpe::Image::parse(pe.to_vec()).unwrap();
+        image
+            .resource_directory()
+            .unwrap()
+            .get_main_icon()
+            .unwrap()
+            .map(<[u8]>::to_vec)
+    };
+    // A PNG install.icon, 64 px: wrapped, the PNG's bytes inside.
+    let toml = WIN_TOML.replace("assets/icon.svg", "assets/icon.png");
+    let app = win_app(&toml);
+    write(app.input.path(), "assets/icon.png", &icon_png(64));
+    let dir = app.w.release_dir("rel", &[]);
+    assert_ok(&app.pack(&dir, "1.0.0", Some(&app.stub)), "png icon");
+    let icon = icon_bytes(&app.stub_in(&dir, "1.0.0")).expect("an icon");
+    assert!(
+        icon.ends_with(&icon_png(64)),
+        "the PNG is carried unchanged"
+    );
+
+    // 256 px is allowed, 257 and a non-square one are not, and the message names the field.
+    for (side, ok) in [(256, true), (257, false)] {
+        let app = win_app(&toml);
+        write(app.input.path(), "assets/icon.png", &icon_png(side));
+        let dir = app.w.release_dir("rel", &[]);
+        let out = app.pack(&dir, "1.0.0", Some(&app.stub));
+        if ok {
+            assert_ok(&out, "a 256 px icon");
+        } else {
+            let err = assert_fails(&out, 1, "a 257 px icon");
+            assert!(err.contains("install.icon"), "{err:?}");
+        }
+    }
+    let app = win_app(&toml);
+    let mut tall = icon_png(32);
+    tall[20..24].copy_from_slice(&48u32.to_be_bytes());
+    write(app.input.path(), "assets/icon.png", &tall);
+    let dir = app.w.release_dir("rel", &[]);
+    let err = assert_fails(&app.pack(&dir, "1.0.0", Some(&app.stub)), 1, "not square");
+    assert!(
+        err.contains("install.icon") && err.contains("not square"),
+        "{err:?}"
+    );
+
+    // `[windows] icon` wins over `install.icon`, even over a PNG that would be refused.
+    let ico = {
+        let mut ico = vec![0, 0, 1, 0, 1, 0, 16, 16, 0, 0, 1, 0, 32, 0];
+        ico.extend_from_slice(&4u32.to_le_bytes());
+        ico.extend_from_slice(&22u32.to_le_bytes());
+        ico.extend_from_slice(b"ICON");
+        ico
+    };
+    let app = win_app(&toml);
+    app.w.append_config("\n[windows]\nicon = \"app.ico\"\n");
+    fs::write(app.w.dir.path().join("app.ico"), &ico).unwrap();
+    write(app.input.path(), "assets/icon.png", &icon_png(999));
+    let dir = app.w.release_dir("rel", &[]);
+    assert_ok(&app.pack(&dir, "1.0.0", Some(&app.stub)), "an ico icon");
+    assert!(icon_bytes(&app.stub_in(&dir, "1.0.0")).is_some());
+
+    // A bad .ico names `[windows] icon`.
+    for bad in [&b"not an icon"[..], &ico[..ico.len() - 1]] {
+        let app = win_app(WIN_TOML);
+        app.w.append_config("\n[windows]\nicon = \"app.ico\"\n");
+        fs::write(app.w.dir.path().join("app.ico"), bad).unwrap();
+        let dir = app.w.release_dir("rel", &[]);
+        let err = assert_fails(&app.pack(&dir, "1.0.0", Some(&app.stub)), 1, "a bad ico");
+        assert!(err.contains("[windows] icon"), "{err:?}");
+    }
+    // `[windows] icon` for a Linux target is not read.
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    w.append_config("\n[windows]\nicon = \"missing.ico\"\n");
+    let dir = w.release_dir("rel", &[]);
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    assert_ok(
+        &pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&runtime),
+            "1.0.0",
+            "linux-x86_64",
+        ),
+        "a Linux pack ignores [windows]",
+    );
+}
+
+/// The console variant for a terminal app (`install.terminal`), the GUI variant otherwise.
+#[cfg(unix)]
+#[test]
+fn windows_stub_variant_follows_terminal() {
+    let console = hardened_pe(0x8664, 3);
+    let app = win_app(&format!("{WIN_TOML}terminal = true\n"));
+    let console_path = app.w.dir.path().join("console.exe");
+    fs::write(&console_path, &console).unwrap();
+    let dir = app.w.release_dir("rel", &[]);
+    let err = assert_fails(
+        &app.pack(&dir, "1.0.0", Some(&app.stub)),
+        1,
+        "a GUI stub for a terminal app",
+    );
+    assert!(err.contains("--stub is not a console stub"), "{err:?}");
+    assert!(err.contains("wrong Windows subsystem"), "{err:?}");
+    assert_ok(
+        &app.pack(&dir, "1.0.0", Some(&console_path)),
+        "console stub",
+    );
+    let stamped = app.stub_in(&dir, "1.0.0");
+    lunepack_core::check_pe_stub(&stamped, Target::WindowsX86_64, true).expect("a console stub");
+
+    let app = win_app(WIN_TOML);
+    let console_path = app.w.dir.path().join("console.exe");
+    fs::write(&console_path, &console).unwrap();
+    let dir = app.w.release_dir("rel", &[]);
+    let err = assert_fails(
+        &app.pack(&dir, "1.0.0", Some(&console_path)),
+        1,
+        "a console stub for a GUI app",
+    );
+    assert!(err.contains("--stub is not a GUI stub"), "{err:?}");
+}
+
+/// C2: the same inputs give identical stamped stubs, packs and manifests, and the stub's input
+/// bytes reach the pack.
+#[cfg(unix)]
+#[test]
+fn windows_pack_is_deterministic() {
+    let toml = WIN_TOML.replace("assets/icon.svg", "assets/icon.png");
+    let app = win_app(&toml);
+    write(app.input.path(), "assets/icon.png", &icon_png(48));
+    let (a, b) = (app.w.release_dir("a", &[]), app.w.release_dir("b", &[]));
+    for dir in [&a, &b] {
+        assert_ok(&app.pack(dir, "1.0.0", Some(&app.stub)), "pack");
+    }
+    for name in [
+        "1.0.0/windows-x86_64.pack",
+        "1.0.0/windows-x86_64.manifest.json",
+    ] {
+        assert_eq!(
+            fs::read(a.join(name)).unwrap(),
+            fs::read(b.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+    assert_eq!(app.stub_in(&a, "1.0.0"), app.stub_in(&b, "1.0.0"));
+    // A different stub gives a different pack.
+    let other = app.w.dir.path().join("other.exe");
+    let mut spec = exe_headers::PeSpec::hardened(2);
+    spec.code_len = 0x800;
+    fs::write(&other, exe_headers::pe_image(0x8664, &spec)).unwrap();
+    let c = app.w.release_dir("c", &[]);
+    assert_ok(&app.pack(&c, "1.0.0", Some(&other)), "pack");
+    assert_ne!(
+        fs::read(a.join("1.0.0/windows-x86_64.pack")).unwrap(),
+        fs::read(c.join("1.0.0/windows-x86_64.pack")).unwrap()
+    );
+}
+
+/// `--stub` refusals name the option or the field and never a value.
+#[cfg(unix)]
+#[test]
+fn windows_stub_refusals() {
+    let app = win_app(WIN_TOML);
+    let dir = app.w.release_dir("rel", &[]);
+    let fails = |out: Output, what: &str| assert_fails(&out, 1, what);
+
+    let err = fails(app.pack(&dir, "1.0.0", None), "no --stub");
+    assert!(err.contains("--stub is required"), "{err:?}");
+
+    // Wrong machine, a C runtime import, no flags, no manifest, the wrong subsystem, not a PE.
+    let mut crt = exe_headers::PeSpec::hardened(2);
+    crt.imports.push("MSVCP140.dll".to_owned());
+    let mut no_flags = exe_headers::PeSpec::hardened(2);
+    no_flags.dependent_load_flags = None;
+    let mut no_manifest = exe_headers::PeSpec::hardened(2);
+    no_manifest.manifest = None;
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+        ("arm64", hardened_pe(0xAA64, 2), "another architecture"),
+        ("crt", exe_headers::pe_image(0x8664, &crt), "C runtime"),
+        (
+            "flags",
+            exe_headers::pe_image(0x8664, &no_flags),
+            "DependentLoadFlags",
+        ),
+        (
+            "manifest",
+            exe_headers::pe_image(0x8664, &no_manifest),
+            "manifest",
+        ),
+        ("console", hardened_pe(0x8664, 3), "subsystem"),
+        ("bare", exe_headers::pe(0x8664, 4_096), "malformed"),
+        ("elf", runtime_elf(62, false), "not an executable"),
+    ];
+    for (name, bytes, want) in cases {
+        let path = app.w.dir.path().join(format!("{name}.exe"));
+        fs::write(&path, bytes).unwrap();
+        let err = fails(app.pack(&dir, "1.0.0", Some(&path)), name);
+        assert!(err.contains("--stub is not a GUI stub"), "{name}: {err:?}");
+        assert!(err.contains(want), "{name}: {err:?}");
+        assert!(!err.contains(path.to_str().unwrap()), "{name}: {err:?}");
+    }
+    let missing = app.w.dir.path().join("missing.exe");
+    fails(app.pack(&dir, "1.0.0", Some(&missing)), "a missing stub");
+
+    // --stub for a Linux target, without --runtime, and without [update].
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    let ldir = w.release_dir("rel", &[]);
+    let linput = tempfile::tempdir().unwrap();
+    app_tree(linput.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let out = pack_win(
+        &w,
+        linput.path(),
+        &ldir,
+        Some(&runtime),
+        Some(&app.stub),
+        "1.0.0",
+        "linux-x86_64",
+    );
+    let err = fails(out, "--stub for linux");
+    assert!(err.contains("--stub is only for windows-*"), "{err:?}");
+    let out = pack_win(
+        &w,
+        linput.path(),
+        &ldir,
+        None,
+        Some(&app.stub),
+        "1.0.0",
+        "windows-x86_64",
+    );
+    let err = fails(out, "--stub without --runtime");
+    assert!(err.contains("--stub needs --runtime"), "{err:?}");
+    let w = World::new(1, 1);
+    let ldir = w.release_dir("rel", &[]);
+    let out = pack_win(
+        &w,
+        linput.path(),
+        &ldir,
+        None,
+        Some(&app.stub),
+        "1.0.0",
+        "windows-x86_64",
+    );
+    let err = fails(out, "--stub without [update]");
+    assert!(err.contains("--stub needs [update]"), "{err:?}");
+}
+
+/// The Windows rules on the config and the input: every clause of M7-D15's `name` rule, the `.exe`
+/// entry, the numeric version, and the reserved stub name.
+#[cfg(unix)]
+#[test]
+fn windows_pack_refusals_name_the_field_not_the_value() {
+    let long = "N".repeat(65);
+    let name_cases: [(&str, &str, &str); 5] = [
+        (&long, "too long", "N"),
+        ("Qa:zb", "a character Windows does not allow", "Qa:zb"),
+        (" Qab", "starts with a dot or space", "Qab"),
+        ("Qab.", "starts with a dot or space, or ends", "Qab"),
+        ("Con.Qab", "a Windows device name", "Qab"),
+    ];
+    for (name, clause, secret) in name_cases {
+        let app = win_app(&WIN_TOML.replace("name = \"Hello\"", &format!("name = \"{name}\"")));
+        let dir = app.w.release_dir("rel", &[]);
+        let err = assert_fails(&app.pack(&dir, "1.0.0", Some(&app.stub)), 1, clause);
+        assert!(err.contains("[install] name"), "{clause}: {err:?}");
+        assert!(err.contains(clause), "{clause}: {err:?}");
+        if secret != "N" {
+            assert!(!err.contains(secret), "{clause}: {err:?}");
+        }
+    }
+    // The rule applies to Windows targets only: a Linux pack with the same names works.
+    let w = World::new(1, 1);
+    w.append_config(&UPDATE_TOML.replace("name = \"Hello\"", "name = \"Con: a/b.\""));
+    let ldir = w.release_dir("rel", &[]);
+    let linput = tempfile::tempdir().unwrap();
+    app_tree(linput.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    assert_ok(
+        &pack_update(
+            &w,
+            linput.path(),
+            &ldir,
+            Some(&runtime),
+            "1.0.0",
+            "linux-x86_64",
+        ),
+        "a Linux pack with a name Windows would refuse",
+    );
+
+    // The entry must be an .exe.
+    let app = win_app(&WIN_TOML.replace("bin/app.exe", "bin/app"));
+    write(app.input.path(), "bin/app", &exe_headers::pe(0x8664, 8_000));
+    let dir = app.w.release_dir("rel", &[]);
+    let err = assert_fails(
+        &app.pack(&dir, "1.0.0", Some(&app.stub)),
+        1,
+        "entry not .exe",
+    );
+    assert!(err.contains("[install] entry"), "{err:?}");
+
+    // The numeric version: each component at most 65535, the message names `--version`.
+    let app = win_app(WIN_TOML);
+    let dir = app.w.release_dir("rel", &[]);
+    for version in ["65536.0.0", "1.65536.0", "1.0.65536"] {
+        let err = assert_fails(&app.pack(&dir, version, Some(&app.stub)), 1, version);
+        assert!(err.contains("--version"), "{version}: {err:?}");
+        assert!(!err.contains("65536"), "{version}: {err:?}");
+    }
+    assert_ok(
+        &app.pack(&dir, "65535.65535.65535", Some(&app.stub)),
+        "the largest",
+    );
+
+    // The stub's name is reserved at any depth, ignoring case; the input is not touched.
+    for at in ["bin/lunepack-stub.exe", "other/Lunepack-Stub.EXE"] {
+        let app = win_app(WIN_TOML);
+        write(app.input.path(), at, b"x");
+        let dir = app.w.release_dir("rel", &[]);
+        let err = assert_fails(&app.pack(&dir, "1.0.0", Some(&app.stub)), 1, at);
+        assert!(err.contains("reserved"), "{at}: {err:?}");
+    }
 }

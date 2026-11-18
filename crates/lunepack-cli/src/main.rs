@@ -13,6 +13,7 @@ mod config;
 mod pipeline;
 mod place;
 mod release_dir;
+mod stamp;
 mod state;
 
 use std::path::PathBuf;

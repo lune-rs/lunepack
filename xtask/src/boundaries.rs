@@ -71,6 +71,10 @@ pub const CORE_EXTERNAL_ALLOWLIST: &[&str] = &[
 /// later confined crate is one line. Matched on the package name, never the rename.
 pub const CONFINED: &[(&str, &[&str])] = &[
     ("lzma-rust2", &["lunepack-codec-lzma"]),
+    // The PE resource editor that stamps the Windows stub and setup file (M7-D22): only the packager
+    // CLI uses it. It holds one `unsafe` block, named in D17. `pe-stamp` is the throwaway probe
+    // (`probes/pe-stamp`, its own lock, never built on a developer machine) that measured it.
+    ("editpe", &["lunepack-cli", "pe-stamp"]),
     // LuneUI's facade crate (D39 (b), M6): only the UI adapter depends on it. The rest of the GPU
     // and window stack is held by `REACH_FAMILIES_ONLY_THROUGH`.
     ("lune-ui", &["lunepack-ui-luneui"]),
@@ -159,7 +163,10 @@ pub const FORBIDDEN_ANYWHERE: &[&str] = &["aws-lc-rs", "aws-lc-sys", "openssl", 
 /// Exact version pins: `(package, dependency, requirement string as cargo reports it)`. The
 /// package must exist in the workspace and must declare the dependency, always with this
 /// requirement.
-pub const EXACT_PINS: &[(&str, &str, &str)] = &[("lunepack-codec-lzma", "lzma-rust2", "=0.25.0")];
+pub const EXACT_PINS: &[(&str, &str, &str)] = &[
+    ("lunepack-codec-lzma", "lzma-rust2", "=0.25.0"),
+    ("lunepack-cli", "editpe", "=0.2.4"),
+];
 
 /// The `source` string cargo metadata reports for a crates.io dependency in this workspace.
 pub const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";

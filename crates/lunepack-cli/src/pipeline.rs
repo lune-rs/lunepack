@@ -23,8 +23,8 @@ use lunepack_core::update_config::{
 };
 use lunepack_core::{
     CodeSign, Codec, CodecId, Encoder, EntryKind, Hasher, InstallMeta, ManifestDocument,
-    PackedFile, RelPath, ReleaseLayout, Sha256Digest, Target, UPDATE_CONFIG_FILE, pack_file,
-    validate_tree,
+    PackedFile, RelPath, ReleaseLayout, STUB_FILE, Sha256Digest, Target, UPDATE_CONFIG_FILE,
+    pack_file, validate_tree,
 };
 
 /// Fixed per-job allowance on top of the input, output and encoder estimates: 16 MiB of slack for
@@ -133,8 +133,8 @@ fn make_symlink(_text: &str, at: &Path) -> Result<()> {
 }
 
 /// What a pack with `[update]` adds to the tree (M5-D7): the runtime beside the entry, the UI
-/// binary beside it when `--ui` is given (M6), and the update configuration at its fixed place
-/// (FORMAT.md 13.1).
+/// binary beside it when `--ui` is given (M6), the Windows stub beside it for a `windows-*` target
+/// (M7), and the update configuration at its fixed place (FORMAT.md 13.1).
 pub struct UpdatePlan<'a> {
     /// The target of the pack.
     pub target: Target,
@@ -144,6 +144,9 @@ pub struct UpdatePlan<'a> {
     pub runtime: &'a [u8],
     /// The UI binary's bytes, already checked against the target; absent without `--ui`.
     pub ui: Option<&'a [u8]>,
+    /// The stamped Windows launcher stub (M7-D14), placed beside the entry as
+    /// [`STUB_FILE`]; `Some` exactly for a `windows-*` target.
+    pub stub: Option<&'a [u8]>,
     /// The update configuration's canonical bytes.
     pub config: &'a [u8],
 }
@@ -158,7 +161,7 @@ fn parent_of(path: &str) -> &str {
 /// runtime's or the UI's name (either form) in the entry's directory. The UI's name is reserved
 /// whether or not `--ui` is given, since the runtime starts a UI from its own directory. Names
 /// compare ignoring ASCII case, as a case-insensitive file system would.
-pub fn check_reserved(input: &Path, entry: &RelPath) -> Result<()> {
+pub fn check_reserved(input: &Path, entry: &RelPath, target: Target) -> Result<()> {
     let entry_dir = parent_of(entry.as_str());
     for (path, ..) in walk(input)? {
         let text = path.as_str();
@@ -166,6 +169,13 @@ pub fn check_reserved(input: &Path, entry: &RelPath) -> Result<()> {
         if name.eq_ignore_ascii_case(UPDATE_CONFIG_FILE) {
             bail!(
                 "the input tree holds {text:?}; the name {UPDATE_CONFIG_FILE} is reserved for the update configuration at any depth"
+            );
+        }
+        // The stub's name is the entry directory's, as the runtime's; for a Windows target it is
+        // kept free at any depth, so no file of the tree can be taken for a launcher (M7-D8).
+        if target.is_windows() && name.eq_ignore_ascii_case(STUB_FILE) {
+            bail!(
+                "the input tree holds {text:?}; the name {STUB_FILE} is reserved for the launcher stub of a Windows target"
             );
         }
         if parent_of(text) == entry_dir {
@@ -187,7 +197,7 @@ pub fn check_reserved(input: &Path, entry: &RelPath) -> Result<()> {
 
 /// Fails unless `rel` names a regular file in `tree`, reached through real directories only (a
 /// symlink on the way would make the last `lstat` say nothing about the path).
-fn regular_file_in(tree: &Path, rel: &RelPath, field: &str) -> Result<fs::Metadata> {
+pub(crate) fn regular_file_in(tree: &Path, rel: &RelPath, field: &str) -> Result<fs::Metadata> {
     let count = rel.components().count();
     let mut at = tree.to_path_buf();
     for (i, component) in rel.components().enumerate() {
@@ -260,6 +270,9 @@ pub fn place_update(tree: &Path, plan: &UpdatePlan<'_>) -> Result<()> {
     write_new(&beside.join(runtime_file(plan.target)), plan.runtime, true)?;
     if let Some(ui) = plan.ui {
         write_new(&beside.join(ui_file(plan.target)), ui, true)?;
+    }
+    if let Some(stub) = plan.stub {
+        write_new(&beside.join(STUB_FILE), stub, true)?;
     }
     let config = tree.join(config_path(plan.target));
     if let Some(parent) = config.parent() {
@@ -621,7 +634,7 @@ pub fn build(
     if let Some(plan) = &set.update
         && input.is_dir()
     {
-        check_reserved(input, &plan.install.entry)?;
+        check_reserved(input, &plan.install.entry, plan.target)?;
     }
     assemble(input, &tree)?;
     say(&format!("assemble: copied {}", input.display()))?;
