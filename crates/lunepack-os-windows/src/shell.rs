@@ -47,6 +47,12 @@ pub fn set_process_aumid(aumid: &str) -> io::Result<()> {
     imp::set_process_aumid(aumid)
 }
 
+/// This process's explicit app user model id (`GetCurrentProcessExplicitAppUserModelID`), read
+/// back: `Ok(None)` when none was set. For tests and diagnostics.
+pub fn process_aumid() -> io::Result<Option<String>> {
+    imp::process_aumid()
+}
+
 /// Lets the process `pid` bring a window to the foreground (`AllowSetForegroundWindow`), so an
 /// app a launcher just started is not hidden behind the launcher's own window.
 pub fn allow_set_foreground(pid: u32) -> io::Result<()> {
@@ -63,8 +69,8 @@ mod imp {
 
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{
-        FOLDERID_Programs, FOLDERID_UserProgramFiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
-        SetCurrentProcessExplicitAppUserModelID,
+        FOLDERID_Programs, FOLDERID_UserProgramFiles, GetCurrentProcessExplicitAppUserModelID,
+        KF_FLAG_DEFAULT, SHGetKnownFolderPath, SetCurrentProcessExplicitAppUserModelID,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AllowSetForegroundWindow, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
@@ -83,6 +89,9 @@ mod imp {
             .chain(std::iter::once(0))
             .collect()
     }
+
+    /// `E_FAIL`, which `GetCurrentProcessExplicitAppUserModelID` returns when no id was set.
+    const E_FAIL_NOT_SET: i32 = 0x8000_4005_u32 as i32;
 
     fn hresult(code: i32) -> io::Result<()> {
         if code >= 0 {
@@ -162,6 +171,34 @@ mod imp {
     }
 
     #[allow(unsafe_code)]
+    pub(super) fn process_aumid() -> io::Result<Option<String>> {
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `raw` is a valid out pointer. On success the system hands over a NUL-terminated
+        // string it allocated (freed below with `CoTaskMemFree`); on failure `raw` is left null or
+        // untouched, and `CoTaskMemFree` accepts null.
+        let code = unsafe { GetCurrentProcessExplicitAppUserModelID(&mut raw) };
+        let result = if code >= 0 && !raw.is_null() {
+            // SAFETY: `raw` is non-null and NUL-terminated (the call succeeded), so scanning for
+            // the terminator and reading that many `u16`s stays inside the allocation.
+            let units = unsafe {
+                let mut len = 0usize;
+                while *raw.add(len) != 0 {
+                    len += 1;
+                }
+                std::slice::from_raw_parts(raw, len)
+            };
+            Ok(Some(String::from_utf16_lossy(units)))
+        } else if code == E_FAIL_NOT_SET {
+            Ok(None)
+        } else {
+            Err(io::Error::from_raw_os_error(code))
+        };
+        // SAFETY: `raw` is null or the allocation the shell made for this call, freed once.
+        unsafe { CoTaskMemFree(raw.cast()) };
+        result
+    }
+
+    #[allow(unsafe_code)]
     pub(super) fn allow_set_foreground(pid: u32) -> io::Result<()> {
         // SAFETY: the call takes a process id by value and no pointer.
         if unsafe { AllowSetForegroundWindow(pid) } == 0 {
@@ -199,6 +236,10 @@ mod imp {
         unsupported()
     }
 
+    pub(super) fn process_aumid() -> io::Result<Option<String>> {
+        unsupported()
+    }
+
     pub(super) fn allow_set_foreground(_pid: u32) -> io::Result<()> {
         unsupported()
     }
@@ -228,6 +269,10 @@ mod tests {
         );
         assert_eq!(
             set_process_aumid("com.example.app").map_err(kind),
+            Err(io::ErrorKind::Unsupported)
+        );
+        assert_eq!(
+            process_aumid().map_err(kind),
             Err(io::ErrorKind::Unsupported)
         );
         assert_eq!(

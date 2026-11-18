@@ -33,8 +33,8 @@ pub use integration::{MARKER_VALUE, UNINSTALL_KEY, WinScope, WindowsIntegration}
 #[cfg(windows)]
 pub use process::WindowsProcess;
 pub use shell::{
-    MessageKind, allow_set_foreground, message_box, set_process_aumid, start_menu_programs,
-    user_program_files,
+    MessageKind, allow_set_foreground, message_box, process_aumid, set_process_aumid,
+    start_menu_programs, user_program_files,
 };
 #[cfg(windows)]
 pub use stub_place::remove_stub_leftovers;
