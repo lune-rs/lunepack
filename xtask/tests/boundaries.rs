@@ -558,6 +558,14 @@ undocumented_unsafe_blocks = "deny"
         let mut fx = Fx::clean();
         fx.add_dep("lunepack-cli", "anyhow = \"1\"");
         fx.lock_extra = None;
+        // `generate-lockfile --offline` must resolve every registry dependency from the local
+        // index, and a fresh cache (the gate's Docker volume, a CI runner) lacks the index entries
+        // for the PE stamper's own dependencies. Generate the lock from a CLI manifest without the
+        // stamper (the lock is only read for its source-less entries), then restore the pin.
+        let cli_with_pin = fx.crates["lunepack-cli"].clone();
+        fx.edit("lunepack-cli", |m| {
+            *m = m.replace("editpe = \"=0.2.4\"", "");
+        });
         let dir = fx.write();
         let vendor = dir.path().join("vendor/anyhow");
         fs::create_dir_all(vendor.join("src")).unwrap();
@@ -574,6 +582,11 @@ undocumented_unsafe_blocks = "deny"
         )
         .unwrap();
         generate_lock(dir.path());
+        fs::write(
+            dir.path().join("crates/lunepack-cli/Cargo.toml"),
+            cli_with_pin,
+        )
+        .unwrap();
         let lock = fs::read_to_string(dir.path().join("Cargo.lock")).unwrap();
         assert!(
             lock.contains("name = \"anyhow\"\nversion = \"1.0.999\"\n\n"),
