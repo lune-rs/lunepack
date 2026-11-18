@@ -6,7 +6,10 @@
 //! manifest written by the core's real writer, every frame stored (the real decoder reads it). The
 //! release tree holds the update config, a shell-script entry that notes when it runs, and the
 //! built `lunepack-runtime` beside it. A bootstrap copy of the same tree sits outside the install,
-//! and its runtime runs `install` with `HOME` set to an empty temporary home. Linux only.
+//! and its runtime runs `install` with `HOME` set to an empty temporary home. Linux only: the
+//! data home these cases redirect through `HOME` is, on Windows, the shell's known folder, which
+//! a test cannot redirect, and the entry is a shell script; the Windows `install` and `uninstall`
+//! flows are covered by step 11's own tests and the Windows E2E (step 13).
 //!
 //! The cases run in parallel on purpose: `uninstall`'s in-use scan must not count another case's
 //! process caught while it exits as using the tree (F9).
