@@ -4,7 +4,8 @@
 //
 // Lpe2eProc starts a process with chosen creation flags (a new console, a new process group, no
 // console at all) and reads its exit code. Lpe2eSnap samples the process table for the console
-// host (conhost.exe) children of two named programs.
+// host (conhost.exe) children of two named programs. Lpe2eWin finds and closes the message boxes
+// one process owns (the runtime's native outcome notice).
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -198,5 +199,100 @@ public static class Lpe2eSnap
             System.Threading.Thread.Sleep(4);
         }
         return new int[] { runtimes.Count, hostsUnderRuntime.Count, controls.Count, hostsUnderControl.Count };
+    }
+}
+
+// A message box one process shows: its window handle, title and message text.
+public sealed class Lpe2eNotice
+{
+    public long Handle;
+    public string Title;
+    public string Text;
+}
+
+public static class Lpe2eWin
+{
+    delegate bool EnumProc(IntPtr window, IntPtr parameter);
+
+    [DllImport("user32.dll")]
+    static extern bool EnumWindows(EnumProc proc, IntPtr parameter);
+
+    [DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetClassNameW")]
+    static extern int GetClassName(IntPtr window, StringBuilder name, int capacity);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetDlgItem(IntPtr dialog, int id);
+
+    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW")]
+    static extern IntPtr SendMessageTimeoutLength(IntPtr window, uint message, IntPtr wParam, IntPtr lParam,
+        uint flags, uint milliseconds, out IntPtr result);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageTimeoutW")]
+    static extern IntPtr SendMessageTimeoutText(IntPtr window, uint message, IntPtr wParam, StringBuilder lParam,
+        uint flags, uint milliseconds, out IntPtr result);
+
+    [DllImport("user32.dll", EntryPoint = "PostMessageW")]
+    static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+
+    const uint WmClose = 0x10;
+    const uint WmGetText = 0x0D;
+    const uint WmGetTextLength = 0x0E;
+    const uint AbortIfHung = 0x2; // SMTO_ABORTIFHUNG
+    const string DialogClass = "#32770"; // the window class of a message box
+    const int MessageTextId = 0xFFFF; // the id of a message box's static text control
+
+    // A window's text through WM_GETTEXT, which the system carries across processes (GetWindowText
+    // does not read another process's controls); null when the window does not answer in time.
+    static string TextOf(IntPtr window)
+    {
+        IntPtr length;
+        if (SendMessageTimeoutLength(window, WmGetTextLength, IntPtr.Zero, IntPtr.Zero, AbortIfHung, 2000, out length) == IntPtr.Zero)
+        {
+            return null;
+        }
+        StringBuilder text = new StringBuilder(length.ToInt32() + 1);
+        IntPtr copied;
+        if (SendMessageTimeoutText(window, WmGetText, new IntPtr(text.Capacity), text, AbortIfHung, 2000, out copied) == IntPtr.Zero)
+        {
+            return null;
+        }
+        return text.ToString();
+    }
+
+    // Every top-level dialog-class window (the class of a message box) that process `pid` owns,
+    // shown or hidden, with its title and text; each one is sent WM_CLOSE (a box with only OK
+    // closes as if OK was pressed). Windows of every other process are never read or touched.
+    public static Lpe2eNotice[] CloseNotices(int pid)
+    {
+        List<IntPtr> found = new List<IntPtr>();
+        EnumProc proc = delegate(IntPtr window, IntPtr parameter)
+        {
+            uint owner;
+            GetWindowThreadProcessId(window, out owner);
+            if (owner == (uint)pid)
+            {
+                StringBuilder name = new StringBuilder(64);
+                GetClassName(window, name, name.Capacity);
+                if (name.ToString() == DialogClass) { found.Add(window); }
+            }
+            return true;
+        };
+        EnumWindows(proc, IntPtr.Zero);
+        GC.KeepAlive(proc);
+        List<Lpe2eNotice> notices = new List<Lpe2eNotice>();
+        foreach (IntPtr window in found)
+        {
+            Lpe2eNotice notice = new Lpe2eNotice();
+            notice.Handle = window.ToInt64();
+            notice.Title = TextOf(window);
+            IntPtr message = GetDlgItem(window, MessageTextId);
+            notice.Text = message == IntPtr.Zero ? null : TextOf(message);
+            PostMessage(window, WmClose, IntPtr.Zero, IntPtr.Zero);
+            notices.Add(notice);
+        }
+        return notices.ToArray();
     }
 }
