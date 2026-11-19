@@ -1237,7 +1237,7 @@ fn zombie_target(lab: &Lab) {
     zombie.wait().expect("reap");
     assert_eq!(run.code, 19, "{run:?}");
     assert_eq!(run.line(), golden_error("process"));
-    run.assert_clean(&lab, &[]);
+    run.assert_clean(lab, &[]);
     lab.assert_nothing_started();
 }
 
