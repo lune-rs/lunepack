@@ -1146,10 +1146,14 @@ start an escape.
 On Windows (section 16) the same declarations are written under the current user's registry only: a file
 type is an "Open with" candidate (a ProgID `<app id>.<ext>` and a value of that name in
 `HKCU\Software\Classes\.<ext>\OpenWithProgids`; the extension's own default value and the user's choice
-are never read or written), a URL scheme is a protocol class whose command starts the stub with the URL as
-its one argument, and `autostart` is a value named by the app id in
-`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. `bin` is not used on Windows (no command link and no
-`PATH` change), and no desktop shortcut is made.
+are never read or written), a URL scheme is a protocol class whose command is `"<stub>" "%1"`, so the
+system puts the URL in one quoted argument and the stub passes the command line on unchanged (section 15),
+and `autostart` is a value named by the app id in
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. A launcher that substitutes the URL into the
+command without escaping it can split a URL holding `"` into several arguments, so the app may receive more
+than one. An app that declares `url_schemes` takes the first argument as the URL only when it starts with
+one of its own schemes and `:`, and ignores or refuses every later argument, never reading one as its own
+flag. `bin` is not used on Windows (no command link and no `PATH` change), and no desktop shortcut is made.
 
 For a `windows-*` target the display name is also a Windows folder and shortcut name, so `name` must pass
 one more rule (M7-D15), in this order; the packager refuses a `windows-*` pack or setup file that breaks it,
