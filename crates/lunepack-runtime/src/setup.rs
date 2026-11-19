@@ -168,9 +168,18 @@ impl Prepared {
 /// The liveness test of an earlier run's marker: whether process `pid` started at `start` runs.
 pub type Alive<'a> = &'a dyn Fn(u32, u64) -> bool;
 
+/// Why [`prepare`] refused a setup: the exit kind, and the app's display name when the payload was
+/// verified before the refusal (a refused root: a taken folder, an unreadable or ambiguous
+/// install), `None` when the payload itself was refused.
+pub struct Refused {
+    pub kind: Kind,
+    pub name: Option<String>,
+}
+
 /// Verifies the setup, finds `R`, and, when `want_ui`, extracts the UI under `ui_home` ([`ui_home`];
 /// M6-D7, M7-D13) with a marker naming `own` (this process). A verification failure or a refused
-/// root is its exit kind, with nothing written; a UI that cannot be extracted means a headless run.
+/// root is its exit kind ([`Refused`]), with nothing written; a UI that cannot be extracted means a
+/// headless run.
 pub fn prepare(
     ad: &Adapters,
     found: Found,
@@ -179,7 +188,7 @@ pub fn prepare(
     want_ui: bool,
     own: Option<lunepack::ProcessId>,
     alive: Alive<'_>,
-) -> Result<Prepared, Kind> {
+) -> Result<Prepared, Refused> {
     let clock = ClockReading::read(&lunepack::SystemClock, None);
     let verified = verify_setup(
         &found.trailer,
@@ -189,7 +198,10 @@ pub fn prepare(
         &*ad.hasher,
         &*ad.verifier,
     )
-    .map_err(|e| Kind::of(&lunepack::Error::from(e)))?;
+    .map_err(|e| Refused {
+        kind: Kind::of(&lunepack::Error::from(e)),
+        name: None,
+    })?;
     // M7-D16: `R` is found by record (or named) under the platform's layout scheme;
     // `<data home>/<app id>` under XDG.
     let install_root = lunepack_core::resolve_root(
@@ -200,7 +212,10 @@ pub fn prepare(
         &verified.config.install.name,
         ad.platform.layout_scheme(),
     )
-    .map_err(|e| Kind::of(&lunepack::Error::from(lunepack_core::Error::Layout(e))))?
+    .map_err(|e| Refused {
+        kind: Kind::of(&lunepack::Error::from(lunepack_core::Error::Layout(e))),
+        name: Some(verified.config.install.name.clone()),
+    })?
     .into_path();
     let mut prepared = Prepared {
         found,
