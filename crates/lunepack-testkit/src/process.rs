@@ -16,11 +16,13 @@ use lunepack_core::{
     SpawnSpec, WaitOutcome,
 };
 
-/// One call to `spawn_detached` or `spawn_child`, as the fake saw it.
+/// One call to `spawn_detached`, `spawn_child` or `spawn_app_background`, as the fake saw it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SpawnRecord {
     /// `true` for `spawn_detached`.
     pub detached: bool,
+    /// `true` for `spawn_app_background` (M8-D13); its child is scripted as any other.
+    pub background: bool,
     /// The program.
     pub program: PathBuf,
     /// Its arguments.
@@ -40,6 +42,7 @@ impl std::fmt::Debug for SpawnRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpawnRecord")
             .field("detached", &self.detached)
+            .field("background", &self.background)
             .field("args", &self.args.len())
             .field("env_set", &self.env_set.len())
             .field("env_remove", &self.env_remove.len())
@@ -360,7 +363,12 @@ impl FakeProcess {
         lock(&self.inner).terminated.clone()
     }
 
-    fn record(&self, detached: bool, spec: &SpawnSpec) -> Result<Option<ProcessId>, Error> {
+    fn record(
+        &self,
+        detached: bool,
+        background: bool,
+        spec: &SpawnSpec,
+    ) -> Result<Option<ProcessId>, Error> {
         let mut inner = lock(&self.inner);
         if !spec.program.is_absolute() || (detached && spec.stdio != ChildStdio::Null) {
             return Err(ProcessError::new(ProcessErrorKind::InvalidRequest, "spawn")
@@ -383,6 +391,7 @@ impl FakeProcess {
         };
         inner.spawns.push(SpawnRecord {
             detached,
+            background,
             program: spec.program.clone(),
             args: spec.args.clone(),
             env_set: spec.env_set.clone(),
@@ -487,12 +496,31 @@ impl Process for FakeProcess {
     }
 
     fn spawn_detached(&self, spec: &SpawnSpec) -> Result<(), Error> {
-        self.record(true, spec).map(drop)
+        self.record(true, false, spec).map(drop)
     }
 
     fn spawn_child(&self, spec: &SpawnSpec) -> Result<Box<dyn Child>, Error> {
+        self.child(spec, false)
+    }
+
+    fn spawn_app_background(&self, spec: &SpawnSpec) -> Result<Box<dyn Child>, Error> {
+        self.child(spec, true)
+    }
+
+    fn wait_exit(&self, id: &ProcessId, timeout: Duration) -> Result<WaitOutcome, Error> {
+        self.wait(id, timeout)
+    }
+
+    fn tree_in_use(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
+        self.in_use(tree, exclude)
+    }
+}
+
+impl FakeProcess {
+    /// A child spawn, recorded as a background one when `background`.
+    fn child(&self, spec: &SpawnSpec, background: bool) -> Result<Box<dyn Child>, Error> {
         let id = self
-            .record(false, spec)?
+            .record(false, background, spec)?
             .expect("a child spawn always has an id");
         let mut inner = lock(&self.inner);
         let script = inner.scripts.pop_front().unwrap_or_else(ChildScript::runs);
@@ -524,7 +552,7 @@ impl Process for FakeProcess {
         }))
     }
 
-    fn wait_exit(&self, id: &ProcessId, timeout: Duration) -> Result<WaitOutcome, Error> {
+    fn wait(&self, id: &ProcessId, timeout: Duration) -> Result<WaitOutcome, Error> {
         let mut inner = lock(&self.inner);
         inner.wait_log.push((*id, timeout));
         if let Some(outcome) = inner.waits.pop_front() {
@@ -537,7 +565,7 @@ impl Process for FakeProcess {
         })
     }
 
-    fn tree_in_use(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
+    fn in_use(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
         let mut inner = lock(&self.inner);
         inner.in_use_log.push((tree.to_owned(), exclude.to_vec()));
         Ok(inner.in_use.pop_front().unwrap_or(false))
@@ -705,6 +733,18 @@ fn process_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
             "try_wait after the exit was seen"
         );
     }
+
+    // A background start of a program that is not an app an OS launch service can start (here
+    // the helper, outside any bundle) is a child start: the default, and every adapter's
+    // fallback (M8-D13).
+    let mut child = process
+        .spawn_app_background(&helper_spec(helper, &["exit", "7"]))
+        .expect("spawn_app_background");
+    assert_eq!(
+        wait_for_exit(child.as_mut(), "background exit kind"),
+        ExitKind::Failure(7),
+        "a background start that falls back to a child start"
+    );
 
     // wait_exit: a running child times out and is left alone; an id with another start time, and
     // a pid that does not exist, count as ended at once; a terminated child is ended.

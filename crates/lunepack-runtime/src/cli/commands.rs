@@ -159,6 +159,7 @@ fn apply_and_restart(
             } else {
                 UiChoice::Auto
             },
+            background: parsed.background,
         },
     )
     .map_err(|e| Kind::of(&e))?;

@@ -20,6 +20,14 @@
 //!   path as the kernel names it (M5-D9; the premise that a tree moved by a swap is reported under
 //!   its new path is a test of this crate). Gap: files only mapped into a process (a library it
 //!   loaded from the tree) are not read.
+//! - A background start (`spawn_app_background`, M8-D13) asks LaunchServices to start the app
+//!   without activating it: `/usr/bin/open -g -n -W <bundle> --args <args>`, run as our own child
+//!   (no shell), the spec's environment changes applied to `open`'s own environment, which `open`
+//!   hands to the app (a health token never appears on a command line). The app is identified
+//!   only as exactly one new process of this user whose executable is the entry and that started
+//!   after the spawn, within [`IDENTIFY_WINDOW`]; zero or several is "unidentified", never a
+//!   guess, and an unidentified app is never signalled. When the bundle's `Info.plist` cannot be
+//!   read, or names another executable than the entry, the start falls back to a child start.
 
 #![allow(unsafe_code)]
 
@@ -45,6 +53,12 @@ const WAIT_SLICE: Duration = Duration::from_millis(500);
 const WAIT_POLL: Duration = Duration::from_millis(100);
 /// How often [`Child::terminate`] looks at the child during the grace period.
 const TERMINATE_POLL: Duration = Duration::from_millis(10);
+/// How long after a background start its app may be identified (M8-D13).
+const IDENTIFY_WINDOW: Duration = Duration::from_secs(10);
+/// LaunchServices' command-line front end.
+const OPEN: &str = "/usr/bin/open";
+/// The property-list tool that reads a bundle's executable name.
+const PLUTIL: &str = "/usr/bin/plutil";
 
 /// The macOS [`Process`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -148,6 +162,31 @@ fn send_sigterm(pid: u32) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Sends `signal` to the process `id` names, a process that is not our child, only after looking
+/// again that it is still that process (same pid and start time, not a zombie). `Ok(false)` when
+/// it has ended (nothing was sent).
+fn signal_identified(id: &ProcessId, signal: libc::c_int) -> io::Result<bool> {
+    let pid = libc::pid_t::try_from(id.pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))?;
+    if pid <= 1 || has_exited(id)? {
+        return Ok(false);
+    }
+    // SAFETY: kill(2) takes two integers and touches no memory. `pid` is above 1, so it names
+    // one process, never a group or every process; it was identified as the app this process
+    // started (M8-D13) and was looked at again just now with its start time, so it is that
+    // process unless the pid was reused in the instant between the look and the call.
+    let rc = unsafe { libc::kill(pid, signal) };
+    if rc == -1 {
+        let err = io::Error::last_os_error();
+        return if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(err)
+        };
+    }
+    Ok(true)
 }
 
 fn effective_uid() -> u32 {
@@ -343,6 +382,20 @@ impl Process for MacProcess {
         }
     }
 
+    fn spawn_app_background(&self, spec: &SpawnSpec) -> Result<Box<dyn Child>, Error> {
+        if !spec.program.is_absolute() {
+            return Err(ProcessError::new(ProcessErrorKind::InvalidRequest, "spawn")
+                .about(&spec.program)
+                .into());
+        }
+        match background_plan(spec) {
+            Some(plan) => start_background(spec, plan),
+            // Not an app LaunchServices can start as this entry: the focus is not protected, the
+            // update is (M8-D13).
+            None => self.spawn_child(spec),
+        }
+    }
+
     fn wait_exit(&self, id: &ProcessId, timeout: Duration) -> Result<WaitOutcome, Error> {
         let deadline = Instant::now().checked_add(timeout);
         let wait_err = |e| unreadable("wait", e);
@@ -529,5 +582,270 @@ impl Child for MacChild {
             .map_err(|e| ProcessError::from_io("terminate", e))?;
         self.done = Some(exit_kind(status));
         Ok(())
+    }
+}
+
+// ---- background start (M8-D13) -----------------------------------------------------------------
+
+/// What a background start needs, read before it starts.
+struct BackgroundPlan {
+    /// The bundle `B` (three levels above the entry).
+    bundle: PathBuf,
+    /// The entry as the kernel names it (what `proc_pidpath` reports for the app).
+    entry: PathBuf,
+}
+
+/// The plan for starting `spec` in the background, or `None` for the fallback: the entry is
+/// `<B>/Contents/MacOS/<name>` with null standard streams, `B/Contents/Info.plist` names `<name>`
+/// as `CFBundleExecutable` (read with a bounded `plutil`, no shell), and the entry exists.
+fn background_plan(spec: &SpawnSpec) -> Option<BackgroundPlan> {
+    if spec.stdio != ChildStdio::Null {
+        return None;
+    }
+    let name = spec.program.file_name()?.to_str()?;
+    let macos = spec.program.parent()?;
+    let contents = macos.parent()?;
+    if macos.file_name()? != "MacOS" || contents.file_name()? != "Contents" {
+        return None;
+    }
+    let bundle = contents.parent()?.to_path_buf();
+    let plist = contents.join("Info.plist");
+    let out = crate::run_bounded(
+        PLUTIL,
+        &[
+            "-extract",
+            "CFBundleExecutable",
+            "raw",
+            "-o",
+            "-",
+            plist.to_str()?,
+        ],
+    )?;
+    if out.strip_suffix('\n').unwrap_or(&out) != name {
+        return None;
+    }
+    let entry = std::fs::canonicalize(&spec.program).ok()?;
+    let entry = libproc::kernel_path(&entry).ok()?;
+    Some(BackgroundPlan { bundle, entry })
+}
+
+/// The pids of this user's processes whose executable is `entry`.
+fn running_from(entry: &Path) -> io::Result<Vec<(u32, u64)>> {
+    let me = effective_uid();
+    let mut out = Vec::new();
+    for pid in libproc::list_pids()? {
+        let Ok(Some(info)) = libproc::bsd_info(pid) else {
+            continue;
+        };
+        if info.uid != me || info.zombie {
+            continue;
+        }
+        if libproc::exe_path(pid).ok().flatten().as_deref() == Some(entry) {
+            out.push((pid, info.start_micros));
+        }
+    }
+    Ok(out)
+}
+
+/// Microseconds since the epoch, in the unit of `PROC_PIDTBSDINFO`'s start time.
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+}
+
+fn start_background(spec: &SpawnSpec, plan: BackgroundPlan) -> Result<Box<dyn Child>, Error> {
+    // The instances already running from the entry are never the new one.
+    let before: Vec<u32> = running_from(&plan.entry)
+        .map_err(|e| unreadable("spawn", e))?
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .collect();
+    let since = now_micros();
+    let mut cmd = Command::new(OPEN);
+    cmd.arg("-g")
+        .arg("-n")
+        .arg("-W")
+        .arg(&plan.bundle)
+        .arg("--args")
+        .args(&spec.args);
+    // The spec's environment goes to `open`'s own environment, which `open` hands to the app:
+    // never `--env`, whose value `ps` would show.
+    for name in &spec.env_remove {
+        cmd.env_remove(name);
+    }
+    for (name, value) in &spec.env_set {
+        cmd.env(name, value);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let open = cmd.spawn().map_err(|e| spawn_error(e, &spec.program))?;
+    let open_id = ProcessId {
+        pid: open.id(),
+        start_ticks: libproc::bsd_info(open.id())
+            .ok()
+            .flatten()
+            .map_or(0, |i| i.start_micros),
+    };
+    Ok(Box::new(BackgroundApp {
+        open,
+        open_id,
+        open_status: None,
+        entry: plan.entry,
+        before,
+        since,
+        window_end: Instant::now() + IDENTIFY_WINDOW,
+        app: None,
+        unidentifiable: false,
+        done: None,
+    }))
+}
+
+/// An app started by [`MacProcess::spawn_app_background`]: our child `open -W`, and the app
+/// itself once identified (not our child).
+struct BackgroundApp {
+    open: std::process::Child,
+    open_id: ProcessId,
+    /// `open`'s exit, once reaped.
+    open_status: Option<ExitKind>,
+    entry: PathBuf,
+    /// The pids running from the entry before the start.
+    before: Vec<u32>,
+    /// When the start began (microseconds since the epoch).
+    since: u64,
+    window_end: Instant,
+    /// The app, once identified.
+    app: Option<ProcessId>,
+    /// Several candidates were seen: the app is never identified.
+    unidentifiable: bool,
+    done: Option<ExitKind>,
+}
+
+impl BackgroundApp {
+    /// Reaps `open` when it has exited (best effort).
+    fn poll_open(&mut self) {
+        if self.open_status.is_none()
+            && let Ok(Some(status)) = self.open.try_wait()
+        {
+            self.open_status = Some(exit_kind(status));
+        }
+    }
+
+    /// Looks for the app while the window is open: exactly one new process of this user from the
+    /// entry that started after the start began. Several is final: never identified.
+    fn identify(&mut self) {
+        if self.app.is_some() || self.unidentifiable || Instant::now() >= self.window_end {
+            return;
+        }
+        let Ok(found) = running_from(&self.entry) else {
+            return;
+        };
+        let new: Vec<(u32, u64)> = found
+            .into_iter()
+            .filter(|(pid, start)| !self.before.contains(pid) && *start >= self.since)
+            .collect();
+        match new.as_slice() {
+            [] => {}
+            [(pid, start)] => {
+                self.app = Some(ProcessId {
+                    pid: *pid,
+                    start_ticks: *start,
+                });
+            }
+            _ => self.unidentifiable = true,
+        }
+    }
+
+    /// Ends `open` (our child) and reaps it.
+    fn end_open(&mut self, grace: Duration) -> Result<(), Error> {
+        self.poll_open();
+        if self.open_status.is_some() {
+            return Ok(());
+        }
+        send_sigterm(self.open_id.pid).map_err(|e| ProcessError::from_io("terminate", e))?;
+        let deadline = Instant::now() + grace.min(Duration::from_secs(2));
+        while Instant::now() < deadline {
+            self.poll_open();
+            if self.open_status.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(TERMINATE_POLL);
+        }
+        let _ = self.open.kill();
+        let status = self
+            .open
+            .wait()
+            .map_err(|e| ProcessError::from_io("terminate", e))?;
+        self.open_status = Some(exit_kind(status));
+        Ok(())
+    }
+}
+
+impl Child for BackgroundApp {
+    /// The app's id once identified; `open`'s until then.
+    fn id(&self) -> ProcessId {
+        self.app.unwrap_or(self.open_id)
+    }
+
+    fn try_wait(&mut self) -> Result<Option<ExitKind>, Error> {
+        if self.done.is_some() {
+            return Ok(self.done);
+        }
+        self.poll_open();
+        self.identify();
+        self.done = match (self.app, self.open_status) {
+            // The app's own status is not observable (not our child).
+            (Some(app), _) => has_exited(&app)
+                .map_err(|e| unreadable("wait", e))?
+                .then_some(ExitKind::Unknown),
+            // The launch failed before the app was seen.
+            (None, Some(ExitKind::Success)) => Some(ExitKind::Unknown),
+            (None, Some(ExitKind::Failure(code))) => Some(ExitKind::Failure(code)),
+            (None, Some(other)) => Some(other),
+            (None, None) => None,
+        };
+        Ok(self.done)
+    }
+
+    fn terminate(&mut self, grace: Duration) -> Result<(), Error> {
+        if self.try_wait()?.is_some() {
+            return self.end_open(grace);
+        }
+        if let Some(app) = self.app {
+            // Only the identified app, looked at again before every signal.
+            let term = |sig| {
+                signal_identified(&app, sig).map_err(|e| ProcessError::from_io("terminate", e))
+            };
+            if term(libc::SIGTERM)? {
+                let deadline = Instant::now().checked_add(grace);
+                loop {
+                    if has_exited(&app).map_err(|e| unreadable("terminate", e))? {
+                        break;
+                    }
+                    let remaining = match deadline {
+                        Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+                        None => TERMINATE_POLL,
+                    };
+                    if remaining.is_zero() {
+                        term(libc::SIGKILL)?;
+                        break;
+                    }
+                    std::thread::sleep(remaining.min(TERMINATE_POLL));
+                }
+            }
+        }
+        // An unidentified app is never signalled: only `open` is ended.
+        self.end_open(grace)?;
+        self.done = Some(ExitKind::Unknown);
+        Ok(())
+    }
+
+    fn take_stdin(&mut self) -> Option<Box<dyn Write + Send>> {
+        None
+    }
+
+    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+        None
     }
 }

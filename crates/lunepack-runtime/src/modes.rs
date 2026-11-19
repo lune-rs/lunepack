@@ -325,6 +325,9 @@ pub struct ApplyArgs {
     pub restart: Vec<OsString>,
     /// `--no-ui`: no update window (D41).
     pub no_ui: bool,
+    /// `--background`: the new version (and after a rollback the previous one) starts without
+    /// coming to the front (M8-D13; macOS only, no effect elsewhere).
+    pub background: bool,
 }
 
 impl std::fmt::Debug for ApplyArgs {
@@ -335,6 +338,7 @@ impl std::fmt::Debug for ApplyArgs {
             .field("version", &self.version.to_string())
             .field("restart", &self.restart.len())
             .field("no_ui", &self.no_ui)
+            .field("background", &self.background)
             .finish()
     }
 }
@@ -342,7 +346,8 @@ impl std::fmt::Debug for ApplyArgs {
 /// A parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// `apply --wait-pid <u32> --wait-start <u64> --version <ver> [--no-ui] [-- <args>…]`.
+    /// `apply --wait-pid <u32> --wait-start <u64> --version <ver> [--no-ui] [--background]
+    /// [-- <args>…]`.
     Apply(ApplyArgs),
     /// `install [--silent]`: the first install from the bootstrap tree this runtime belongs to.
     Install {
@@ -502,6 +507,7 @@ fn parse_apply(args: &[OsString]) -> Result<ApplyArgs, UsageError> {
     let mut version: Option<Version> = None;
     let mut restart = Vec::new();
     let mut no_ui = false;
+    let mut background = false;
     let mut i = 0;
     while i < args.len() {
         let name = args[i].to_str().ok_or(UsageError)?;
@@ -514,6 +520,14 @@ fn parse_apply(args: &[OsString]) -> Result<ApplyArgs, UsageError> {
                 return Err(UsageError);
             }
             no_ui = true;
+            i += 1;
+            continue;
+        }
+        if name == "--background" {
+            if background {
+                return Err(UsageError);
+            }
+            background = true;
             i += 1;
             continue;
         }
@@ -546,6 +560,7 @@ fn parse_apply(args: &[OsString]) -> Result<ApplyArgs, UsageError> {
             version,
             restart,
             no_ui,
+            background,
         }),
         _ => Err(UsageError),
     }
@@ -604,7 +619,26 @@ mod tests {
             panic!("not apply");
         };
         assert!(a.no_ui);
+        assert!(!a.background);
         assert_eq!(a.restart, os(&["--no-ui"]));
+        let got = parse(&os(&[
+            "apply",
+            "--background",
+            "--version",
+            "1.1.0",
+            "--wait-start",
+            "77",
+            "--wait-pid",
+            "42",
+            "--",
+            "--background",
+        ]))
+        .expect("parse");
+        let Mode::Apply(a) = got else {
+            panic!("not apply");
+        };
+        assert!(a.background && !a.no_ui);
+        assert_eq!(a.restart, os(&["--background"]));
     }
 
     #[test]
@@ -631,6 +665,11 @@ mod tests {
             ok(&["--no-ui", "--no-ui"]),
             ok(&["--no-ui=1"]),
             ok(&["--no-ui", "1"]),
+            ok(&["--background", "--background"]),
+            ok(&["--background=1"]),
+            ok(&["--background", "1"]),
+            os(&["install", "--background"]),
+            os(&["uninstall", "--background"]),
             os(&["install", "--silent", "--silent"]),
             os(&["install", "--silent=1"]),
             os(&["install", "--silent", "x"]),

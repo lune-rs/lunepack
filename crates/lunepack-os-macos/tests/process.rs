@@ -80,6 +80,25 @@ mod macos {
             "terminate_kills_a_child_that_ignores_sigterm",
             terminate_stubborn,
         ),
+        // M8-D13: the background start through LaunchServices.
+        (
+            "a_background_app_is_identified_and_gets_the_token_by_its_environment_only",
+            background_identified,
+        ),
+        ("a_background_app_gets_its_arguments", background_arguments),
+        ("terminate_ends_a_background_app", background_terminate),
+        (
+            "a_background_start_of_a_missing_or_broken_bundle_fails",
+            background_missing,
+        ),
+        (
+            "an_info_plist_naming_another_executable_falls_back_to_a_child_start",
+            background_fallback,
+        ),
+        (
+            "a_running_instance_is_never_identified_as_the_new_one",
+            background_second_instance,
+        ),
     ];
 
     pub fn run_all(args: &[String]) {
@@ -585,5 +604,263 @@ mod macos {
             os().wait_exit(&child.id(), Duration::from_secs(5)).unwrap(),
             WaitOutcome::Exited
         );
+    }
+
+    // ---- background start (M8-D13) -------------------------------------------------------------
+
+    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+    const TOKEN_VAR: &str = "LUNEPACK_HEALTH_TOKEN";
+
+    /// A temporary app bundle `<scratch>/<name>.app` whose executable `hello` is a copy of this
+    /// helper (no Dock icon: `LSUIElement`). On drop every process running from it is killed and
+    /// the bundle is unregistered from LaunchServices (`lsregister -u`).
+    struct Bundle {
+        path: PathBuf,
+    }
+
+    impl Bundle {
+        fn new(scratch: &Path, name: &str, executable: &str) -> Bundle {
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = scratch.join(format!("{name}.app"));
+            let macos = path.join("Contents/MacOS");
+            std::fs::create_dir_all(&macos).unwrap();
+            std::fs::copy(helper(), macos.join("hello")).expect("copy the helper");
+            let plist = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>{executable}</string>
+  <key>CFBundleIdentifier</key><string>dev.lunepack.test.background.p{}.n{n}</string>
+  <key>CFBundleName</key><string>{name}</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+"#,
+                std::process::id()
+            );
+            std::fs::write(path.join("Contents/Info.plist"), plist).unwrap();
+            Bundle { path }
+        }
+
+        fn entry(&self) -> PathBuf {
+            self.path.join("Contents/MacOS/hello")
+        }
+    }
+
+    /// The pids of processes whose executable lies in `bundle`.
+    fn running_in(bundle: &Path) -> Vec<u32> {
+        let bundle = libproc::kernel_path(bundle).unwrap_or_else(|_| bundle.to_path_buf());
+        libproc::list_pids()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|pid| {
+                libproc::exe_path(*pid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| p.starts_with(&bundle))
+            })
+            .collect()
+    }
+
+    impl Drop for Bundle {
+        fn drop(&mut self) {
+            for pid in running_in(&self.path) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
+            let _ = Command::new(LSREGISTER)
+                .arg("-u")
+                .arg(&self.path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    /// Polls `child` until it is identified (its id is no longer `open`'s), within `LIMIT`.
+    fn identified(child: &mut Box<dyn lunepack_core::Child>, open: ProcessId) -> ProcessId {
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let _ = child.try_wait().unwrap();
+            if child.id() != open {
+                return child.id();
+            }
+            assert!(Instant::now() < deadline, "the app was not identified");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn exit_within(child: &mut Box<dyn lunepack_core::Child>) -> ExitKind {
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            if let Some(kind) = child.try_wait().unwrap() {
+                return kind;
+            }
+            assert!(Instant::now() < deadline, "no exit seen");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn token() -> String {
+        format!(
+            "{:064x}",
+            u128::from(std::process::id()) * 0x1234_5678_9abc_def1
+        )
+    }
+
+    fn background_identified(scratch: &Path) {
+        let bundle = Bundle::new(scratch, "Back", "hello");
+        let out = scratch.join("env");
+        let secret = token();
+        let mut spec = spec(
+            &bundle.entry(),
+            &["env-sleep", &out.to_string_lossy(), "600", TOKEN_VAR],
+        );
+        spec.env_remove.push(TOKEN_VAR.into());
+        spec.env_set.push((TOKEN_VAR.into(), secret.clone().into()));
+        let mut child = os().spawn_app_background(&spec).expect("background start");
+        let open = child.id();
+        let app = identified(&mut child, open);
+        // The app is a process of the entry, and not `open`.
+        let exe = libproc::exe_path(app.pid).unwrap().expect("exe");
+        assert_eq!(exe, libproc::kernel_path(&bundle.entry()).unwrap());
+        assert_eq!(
+            wait_for_file(&out),
+            format!("{TOKEN_VAR}={secret}\n"),
+            "the token reached the app"
+        );
+        // No command line of any process carries it (`open`'s included).
+        let ps = Command::new("/bin/ps")
+            .args(["-axww", "-o", "args="])
+            .output()
+            .expect("ps");
+        let all = String::from_utf8_lossy(&ps.stdout);
+        assert!(
+            all.contains("/usr/bin/open -g -n -W"),
+            "open was seen running"
+        );
+        assert!(!all.contains(&secret), "the token is on a command line");
+        assert_eq!(child.try_wait().unwrap(), None, "still running");
+        child.terminate(Duration::from_secs(5)).unwrap();
+        assert_eq!(child.try_wait().unwrap(), Some(ExitKind::Unknown));
+        assert!(running_in(&bundle.path).is_empty(), "the app is gone");
+    }
+
+    fn background_arguments(scratch: &Path) {
+        let bundle = Bundle::new(scratch, "Args", "hello");
+        let out = scratch.join("args");
+        let mut child = os()
+            .spawn_app_background(&spec(
+                &bundle.entry(),
+                &[
+                    "args",
+                    &out.to_string_lossy(),
+                    "one",
+                    "two words",
+                    "--three",
+                ],
+            ))
+            .expect("background start");
+        assert_eq!(wait_for_file(&out), "one\ntwo words\n--three\n");
+        assert_eq!(exit_within(&mut child), ExitKind::Unknown);
+    }
+
+    fn background_terminate(scratch: &Path) {
+        let bundle = Bundle::new(scratch, "Stop", "hello");
+        let out = scratch.join("pid");
+        let mut child = os()
+            .spawn_app_background(&spec(
+                &bundle.entry(),
+                &["pid-sleep", &out.to_string_lossy(), "600"],
+            ))
+            .expect("background start");
+        let open = child.id();
+        let app = identified(&mut child, open);
+        let written = wait_for_file(&out);
+        assert_eq!(
+            written.split_whitespace().next(),
+            Some(app.pid.to_string().as_str())
+        );
+        let started = Instant::now();
+        child.terminate(Duration::from_secs(5)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "SIGTERM sufficed"
+        );
+        assert_eq!(
+            os().wait_exit(&app, Duration::from_secs(5)).unwrap(),
+            WaitOutcome::Exited
+        );
+        assert_eq!(
+            os().wait_exit(&open, Duration::from_secs(5)).unwrap(),
+            WaitOutcome::Exited,
+            "open is ended and reaped too"
+        );
+    }
+
+    fn background_missing(scratch: &Path) {
+        // No bundle at all: nothing to start (the runtime treats it as a failed launch).
+        let gone = scratch.join("Gone.app/Contents/MacOS/hello");
+        let got = os().spawn_app_background(&spec(&gone, &["exit", "0"]));
+        assert!(got.is_err(), "a missing bundle started");
+        // A bundle LaunchServices cannot start (its executable is not executable): `open` fails
+        // before any app is seen, which is a failure, never an unknown exit.
+        let bundle = Bundle::new(scratch, "Broken", "hello");
+        std::fs::set_permissions(
+            bundle.entry(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
+        let mut child = os()
+            .spawn_app_background(&spec(&bundle.entry(), &["exit", "0"]))
+            .expect("the start itself");
+        assert!(
+            matches!(exit_within(&mut child), ExitKind::Failure(_)),
+            "a launch that failed"
+        );
+    }
+
+    fn background_fallback(scratch: &Path) {
+        let bundle = Bundle::new(scratch, "Other", "something-else");
+        let mut child = os()
+            .spawn_app_background(&spec(&bundle.entry(), &["exit", "7"]))
+            .expect("start");
+        // A child start: the exit status is observable.
+        assert_eq!(exit_within(&mut child), ExitKind::Failure(7));
+    }
+
+    fn background_second_instance(scratch: &Path) {
+        let bundle = Bundle::new(scratch, "Twice", "hello");
+        let first_ready = scratch.join("first");
+        let first = Reap(
+            Command::new(bundle.entry())
+                .args(["pid-sleep", &first_ready.to_string_lossy(), "600"])
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("the first instance"),
+        );
+        wait_for_file(&first_ready);
+        let out = scratch.join("second");
+        let mut child = os()
+            .spawn_app_background(&spec(
+                &bundle.entry(),
+                &["pid-sleep", &out.to_string_lossy(), "600"],
+            ))
+            .expect("background start");
+        let open = child.id();
+        let app = identified(&mut child, open);
+        assert_ne!(app.pid, first.0.id(), "the running instance was taken");
+        let written = wait_for_file(&out);
+        assert_eq!(
+            written.split_whitespace().next(),
+            Some(app.pid.to_string().as_str())
+        );
+        child.terminate(Duration::from_secs(5)).unwrap();
+        // The first instance was left alone.
+        assert!(running_in(&bundle.path).contains(&first.0.id()));
     }
 }

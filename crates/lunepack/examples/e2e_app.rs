@@ -259,6 +259,7 @@ fn update(inst: &Installation, no_ui: bool) -> Result<String, &'static str> {
         } else {
             lunepack::UiChoice::Auto
         },
+        background: false,
     })
     .map_err(|_| "apply")?;
     Ok("apply-scheduled".to_owned())
