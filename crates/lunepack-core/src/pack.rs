@@ -17,6 +17,10 @@ use crate::ident::AppId;
 use crate::limits::Limits;
 use crate::manifest::{EntryDoc, ManifestDocument};
 use crate::path::{EntryKind, RelPath, validate_tree};
+use crate::pe::{
+    LOAD_LIBRARY_SEARCH_SYSTEM32, MACHINE_ARM64, MACHINE_X86_64, PeError, PeImage,
+    SUBSYSTEM_CONSOLE, SUBSYSTEM_GUI, is_c_runtime, manifest_is_hardened,
+};
 use crate::target::Target;
 use crate::traits::{Codec, CodecId, EncodedFrame, EncodedStream, Encoder, Hasher};
 use crate::version::Version;
@@ -205,6 +209,29 @@ pub enum RuntimeImageError {
     /// The ELF header or its program header table does not hold together.
     #[error("the ELF program headers are malformed")]
     Malformed,
+    /// The PE headers or tables do not hold together.
+    #[error("the PE headers or tables are malformed")]
+    PeMalformed,
+    /// A Windows binary with the wrong subsystem (GUI for the runtime, the UI and a GUI app's
+    /// stub; console for a terminal app's stub).
+    #[error("built for the wrong Windows subsystem (GUI or console)")]
+    Subsystem,
+    /// A Windows binary that imports a C runtime DLL (it must link the CRT statically).
+    #[error("imports a C runtime DLL; it must link the C runtime statically")]
+    CRuntime,
+    /// A Windows binary that imports `advapi32.dll` statically. Some of its exports
+    /// (`SystemFunction036` and others) forward to `cryptbase.dll`, which is not a KnownDLL, and the
+    /// loader resolves a static import's forwarder from the application directory before `main`
+    /// runs, whatever the `DependentLoadFlags`; `advapi32.dll` must be delay-loaded.
+    #[error("imports advapi32.dll statically; it must be delay-loaded")]
+    StaticAdvapi32,
+    /// A Windows binary whose `DependentLoadFlags` is not `LOAD_LIBRARY_SEARCH_SYSTEM32`.
+    #[error("its DependentLoadFlags is not 0x800 (load imports from System32 only)")]
+    DependentLoadFlags,
+    /// A Windows binary without an embedded manifest that requests `asInvoker` and sets
+    /// `longPathAware`.
+    #[error("it has no embedded manifest with asInvoker and longPathAware")]
+    Manifest,
 }
 
 const ELF_PHENTSIZE: usize = 56;
@@ -263,7 +290,11 @@ fn check_elf_image(bytes: &[u8], machine: u16, dynamic_ok: bool) -> Result<(), R
     Ok(())
 }
 
-fn check_pe_runtime(bytes: &[u8], machine: u16) -> Result<(), RuntimeImageError> {
+/// The PE checks of a shipped Windows binary (M7-D10): a PE of `machine` with the `subsystem`,
+/// no C-runtime DLL among its imports or delay imports, no static import of `advapi32.dll` (only a
+/// delay import), `DependentLoadFlags` of `LOAD_LIBRARY_SEARCH_SYSTEM32`, and an `RT_MANIFEST` with
+/// `asInvoker` and `longPathAware`.
+fn check_pe_hardened(bytes: &[u8], machine: u16, subsystem: u16) -> Result<(), RuntimeImageError> {
     use RuntimeImageError as E;
     if !bytes.starts_with(b"MZ") {
         return Err(E::Format);
@@ -275,11 +306,58 @@ fn check_pe_runtime(bytes: &[u8], machine: u16) -> Result<(), RuntimeImageError>
     if bytes.get(lfanew..sig_end) != Some(b"PE\0\0".as_slice()) {
         return Err(E::Format);
     }
-    if u16_at(bytes, sig_end, false).ok_or(E::Format)? == machine {
-        Ok(())
-    } else {
-        Err(E::Machine)
+    if u16_at(bytes, sig_end, false).ok_or(E::Format)? != machine {
+        return Err(E::Machine);
     }
+    let image = PeImage::parse(bytes).map_err(|e| match e {
+        PeError::NotPe => E::Format,
+        _ => E::PeMalformed,
+    })?;
+    if image.headers.machine != machine {
+        return Err(E::Machine);
+    }
+    if image.headers.subsystem != subsystem {
+        return Err(E::Subsystem);
+    }
+    if image.all_imports().any(is_c_runtime) {
+        return Err(E::CRuntime);
+    }
+    if image
+        .imports
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case("advapi32.dll"))
+    {
+        return Err(E::StaticAdvapi32);
+    }
+    if image.dependent_load_flags != Some(LOAD_LIBRARY_SEARCH_SYSTEM32) {
+        return Err(E::DependentLoadFlags);
+    }
+    if !image.manifest.as_deref().is_some_and(manifest_is_hardened) {
+        return Err(E::Manifest);
+    }
+    Ok(())
+}
+
+fn windows_machine(target: Target) -> Option<u16> {
+    match target {
+        Target::WindowsX86_64 => Some(MACHINE_X86_64),
+        Target::WindowsAarch64 => Some(MACHINE_ARM64),
+        _ => None,
+    }
+}
+
+/// Checks that `bytes` can be the Windows stub launcher (`lunepack-stub.exe`) of `target`: the
+/// hardening of [`check_runtime_image`]'s Windows rule (M7-D10), with the console subsystem when
+/// `console` (the app is a terminal app) and the GUI subsystem otherwise. Any other target is
+/// [`RuntimeImageError::Format`]. Bounds-checked; never panics.
+pub fn check_pe_stub(bytes: &[u8], target: Target, console: bool) -> Result<(), RuntimeImageError> {
+    let machine = windows_machine(target).ok_or(RuntimeImageError::Format)?;
+    let subsystem = if console {
+        SUBSYSTEM_CONSOLE
+    } else {
+        SUBSYSTEM_GUI
+    };
+    check_pe_hardened(bytes, machine, subsystem)
 }
 
 fn check_macho_runtime(bytes: &[u8], target: Target) -> Result<(), RuntimeImageError> {
@@ -320,8 +398,8 @@ pub fn check_runtime_image(bytes: &[u8], target: Target) -> Result<(), RuntimeIm
     match target {
         Target::LinuxX86_64 => check_elf_image(bytes, 62, false),
         Target::LinuxAarch64 => check_elf_image(bytes, 183, false),
-        Target::WindowsX86_64 => check_pe_runtime(bytes, 0x8664),
-        Target::WindowsAarch64 => check_pe_runtime(bytes, 0xAA64),
+        Target::WindowsX86_64 => check_pe_hardened(bytes, MACHINE_X86_64, SUBSYSTEM_GUI),
+        Target::WindowsAarch64 => check_pe_hardened(bytes, MACHINE_ARM64, SUBSYSTEM_GUI),
         Target::MacosX86_64 | Target::MacosAarch64 | Target::MacosUniversal => {
             check_macho_runtime(bytes, target)
         }

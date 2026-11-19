@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
@@ -746,6 +746,27 @@ fn dropping_a_download_after_any_poll_leaves_a_resumable_cache() {
     );
 }
 
+/// Cancels `token` the moment `inner` is polled for the `at`-th time, then keeps polling it: the
+/// cancel lands after a fixed number of polls, never after a wall-clock delay (F6).
+struct CancelAtPoll<F> {
+    inner: Pin<Box<F>>,
+    polls: usize,
+    at: usize,
+    token: CancelToken,
+}
+
+impl<F: Future> Future for CancelAtPoll<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        self.polls += 1;
+        if self.polls == self.at {
+            self.token.cancel();
+        }
+        self.inner.as_mut().poll(cx)
+    }
+}
+
 #[test]
 fn a_cancelled_token_stops_a_download() {
     let _s = serial();
@@ -753,12 +774,14 @@ fn a_cancelled_token_stops_a_download() {
     r.origin.set_faults(vec![TransportFault::SlowChunks]);
     let cancel = CancelToken::new();
     r.ctx.cancel = cancel.clone();
-    let canceller = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(5));
-        cancel.cancel();
+    // The download needs well over ten polls (the test above asserts it), so a cancel on the
+    // third poll always lands mid-transfer, whatever the machine's load.
+    let result = block_on(CancelAtPoll {
+        inner: Box::pin(fetch_pack(&r.ctx, &pack_target(), None)),
+        polls: 0,
+        at: 3,
+        token: cancel,
     });
-    let result = block_on(fetch_pack(&r.ctx, &pack_target(), None));
-    canceller.join().expect("canceller");
     assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
     workers_stopped();
     only_cache_files(&*r.fs);

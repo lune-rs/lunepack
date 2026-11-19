@@ -27,7 +27,7 @@ use lunepack::{
 };
 use lunepack_core::state::{InstallState, Scope, StagedIssued, StagedRef, UserScope};
 use lunepack_core::{
-    CodecId, FeedRule, Fs, InstallMeta, ProcessId, RelPath, TrustedRoot, UpdateConfig,
+    CodecId, FeedRule, Fs, InstallMeta, LayoutScheme, ProcessId, RelPath, TrustedRoot, UpdateConfig,
 };
 use lunepack_testkit::{
     FakeCodec, FakeHasher, FakeIntegration, FakeProcess, FakeRng, FakeVerifier, IntegrationOp,
@@ -64,6 +64,9 @@ fn meta(entry: &str, bin: Option<&str>, name: &str) -> InstallMeta {
         bin: bin.map(str::to_owned),
         terminal: false,
         publisher: None,
+        file_types: Vec::new(),
+        url_schemes: Vec::new(),
+        autostart: false,
     }
 }
 
@@ -143,10 +146,17 @@ struct Lab {
     fs: MemFs,
     process: FakeProcess,
     integration: FakeIntegration,
+    scheme: LayoutScheme,
 }
 
 impl Lab {
+    /// A lab on the XDG layout, whatever OS the test runs on (M7-D2: the layout is a value the
+    /// platform picks; the Windows scheme has its own cases).
     fn new() -> Lab {
+        Lab::with_scheme(LayoutScheme::XDG)
+    }
+
+    fn with_scheme(scheme: LayoutScheme) -> Lab {
         let world = World::new();
         let fs = world.fs.clone();
         Lab {
@@ -154,6 +164,7 @@ impl Lab {
             fs,
             process: FakeProcess::new("/unused"),
             integration: FakeIntegration::new(),
+            scheme,
         }
     }
 
@@ -171,6 +182,7 @@ impl Lab {
             .with_rng(Arc::new(FakeRng::new(9)))
             .with_health_token(token)
             .with_data_home(abs_path(DATA_HOME))
+            .with_layout_scheme(self.scheme)
             .with_busy_wait(Duration::from_millis(300))
     }
 
@@ -502,7 +514,8 @@ fn real_install(dir: &Path, feed: &str) -> PathBuf {
 fn child_check(exe: &str) {
     let platform = Platform::native()
         .with_hasher(Arc::new(FakeHasher))
-        .with_verifier(Arc::new(FakeVerifier));
+        .with_verifier(Arc::new(FakeVerifier))
+        .with_layout_scheme(LayoutScheme::XDG);
     let inst = Installation::from_exe_with(Path::new(exe), platform).expect("installation");
     let updater = inst
         .updater_builder()
@@ -627,6 +640,10 @@ fn unsupervised_starts_count_attempts_and_the_fourth_rolls_back() {
     assert_eq!(applied[0].meta.name, "App 1.0.0");
     assert_eq!(applied[0].install_root, root_dir());
     assert_eq!(applied[0].stale_bins, vec!["app2".to_owned()]);
+    // The request names the version it applies and carries the outgoing version's metadata.
+    assert_eq!(applied[0].version, version(V100));
+    let previous = applied[0].previous.as_ref().expect("previous metadata");
+    assert_eq!(previous.name, "App 1.1.0");
 }
 
 /// Three unsupervised starts of 1.1.0, so the next one rolls back.
@@ -1063,6 +1080,65 @@ fn install_from_an_empty_root_installs_the_newest_release() {
     common::workers_stopped();
 }
 
+/// M7-D16: under the Windows scheme a first install of an app already recorded under an older
+/// display name goes into that folder (found by its record), not into a folder named after the
+/// bootstrap's current name; no `current` link is made and the tree is `R/app/<version>`.
+#[test]
+fn a_windows_bootstrap_installs_into_the_folder_the_record_lives_in() {
+    let _serial = common::serial();
+    let lab = Lab::with_scheme(LayoutScheme::WINDOWS);
+    publish_with_config(&lab, 1, V100);
+    let boot = bootstrap(&lab, V100);
+    let old = abs_path(DATA_HOME).join("Old Display Name");
+    let layout = lunepack_core::UserLayout::from_root(old.clone(), LayoutScheme::WINDOWS);
+    let made = {
+        let store = UserScope {
+            dir: layout.state_dir(),
+            app_id: app_id(),
+        };
+        lab.fs.create_dir_all(&layout.state_dir()).expect("state");
+        let loaded = store.load(&lab.fs, &FakeHasher).expect("load");
+        let first = InstallState::new(1, app_id(), Scope::User, [3; 16], TARGET);
+        store
+            .commit(&lab.fs, &loaded, &first, &FakeHasher)
+            .expect("commit")
+    };
+
+    let got = install(&lab, &boot).expect("install");
+    assert_eq!(got.version(), &version(V100));
+
+    let rec = record_under(&lab.fs, &layout).expect("record");
+    assert_eq!(rec.install_id, made.install_id, "the existing record");
+    assert_eq!(rec.current.expect("current").version, version(V100));
+    let tree = old.join("app").join(V100);
+    for (path, bytes) in files(V100) {
+        assert_eq!(
+            lab.fs.read_capped(&tree.join(path), 1 << 20).expect("file"),
+            bytes
+        );
+    }
+    let name = boot.meta().name.clone();
+    for absent in [abs_path(DATA_HOME).join(&name), old.join("current")] {
+        assert!(
+            matches!(lab.fs.symlink_metadata(&absent), Ok(None)),
+            "{absent:?} was made"
+        );
+    }
+    let applied = lab.integration.calls().pop().expect("apply");
+    assert_eq!(applied.install_root, old);
+    common::workers_stopped();
+}
+
+fn record_under(fs: &dyn Fs, layout: &lunepack_core::UserLayout) -> Option<InstallState> {
+    UserScope {
+        dir: layout.state_dir(),
+        app_id: app_id(),
+    }
+    .load(fs, &FakeHasher)
+    .expect("load")
+    .record
+}
+
 #[test]
 fn install_resumes_a_record_created_before_a_crash_and_keeps_its_install_id() {
     let _serial = common::serial();
@@ -1142,6 +1218,7 @@ fn a_kill_around_the_install_commit_never_leaves_current_missing() {
             world: lab.world,
             process: lab.process,
             integration: lab.integration,
+            scheme: lab.scheme,
         };
         let boot = Installation::from_exe_with(
             &abs_path(&format!("/media/boot/{V100}")).join("bin/app"),
@@ -1414,6 +1491,7 @@ fn a_commit_that_fails_after_the_integration_leaves_install_resumable() {
         world: lab.world,
         process: lab.process,
         integration: lab.integration,
+        scheme: lab.scheme,
     };
     assert!(after.record().current.is_none(), "the commit went through");
     let boot = Installation::from_exe_with(&tree.join("bin/app"), after.platform(None))
@@ -1531,6 +1609,7 @@ fn discovery_and_startup_work_on_a_real_directory() {
         .with_hasher(Arc::new(FakeHasher))
         .with_verifier(Arc::new(FakeVerifier))
         .with_process(Arc::new(FakeProcess::new("/unused")))
+        .with_layout_scheme(LayoutScheme::XDG)
         .with_health_token(None);
     let inst = Installation::from_exe_with(&link, platform).expect("installation");
     assert!(inst.is_installed());
@@ -1575,7 +1654,8 @@ fn a_file_feed_from_the_config_is_served_by_the_directory_source() {
     let exe = real_install(&dir.join("install"), &feed);
     let platform = Platform::native()
         .with_hasher(Arc::new(FakeHasher))
-        .with_verifier(Arc::new(FakeVerifier));
+        .with_verifier(Arc::new(FakeVerifier))
+        .with_layout_scheme(LayoutScheme::XDG);
     let updater = Installation::from_exe_with(&exe, platform)
         .expect("installation")
         .updater_builder()
@@ -1588,14 +1668,24 @@ fn a_file_feed_from_the_config_is_served_by_the_directory_source() {
     assert_eq!(info.version(), &version(V110));
 }
 
-/// The native composition: on Linux the process adapter finds the test binary, whose tree holds no
-/// update config; elsewhere processes are unsupported.
+/// The native composition: on Linux and Windows the process adapter finds the test binary, whose
+/// tree holds no update config; elsewhere processes are unsupported. The native layout scheme is
+/// the OS's own.
 #[test]
-fn the_native_platform_wires_the_process_adapter_on_linux_only() {
+fn the_native_platform_wires_the_process_adapter_on_linux_and_windows_only() {
     let got = Installation::from_current_exe_with(Platform::native());
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", windows)) {
         assert!(matches!(got, Err(Error::NoUpdateConfig)), "{got:?}");
     } else {
         assert!(matches!(got, Err(Error::Unsupported)), "{got:?}");
     }
+    let scheme = Platform::native().layout_scheme();
+    assert_eq!(
+        scheme,
+        if cfg!(windows) {
+            LayoutScheme::WINDOWS
+        } else {
+            LayoutScheme::XDG
+        }
+    );
 }

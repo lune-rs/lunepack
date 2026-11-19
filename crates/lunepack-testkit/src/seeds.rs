@@ -84,6 +84,7 @@ pub fn fuzz_seeds() -> Vec<Seed> {
     http_seeds(&mut out);
     state_seeds(&mut out);
     update_config_seeds(&mut out);
+    setup_seeds(&fx, &mut out);
     out.0
 }
 
@@ -1010,6 +1011,9 @@ pub fn sample_update_config() -> UpdateConfig {
             bin: Some("hello".to_owned()),
             terminal: false,
             publisher: None,
+            file_types: Vec::new(),
+            url_schemes: Vec::new(),
+            autostart: false,
         },
         extra: Default::default(),
     }
@@ -1049,6 +1053,9 @@ fn update_config_seeds(out: &mut Out) {
         bin: None,
         terminal: true,
         publisher: None,
+        file_types: Vec::new(),
+        url_schemes: Vec::new(),
+        autostart: false,
     };
     out.ok(
         "update_config",
@@ -1060,6 +1067,17 @@ fn update_config_seeds(out: &mut Out) {
         "publisher",
         install_with("publisher", json!("Acme, Inc.")),
     );
+    out.ok("update_config", "declarations", {
+        let mut declared = full.clone();
+        declared.install.file_types = vec![lunepack_core::FileType {
+            ext: "hello".to_owned(),
+            mime: "application/x-hello".to_owned(),
+            name: "Hello file".to_owned(),
+        }];
+        declared.install.url_schemes = vec!["hello".to_owned()];
+        declared.install.autostart = true;
+        declared.to_bytes().expect("declarations")
+    });
     out.ok(
         "update_config",
         "unknown-top-level",
@@ -1107,6 +1125,24 @@ fn update_config_seeds(out: &mut Out) {
     );
     out.bad(
         "update_config",
+        "url-scheme-denied",
+        install_with("url_schemes", json!(["MS-settings"])),
+    );
+    out.bad(
+        "update_config",
+        "file-type-mime-semicolon",
+        install_with(
+            "file_types",
+            json!([{"ext": "x", "mime": "a/b;c/d", "name": "n"}]),
+        ),
+    );
+    out.bad(
+        "update_config",
+        "autostart-null",
+        install_with("autostart", json!(null)),
+    );
+    out.bad(
+        "update_config",
         "name-newline",
         install_with("name", json!("Hello\nExec=evil")),
     );
@@ -1140,4 +1176,81 @@ fn update_config_seeds(out: &mut Out) {
     let tail = dup.iter().rposition(|&b| b == b'}').expect("closing brace");
     dup.splice(tail..tail, b",\"kind\":\"update-config\"\n".iter().copied());
     out.bad("update_config", "duplicate-key", dup);
+}
+
+/// A setup file over `exe` (FORMAT.md 14): 8-aligned 8-byte stand-ins for the key set, the
+/// manifest and the pack, then the trailer naming them.
+fn setup_over(fx: &ChainFixture<'_>, mut exe: Vec<u8>) -> Vec<u8> {
+    use lunepack_core::setup::{SetupPart, SetupTrailer};
+    let mut parts = [SetupPart {
+        offset: 0,
+        length: 8,
+    }; 3];
+    for part in &mut parts {
+        exe.resize(exe.len().div_ceil(8) * 8, 0);
+        part.offset = exe.len() as u64;
+        exe.extend_from_slice(&[0x42; 8]);
+    }
+    let trailer = SetupTrailer {
+        root: fx.trusted_root(1, 1, &[0]),
+        version: Version::parse(FUZZ_VERSION).expect("version"),
+        target: Target::WindowsX86_64,
+        keys: parts[0],
+        manifest: parts[1],
+        pack: parts[2],
+    };
+    exe.extend_from_slice(&trailer.encode().expect("trailer"));
+    exe
+}
+
+/// Pads `file` to 8, points the PE's security directory at the end and appends a `len`-byte
+/// certificate table (signtool's layout).
+fn signed(mut file: Vec<u8>, pe32: bool, len: usize) -> Vec<u8> {
+    file.resize(file.len().div_ceil(8) * 8, 0);
+    let at = 0x84 + 20 + if pe32 { 96 } else { 112 } + 4 * 8;
+    let offset = file.len() as u32;
+    file[at..at + 4].copy_from_slice(&offset.to_le_bytes());
+    file[at + 4..at + 8].copy_from_slice(&(len as u32).to_le_bytes());
+    file.extend((0..len).map(|i| (i % 251) as u8));
+    file
+}
+
+fn setup_seeds(fx: &ChainFixture<'_>, out: &mut Out) {
+    use crate::exe_headers::{PeSpec, elf, pe_image};
+    let pe = |pe32: bool| {
+        pe_image(
+            0x8664,
+            &PeSpec {
+                pe32,
+                code_len: 0x200,
+                ..PeSpec::hardened(2)
+            },
+        )
+    };
+    out.ok("setup", "elf", setup_over(fx, elf(62, false, 256)));
+    out.ok("setup", "pe-unsigned", setup_over(fx, pe(false)));
+    out.ok(
+        "setup",
+        "pe-signed",
+        signed(setup_over(fx, pe(false)), false, 64),
+    );
+    out.ok(
+        "setup",
+        "pe32-signed",
+        signed(setup_over(fx, pe(true)), true, 64),
+    );
+    out.bad("setup", "pe-no-trailer", pe(false));
+    out.bad(
+        "setup",
+        "pe-signed-no-trailer",
+        signed(pe(false), false, 64),
+    );
+    out.bad(
+        "setup",
+        "appended-after-signature",
+        setup_over(fx, signed(pe(false), false, 64)),
+    );
+    let mut gap = signed(setup_over(fx, pe(false)), false, 64);
+    gap.push(0);
+    out.bad("setup", "byte-after-table", gap);
 }

@@ -2,7 +2,7 @@
 
 libFuzzer targets over the untrusted-input harnesses of `lunepack_core::fuzz` (envelopes, root,
 key set, feed, manifest, paths, trees, version/target/id rules, strict JSON, frames, HTTP response
-headers). Each target
+headers, the setup-file locator and trailer). Each target
 calls one harness; a harness must return for any input without panicking.
 
 This directory is outside the Cargo workspace (root `exclude`) and has its own committed
@@ -18,7 +18,7 @@ the committed seeds and random and mutated inputs on stable:
     cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
 
 Targets: `envelope`, `root`, `keys`, `feed`, `manifest`, `path`, `tree`, `rules`, `json`, `frame`, `http`,
-`state`, `update_config`.
+`state`, `update_config`, `setup`.
 If AddressSanitizer does not work on your host, add `-s none`. `corpus/` and `artifacts/` are
 local and gitignored; a crash lands in `artifacts/<target>/`.
 
@@ -52,3 +52,6 @@ regression case and fix the parser.
   `Content-Length` checks and the document check.
 - `update_config`: the bytes are an update-config document (FORMAT.md 13); an accepted one must
   round-trip through the writer to the same value and canonical bytes.
+- `setup`: the bytes are a whole executable. The harness runs the PE reader, the setup locator (the
+  trailer at the end of the file or before a signed PE's certificate table) and parses the trailer
+  it finds with the fake scheme.

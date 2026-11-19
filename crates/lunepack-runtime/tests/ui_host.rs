@@ -21,36 +21,45 @@
 //!   at a prompt before any change), and the launched or relaunched app holds none of the UI's
 //!   pipes.
 //!
-//! The cases run in parallel, each in its own directory. Linux only.
+//! The cases run in parallel, each in its own directory. Linux and Windows (M7 step 10). On
+//! Windows the fake UI is this binary hard-linked as `lunepack-ui.exe` with its script in a file
+//! beside it (no shell wrapper), the host cases and the `apply` cases run, and the cases that need
+//! a shell script app, procfs, or a data home a test can redirect (`install`, `uninstall`: the
+//! data home on Windows is the shell's known folder) are listed in `LINUX_ONLY` with their reason;
+//! the Windows E2E (step 13) covers them against a real install.
+// The Linux-only cases stay compiled on Windows (their helpers are shared), so some are unused.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[allow(dead_code)]
 #[path = "../src/events.rs"]
 mod events;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[allow(dead_code, unused_imports)]
 #[path = "../src/ui_host.rs"]
 mod ui_host;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("--engine") => linux::fake_ui(),
-        Some(linux::HELPER_ARG) => linux::helper_app(),
-        _ => linux::run_all(&args),
+        Some("--engine") => native::fake_ui(),
+        Some(native::HELPER_ARG) => native::helper_app(),
+        Some(native::SLEEP_ARG) => native::sleep(&args[1..]),
+        _ => native::run_all(&args),
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn main() {
-    println!("lunepack-runtime ui_host tests: Linux only, skipped");
+    println!("lunepack-runtime ui_host tests: Linux and Windows only, skipped");
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", windows))]
+mod native {
     use std::io::{Read, Write};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
@@ -66,18 +75,42 @@ mod linux {
         self, ChoiceValue, Details, EngineMsg, Flow, Outcome, PromptKind, UiMsg,
     };
     use lunepack_core::{
-        AppId, Channel, CodecId, EncodedFrame, Encoder, Hasher, PayloadKind, ReleaseLayout, Signer,
-        U53, pack_file,
+        AppId, Channel, CodecId, EncodedFrame, Encoder, Hasher, LayoutScheme, PayloadKind,
+        ReleaseLayout, Signer, U53, UserLayout, pack_file,
     };
     use lunepack_crypto::{Ed25519Signer, Ed25519Verifier, Sha256Hasher, generate_key_file};
     use lunepack_fs::StdFs;
-    use lunepack_os_linux::LinuxProcess;
+    #[cfg(target_os = "linux")]
+    use lunepack_os_linux::LinuxProcess as NativeProcess;
+    #[cfg(windows)]
+    use lunepack_os_windows::WindowsProcess as NativeProcess;
     use lunepack_testkit::{ChainFixture, FakeCodec, SUITE_APP_ID, SUITE_CHANNEL};
 
     use crate::events::{Event, Events, Sink, SinkFailed, to_json_line};
     use crate::ui_host::{self, Bounds, Start, UiHost, UiStop};
 
     pub const HELPER_ARG: &str = "helper-app";
+    /// A helper mode of this binary: `sleep-for <seconds>`, a process to wait for.
+    pub const SLEEP_ARG: &str = "sleep-for";
+    /// The layout scheme of this OS (what the runtime's platform picks).
+    #[cfg(windows)]
+    const SCHEME: LayoutScheme = LayoutScheme::WINDOWS;
+    #[cfg(not(windows))]
+    const SCHEME: LayoutScheme = LayoutScheme::XDG;
+    #[cfg(windows)]
+    const RUNTIME_FILE: &str = "lunepack-runtime.exe";
+    #[cfg(not(windows))]
+    const RUNTIME_FILE: &str = "lunepack-runtime";
+
+    /// An entry path as this OS names an executable (`bin/app` is `bin/app.exe` on Windows).
+    fn exe(entry: &str) -> String {
+        if cfg!(windows) {
+            format!("{entry}.exe")
+        } else {
+            entry.to_owned()
+        }
+    }
+
     const FAKE_VAR: &str = "LUNEPACK_FAKE_UI";
     const OUT_VAR: &str = "LUNEPACK_FAKE_UI_OUT";
     const RUNTIME: &str = env!("CARGO_BIN_EXE_lunepack-runtime");
@@ -88,11 +121,33 @@ mod linux {
     const INSTALL_ID: [u8; 16] = [3; 16];
     /// A bound on any one runtime run.
     const RUN_LIMIT: Duration = Duration::from_secs(90);
+    /// What a bound measured from a run's own events may exceed the channel's bound by, for a
+    /// runner under load. The cases measure the channel's waits, never a run's whole time: how
+    /// long an install or an apply takes on a shared runner is not what they check.
+    const SLACK: Duration = Duration::from_secs(15);
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     const TARGET: Target = Target::LinuxAarch64;
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
     const TARGET: Target = Target::LinuxX86_64;
+    #[cfg(all(windows, target_arch = "aarch64"))]
+    const TARGET: Target = Target::WindowsAarch64;
+    #[cfg(all(windows, not(target_arch = "aarch64")))]
+    const TARGET: Target = Target::WindowsX86_64;
+
+    /// The cases (by name prefix) that need a Linux-only mechanism, each with why; they are
+    /// skipped on Windows.
+    #[cfg(windows)]
+    const LINUX_ONLY: &[(&str, &str)] = &[
+        (
+            "install_",
+            "the data home is the shell's known folder, which a test cannot redirect",
+        ),
+        (
+            "uninstall_",
+            "the data home is the shell's known folder; the uninstall hand-off is step 11",
+        ),
+    ];
 
     // ---- the fake UI ------------------------------------------------------------------------
 
@@ -131,8 +186,18 @@ mod linux {
         expect: Option<PathBuf>,
     }
 
+    /// A file beside this executable (the fake UI's script and notes directory when its
+    /// environment cannot carry them: Windows has no wrapper script).
+    fn beside(name: &str) -> Option<String> {
+        let exe = std::env::current_exe().ok()?;
+        std::fs::read_to_string(exe.parent()?.join(name)).ok()
+    }
+
     fn script() -> Script {
-        let text = std::env::var(FAKE_VAR).unwrap_or_default();
+        let text = std::env::var(FAKE_VAR)
+            .ok()
+            .or_else(|| beside("fake-ui.spec"))
+            .unwrap_or_default();
         let mut s = Script::default();
         for item in text.split(',').filter(|i| !i.is_empty()) {
             let (key, value) = item.split_once('=').unwrap_or((item, ""));
@@ -163,7 +228,8 @@ mod linux {
     }
 
     fn note(line: &str) {
-        let Some(out) = std::env::var_os(OUT_VAR) else {
+        let Some(out) = std::env::var_os(OUT_VAR).or_else(|| beside("fake-ui.out").map(Into::into))
+        else {
             return;
         };
         let mut f = std::fs::OpenOptions::new()
@@ -174,13 +240,26 @@ mod linux {
         f.write_all(format!("{line}\n").as_bytes()).expect("note");
     }
 
+    #[cfg(target_os = "linux")]
     fn fd_target(fd: u32) -> String {
         std::fs::read_link(format!("/proc/self/fd/{fd}"))
             .map(|p| p.display().to_string())
             .unwrap_or_default()
     }
 
+    /// Windows has no descriptor table to read (the pipe checks are Linux only).
+    #[cfg(windows)]
+    fn fd_target(_fd: u32) -> String {
+        String::new()
+    }
+
+    #[cfg(windows)]
+    fn all_fds() -> String {
+        String::new()
+    }
+
     /// Every fd target of this process, space separated.
+    #[cfg(target_os = "linux")]
     fn all_fds() -> String {
         let mut out = Vec::new();
         for entry in std::fs::read_dir("/proc/self/fd").expect("fds") {
@@ -190,6 +269,15 @@ mod linux {
             }
         }
         out.join(" ")
+    }
+
+    /// The UI dies abnormally: an abort on Linux; a plain nonzero exit on Windows (an abort there
+    /// can raise the error-reporting dialog).
+    fn die() -> ! {
+        #[cfg(windows)]
+        std::process::exit(3);
+        #[cfg(not(windows))]
+        std::process::abort();
     }
 
     fn hit(at: &Option<String>, trigger: &str) -> bool {
@@ -276,7 +364,7 @@ mod linux {
                         });
                     }
                     if hit(&s.die_at, "hello") {
-                        std::process::abort();
+                        die();
                     }
                     if hit(&s.stop_at, "hello") {
                         sleep_for_good();
@@ -285,7 +373,7 @@ mod linux {
                 EngineMsg::Progress { .. } => {
                     if hit(&s.die_at, "progress") {
                         note("ui dies at progress");
-                        std::process::abort();
+                        die();
                     }
                     if hit(&s.stop_at, "progress") {
                         note("ui stops at progress");
@@ -306,7 +394,7 @@ mod linux {
                     note(&format!("ui got prompt {kind:?}"));
                     let trigger = format!("prompt:{kind:?}");
                     if hit(&s.die_at, &trigger) {
-                        std::process::abort();
+                        die();
                     }
                     if hit(&s.stop_at, &trigger) {
                         sleep_for_good();
@@ -348,7 +436,17 @@ mod linux {
         }
     }
 
+    /// Whether the thing `expect=` names is true. Windows (no procfs): the text is a note the app
+    /// writes when it starts, found in this run's notes.
+    #[cfg(windows)]
+    fn runs(what: &Path) -> bool {
+        let out = std::env::var_os(OUT_VAR).or_else(|| beside("fake-ui.out").map(Into::into));
+        out.and_then(|o| std::fs::read_to_string(Path::new(&o).join("notes")).ok())
+            .is_some_and(|notes| notes.contains(&*what.to_string_lossy()))
+    }
+
     /// Whether a process runs with `exe` as its executable.
+    #[cfg(target_os = "linux")]
     fn runs(exe: &Path) -> bool {
         let Ok(entries) = std::fs::read_dir("/proc") else {
             return false;
@@ -374,6 +472,12 @@ mod linux {
     }
 
     // ---- the app for `apply` ---------------------------------------------------------------
+
+    /// A process that sleeps `<seconds>` (the wait target of a case).
+    pub fn sleep(rest: &[String]) {
+        let secs: f64 = rest.first().and_then(|s| s.parse().ok()).expect("seconds");
+        std::thread::sleep(Duration::from_secs_f64(secs));
+    }
 
     /// The app `apply` starts: notes its start and its fds, then confirms or crashes as its
     /// tree's marker says.
@@ -528,6 +632,11 @@ mod linux {
                     continue;
                 }
                 let failed = &failed;
+                #[cfg(windows)]
+                if let Some((_, why)) = LINUX_ONLY.iter().find(|(p, _)| name.starts_with(p)) {
+                    println!("test {name} ... skipped on Windows ({why})");
+                    continue;
+                }
                 scope.spawn(move || {
                     let started = Instant::now();
                     match std::panic::catch_unwind(test) {
@@ -554,13 +663,23 @@ mod linux {
             .prefix(prefix)
             .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
             .expect("tmp");
-        let base = std::fs::canonicalize(tmp.path()).expect("canonical");
+        let base = plain(std::fs::canonicalize(tmp.path()).expect("canonical"));
         (tmp, base)
+    }
+
+    /// `path` without Windows' `\\?\` prefix (a canonical path there).
+    fn plain(path: PathBuf) -> PathBuf {
+        let text = path.to_string_lossy().into_owned();
+        match text.strip_prefix(r"\\?\") {
+            Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+            _ => path,
+        }
     }
 
     fn write_exec(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         std::fs::write(path, text).expect("write");
+        #[cfg(unix)]
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("mode");
     }
 
@@ -570,6 +689,20 @@ mod linux {
     static WRAPPER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
     fn write_wrapper(dir: &Path) {
+        // Windows has no wrapper: the fake UI is this binary itself (see `place_ui`).
+        #[cfg(windows)]
+        {
+            let _ = dir;
+            WRAPPER
+                .set(std::env::current_exe().expect("exe"))
+                .expect("wrapper once");
+        }
+        #[cfg(not(windows))]
+        write_unix_wrapper(dir);
+    }
+
+    #[cfg(not(windows))]
+    fn write_unix_wrapper(dir: &Path) {
         let me = std::env::current_exe().expect("exe");
         let path = dir.join("fake-ui-wrapper");
         write_exec(
@@ -588,8 +721,11 @@ mod linux {
         std::fs::create_dir_all(dir).expect("dir");
         std::fs::write(dir.join("fake-ui.spec"), spec).expect("spec");
         std::fs::write(dir.join("fake-ui.out"), out.as_os_str().as_encoded_bytes()).expect("out");
-        std::fs::hard_link(WRAPPER.get().expect("wrapper"), dir.join(ui_host::UI_FILE))
-            .expect("link the wrapper");
+        let wrapper = WRAPPER.get().expect("wrapper");
+        let link = dir.join(ui_host::UI_FILE);
+        if std::fs::hard_link(wrapper, &link).is_err() {
+            std::fs::copy(wrapper, &link).expect("copy the wrapper");
+        }
     }
 
     fn notes(out: &Path) -> String {
@@ -605,6 +741,12 @@ mod linux {
             .collect()
     }
 
+    #[cfg(windows)]
+    fn assert_app_holds_no_ui_pipe(_out: &Path, _app_fds: &str) {
+        // Linux only: Windows has no descriptor table to read; the E2E covers handle inheritance.
+    }
+
+    #[cfg(target_os = "linux")]
     fn assert_app_holds_no_ui_pipe(out: &Path, app_fds: &str) {
         let pipes = ui_pipes(out);
         assert_eq!(pipes.len(), 2, "the UI noted its pipes: {}", notes(out));
@@ -690,7 +832,7 @@ mod linux {
         }
 
         fn start_with(&self, flow: Flow, icon: Option<Vec<u8>>) -> UiHost {
-            let process: Arc<dyn Process> = Arc::new(LinuxProcess::new());
+            let process: Arc<dyn Process> = Arc::new(NativeProcess::new());
             let env = |name: &str| (name == "DISPLAY").then(|| ":99".into());
             let mut app = ui_host::card("Host test", V100, None);
             app.icon_png = icon;
@@ -926,7 +1068,11 @@ mod linux {
             ui.steps(&[ui::StepItem::WaitApp]);
             slowest = slowest.max(one.elapsed());
         }
-        assert!(slowest < Duration::from_millis(100), "{slowest:?}");
+        // The one emit that finds the queue full stops the UI, which ends the child: on Windows a
+        // window-less child gets WM_CLOSE and then the kill after the grace (100 ms), so that
+        // call may take the grace on top (bounded; the real UI has windows and closes at once).
+        let bound = Duration::from_millis(if cfg!(windows) { 300 } else { 100 });
+        assert!(slowest < bound, "{slowest:?}");
         assert!(wait_until(FAST.stall + Duration::from_secs(2), || ui
             .stopped()
             .is_some()));
@@ -952,7 +1098,10 @@ mod linux {
         let icon = vec![0x89u8; ui::MAX_ICON_BYTES];
         let t = Instant::now();
         let ui = lab.start_with(Flow::Install, Some(icon));
-        assert!(t.elapsed() < Duration::from_millis(500), "start waited");
+        // The start spawns the UI and returns; it does not wait for the write. On Windows the
+        // first launch of a fresh executable can take a second under real-time scanning.
+        let start_bound = Duration::from_millis(if cfg!(windows) { 3000 } else { 500 });
+        assert!(t.elapsed() < start_bound, "start waited");
         let events = lab.events(&ui);
         assert!(wait_until(FAST.stall + Duration::from_secs(1), || ui
             .stopped()
@@ -1019,8 +1168,13 @@ mod linux {
     fn write_file(path: &Path, bytes: &[u8], exec: bool) {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         std::fs::write(path, bytes).expect("write");
-        let mode = if exec { 0o755 } else { 0o644 };
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
+        #[cfg(unix)]
+        {
+            let mode = if exec { 0o755 } else { 0o644 };
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
+        }
+        #[cfg(not(unix))]
+        let _ = exec;
     }
 
     /// One install case: a release of 1.0.0 on a `file:` feed, its bootstrap tree, an empty home.
@@ -1127,6 +1281,9 @@ mod linux {
                 bin: Some(BIN.to_owned()),
                 terminal: false,
                 publisher: None,
+                file_types: Vec::new(),
+                url_schemes: Vec::new(),
+                autostart: false,
             };
             let config = UpdateConfig::new(
                 &root,
@@ -1245,6 +1402,11 @@ mod linux {
         stdout: String,
         stderr: String,
         took: Duration,
+        /// When the run ended, in milliseconds since the Unix epoch (the clock of the log's
+        /// `time_ms`).
+        ended_ms: u64,
+        /// When each stderr line arrived, as `ended_ms` (one per line of `stderr`).
+        stderr_ms: Vec<u64>,
     }
 
     impl std::fmt::Debug for Run {
@@ -1258,13 +1420,46 @@ mod linux {
     }
 
     impl Run {
-        fn of(out: Output, took: Duration) -> Run {
+        fn of(out: Finished, took: Duration) -> Run {
             Run {
-                code: out.status.code().unwrap_or(-1),
-                stdout: String::from_utf8(out.stdout).expect("utf-8 stdout"),
-                stderr: String::from_utf8(out.stderr).expect("utf-8 stderr"),
+                code: out.output.status.code().unwrap_or(-1),
+                stdout: String::from_utf8(out.output.stdout).expect("utf-8 stdout"),
+                stderr: String::from_utf8(out.output.stderr).expect("utf-8 stderr"),
                 took,
+                ended_ms: wall_ms(),
+                stderr_ms: out.stderr_ms,
             }
+        }
+
+        /// How long the stderr line holding `needle` came after the line before it. The span of
+        /// a stop that is found by the channel's own bounds, from the last thing the run said
+        /// before it started waiting for the UI: the install work before that, which a loaded
+        /// runner stretches, is not in it.
+        fn gap_before_stderr_line(&self, needle: &str) -> Duration {
+            let at = self
+                .stderr
+                .lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no stderr line with {needle}: {self:?}"));
+            assert!(at > 0, "a line before the one with {needle}: {self:?}");
+            Duration::from_millis(self.stderr_ms[at].saturating_sub(self.stderr_ms[at - 1]))
+        }
+
+        /// How long the run lasted after its final event, `log`'s last result or error line:
+        /// what the run did after it committed its outcome, which is the UI waits only (the
+        /// operation's own work, which a loaded runner stretches, is not in it).
+        fn since_final_event(&self, log: &str) -> Duration {
+            let final_ms = log
+                .lines()
+                .rev()
+                .find(|l| l.contains("\"type\":\"result\"") || l.contains("\"type\":\"error\""))
+                .and_then(|l| l.split_once("\"time_ms\":"))
+                .and_then(|(_, rest)| {
+                    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                    digits.parse::<u64>().ok()
+                })
+                .unwrap_or_else(|| panic!("a final event with a time in the log: {log:?}"));
+            Duration::from_millis(self.ended_ms.saturating_sub(final_ms))
         }
 
         fn line(&self) -> &str {
@@ -1274,9 +1469,25 @@ mod linux {
         }
     }
 
+    fn wall_ms() -> u64 {
+        u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_millis(),
+        )
+        .expect("ms")
+    }
+
+    /// What a run left: its output, and when each stderr line arrived.
+    struct Finished {
+        output: Output,
+        stderr_ms: Vec<u64>,
+    }
+
     /// Waits for `child` (at most [`RUN_LIMIT`], then kills it and fails), reading its stdout
     /// and stderr meanwhile so a full pipe never holds it up.
-    fn finish(mut child: Child) -> Output {
+    fn finish(mut child: Child) -> Finished {
         fn drain(stream: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
             std::thread::spawn(move || {
                 let mut all = Vec::new();
@@ -1286,8 +1497,26 @@ mod linux {
                 all
             })
         }
+        /// [`drain`], stamping the arrival of every line.
+        fn drain_lines(
+            stream: Option<impl Read + Send + 'static>,
+        ) -> std::thread::JoinHandle<(Vec<u8>, Vec<u64>)> {
+            std::thread::spawn(move || {
+                let mut all = Vec::new();
+                let mut stamps = Vec::new();
+                if let Some(s) = stream {
+                    let mut lines = std::io::BufReader::new(s);
+                    while std::io::BufRead::read_until(&mut lines, b'\n', &mut all)
+                        .is_ok_and(|n| n > 0)
+                    {
+                        stamps.push(wall_ms());
+                    }
+                }
+                (all, stamps)
+            })
+        }
         let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
+        let stderr = drain_lines(child.stderr.take());
         let start = Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait().expect("wait") {
@@ -1300,10 +1529,14 @@ mod linux {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        Output {
-            status,
-            stdout: stdout.join().expect("stdout"),
-            stderr: stderr.join().expect("stderr"),
+        let (stderr, stderr_ms) = stderr.join().expect("stderr");
+        Finished {
+            output: Output {
+                status,
+                stdout: stdout.join().expect("stdout"),
+                stderr,
+            },
+            stderr_ms,
         }
     }
 
@@ -1419,8 +1652,13 @@ mod linux {
         let run = lab.install(&[]);
         assert_installed(&lab, &run);
         assert!(lab.notes().contains("ui stops at progress"));
-        // Found at the done prompt at the latest: no pong within the hang bound.
-        assert!(run.took < Duration::from_secs(30), "{run:?}");
+        // Found at the done prompt at the latest: no pong within the hang bound. Measured from
+        // the last event before the prompt to the stop's report, not over the whole install.
+        let found = run.gap_before_stderr_line("\"code\":\"ui_stopped\"");
+        assert!(
+            found < Bounds::default().pong_wait + SLACK,
+            "{found:?} {run:?}"
+        );
         assert!(run.stderr.contains("\"code\":\"ui_stopped\""), "{run:?}");
         assert!(!lab.notes().contains("app-ran"));
     }
@@ -1547,14 +1785,18 @@ mod linux {
             };
             lab.tree(V100, "linger");
             lab.tree(V110, marker);
-            let spec = spec.replace(
-                "@expect@",
-                &lab.tree_dir(V100).join("bin/app").display().to_string(),
-            );
+            // Linux: the app's executable, which a process must be running from; Windows (no
+            // procfs): the note the relaunched 1.0.0 writes when it starts.
+            let expect = if cfg!(windows) {
+                "1.0.0 start token=no".to_owned()
+            } else {
+                lab.tree_dir(V100).join("bin/app").display().to_string()
+            };
+            let spec = spec.replace("@expect@", &expect);
             place_ui(&lab.tree_dir(V100).join("bin"), &spec, &lab.out);
             let fs = StdFs::new();
             let store = UserScope {
-                dir: lab.root.join("state"),
+                dir: lab.layout().state_dir(),
                 app_id: app_id(),
             };
             let loaded = store.load(&fs, &Sha256Hasher).expect("load");
@@ -1570,8 +1812,12 @@ mod linux {
             lab
         }
 
+        fn layout(&self) -> UserLayout {
+            UserLayout::from_root(self.root.clone(), SCHEME)
+        }
+
         fn tree_dir(&self, v: &str) -> PathBuf {
-            self.root.join("versions").join(v)
+            self.layout().versions_dir().join(v)
         }
 
         fn tree(&self, v: &str, marker: &str) {
@@ -1581,7 +1827,7 @@ mod linux {
             cfg.target = TARGET;
             cfg.health_timeout_secs = 10;
             cfg.install = InstallMeta {
-                entry: RelPath::parse("bin/app").expect("entry"),
+                entry: RelPath::parse(&exe("bin/app")).expect("entry"),
                 name: format!("UI apply test {v}"),
                 comment: None,
                 icon: None,
@@ -1589,20 +1835,26 @@ mod linux {
                 bin: None,
                 terminal: false,
                 publisher: None,
+                file_types: Vec::new(),
+                url_schemes: Vec::new(),
+                autostart: false,
             };
             write_file(
                 &dir.join("lunepack-update.json"),
                 &cfg.to_bytes().expect("config bytes"),
                 false,
             );
-            place(&std::env::current_exe().expect("exe"), &dir.join("bin/app"));
-            place(Path::new(RUNTIME), &dir.join("bin/lunepack-runtime"));
+            place(
+                &std::env::current_exe().expect("exe"),
+                &dir.join(exe("bin/app")),
+            );
+            place(Path::new(RUNTIME), &dir.join("bin").join(RUNTIME_FILE));
             std::fs::write(dir.join("marker"), marker).expect("marker");
         }
 
         fn command(&self, extra: &[&str]) -> Command {
             let target = wait_target();
-            let mut cmd = Command::new(self.tree_dir(V100).join("bin/lunepack-runtime"));
+            let mut cmd = Command::new(self.tree_dir(V100).join("bin").join(RUNTIME_FILE));
             cmd.args([
                 "apply",
                 "--wait-pid",
@@ -1613,16 +1865,22 @@ mod linux {
                 V110,
             ])
             .args(extra)
-            .args(["--", HELPER_ARG])
-            .env_clear()
-            .env("HOME", &self.home)
-            .env("XDG_DATA_HOME", &self.data)
-            .env("PATH", "/usr/bin:/bin")
-            .env("DISPLAY", ":99")
-            .env(OUT_VAR, &self.out)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .args(["--", HELPER_ARG]);
+            // Linux: a cleared environment, with a display so a UI is wanted. Windows: the
+            // inherited one (the system needs its variables), minus what would change the run.
+            #[cfg(not(windows))]
+            cmd.env_clear()
+                .env("HOME", &self.home)
+                .env("XDG_DATA_HOME", &self.data)
+                .env("PATH", "/usr/bin:/bin")
+                .env("DISPLAY", ":99");
+            #[cfg(windows)]
+            cmd.env_remove("LUNEPACK_NO_UI")
+                .env_remove(HEALTH_TOKEN_VAR);
+            cmd.env(OUT_VAR, &self.out)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             cmd
         }
 
@@ -1637,12 +1895,13 @@ mod linux {
         }
 
         fn log(&self) -> String {
-            std::fs::read_to_string(self.root.join("logs/runtime.log")).unwrap_or_default()
+            std::fs::read_to_string(self.layout().logs_dir().join("runtime.log"))
+                .unwrap_or_default()
         }
 
         fn current(&self) -> Version {
             UserScope {
-                dir: self.root.join("state"),
+                dir: self.layout().state_dir(),
                 app_id: app_id(),
             }
             .load(&StdFs::new(), &Sha256Hasher)
@@ -1667,8 +1926,11 @@ mod linux {
 
     /// A short-lived process to wait for (reaped by a thread), and its id.
     fn wait_target() -> ProcessId {
-        let mut child = Command::new("sleep").arg("0.3").spawn().expect("sleep");
-        let id = LinuxProcess::new()
+        let mut child = Command::new(std::env::current_exe().expect("exe"))
+            .args([SLEEP_ARG, "0.3"])
+            .spawn()
+            .expect("sleep");
+        let id = NativeProcess::new()
             .process_id(child.id())
             .expect("probe")
             .expect("running");
@@ -1716,8 +1978,12 @@ mod linux {
         let run = lab.run(lab.command(&[]));
         assert_eq!(run.code, 0, "{run:?}");
         assert_eq!(lab.current(), version(V110));
-        // The close bound, then the kill.
-        assert!(run.took < Duration::from_secs(20), "{run:?}");
+        // The close bound, then the kill, after the outcome was committed.
+        let after = run.since_final_event(&lab.log());
+        assert!(
+            after < Bounds::default().close_wait + SLACK,
+            "{after:?} {run:?}"
+        );
     }
 
     fn apply_rollback_with_a_hung_ui_relaunches_first_and_ends() {
@@ -1741,8 +2007,14 @@ mod linux {
             .find_map(|l| l.strip_prefix("1.0.0 app-fds "))
             .expect("1.0.0 app fds");
         assert_app_holds_no_ui_pipe(&lab.out, fds);
-        // Found hung by the pings, within the bounds: a ping at once, a pong bound of 15 s.
-        assert!(run.took < Duration::from_secs(45), "{run:?}");
+        // Found hung by the pings, within the bounds: a ping at once, a pong bound of 15 s,
+        // then the close bound, all after the outcome was committed.
+        let after = run.since_final_event(&lab.log());
+        let bounds = Bounds::default();
+        assert!(
+            after < bounds.pong_wait + bounds.close_wait + SLACK,
+            "{after:?} {run:?}"
+        );
         assert!(lab.log().contains("\"reason\":\"hung\""), "{}", lab.log());
     }
 
@@ -1751,7 +2023,13 @@ mod linux {
         let run = lab.run(lab.command(&["--no-ui"]));
         assert_eq!(run.code, 0, "{run:?}");
         assert!(!lab.notes().contains("ui start"), "{}", lab.notes());
-        for (name, value) in [("LUNEPACK_NO_UI", Some("1")), ("DISPLAY", None)] {
+        // Windows has no display to be missing: only the policy variable.
+        let policies: &[(&str, Option<&str>)] = if cfg!(windows) {
+            &[("LUNEPACK_NO_UI", Some("1"))]
+        } else {
+            &[("LUNEPACK_NO_UI", Some("1")), ("DISPLAY", None)]
+        };
+        for (name, value) in policies.iter().copied() {
             let lab = ApplyLab::new("confirm", "");
             let mut cmd = lab.command(&[]);
             match value {

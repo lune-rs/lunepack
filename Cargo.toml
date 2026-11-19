@@ -72,9 +72,40 @@ lune-ui = { git = "https://github.com/lune-rs/luneui-rs", rev = "cbeae0109f970ea
 wgpu = "30"
 png = "0.18"
 
-# OS adapters (M6 step 9, M6-D8): the Windows reduce-motion reader calls user32 through windows-sys,
-# already in the lock for other crates; no window stack.
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+# OS adapters (M6 step 9, M6-D8; M7 step 5): the Windows reduce-motion reader calls user32 through
+# windows-sys, already in the lock for other crates; no window stack. The process adapter adds the
+# process snapshot and process-handle APIs (kernel32). The integration (M7 step 6) adds the
+# registry (advapi32; `RegCreateKeyExW` is behind `Win32_Security`) and file attributes. The launcher
+# stub (M7 step 8) adds the raw command line and the console control handler.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# COM for the Windows Start-menu shortcut (M7-D4): IShellLinkW, IPersistFile and IPropertyStore,
+# used only by lunepack-os-windows. The version is the one the UI stack already pulls in, so the
+# lock gains no package. `REACH_ONLY_THROUGH` in the boundary check holds it to that crate and to
+# the UI adapter (D17).
+windows = { version = "0.62", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
 
 # The window stack the UI binary needs, named through lunepack-ui-luneui's re-exports so the
 # boundary check still sees it reachable only through that crate (the version LuneUI uses).

@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lunepack_core::fetch::FetchPolicy;
-use lunepack_core::state::{CurrentRef, Scope};
+use lunepack_core::layout::LOCK_FILE;
+use lunepack_core::state::{CurrentRef, Scope, is_record_name};
 use lunepack_core::state::{
     Floors, InstallCounters, InstallState, Loaded, MachineScope as MachineStore, RootParts,
     StagedRef, UserScope,
@@ -29,11 +30,12 @@ use lunepack_core::state::{
 use lunepack_core::update_config::MAX_UPDATE_CONFIG_BYTES;
 use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, CancelToken, Channel, ClockReading, Codec,
-    FileKind, Fs, Hasher, IntegrationRequest, Limits, OsIntegration, Phase, Progress, ReadAt,
-    RelPath, Request, Rng, Sha256Digest, SourceFor, StageEnv, StageError, StageInput, Target,
-    Transport, TransportError, TrustedRoot, UPDATE_CONFIG_FILE, UpdateConfig, UpdateConfigError,
-    VerifiedEntry, VerifiedManifest, Verifier, Version, advance_root, read_entry, select_candidate,
-    verify_feed, verify_key_set, verify_manifest, verify_payload_manifest,
+    FileKind, Fs, Hasher, IntegrationError, IntegrationRequest, Limits, OsIntegration, Phase,
+    Progress, ReadAt, RelPath, Request, Rng, RootNaming, Sha256Digest, SourceFor, StageEnv,
+    StageError, StageInput, Target, Transport, TransportError, TrustedRoot, UPDATE_CONFIG_FILE,
+    UpdateConfig, UpdateConfigError, UserLayout, VerifiedEntry, VerifiedManifest, Verifier,
+    Version, advance_root, read_entry, select_candidate, verify_feed, verify_key_set,
+    verify_manifest, verify_payload_manifest,
 };
 
 use crate::cache::{Cache, CacheKind, PartTools};
@@ -878,9 +880,6 @@ where
     cancellable(cancel, future).await??
 }
 
-/// The updater lock's file name in the lock directory.
-const LOCK_FILE: &str = "lock";
-
 /// Takes the updater lock on a short job: [`Error::Busy`] when it is held.
 async fn take_lock(inner: &Arc<Inner>, cancel: &CancelToken) -> Result<OpLock, Error> {
     on_job(inner, None, cancel, "lock", |inner, _| {
@@ -1119,7 +1118,7 @@ async fn check(inner: Arc<Inner>) -> Result<Option<UpdateInfo>, Error> {
 async fn check_first(
     inner: &Arc<Inner>,
     cancel: &CancelToken,
-    root: &Path,
+    root: &UserLayout,
 ) -> Result<Option<UpdateInfo>, Error> {
     let lock = take_lock(inner, cancel).await?;
     let snap = on_job(inner, Some(&lock), cancel, "state-load", |inner, _| {
@@ -1128,7 +1127,7 @@ async fn check_first(
     .await?;
     if snap.record().current.is_some() {
         let record = snap.record().clone();
-        let root = root.to_path_buf();
+        let root = root.clone();
         let outcome = on_job(inner, Some(&lock), cancel, "reconcile", move |inner, _| {
             Ok(already_installed(&*inner.fs, &root, &record))
         })
@@ -1645,27 +1644,28 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
 
 // ---- first install -------------------------------------------------------------------------------
 
-/// The install root `R` of a per-user layout made by [`Layout::user`]: `versions` and `state`
-/// directly under one directory.
-fn install_root_of(state_dir: &Path, versions_dir: &Path) -> Result<PathBuf, Error> {
-    let root = versions_dir
-        .parent()
-        .filter(|r| {
-            versions_dir == r.join(lunepack_core::layout::VERSIONS_DIR)
-                && state_dir == r.join(lunepack_core::layout::STATE_DIR)
-        })
-        .ok_or(Error::Config(
-            "install needs the per-user layout of an install root",
-        ))?;
-    Ok(root.to_path_buf())
+/// The per-user layout of an install root made by [`Layout::user`]: the versions and state
+/// directories of one root under a scheme this build knows ([`UserLayout::from_dirs`]).
+fn install_root_of(state_dir: &Path, versions_dir: &Path) -> Result<UserLayout, Error> {
+    UserLayout::from_dirs(state_dir, versions_dir).ok_or(Error::Config(
+        "install needs the per-user layout of an install root",
+    ))
+}
+
+/// M7-D16 rule 3, first thing under the lock of a first install: `state_dir` holds no record of
+/// another app id ([`Error::ForeignInstallRoot`]), so two apps with one display name cannot both
+/// take a new folder.
+fn refuse_foreign_record(inner: &Inner, state_dir: &Path) -> Result<(), Error> {
+    lunepack_core::ensure_no_foreign_record(&*inner.fs, &*inner.hasher, state_dir, &inner.app_id)
+        .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))
 }
 
 /// What a first install that finds a current version returns (F15). `current` is first put
 /// back from the record (idempotent, and never ahead of it), so a run cut off between the install
 /// commit and the link, or whose reconcile failed, still ends with a startable install; a
 /// reconcile that fails again is that error, so a retry can still fix it.
-fn already_installed(fs: &dyn Fs, root: &Path, record: &InstallState) -> Error {
-    match lunepack_core::reconcile_current(fs, root, record) {
+fn already_installed(fs: &dyn Fs, root: &UserLayout, record: &InstallState) -> Error {
+    match root.reconcile(fs, record) {
         Ok(()) => Error::AlreadyInstalled,
         Err(e) => Error::from(lunepack_core::Error::Layout(e)),
     }
@@ -1675,9 +1675,16 @@ fn already_installed(fs: &dyn Fs, root: &Path, record: &InstallState) -> Error {
 /// `root` is `<parent>/<app id>` (the derivation of M5-D2; tombstones are named after the app id
 /// only and never sit anywhere else). Best effort: a tombstone is never the install root, so one
 /// that stays changes nothing about the install and the next install or uninstall tries again.
-fn clear_tombstones(inner: &Inner, root: &Path) {
+fn clear_tombstones(inner: &Inner, layout: &UserLayout) {
+    let root = layout.root();
+    let derived = match layout.scheme().root {
+        RootNaming::AppId => root.file_name().is_some_and(|n| n == inner.app_id.as_str()),
+        // A display-name root is found in the data home by its record (M7-D16); the tombstones
+        // are named after the app id only, so the parent is the place to look.
+        RootNaming::DisplayName => true,
+    };
     if let Some(parent) = root.parent()
-        && root.file_name().is_some_and(|n| n == inner.app_id.as_str())
+        && derived
     {
         let _ = lunepack_core::remove_tombstones(&*inner.fs, parent, &inner.app_id);
     }
@@ -1692,7 +1699,9 @@ fn clear_tombstones(inner: &Inner, root: &Path) {
 /// lunepack did not make. Reads only. An uninstall renames `root` to a tombstone beside it before
 /// removing it (F18), so a cut-off uninstall leaves `root` whole or absent, never half removed;
 /// a tombstone is never looked at here.
-fn adoptable(inner: &Inner, root: &Path, state_dir: &Path) -> Result<(), Error> {
+fn adoptable(inner: &Inner, layout: &UserLayout) -> Result<(), Error> {
+    let root = layout.root();
+    let state_dir = layout.state_dir();
     match inner.fs.symlink_metadata(root) {
         Ok(None) => return Ok(()),
         Ok(Some(meta)) if meta.kind == FileKind::Dir => {}
@@ -1704,22 +1713,35 @@ fn adoptable(inner: &Inner, root: &Path, state_dir: &Path) -> Result<(), Error> 
     if entries.is_empty() {
         return Ok(());
     }
-    let state_name = state_dir.file_name();
-    let has_state = entries
-        .iter()
-        .any(|e| Some(e.name.as_os_str()) == state_name && e.kind == FileKind::Dir);
-    let only_state = has_state && entries.len() == 1;
-    if !has_state {
-        return Err(Error::ForeignInstallRoot);
+    // The state directory's names from `root` down (one under XDG, `.lunepack/state` under
+    // Windows): each must be a real directory, and "only state" means each level holds nothing
+    // but the next name.
+    let mut only_state = true;
+    let mut dir = root.to_path_buf();
+    let mut listing = entries;
+    for name in layout.scheme().state.split('/') {
+        let has = listing
+            .iter()
+            .any(|e| e.name.as_os_str() == std::ffi::OsStr::new(name) && e.kind == FileKind::Dir);
+        if !has {
+            return Err(Error::ForeignInstallRoot);
+        }
+        only_state &= listing.len() == 1;
+        dir.push(name);
+        if dir != state_dir {
+            listing = inner.fs.list_dir(&dir)?;
+        }
     }
+    // Another app's record is never taken over (M7-D16: two apps with one display name).
+    refuse_foreign_record(inner, &state_dir)?;
     let store = UserScope {
-        dir: state_dir.to_path_buf(),
+        dir: state_dir.clone(),
         app_id: inner.app_id.clone(),
     };
     if store.load(&*inner.fs, &*inner.hasher)?.record.is_some() {
         return Ok(());
     }
-    let only_ours = inner.fs.list_dir(state_dir)?.iter().all(|e| {
+    let only_ours = inner.fs.list_dir(&state_dir)?.iter().all(|e| {
         e.kind == FileKind::File
             && e.name
                 .to_str()
@@ -1732,22 +1754,19 @@ fn adoptable(inner: &Inner, root: &Path, state_dir: &Path) -> Result<(), Error> 
     }
 }
 
-/// A record file name of the state store, `<20 digits>.rec` (FORMAT.md 12.4).
-fn is_record_name(name: &str) -> bool {
-    name.strip_suffix(".rec")
-        .is_some_and(|digits| digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// The integration request for `meta` of the install at `root`.
+/// The integration request for the first install of `config`'s tree at `root` (no outgoing
+/// version).
 fn integration_request(
     app_id: &AppId,
     root: &Path,
-    meta: lunepack_core::InstallMeta,
+    config: &lunepack_core::UpdateConfig,
 ) -> IntegrationRequest {
     IntegrationRequest {
         app_id: app_id.clone(),
         install_root: root.to_path_buf(),
-        meta,
+        version: config.version.clone(),
+        meta: config.install.clone(),
+        previous: None,
         stale_bins: Vec::new(),
     }
 }
@@ -1788,13 +1807,12 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
     // write to the install (the lock is the first); only an earlier uninstall's tombstones beside
     // the root are removed in between (F18).
     let boot_root = root.clone();
-    let boot_state = state_dir.clone();
     let (target, boot_version) = on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
         let config = tree_config(&*inner.fs, &inner.app_id, &bootstrap)?;
-        let request = integration_request(&inner.app_id, &boot_root, config.install.clone());
+        let request = integration_request(&inner.app_id, boot_root.root(), &config);
         inner.integration.check(Scope::User, &request)?;
         clear_tombstones(inner, &boot_root);
-        adoptable(inner, &boot_root, &boot_state)?;
+        adoptable(inner, &boot_root)?;
         Ok((config.target, config.version))
     })
     .await?;
@@ -1812,6 +1830,7 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
                 let Layout::User { state_dir, .. } = &inner.layout else {
                     return Err(Error::MachineScope);
                 };
+                refuse_foreign_record(inner, state_dir)?;
                 let store = UserScope {
                     dir: state_dir.clone(),
                     app_id: inner.app_id.clone(),
@@ -1909,7 +1928,7 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
                     rule: "is not the version of its directory",
                 }));
             }
-            let request = integration_request(&inner.app_id, &root, config.install);
+            let request = integration_request(&inner.app_id, root.root(), &config);
             inner.integration.check(Scope::User, &request)?;
             let next =
                 lunepack_core::install_first(&record, version.clone(), issued, record.install_id)?;
@@ -1921,7 +1940,7 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
             // the committed record before it reports `AlreadyInstalled` (F15).
             inner.integration.apply(Scope::User, &request)?;
             let committed = store.commit(&*inner.fs, &loaded, &next, &*inner.hasher)?;
-            lunepack_core::reconcile_current(&*inner.fs, &root, &committed)
+            root.reconcile(&*inner.fs, &committed)
                 .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))?;
             Ok(InstalledVersion {
                 version,
@@ -2066,7 +2085,7 @@ fn verify_payload(
         manifest.version(),
         manifest.target(),
     )?;
-    let request = integration_request(&inner.app_id, install_root, config.install);
+    let request = integration_request(&inner.app_id, install_root, &config);
     inner.integration.check(Scope::User, &request)?;
 
     Ok(VerifiedPayload {
@@ -2112,25 +2131,59 @@ async fn refuse_installed(
     inner: &Arc<Inner>,
     lock: &OpLock,
     cancel: &CancelToken,
-    root: &Path,
+    root: &UserLayout,
 ) -> Result<(), Error> {
-    let root = root.to_path_buf();
+    let root = root.clone();
     on_job(inner, Some(lock), cancel, "state-check", move |inner, _| {
         let Layout::User { state_dir, .. } = &inner.layout else {
             return Err(Error::MachineScope);
         };
+        refuse_foreign_record(inner, state_dir)?;
         let store = UserScope {
             dir: state_dir.clone(),
             app_id: inner.app_id.clone(),
         };
         match store.load(&*inner.fs, &*inner.hasher)?.record {
-            Some(record) if record.current.is_some() => {
-                Err(already_installed(&*inner.fs, &root, &record))
-            }
+            Some(record) if record.current.is_some() => Err(rerun_installed(inner, &root, &record)),
             _ => Ok(()),
         }
     })
     .await
+}
+
+/// What a Setup rerun on an installed app returns (M7-D8: a setup rerun is an integration apply).
+/// [`already_installed`] first, then the integration of the *installed* current version is
+/// applied again under the same lock (the stub at `R`, the shortcut, the uninstall entry and the
+/// declarations), so a run cut off between the two renames of a stub self-replace, or an entry
+/// the user deleted, is repaired by running Setup again. The payload's own config is not used:
+/// the rerun changes nothing about which version is installed. It still ends as
+/// [`Error::AlreadyInstalled`]; a failure of the repair is that error, so another rerun can try
+/// again. An entry that is not lunepack's is left alone ([`IntegrationError::Conflict`]): nothing
+/// was asked of the rerun beyond the repair, so that leaves the answer as it was.
+fn rerun_installed(inner: &Inner, root: &UserLayout, record: &InstallState) -> Error {
+    let outcome = already_installed(&*inner.fs, root, record);
+    if !matches!(outcome, Error::AlreadyInstalled) {
+        return outcome;
+    }
+    let Some(current) = record.current.as_ref() else {
+        return outcome;
+    };
+    let repaired = tree_config(
+        &*inner.fs,
+        &inner.app_id,
+        &root.version_dir(&current.version),
+    )
+    .and_then(|config| {
+        let request = integration_request(&inner.app_id, root.root(), &config);
+        match inner.integration.apply(Scope::User, &request) {
+            Ok(_) | Err(IntegrationError::Conflict(_)) => Ok(()),
+            Err(e) => Err(Error::from(e)),
+        }
+    });
+    match repaired {
+        Ok(()) => outcome,
+        Err(e) => e,
+    }
 }
 
 async fn install_from_payload(
@@ -2164,7 +2217,7 @@ async fn install_from_payload(
 
         // 2. Verification; nothing is written.
         let check_root = root.clone();
-        let check_install_root = install_root.clone();
+        let check_install_root = install_root.root().to_path_buf();
         let verified = on_job(&inner, None, &cancel, "payload-verify", move |inner, _| {
             verify_payload(inner, &payload, &check_root, &check_install_root)
         })
@@ -2175,10 +2228,9 @@ async fn install_from_payload(
 
         // 3. The install root, then the record, as `install`.
         let boot_root = install_root.clone();
-        let boot_state = state_dir.clone();
         on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
             clear_tombstones(inner, &boot_root);
-            adoptable(inner, &boot_root, &boot_state)
+            adoptable(inner, &boot_root)
         })
         .await?;
         let lock = take_lock(&inner, &cancel).await?;
@@ -2189,6 +2241,7 @@ async fn install_from_payload(
             &cancel,
             "state-create",
             move |inner, _| {
+                refuse_foreign_record(inner, &state_dir)?;
                 let store = UserScope {
                     dir: state_dir.clone(),
                     app_id: inner.app_id.clone(),
@@ -2387,7 +2440,7 @@ async fn install_from_payload(
                 }
                 let tree = staged.tree;
                 let config = tree_config(&*inner.fs, &inner.app_id, &tree)?;
-                let request = integration_request(&inner.app_id, &install_root, config.install);
+                let request = integration_request(&inner.app_id, install_root.root(), &config);
                 inner.integration.check(Scope::User, &request)?;
                 let next = lunepack_core::install_first(
                     &record.raise_floors(&floors),
@@ -2398,7 +2451,8 @@ async fn install_from_payload(
                 // As `install` (F11, Q42): the integration before the commit.
                 inner.integration.apply(Scope::User, &request)?;
                 let committed = store.commit(&*inner.fs, &loaded, &next, &*inner.hasher)?;
-                lunepack_core::reconcile_current(&*inner.fs, &install_root, &committed)
+                install_root
+                    .reconcile(&*inner.fs, &committed)
                     .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))?;
                 // Housekeeping (M4-D17): a failure here is not an error of the install.
                 let cache = inner.cache();

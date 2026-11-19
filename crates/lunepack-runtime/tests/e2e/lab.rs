@@ -667,6 +667,9 @@ impl Lab {
             bin: None,
             terminal: false,
             publisher: None,
+            file_types: Vec::new(),
+            url_schemes: Vec::new(),
+            autostart: false,
         };
         let config = UpdateConfig::new(
             &root,

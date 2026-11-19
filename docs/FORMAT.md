@@ -924,6 +924,10 @@ step 3 completed.
   live tree is not under the versions directory), else `<versions dir>/<current.version text>`. It
   counts only when it is a real directory (a symlink is not followed); otherwise there is none and
   every file is fetched. A machine install's tree is only read.
+- The directory names above (`versions`, `state`, `cache`, `logs`, the `current` link) are those of the
+  Linux per-user layout. A Windows per-user install uses the names of section 16 (`app`, `.lunepack\state`,
+  `.lunepack\cache`, `.lunepack\logs`, no `current` link); a reader recognises an installed tree by its
+  parent directory being the versions directory of one of the two schemes.
 - A `staged` entry is usable only when `staged.version` is newer than `current.version` by
   precedence, is not in `bad`, `staged.target` equals the record's `target`, and the tree directory
   `<versions dir>/<staged.tree>` exists as a real directory. Otherwise it is ignored and the next
@@ -1101,10 +1105,11 @@ only a feed read from an update configuration.
 
 ### 13.4 Install metadata
 
-`install` is `{entry, name, comment, icon, categories, bin, terminal}` (M5-D4) and the optional
-`publisher` (M6-D3), with exactly these members; an unknown member makes the document invalid (13.7).
-A format-1 reader from before `publisher` was added refuses a document that holds it; nothing was
-released with that reader.
+`install` is `{entry, name, comment, icon, categories, bin, terminal}` (M5-D4), the optional
+`publisher` (M6-D3) and the optional `file_types`, `url_schemes` and `autostart` (M7-D3), with exactly
+these members; an unknown member makes the document invalid (13.7). A format-1 reader from before
+`publisher`, or from before the three declarations, refuses a document that holds one of them;
+nothing was released with such a reader.
 
 | Member | Type | Rule |
 |---|---|---|
@@ -1116,11 +1121,55 @@ released with that reader.
 | `bin` | string or null | the name of the command-line link (`~/.local/bin/<bin>` on Linux): `[A-Za-z0-9._-]{1,64}`, not starting with `-` or `.` |
 | `terminal` | boolean | whether the app runs in a terminal |
 | `publisher` | string, optional | the publisher's display name, shown by the installer beside "verified": 1 to 128 Unicode scalar values. The member is left out when there is no publisher (never `null`), so the bytes of a document without one are the same as before the member existed |
+| `file_types` | array of objects, optional | file types the app can open: at most 32 objects `{ext, mime, name}`. `ext`: `[a-z0-9]{1,16}`, no dot, no `ext` twice. `mime`: `type/subtype`, each side `[A-Za-z0-9!#$&^_.+-]{1,127}`, no parameters (the same `mime` under two `ext` values is allowed). `name`: a display name, with the rule of `name` below (1 to 128). The member is left out when the array is empty (never `[]`) |
+| `url_schemes` | array of strings, optional | URL schemes the app handles: at most 8, each `[a-z][a-z0-9+.-]{0,31}`, none twice, none on the deny-list below. Left out when empty |
+| `autostart` | boolean, optional | whether the app starts when the user signs in. Left out when `false` (never written as `false`) |
 
-`name`, `comment` and `publisher` hold no C0 or C1 control character, no DEL, no U+2028 or U+2029, no `\`, and
-no leading or trailing whitespace, so neither can break a line of a desktop entry or start an escape.
-File associations, URL schemes and autostart are not in format 1's first revision; they arrive as new
-optional members under 13.7.
+A reader accepts the explicit empty forms (`[]`, `false`) of the three optional declarations as the absent
+form; the writer never writes them, so a document without declarations has the same bytes as before
+the members existed. Every violation names the member and the rule, never the value.
+
+The deny-list of `url_schemes`, compared ignoring ASCII case: `about`, `blob`, `chrome`, `cid`, `data`,
+`file`, `ftp`, `ftps`, `gopher`, `http`, `https`, `irc`, `javascript`, `ldap`, `ldaps`, `mailto`,
+`microsoft-edge`, `mid`, `news`, `nntp`, `res`, `search-ms`, `sftp`, `shell`, `sms`, `ssh`, `tel`,
+`telnet`, `urn`, `view-source`, `vbscript`, and every scheme starting with `ms-`.
+
+The declarations are requests, not claims on the system: an integration offers the app as a handler
+(Linux: `MimeType=` entries in the desktop entry, `x-scheme-handler/<scheme>` for a scheme, and an XDG
+autostart entry; the Linux desktop entry then ends its `Exec` with `%U`) and never sets a default
+handler. `name` in a file type is shown where the OS has a place for it and is otherwise unused.
+
+`name`, `comment`, `publisher` and a file type's `name` hold no C0 or C1 control character, no DEL, no U+2028
+or U+2029, no `\`, and no leading or trailing whitespace, so none can break a line of a desktop entry or
+start an escape.
+
+On Windows (section 16) the same declarations are written under the current user's registry only: a file
+type is an "Open with" candidate (a ProgID `<app id>.<ext>` and a value of that name in
+`HKCU\Software\Classes\.<ext>\OpenWithProgids`; the extension's own default value and the user's choice
+are never read or written), a URL scheme is a protocol class whose command is `"<stub>" "%1"`, so the
+system puts the URL in one quoted argument and the stub passes the command line on unchanged (section 15),
+and `autostart` is a value named by the app id in
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. A launcher that substitutes the URL into the
+command without escaping it can split a URL holding `"` into several arguments, so the app may receive more
+than one. An app that declares `url_schemes` takes the first argument as the URL only when it starts with
+one of its own schemes and `:`, and ignores or refuses every later argument, never reading one as its own
+flag. `bin` is not used on Windows (no command link and no `PATH` change), and no desktop shortcut is made.
+
+For a `windows-*` target the display name is also a Windows folder and shortcut name, so `name` must pass
+one more rule (M7-D15), in this order; the packager refuses a `windows-*` pack or setup file that breaks it,
+naming the field and the clause and never the value, and a Windows install or setup refuses it again:
+
+1. at most 64 UTF-16 code units;
+2. none of `< > : " / \ | ? *` and no character below U+0020;
+3. no leading `.` or space and no trailing `.` or space;
+4. its stem (the part before the first `.`, trailing spaces removed) is none of `CON`, `PRN`, `AUX`, `NUL`,
+   `CONIN$`, `CONOUT$`, `COM0` to `COM9`, `LPT0` to `LPT9`, `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²` or `LPT³`,
+   compared ignoring ASCII case.
+
+The rule validates and never rewrites a name. It is not applied to other targets.
+
+For a `windows-*` target the file name `lunepack-stub.exe` (any ASCII case, at any depth of the input tree) is
+reserved for the launcher stub the packager places beside the entry (section 15) and is an error in the input.
 
 ### 13.5 Desktop-entry paths
 
@@ -1156,7 +1205,7 @@ reads them through the verified manifest:
 - `format` above 1 is a newer format: the reader stops and nothing is written. `format` 0 is invalid.
 - Every refusal names the member or rule; no value from the document is shown in an error.
 
-## 14. Setup file (Linux)
+## 14. Setup file
 
 A setup file installs one release of one target with no network. It is the release's own runtime
 (the `lunepack-runtime` file entry beside the entry, 13.1, taken from the pack through its signed
@@ -1167,9 +1216,19 @@ runtime ‖ keys.json ‖ <ver>/<target>.manifest.json ‖ <ver>/<target>.pack �
 ```
 
 Each payload part starts at an offset that is a multiple of 8 (zero bytes fill the gaps) and holds
-the release directory's file byte for byte. The writer is `lunepack setup` and its output is a
-function of the release directory alone; it is named `<app_id>-<ver>-<target>-setup`. Only Linux
-targets have setup files in this revision.
+the release directory's file byte for byte. The trailer also starts at a multiple of 8 (zero bytes
+follow the last part), so the file's length is a multiple of 8: Authenticode pads to 8 before a
+certificate table, and a signed file then keeps the trailer as the last bytes before the table. The writer is `lunepack setup` and its output is a
+function of the release directory (and, for a Windows file, of its output file name, which the stamped
+runtime carries); it is named `<app_id>-<ver>-<target>-setup`, with `.exe` appended
+for a `windows-*` target. Linux and Windows targets have setup files in this revision.
+
+On Windows the runtime part is the release's `lunepack-runtime.exe`, taken from the pack through its signed
+frame, with any certificate table removed and the app's icon and version information stamped in (the
+stamp keeps the machine, subsystem, import table, `DependentLoadFlags` and manifest of its input, and the
+writer checks that it did). Nothing follows the trailer. A setup file may then be signed with Authenticode
+(its certificate table is appended after the trailer, which the signature covers); 14.3 says how a reader
+finds the trailer in a signed file.
 
 ### 14.1 Trailer
 
@@ -1198,8 +1257,9 @@ members, followed by zero bytes to the end of the body area:
 
 ### 14.2 Reading
 
-A reader looks only at the last 4096 bytes of its own resolved executable. Without the magic there
-the file is not a setup file. With the magic, everything else MUST hold or the file is refused
+A reader looks only at the last 4096 bytes of its own resolved executable, or, for a signed Windows
+executable, at the 4096 bytes before its certificate table (14.3). Without the magic there the file is not
+a setup file. With the magic, everything else MUST hold or the file is refused
 (the runtime's exit 7 `verify`; it never falls back to another mode):
 
 1. `format` is 1 (another is a newer format); the reserved bytes are zero; the body length is in
@@ -1230,3 +1290,126 @@ the root that verified it, and its later updates come from the feed as usual.
 A setup file stops installing when its key set's `expires` passes or its release keys' windows end.
 A publisher builds setup files from a current release; nothing re-signs old ones.
 
+### 14.3 Locating the trailer in a signed Windows file
+
+An Authenticode signature adds a certificate table at the end of a PE file, so the trailer is then not
+the last 4096 bytes. A reader opens its own executable once and reads through that one handle. It has two
+candidate ends: the file's length, and, when the file is a PE whose certificate-table data directory is
+non-zero and starts at or after 4096 and before the file's end, the start of that table. It then decides
+by the magic (14.1):
+
+1. The magic at neither candidate end: not a setup file, whatever the headers or the table look like. The
+   file is an ordinary runtime and runs as one (this is what every runtime start does, so no layout may
+   turn it into a refusal).
+2. The magic before the certificate table: the table starts at a multiple of 8, is at least 8 bytes long
+   and ends exactly at the end of the file, and the trailer lies after the PE's headers and section data.
+   Setup data then ends at the table's start, and the trailer is the 4096 bytes before it, read as in 14.1
+   and 14.2 with that end as the file's size. Any other layout is refused.
+3. The magic at the end of a file whose certificate-table directory is non-zero (bytes added after a
+   signature), or at the end of a file that begins `MZ` whose PE headers cannot be read: refused.
+4. The magic at the end of any other file (an unsigned PE, an ELF): a setup file ending there.
+
+A refusal is the runtime's exit 7 `verify`, never a run as an ordinary runtime. The trailer and every
+part lie inside the bytes an Authenticode signature covers, so a signature protects them; a signature is
+not what makes a setup file trusted (14.2: the trailer's root is).
+
+## 15. Windows stub launch contract, version 1
+
+The launcher stub is a small Windows executable that the packager stamps with the app's icon and version
+information and places beside the entry as `lunepack-stub.exe`; the runtime copies it to the install
+root as `R\<file name of install.entry>` whenever the current version changes (16). Shortcuts, the
+uninstall entry and the declarations of 13.4 start that file. This contract is read by every stub of every
+version against installs written by any other version (D28): once an app ships, a later stub and a later
+runtime must keep both sides of it.
+
+The stub takes `R` as the directory of its own resolved path (the final path of its executable) and from
+nothing else: no argument, environment variable, registry value or folder name. It then:
+
+1. Reads the newest whole install record under `R\.lunepack\state` (12; read only, no lock; each
+   directory on the way is a real directory) and takes `current.version` from it. No record, or one with no
+   current version, is exit 90; a record that cannot be read, is of a newer format or is not a per-user one
+   is exit 91.
+2. Reads `R\app\<current>\lunepack-update.json` (13) and takes `install.entry`. A missing, unreadable or
+   invalid configuration, or one that does not name that version and the record's app, is exit 92.
+3. Checks that `R\app\<current>\<entry>` is a regular file (else exit 93) and that no directory or file on
+   the path below `R` is a symbolic link or reparse point (else exit 94). No link is ever followed.
+4. Starts that file with the stub's own command-line tail passed through byte for byte, its environment
+   and its current directory unchanged, and no job object. A failure to start it is exit 95.
+
+The GUI stub (Windows subsystem) lets the child take the foreground and exits 0 without waiting. The console
+stub (console subsystem) gives the child its console and standard handles, ignores Ctrl+C and Ctrl+Break in
+itself (the child still receives them), waits, and exits with the child's exit code. The failures are shown
+as one fixed message with no path or value from the install: a message box (GUI) or one line on standard
+error (console).
+
+Reserved: a command line of exactly `--lunepack-uninstall`, optionally followed by exactly one more argument,
+`/S` or `--silent`, makes the stub start the current version's `lunepack-runtime.exe` (beside the entry) as
+`uninstall`, with `--silent` for the optional argument, and exit 0. Any other command line, including the
+same words in another position or case, goes to the app.
+
+## 16. Windows per-user layout
+
+A per-user install on Windows has the install root `R` and these names inside it (cross-version contract
+with section 15):
+
+| Path under `R` | Holds |
+|---|---|
+| `<entry file name>` | the launcher stub (15) |
+| `app\<version>\` | the version's tree (12.7) |
+| `.lunepack\state\` | the install records and the lock (12) |
+| `.lunepack\cache\` | the staging cache |
+| `.lunepack\logs\` | the runtime's log |
+| `.<entry file name>.old-<16 hex>`, `.<entry file name>.new-<16 hex>` | transient stub copies (below) |
+
+There is no `current` link; the stub and the runtime read the record. `.lunepack` carries the hidden
+attribute (set on every integration apply; nothing reads it).
+
+**The folder name.** `R` is `<FOLDERID_UserProgramFiles>\<name>`, by default under
+`%LOCALAPPDATA%\Programs`, where `<name>` is the app's display name `install.name` at its first install, which
+must pass the Windows name rule of 13.4. The folder is chosen once and never recomputed: a later release
+with another `name` keeps the folder, and an install is found by its record, not by its name.
+
+To find or place an install of an app id, a first install or setup lists the entries of the programs folder
+(at most 4096, else it refuses) and reads, read only, the newest whole record of every real directory whose
+name does not start with `.` and that holds `.lunepack\state` (no link or reparse point is followed):
+
+1. A record of this app id (per-user scope) in exactly one folder: that folder is `R`. In two or more:
+   refused, because the user has copies of the install.
+2. A record that cannot be read or is of another format is skipped, except in the folder named exactly
+   `<name>` or `<name> (<app id>)`, where it is a refusal (installing beside it would make a second copy).
+3. No match: `<name>` is used when it does not exist, is an empty real directory (adopted), or holds only what
+   a first install cut off before its first record leaves (`.lunepack\state` with nothing but the lock and
+   record-named files, no whole record: resumed). Otherwise (a file, a link or reparse point, a non-empty
+   directory, another app's install) `<name> (<app id>)` is
+   used under the same rule. When both are taken the install is refused (`install_mismatch`) and nothing is
+   written; the entry that is in the way is never touched.
+4. Every writer, under `R`'s lock and before its first write, checks that `.lunepack\state` holds no record of
+   another app id.
+
+**Uninstall** takes `R` from the uninstaller's own path and requires a real directory, not a reparse point,
+whose canonical parent is the canonical programs folder and whose record carries this app's id. It does
+not require that `R` is the only folder holding that record.
+
+**Renaming the folder is not supported.** The stub and the runtime take `R` from their own paths, so an app
+started from the renamed folder's stub still runs, but the Start-menu shortcut still points at the old
+path, so lunepack no longer treats it as its own (a shortcut is lunepack's only when it carries the app id
+and points at this install's stub): the next integration apply reports a conflict and leaves it until the
+app is reinstalled.
+
+**Stub placement.** On every integration apply (first install, an update, a rollback, a Setup rerun) the
+stub at `R\<entry file name>` is made equal, byte for byte, to `R\app\<current>\<directory of the entry>\lunepack-stub.exe`.
+When the file there is running (it cannot be replaced), it is renamed to `.<entry file name>.old-<16 hex>` and the
+new copy moved in; on any error the old file is restored. A leftover `.old-` or `.new-` copy is removed by
+a later collection once it is no longer running. A release whose entry has another file name gets a new stub
+name, and the old stub (from the previous version's configuration) is removed when it is a regular file
+directly in `R`.
+
+**Shortcut, entries.** The Start-menu shortcut is `<Start menu>\Programs\<name>.lnk`; it carries the app id as
+its app user model id and targets the stub. A shortcut, a registry key or a value is lunepack's only when it
+carries this app's marker (the shortcut: the app user model id and the target; a key: a `LunepackAppId`
+value naming the app id; a `Run` value: exactly the command lunepack writes); anything else is left alone
+and reported. The uninstall entry is
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\<app id>` with `DisplayName`, `DisplayVersion`,
+`Publisher` (when present), `DisplayIcon`, `InstallLocation`, `UninstallString` (`"<stub>" --lunepack-uninstall`),
+`QuietUninstallString` (the same with `/S`), `NoModify`, `NoRepair` and the marker. `InstallLocation` is
+written for Windows' sake and never read by lunepack.

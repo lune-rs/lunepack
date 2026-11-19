@@ -21,6 +21,7 @@ pub mod limits;
 pub mod manifest;
 pub mod pack;
 pub mod path;
+pub mod pe;
 pub mod policy;
 pub mod process;
 pub mod progress;
@@ -28,6 +29,7 @@ pub mod root;
 pub mod setup;
 pub mod stage;
 pub mod state;
+pub mod stub;
 pub mod target;
 pub mod traits;
 pub mod transport;
@@ -64,8 +66,10 @@ pub use integration::{
 };
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use layout::{
-    Discovery, UserLayout, discover, is_tombstone_of, reconcile_current, remove_tombstones,
-    tombstone_name, tree_candidates, version_config_path,
+    Discovery, LayoutScheme, NameRule, Projection, RootChoice, RootNaming, UserLayout, discover,
+    ensure_no_foreign_record, is_tombstone_of, reconcile_current, remove_tombstones, resolve_root,
+    root_valid_for_uninstall, tombstone_name, tree_candidates, version_config_path,
+    windows_name_ok,
 };
 pub use lifecycle::{
     AttemptOutcome, ConfirmOutcome, TokenCheck, apply, confirm, count_attempt, deliver_events,
@@ -77,8 +81,8 @@ pub use manifest::{
     verify_payload_manifest,
 };
 pub use pack::{
-    FileClass, PackedFile, ReleaseLayout, RuntimeImageError, candidates, check_runtime_image,
-    check_ui_image, classify, pack_file,
+    FileClass, PackedFile, ReleaseLayout, RuntimeImageError, candidates, check_pe_stub,
+    check_runtime_image, check_ui_image, classify, pack_file,
 };
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
@@ -94,6 +98,7 @@ pub use state::{
     MachineScope, PendingRef, PreviousRef, Record, RootParts, Scope, StagedIssued, StagedRef,
     UserScope,
 };
+pub use stub::{LaunchTarget, STUB_CONTRACT_VERSION, STUB_FILE, StubError, launch_target};
 pub use target::Target;
 pub use traits::{
     Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,
@@ -105,7 +110,8 @@ pub use transport::{
 };
 pub use trust::{ClockReading, KeyEntry, KeyRing, PublicKey, RollbackFloor};
 pub use update_config::{
-    FeedKind, InstallMeta, UPDATE_CONFIG_FILE, UpdateConfig, check_feed, desktop_safe_path,
+    FeedKind, FileType, InstallMeta, UPDATE_CONFIG_FILE, UpdateConfig, check_feed,
+    desktop_safe_path,
 };
 pub use version::Version;
 pub use write::{

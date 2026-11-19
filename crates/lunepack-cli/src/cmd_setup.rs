@@ -1,4 +1,5 @@
-//! `setup` (M6 step 7): builds a Linux setup file from a release directory (FORMAT.md 14).
+//! `setup` (M6 step 7, M7 step 12): builds a Linux or Windows setup file from a release directory
+//! (FORMAT.md 14).
 //!
 //! The file is the release's own runtime, then the payload (the key set, the manifest and the pack
 //! of one version and target, each starting 8-byte aligned), then the trailer. Run, the runtime
@@ -9,7 +10,15 @@
 //! clock), the pack against the manifest; the runtime and the update config come from the pack
 //! through their signed frames (FORMAT.md 13.6), and the trailer carries the root the config names.
 //! The written file is then parsed back and verified as the runtime parses it. The output is a
-//! function of the release directory only (no time, no name), so two runs give the same bytes.
+//! function of the release directory only (no time, no name; a Windows setup file also depends on its
+//! output file name, which the stamped runtime carries as `OriginalFilename`), so two runs with the
+//! same inputs give the same bytes.
+//!
+//! A Windows setup file (M7-D1, M7-D11) is built the same way, with the runtime copy prepared first:
+//! its Authenticode certificate table (when the pack's runtime carries one) is stripped, it is
+//! stamped with the app's icon and version info (M7-D14), the stamped bytes are checked again as a
+//! Windows runtime, and nothing follows the trailer. The self-check reads the file back through the
+//! trailer locator the runtime uses.
 
 use std::path::{Path, PathBuf};
 
@@ -17,16 +26,18 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use lunepack_codec_lzma::LzmaCodec;
 use lunepack_core::setup::{
-    MAX_SETUP_RUNTIME_BYTES, PART_ALIGN, SetupPart, SetupTrailer, TRAILER_SIZE, verify_setup,
+    Located, MAX_SETUP_RUNTIME_BYTES, PART_ALIGN, SetupPart, SetupTrailer, TRAILER_SIZE,
+    locate_file, verify_setup,
 };
 use lunepack_core::{
-    Clock, ClockReading, FsError, FsErrorKind, Limits, ReadAt, Target, Version, read_entry,
-    verify_payload_manifest,
+    Clock, ClockReading, FsError, FsErrorKind, Limits, ReadAt, Target, Version,
+    check_runtime_image, read_entry, verify_payload_manifest, windows_name_ok,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
 use crate::config::{Config, FixedClock};
 use crate::release_dir::{self, read_capped};
+use crate::stamp;
 
 /// Arguments of `setup`.
 #[derive(Args)]
@@ -36,11 +47,11 @@ pub struct SetupArgs {
     /// The version to install (the text as written in the release).
     #[arg(long)]
     version: String,
-    /// The target (Linux only in this release).
+    /// The target (`linux-*` or `windows-*`).
     #[arg(long)]
     target: String,
-    /// Where to write the setup file (default: `<app_id>-<version>-<target>-setup` in the current
-    /// directory). An existing file is not replaced.
+    /// Where to write the setup file (default: `<app_id>-<version>-<target>-setup`, with `.exe` for
+    /// a Windows target, in the current directory). An existing file is not replaced.
     #[arg(long)]
     out: Option<PathBuf>,
     /// Verify at this Unix time instead of the system clock.
@@ -93,19 +104,72 @@ fn place(out: &mut Vec<u8>, bytes: &[u8]) -> SetupPart {
     part
 }
 
+/// The file name `setup` writes by default.
+fn default_name(app_id: &str, version: &str, target: &str) -> String {
+    let exe = if Target::parse(target).is_ok_and(Target::is_windows) {
+        ".exe"
+    } else {
+        ""
+    };
+    format!("{app_id}-{version}-{target}-setup{exe}")
+}
+
+/// The Windows runtime copy of a setup file (M7-D1, M7-D14): the certificate table stripped,
+/// stamped as the setup variant (`<name> Setup`, the file's own name as `OriginalFilename`), and
+/// checked again as a Windows runtime so the stamped bytes are what the packager would accept.
+fn windows_runtime(
+    runtime: &[u8],
+    update: &lunepack_core::UpdateConfig,
+    file_name: &str,
+    icon: Option<&[u8]>,
+    target: Target,
+) -> Result<Vec<u8>> {
+    let install = &update.install;
+    if let Err(rule) = windows_name_ok(&install.name) {
+        bail!("[install] name: not a valid Windows folder and shortcut name: {rule}");
+    }
+    let unsigned = stamp::strip_certificate_table(runtime)?;
+    let description = format!("{} Setup", install.name);
+    let version_text = update.version.to_string();
+    let fields = stamp::Fields {
+        description: &description,
+        product: &install.name,
+        company: install.publisher.as_deref(),
+        version_text: &version_text,
+        numbers: stamp::version_numbers(&update.version)?,
+        original_filename: file_name,
+        icon,
+    };
+    let stamped =
+        stamp::stamp(&unsigned, &fields).context("the setup runtime cannot be stamped")?;
+    check_runtime_image(&stamped, target).map_err(|e| {
+        anyhow::anyhow!(
+            "the stamped setup runtime is not a runtime for {}: {e}",
+            target.as_str()
+        )
+    })?;
+    Ok(stamped)
+}
+
 /// The bytes of the setup file of `version` for `target` in the release directory `dir`, verified.
+/// `file_name` is the name the file will have (a Windows setup file carries it as its
+/// `OriginalFilename`).
 pub fn build(
     dir: &Path,
     config: &Config,
     version: &str,
     target: &str,
     clock: &dyn Clock,
+    file_name: &str,
 ) -> Result<Vec<u8>> {
     let (hasher, verifier, codec) = (Sha256Hasher, Ed25519Verifier, LzmaCodec);
     let target =
         Target::parse(target).with_context(|| format!("--target {target:?} is not a target id"))?;
-    if !matches!(target, Target::LinuxX86_64 | Target::LinuxAarch64) {
-        bail!("setup files are built for Linux targets only in this release");
+    if !matches!(
+        target,
+        Target::LinuxX86_64 | Target::LinuxAarch64 | Target::WindowsX86_64 | Target::WindowsAarch64
+    ) {
+        bail!("setup files are built for Linux and Windows targets only in this release");
     }
     let version_text = version;
     let version = Version::parse(version_text)
@@ -183,7 +247,7 @@ pub fn build(
     // The runtime this release ships, beside its entry.
     let partial = lunepack_core::setup::VerifiedSetup {
         manifest: manifest.clone(),
-        config: update,
+        config: update.clone(),
     };
     let runtime_at = partial.runtime_path()?;
     let runtime = read_entry(
@@ -195,11 +259,31 @@ pub fn build(
         MAX_SETUP_RUNTIME_BYTES,
     )
     .context("the release has no runtime beside its entry (pack it with --runtime)")?;
+    let runtime = if target.is_windows() {
+        let icon = crate::cmd_pack::pick_icon(config, &update.install, |icon| {
+            read_entry(
+                &manifest,
+                icon,
+                &Bytes(&pack),
+                &codec,
+                &hasher,
+                stamp::MAX_ICON_BYTES,
+            )
+            .context("the release has no readable install.icon")
+        })?;
+        windows_runtime(&runtime, &update, file_name, icon.as_deref(), target)?
+    } else {
+        runtime
+    };
 
     let mut out = runtime;
     let keys_part = place(&mut out, &keys_bytes);
     let manifest_part = place(&mut out, &manifest_bytes);
     let pack_part = place(&mut out, &pack);
+    // The trailer starts 8-aligned, so the file's length is a multiple of 8 (the trailer's size is):
+    // signtool zero-pads to 8 before the certificate table, and that padding must be none or the
+    // trailer is no longer the last bytes the table follows (FORMAT.md 14).
+    align(&mut out);
     let trailer = SetupTrailer {
         keys: keys_part,
         manifest: manifest_part,
@@ -208,9 +292,15 @@ pub fn build(
     };
     out.extend_from_slice(&trailer.encode()?);
 
-    // Read back as the runtime reads it: the trailer at the end, then the payload under it.
-    let tail = &out[out.len() - TRAILER_SIZE as usize..];
-    let parsed = SetupTrailer::parse(tail, out.len() as u64, &hasher, &verifier)
+    // Read back as the runtime reads it: the locator finds the end of the setup data (a setup file,
+    // never an ordinary file or a malformed one), the trailer is the bytes before it, then the
+    // payload under it.
+    let end = match locate_file(&Bytes(&out)).context("internal error: the locator cannot read")? {
+        Located::Setup { end } if end == out.len() as u64 => end,
+        _ => bail!("internal error: the written file is not read back as a setup file"),
+    };
+    let tail = &out[(end - TRAILER_SIZE) as usize..end as usize];
+    let parsed = SetupTrailer::parse(tail, end, &hasher, &verifier)
         .context("internal error: the written trailer does not parse")?;
     if parsed != trailer {
         bail!("internal error: the written trailer reads back differently");
@@ -229,16 +319,26 @@ pub fn setup(config_path: &Path, args: &SetupArgs) -> Result<()> {
         Some(t) => Box::new(FixedClock(t)),
         None => Box::new(lunepack::SystemClock),
     };
-    let bytes = build(&args.dir, &config, &args.version, &args.target, &*clock)?;
     let out = match &args.out {
         Some(p) => p.clone(),
-        None => PathBuf::from(format!(
-            "{}-{}-{}-setup",
+        None => PathBuf::from(default_name(
             config.app_id.as_str(),
-            args.version,
-            args.target
+            &args.version,
+            &args.target,
         )),
     };
+    let file_name = out
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let bytes = build(
+        &args.dir,
+        &config,
+        &args.version,
+        &args.target,
+        &*clock,
+        &file_name,
+    )?;
     crate::place::write_new(&out, &bytes)?;
     #[cfg(unix)]
     {
@@ -254,4 +354,25 @@ pub fn setup(config_path: &Path, args: &SetupArgs) -> Result<()> {
         bytes.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_name;
+
+    #[test]
+    fn the_default_name_carries_exe_for_windows_targets_only() {
+        assert_eq!(
+            default_name("org.example.app", "1.2.3", "windows-x86_64"),
+            "org.example.app-1.2.3-windows-x86_64-setup.exe"
+        );
+        assert_eq!(
+            default_name("org.example.app", "1.2.3", "windows-aarch64"),
+            "org.example.app-1.2.3-windows-aarch64-setup.exe"
+        );
+        assert_eq!(
+            default_name("org.example.app", "1.2.3", "linux-x86_64"),
+            "org.example.app-1.2.3-linux-x86_64-setup"
+        );
+    }
 }

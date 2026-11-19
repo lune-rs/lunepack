@@ -42,6 +42,7 @@ pub const ROLES: &[(&str, Role)] = &[
     ("lunepack-runtime", Role::Binary),
     ("lunepack-cli", Role::Binary),
     ("lunepack-ui", Role::Binary),
+    ("lunepack-stub", Role::Binary),
     ("xtask", Role::Tool),
 ];
 
@@ -70,6 +71,10 @@ pub const CORE_EXTERNAL_ALLOWLIST: &[&str] = &[
 /// later confined crate is one line. Matched on the package name, never the rename.
 pub const CONFINED: &[(&str, &[&str])] = &[
     ("lzma-rust2", &["lunepack-codec-lzma"]),
+    // The PE resource editor that stamps the Windows stub and setup file (M7-D22): only the packager
+    // CLI uses it. It holds one `unsafe` block, named in D17. `pe-stamp` is the throwaway probe
+    // (`probes/pe-stamp`, its own lock, never built on a developer machine) that measured it.
+    ("editpe", &["lunepack-cli", "pe-stamp"]),
     // LuneUI's facade crate (D39 (b), M6): only the UI adapter depends on it. The rest of the GPU
     // and window stack is held by `REACH_FAMILIES_ONLY_THROUGH`.
     ("lune-ui", &["lunepack-ui-luneui"]),
@@ -83,10 +88,32 @@ pub const ONLY_DEPENDED_ON_BY: &[(&str, &[&str])] = &[
     ("lunepack-ui", &[]),
 ];
 
-/// Reach-only-through crates (M4-D16): `(crate, via)`. In the lock graph of the workspace and of
-/// `fuzz/`, no workspace member may reach `crate` except through the member `via`. `ring` is the
-/// only crypto provider the project allows (D17), and only the HTTP adapter links it.
-pub const REACH_ONLY_THROUGH: &[(&str, &str)] = &[("ring", "lunepack-http")];
+/// Closed dependency lists (M7-D7, M7-D20): `(package, the only crates it may depend on)`. Every
+/// normal and build dependency of the package, workspace member or external, must be named here;
+/// dev-dependencies are not held. The launcher stub's contract is frozen across versions, so it
+/// links the core's read path, the filesystem, the record's hash and the Windows helpers, and no
+/// facade, network, codec or UI code.
+pub const DEPENDS_ONLY_ON: &[(&str, &[&str])] = &[(
+    "lunepack-stub",
+    &[
+        "lunepack-core",
+        "lunepack-fs",
+        "lunepack-crypto",
+        "lunepack-os-windows",
+    ],
+)];
+
+/// Reach-only-through crates (M4-D16): `(crate, vias)`. In the lock graph of the workspace and of
+/// `fuzz/`, no workspace member may reach `crate` except through one of the members in `vias`.
+/// `ring` is the only crypto provider the project allows (D17), and only the HTTP adapter links
+/// it. The `windows` crate (M7-D4) is the COM binding of the Windows integration (D17); its other
+/// dependents are third-party crates of the UI stack, so it cannot be confined by a `CONFINED`
+/// line, and it is matched by exact package name (`windows-sys`, `windows-core` and
+/// `windows-targets` are other packages and are not held by this row).
+pub const REACH_ONLY_THROUGH: &[(&str, &[&str])] = &[
+    ("ring", &["lunepack-http"]),
+    ("windows", &["lunepack-os-windows", "lunepack-ui-luneui"]),
+];
 
 /// Like [`REACH_ONLY_THROUGH`], for whole crate families (M6): `(family, via)`. A package belongs
 /// to a family when its name is the family name or continues it with `-` or `_` (`wgpu-hal`,
@@ -136,7 +163,10 @@ pub const FORBIDDEN_ANYWHERE: &[&str] = &["aws-lc-rs", "aws-lc-sys", "openssl", 
 /// Exact version pins: `(package, dependency, requirement string as cargo reports it)`. The
 /// package must exist in the workspace and must declare the dependency, always with this
 /// requirement.
-pub const EXACT_PINS: &[(&str, &str, &str)] = &[("lunepack-codec-lzma", "lzma-rust2", "=0.25.0")];
+pub const EXACT_PINS: &[(&str, &str, &str)] = &[
+    ("lunepack-codec-lzma", "lzma-rust2", "=0.25.0"),
+    ("lunepack-cli", "editpe", "=0.2.4"),
+];
 
 /// The `source` string cargo metadata reports for a crates.io dependency in this workspace.
 pub const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -548,7 +578,7 @@ fn resolve_lock_dep(nodes: &[LockNode], dep: &str) -> std::result::Result<usize,
 ///
 /// - `forbidden`: an entry named exactly like a [`FORBIDDEN_ANYWHERE`] package.
 /// - `reach`: for each [`REACH_ONLY_THROUGH`] pair, the walk from each root does not enter a
-///   member named `via`; reaching `crate` anyway is a violation that names one shortest path.
+///   member named in `vias`; reaching `crate` anyway is a violation that names one shortest path.
 /// - A `dependencies` value that is not an array of strings, and an edge that matches no entry or
 ///   several, is a `reach` violation too (the graph cannot be trusted). A missing lock or a
 ///   malformed `[[package]]` array is reported by [`check_lock_for`], not here.
@@ -641,13 +671,13 @@ fn check_lock_graph(
         |n: &LockNode| n.source.is_none() && members.contains(&(n.name.clone(), n.version.clone()));
     let rules = REACH_ONLY_THROUGH
         .iter()
-        .map(|(t, via)| (*t, false, *via))
+        .map(|(t, vias)| (*t, false, *vias))
         .chain(
             REACH_FAMILIES_ONLY_THROUGH
                 .iter()
-                .map(|(t, via)| (*t, true, *via)),
+                .map(|(t, via)| (*t, true, std::slice::from_ref(via))),
         );
-    for (target, family, via) in rules {
+    for (target, family, vias) in rules {
         let is_target = |name: &str| {
             if family {
                 in_family(name, target)
@@ -655,7 +685,7 @@ fn check_lock_graph(
                 name == target
             }
         };
-        let blocked = |i: usize| is_member(&nodes[i]) && nodes[i].name == via;
+        let blocked = |i: usize| is_member(&nodes[i]) && vias.contains(&nodes[i].name.as_str());
         for root in (0..nodes.len()).filter(|&i| is_member(&nodes[i]) && !blocked(i)) {
             // Breadth first, so the first hit has a shortest path.
             let mut parent: Vec<Option<usize>> = vec![None; nodes.len()];
@@ -687,9 +717,13 @@ fn check_lock_graph(
                     &nodes[root].name,
                     "reach",
                     format!(
-                        "Cargo.lock ({label}): `{}` reaches `{}` other than through `{via}`: {}",
+                        "Cargo.lock ({label}): `{}` reaches `{}` other than through {}: {}",
                         nodes[root].name,
                         path.last().map_or("", String::as_str),
+                        vias.iter()
+                            .map(|via| format!("`{via}`"))
+                            .collect::<Vec<_>>()
+                            .join(" or "),
                         path.join(" -> ")
                     ),
                 ));
@@ -1093,6 +1127,20 @@ fn check_dependency(
             return;
         }
     };
+
+    if dep.kind != DependencyKind::Development
+        && let Some((_, only)) = DEPENDS_ONLY_ON.iter().find(|(p, _)| *p == package)
+        && !only.contains(&dname)
+    {
+        out.push(v(
+            package,
+            "depends-only-on",
+            format!(
+                "{kind} dependency on `{dname}`: {package} may depend only on {}",
+                only.join(", ")
+            ),
+        ));
+    }
 
     if let Some(dir) = member_dirs.get(dname) {
         // Workspace edge: must be a path dependency on that exact member.

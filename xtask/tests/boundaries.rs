@@ -95,9 +95,14 @@ undocumented_unsafe_blocks = "deny"
                     &format!("{core}\nlunepack-http = {{ path = \"../lunepack-http\" }}"),
                 ),
             );
+            // The packager pins its PE stamper exactly (M7-D22, `EXACT_PINS`).
             crates.insert(
                 "lunepack-cli".into(),
-                manifest("lunepack-cli", INHERIT, core),
+                manifest(
+                    "lunepack-cli",
+                    INHERIT,
+                    &format!("{core}\neditpe = \"=0.2.4\""),
+                ),
             );
             Fx {
                 root: ROOT.to_string(),
@@ -553,6 +558,14 @@ undocumented_unsafe_blocks = "deny"
         let mut fx = Fx::clean();
         fx.add_dep("lunepack-cli", "anyhow = \"1\"");
         fx.lock_extra = None;
+        // `generate-lockfile --offline` must resolve every registry dependency from the local
+        // index, and a fresh cache (the gate's Docker volume, a CI runner) lacks the index entries
+        // for the PE stamper's own dependencies. Generate the lock from a CLI manifest without the
+        // stamper (the lock is only read for its source-less entries), then restore the pin.
+        let cli_with_pin = fx.crates["lunepack-cli"].clone();
+        fx.edit("lunepack-cli", |m| {
+            *m = m.replace("editpe = \"=0.2.4\"", "");
+        });
         let dir = fx.write();
         let vendor = dir.path().join("vendor/anyhow");
         fs::create_dir_all(vendor.join("src")).unwrap();
@@ -569,6 +582,11 @@ undocumented_unsafe_blocks = "deny"
         )
         .unwrap();
         generate_lock(dir.path());
+        fs::write(
+            dir.path().join("crates/lunepack-cli/Cargo.toml"),
+            cli_with_pin,
+        )
+        .unwrap();
         let lock = fs::read_to_string(dir.path().join("Cargo.lock")).unwrap();
         assert!(
             lock.contains("name = \"anyhow\"\nversion = \"1.0.999\"\n\n"),
@@ -1200,6 +1218,166 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         assert_clean(&vs);
     }
 
+    // M7-D4: `windows` only through the Windows OS adapter and the UI adapter ----------------------------
+
+    /// The clean fixture plus the Windows OS adapter (a member, so it can be a `via`).
+    fn with_windows_adapter() -> Fx {
+        let mut fx = Fx::clean();
+        fx.crates.insert(
+            "lunepack-os-windows".into(),
+            manifest(
+                "lunepack-os-windows",
+                OVERRIDE_LINTS,
+                r#"lunepack-core = { path = "../lunepack-core" }"#,
+            ),
+        );
+        fx
+    }
+
+    /// `windows` and the crates of its family that are other packages.
+    fn windows_crates() -> String {
+        [
+            lock_crate("windows", "0.62.2", Some("[\"windows-core 0.62.2\"]")),
+            lock_crate("windows-core", "0.62.2", None),
+            lock_crate("windows-sys", "0.61.2", None),
+            lock_crate("windows-targets", "0.53.5", None),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn x_windows_through_the_os_adapter_passes() {
+        let mut fx = with_windows_adapter();
+        fx.lock_member_extra.insert(
+            "lunepack-os-windows".into(),
+            "dependencies = [\"lunepack-core\", \"windows 0.62.2\"]\n".into(),
+        );
+        fx.lock_member_extra.insert(
+            "lunepack".into(),
+            "dependencies = [\"lunepack-core\", \"lunepack-os-windows\"]\n".into(),
+        );
+        fx.lock_extra = Some(windows_crates());
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn x_windows_reached_by_another_member_directly_fails_and_names_the_path() {
+        let mut fx = with_windows_adapter();
+        fx.lock_member_extra.insert(
+            "lunepack-os-windows".into(),
+            "dependencies = [\"lunepack-core\", \"windows 0.62.2\"]\n".into(),
+        );
+        fx.lock_member_extra.insert(
+            "lunepack".into(),
+            "dependencies = [\"lunepack-core\", \"windows 0.62.2\"]\n".into(),
+        );
+        fx.lock_extra = Some(windows_crates());
+        let vs = fx.run().1;
+        let detail = detail_of(&vs, "lunepack", "reach");
+        assert!(detail.contains("lunepack -> windows"), "{detail}");
+        assert!(
+            detail.contains("`lunepack-os-windows` or `lunepack-ui-luneui`"),
+            "both vias are named: {detail}"
+        );
+        assert!(!has(&vs, "lunepack-os-windows", "reach"), "{}", render(&vs));
+    }
+
+    #[test]
+    fn x_windows_reached_through_any_third_party_crate_fails() {
+        let mut fx = with_windows_adapter();
+        fx.lock_member_extra.insert(
+            "lunepack-cli".into(),
+            "dependencies = [\"lunepack-core\", \"shiny 1.0.0\"]\n".into(),
+        );
+        fx.lock_extra = Some(
+            [
+                windows_crates(),
+                lock_crate("shiny", "1.0.0", Some("[\"windows 0.62.2\"]")),
+            ]
+            .concat(),
+        );
+        let vs = fx.run().1;
+        let detail = detail_of(&vs, "lunepack-cli", "reach");
+        assert!(
+            detail.contains("lunepack-cli -> shiny -> windows"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn x_windows_through_the_ui_adapter_passes_and_a_crates_io_look_alike_does_not() {
+        let mut fx = with_ui();
+        fx.crates.insert(
+            "lunepack-os-windows".into(),
+            manifest(
+                "lunepack-os-windows",
+                OVERRIDE_LINTS,
+                r#"lunepack-core = { path = "../lunepack-core" }"#,
+            ),
+        );
+        let src = lune_lock_source();
+        fx.lock_member_extra.insert(
+            "lunepack-ui-luneui".into(),
+            format!(
+                "dependencies = [\n \"accesskit_windows 0.31.0\",\n \"lune-ui 0.7.0 ({src})\",\n \"lunepack-core\",\n]\n"
+            ),
+        );
+        let base = fx.lock_extra.clone().expect("lock");
+        fx.lock_extra = Some(
+            [
+                base.clone(),
+                windows_crates(),
+                lock_crate("accesskit_windows", "0.31.0", Some("[\"windows 0.62.2\"]")),
+            ]
+            .concat(),
+        );
+        assert_clean(&fx.run().1);
+
+        // A package from crates.io named like the adapter is not the member, so it is walked.
+        fx.lock_extra = Some(
+            [
+                base,
+                windows_crates(),
+                lock_crate("lunepack-os-windows", "9.9.9", Some("[\"windows 0.62.2\"]")),
+            ]
+            .concat(),
+        );
+        fx.lock_member_extra.insert(
+            "lunepack".into(),
+            "dependencies = [\"lunepack-core\", \"lunepack-os-windows 9.9.9\"]\n".into(),
+        );
+        assert_has(&fx.run().1, "lunepack", "reach");
+    }
+
+    #[test]
+    fn x_the_windows_row_matches_the_exact_name_only() {
+        let mut fx = with_windows_adapter();
+        fx.lock_member_extra.insert(
+            "lunepack".into(),
+            "dependencies = [\"lunepack-core\", \"windows-sys 0.61.2\", \"windows-core 0.62.2\", \"windows-targets 0.53.5\"]\n"
+                .into(),
+        );
+        fx.lock_extra = Some(windows_crates());
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn x_the_ring_row_still_names_its_one_via() {
+        let fx = with_graph(
+            &[
+                ("lunepack", "[\"lunepack-core\", \"rustls\"]"),
+                ("lunepack-http", "[\"lunepack-core\"]"),
+            ],
+            &tls_chain(),
+        );
+        let vs = fx.run().1;
+        let detail = detail_of(&vs, "lunepack", "reach");
+        assert!(
+            detail.contains("other than through `lunepack-http`:"),
+            "{detail}"
+        );
+    }
+
     #[test]
     fn p_real_workspace_passes() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -1213,7 +1391,7 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         );
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            "boundaries: ok (15 packages)"
+            "boundaries: ok (16 packages)"
         );
     }
 
@@ -1577,5 +1755,80 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         .unwrap();
         let (_, vs) = check_workspace(dir.path()).expect("check");
         assert_has(&vs, "lune-ui", "lock-source");
+    }
+
+    /// The clean fixture plus the launcher stub on its allowed list (two of its four crates exist
+    /// in the fixture).
+    fn with_stub() -> Fx {
+        let mut fx = Fx::clean();
+        fx.crates.insert(
+            "lunepack-stub".into(),
+            manifest(
+                "lunepack-stub",
+                INHERIT,
+                "lunepack-core = { path = \"../lunepack-core\" }\n\
+                 lunepack-fs = { path = \"../lunepack-fs\" }",
+            ),
+        );
+        fx
+    }
+
+    #[test]
+    fn x_the_stub_depends_only_on_its_closed_list() {
+        assert_clean(&with_stub().run().1);
+        // The facade is allowed for a binary by role, but not for the stub.
+        let mut fx = with_stub();
+        fx.add_dep("lunepack-stub", r#"lunepack = { path = "../lunepack" }"#);
+        assert_has(&fx.run().1, "lunepack-stub", "depends-only-on");
+        let mut fx = with_stub();
+        fx.add_dep(
+            "lunepack-stub",
+            r#"lunepack-http = { path = "../lunepack-http" }"#,
+        );
+        assert_has(&fx.run().1, "lunepack-stub", "depends-only-on");
+        // Build dependencies count; dev-dependencies do not.
+        let mut fx = with_stub();
+        fx.append(
+            "lunepack-stub",
+            "[build-dependencies]\nlunepack-http = { path = \"../lunepack-http\" }",
+        );
+        assert_has(&fx.run().1, "lunepack-stub", "depends-only-on");
+        let mut fx = with_stub();
+        fx.append(
+            "lunepack-stub",
+            "[dev-dependencies]\nlunepack-testkit = { path = \"../lunepack-testkit\" }",
+        );
+        assert_clean(&fx.run().1);
+        // Another binary is not held by the stub's list.
+        let mut fx = with_stub();
+        fx.add_dep("lunepack-cli", r#"lunepack = { path = "../lunepack" }"#);
+        assert!(
+            !has(&fx.run().1, "lunepack-cli", "depends-only-on"),
+            "the list is the stub's only"
+        );
+    }
+
+    // M7-D22: editpe is confined to the packager CLI and pinned there --------------------------------
+
+    #[test]
+    fn y_editpe_is_confined_to_the_cli_and_pinned_exactly() {
+        let editpe = r#"editpe = "=0.2.4""#;
+        // The clean fixture's CLI holds the pin.
+        assert_clean(&Fx::clean().run().1);
+        // Another member naming it is rejected.
+        let mut fx = Fx::clean();
+        fx.add_dep("lunepack", editpe);
+        assert_has(&fx.run().1, "lunepack", "confined");
+        // A loose requirement, or none, in the CLI is not the pin.
+        for loose in ["0.2", "^0.2.4", "=0.2.5"] {
+            let mut fx = Fx::clean();
+            fx.edit("lunepack-cli", |m| {
+                *m = m.replace(editpe, &format!("editpe = \"{loose}\""))
+            });
+            assert_has(&fx.run().1, "lunepack-cli", "exact-pin");
+        }
+        let mut fx = Fx::clean();
+        fx.edit("lunepack-cli", |m| *m = m.replace(editpe, ""));
+        assert_has(&fx.run().1, "lunepack-cli", "exact-pin");
     }
 }

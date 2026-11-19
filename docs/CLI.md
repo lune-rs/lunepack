@@ -74,6 +74,16 @@ icon = "assets/hello.svg"    # optional: a .png or .svg file of the tree
 categories = ["Utility"]     # optional: freedesktop category names
 bin = "hello"                # optional: the name of the command-line link
 terminal = false             # optional, default false
+url_schemes = ["hello"]      # optional (M7-D3): URL schemes the app handles, at most 8
+autostart = false            # optional (M7-D3): start when the user signs in, default false
+
+[[install.file_types]]       # optional (M7-D3): at most 32; each ext, mime and name
+ext = "hello"
+mime = "application/x-hello"
+name = "Hello file"
+
+[windows]                    # optional: inputs of the Windows stamp, not part of any signed document
+icon = "assets/hello.ico"    # an .ico file, relative to this file
 ```
 
 ## The publisher state file (M3-R2-D1)
@@ -263,7 +273,7 @@ in the release directory.
 ```
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
-    [--runtime <RUNTIME>] [--ui <UI>] [--config <CONFIG>]
+    [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--config <CONFIG>]
 ```
 
 - `--version`: SemVer 2.0.0, used verbatim as the directory name. A directory of equal precedence with
@@ -278,6 +288,10 @@ lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-di
   refused without it (see "Self-updating apps").
 - `--ui`: the `lunepack-ui` binary to place beside the runtime. Needs `--runtime` and `[update]`, and
   is refused without them. Without it no UI is placed. A file over 64 MiB is refused.
+- `--stub`: the Windows launcher stub, stamped and placed beside the entry as `lunepack-stub.exe`.
+  Required for a `windows-*` target when the config has `[update]`; refused for any other target and
+  without `[update]`. The console stub is needed when `install.terminal` is set, the GUI stub
+  otherwise. A file over 32 MiB is refused.
 
 Pre-checks run before any encoding: `keys.json` verifies; every `--sign` key is in the key set and
 inside its window; the signers reach the threshold; the manifest and pack do not exist yet; the target
@@ -347,6 +361,46 @@ Building the runtime: `scripts/build-runtime.sh <linux-x86_64|linux-aarch64>` ru
 build (the target must be installed with `rustup target add`; `--print-command` shows the command and
 runs nothing). `pack` does not build the runtime itself in M5; D19's build-from-source waits for a
 published crate (M13).
+
+### Windows targets (M7)
+
+A `windows-*` pack with `[update]` carries three more things, each written before hashing so the signed
+manifest covers them (FORMAT.md 13, 15):
+
+- `--stub <path>` is required: the launcher stub (`lunepack-stub.exe`, or `lunepack-stub-console.exe` when
+  `install.terminal` is set). It is stamped (below) and placed in the entry's directory as
+  `lunepack-stub.exe`; that name is reserved at any depth of the input. The runtime copies it to the install
+  root under the entry's own file name.
+- The runtime, the UI and the stub must be Windows executables of the target's machine, built hardened
+  (a static C runtime, `DependentLoadFlags` 0x800 and an embedded manifest with `asInvoker` and
+  `longPathAware`; the stub, the runtime and the UI are checked for the right subsystem). `pack` refuses one that
+  imports a C runtime DLL (`vcruntime*`, `msvcp*`, `api-ms-win-crt-*`, `ucrtbase`) or imports `advapi32.dll`
+  statically (it must be delay-loaded, so a planted `cryptbase.dll` is never loaded), or that lacks the flag
+  or the manifest. The error names the file and the field, never a value.
+- `install.name` must be a valid Windows folder and shortcut name (FORMAT.md 13.4: at most 64 UTF-16 code
+  units, none of `< > : " / \ | ? *`, no control character, no leading or trailing dot or space, no device
+  name), because the display name is the folder name of a first install. The error names `[install] name`
+  and the clause, never the name. The rule is not applied to Linux or macOS targets.
+
+**Stamping (M7-D14).** The stub and a Windows setup file's runtime get an icon and a VERSIONINFO resource,
+written with `editpe`, a pure Rust crate (D17, M7-D22). The icon is `[windows] icon` when set (checked as
+an ICO file: at most 64 images, at most 4 MiB), else `install.icon` when it is a PNG that is square and at
+most 256 pixels (wrapped as a PNG-in-ICO entry without resampling), else none. A `.svg` `install.icon` or none
+means no icon; a PNG that is not square or is larger is an error. The strings are `FileDescription` and
+`ProductName` = `install.name` (the setup file's `FileDescription` is `<name> Setup`), `CompanyName` =
+`install.publisher` when present, `FileVersion` and `ProductVersion` = the full version, and
+`OriginalFilename` = the entry's file name (a setup file's: its own name); the numeric version is
+`major.minor.patch.0`, and a component above 65535 fails the pack, naming `--version`. After stamping,
+`pack` re-reads the output and refuses it if the machine, subsystem, import table, `DependentLoadFlags` or
+manifest differ from the input's, naming the field. The stamp is a function of the input bytes and these
+fields only, so two packs of the same input give the same bytes (C2).
+
+**Windows setup files.** `lunepack setup` for a `windows-*` target takes the runtime out of the pack through
+its signed frame, removes any certificate table, stamps it as above (its `OriginalFilename` is the file's
+name) and appends the payload and the trailer, with nothing after it (FORMAT.md 14). The output is
+`<app_id>-<VERSION>-<TARGET>-setup.exe` by default. Sign it with Authenticode after it is built (M9); the
+runtime finds the trailer in a signed file (FORMAT.md 14.3), and a byte added after the signature makes it
+refuse to run.
 
 ### `lunepack feed add`
 
@@ -424,7 +478,7 @@ lunepack setup <DIR> --version <VERSION> --target <TARGET> [--out <FILE>] [--at 
     [--config <CONFIG>]
 ```
 
-Builds a Linux setup file (FORMAT.md 14): the release's own runtime, then `keys.json`, the manifest
+Builds a Linux or Windows setup file (FORMAT.md 14): the release's own runtime, then `keys.json`, the manifest
 and the pack of `<VERSION>` for `<TARGET>`, then the trailer naming them and the root the release's
 update configuration trusts. Run, the file installs exactly that version with no network, with the
 window or `--silent` (RUNTIME.md, "Setup files").
@@ -436,10 +490,10 @@ pack through their signed frames. The release must have been packed with `[updat
 (and `--ui` for a window). The written bytes are then parsed back and verified as the runtime
 parses them, so `keys.json` must be signed under the root the update configuration names.
 
-`<VERSION>` is the text as written in the release (canonical). Only `linux-x86_64` and
-`linux-aarch64` are accepted in this release. The file goes to `--out`, or to
-`<app_id>-<VERSION>-<TARGET>-setup` in the current directory; an existing file is not replaced.
-It is made executable (mode 0755). The output depends on the release directory only: two runs give
+`<VERSION>` is the text as written in the release (canonical). Only the `linux-*` and `windows-*`
+targets are accepted in this release. The file goes to `--out`, or to
+`<app_id>-<VERSION>-<TARGET>-setup` (with `.exe` for a `windows-*` target) in the current directory;
+an existing file is not replaced. On a Unix host it is made executable (mode 0755). The output depends on the release directory only: two runs give
 the same bytes. `--at` verifies at that Unix time instead of the system clock. A setup file stops
 installing when its key set expires or its release keys' windows end: build it from a current
 release.
