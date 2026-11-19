@@ -53,6 +53,9 @@ const GOLDEN_NOTHING_STAGED: usize = 40;
 const GOLDEN_UNEXPECTED: usize = 41;
 
 const GOLDEN_OBJECTS: &str = include_str!("golden/objects.jsonl");
+/// The golden line of a check that adopted the running bundle and found no update (M8-D9).
+#[cfg(target_os = "macos")]
+const GOLDEN_ADOPTED: usize = 46;
 
 fn app_id() -> AppId {
     AppId::parse(SUITE_APP_ID).expect("app id")
@@ -154,6 +157,13 @@ struct Lab {
 impl Lab {
     /// Publishes 1.0.0 and installs it.
     fn installed() -> Lab {
+        let lab = Lab::published();
+        lab.install_1_0_0();
+        lab
+    }
+
+    /// Publishes 1.0.0 (and writes its bootstrap tree); installs nothing.
+    fn published() -> Lab {
         let h = common::Home::new("cli-", SUITE_APP_ID, Some("CLI test"), false);
         let keys = tempfile::tempdir().expect("keys");
         let signers = (0..2)
@@ -173,7 +183,6 @@ impl Lab {
             publishes: 0,
         };
         lab.publish(&["1.0.0"]);
-        lab.install_1_0_0();
         lab
     }
 
@@ -855,6 +864,77 @@ fn a_tree_that_is_not_installed_has_nothing_to_check_or_download() {
     let run = lab.run(&boot, &["confirm", "--json"], &[]);
     assert_eq!(run.code, 0, "{run:?}");
     assert_eq!(run.line(), golden(9));
+}
+
+// ---- adoption of a dragged bundle (macOS, M8-D9 (b)) ---------------------------------------------
+
+/// Copies the directory `from` to `to`: files (with their mode) and directories only.
+#[cfg(target_os = "macos")]
+fn copy_bundle(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("dirs");
+    for entry in std::fs::read_dir(from).expect("read_dir") {
+        let entry = entry.expect("entry");
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if entry.file_type().expect("type").is_dir() {
+            copy_bundle(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).expect("copy");
+        }
+    }
+}
+
+/// A released bundle dragged into `~/Applications` is adopted by its first `check`, which says
+/// so (`adopted`, and the `adopt` progress phase), and is installed from then on.
+#[cfg(target_os = "macos")]
+#[test]
+fn check_adopts_a_bundle_dragged_into_the_applications_folder() {
+    let lab = Lab::published();
+    let bundle = lab.home.join("Applications").join("CLI test.app");
+    copy_bundle(&lab.boot, &bundle);
+    assert!(!lab.root.exists());
+    let run = lab.run(&bundle.join(RUNTIME_PATH), &["check", "--json"], &[]);
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.last_line(), golden(GOLDEN_ADOPTED));
+    assert!(
+        run.stdout
+            .lines()
+            .any(|l| l.contains("\"type\":\"progress\",\"phase\":\"adopt\"")),
+        "{run:?}"
+    );
+    run.assert_clean(&lab, &[]);
+    let record = lab.record().expect("record");
+    assert_eq!(
+        record.current.expect("current").version.to_string(),
+        "1.0.0"
+    );
+    assert_eq!(
+        std::fs::read_link(lab.root.join("bundle")).expect("pointer"),
+        bundle
+    );
+    // From now on it is the install: a check is a plain one.
+    let run = lab.run(&bundle.join(RUNTIME_PATH), &["check", "--json"], &[]);
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.line(), golden(0));
+}
+
+/// The same bundle anywhere but directly in an apps folder is a development run: `not_installed`
+/// before any request (the feed is gone, so a request would have been a transport error) and
+/// nothing written.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_bundle_outside_an_applications_folder_is_not_adopted_and_makes_no_request() {
+    let lab = Lab::published();
+    std::fs::remove_dir_all(lab.release_dir()).expect("remove the release");
+    for dir in ["Downloads", "Applications/Sub"] {
+        let bundle = lab.home.join(dir).join("CLI test.app");
+        copy_bundle(&lab.boot, &bundle);
+        for command in ["check", "download"] {
+            let run = lab.run(&bundle.join(RUNTIME_PATH), &[command, "--json"], &[]);
+            assert_eq!(run.code, 3, "{dir} {command}: {run:?}");
+            assert!(run.line().contains("\"kind\":\"not_installed\""), "{run:?}");
+        }
+    }
+    assert!(!lab.root.exists(), "nothing was written");
 }
 
 // ---- a closed stdout --------------------------------------------------------------------------

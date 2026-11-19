@@ -16,17 +16,18 @@ use std::time::Duration;
 
 use common::{INSTALL_ID, TARGET, World, app_id, channel, sha, version};
 use lunepack::{
-    DownloadOptions, Error, Installation, Platform, StartupAction, UpdateConfigError, block_on,
-    follow_move, startup_for,
+    CheckOptions, CheckOutcome, DownloadOptions, Error, Installation, Platform, StartupAction,
+    UpdateConfigError, block_on, follow_move, startup_for,
 };
-use lunepack_core::state::{InstallState, Scope, StagedRef, UserScope};
+use lunepack_core::state::{InstallState, LifecycleEvent, Scope, StagedRef, UserScope};
 use lunepack_core::{
-    CodecId, Fs, InstallMeta, IntegrationRequest, LayoutScheme, LocationReason, RelPath,
-    UpdateConfig, UserLayout, set_bundle_pointer, write_bundle_identity,
+    CodecId, FileKind, Fs, InstallMeta, IntegrationRequest, LayoutScheme, LocationReason,
+    PayloadKind, Phase, RelPath, UpdateConfig, UserLayout, read_bundle_identity,
+    set_bundle_pointer, write_bundle_identity,
 };
 use lunepack_testkit::{
     FakeCodec, FakeHasher, FakeIntegration, FakeProcess, FakeRng, FakeVerifier, IntegrationOp,
-    MemFs, MemPlace, PackBuilder,
+    MemFs, MemPlace, PackBuilder, RecoverMode, SUITE_CHANNEL, TransportFault,
 };
 
 const V100: &str = "1.0.0";
@@ -209,6 +210,11 @@ impl Mac {
         set_bundle_pointer(&self.fs, &layout, &self.bundle()).expect("pointer");
         write_bundle_identity(&self.fs, &layout, &self.bundle()).expect("identity");
         commit(&self.fs, &layout, record);
+    }
+
+    /// The same install after a restart: `fs` is the disk a crash left.
+    fn with_fs(self, fs: MemFs) -> Mac {
+        Mac { fs, ..self }
     }
 
     fn open(&self, tree: &Path, token: Option<OsString>) -> Result<Installation, Error> {
@@ -613,20 +619,29 @@ fn an_install_whose_bundle_is_gone_is_not_installed_for_the_app() {
 
 // ---- the first install ---------------------------------------------------------------------------
 
-/// Publishes release `v` (feed `seq`) as a bundle: the entry, a file and the config in the pack.
-fn publish(mac: &Mac, seq: u64, v: &str) {
-    let mut pack = PackBuilder::new();
-    for (path, bytes) in [
+/// The files of release `v` as a bundle: the entry, a file and the config.
+fn release_files(mac: &Mac, v: &str) -> Vec<(&'static str, Vec<u8>)> {
+    vec![
         ("Contents/MacOS/hello", format!("app {v}").into_bytes()),
         ("Contents/Resources/share.txt", b"shared".repeat(20)),
         (
             "Contents/Resources/lunepack-update.json",
             config(&mac.world, v).to_bytes().expect("bytes"),
         ),
-    ] {
+    ]
+}
+
+fn release_pack(mac: &Mac, v: &str) -> PackBuilder {
+    let mut pack = PackBuilder::new();
+    for (path, bytes) in release_files(mac, v) {
         pack.file(&FakeHasher, path, &bytes, CodecId::Lzma2);
     }
-    mac.world.publish_pack(seq, v, &pack);
+    pack
+}
+
+/// Publishes release `v` (feed `seq`) as a bundle: the entry, a file and the config in the pack.
+fn publish(mac: &Mac, seq: u64, v: &str) {
+    mac.world.publish_pack(seq, v, &release_pack(mac, v));
 }
 
 /// A bootstrap bundle of `v` outside the install.
@@ -857,4 +872,474 @@ fn a_real_install_is_found_and_reports_its_version() {
         .expect("build");
     let got = updater.installed().expect("installed").expect("an install");
     assert_eq!(got.version(), &version(V100));
+}
+
+// ---- adoption of a dragged bundle (M8-D9 (b)) -----------------------------------------------------
+
+/// Publishes each release of `versions` (manifest and pack) and a feed `seq` listing them all.
+fn publish_all(mac: &Mac, seq: u64, versions: &[&str]) {
+    let mut releases = Vec::new();
+    for v in versions {
+        let pack = release_pack(mac, v);
+        let fx = &mac.world.fx;
+        let manifest = fx.manifest_document(v, TARGET, &pack);
+        let bytes = fx.envelope(PayloadKind::Manifest, &manifest.to_payload(), &[1]);
+        let origin = &mac.world.origin;
+        origin.put(
+            &format!("{v}/{}.manifest.json", TARGET.as_str()),
+            bytes.clone(),
+        );
+        origin.put(&format!("{v}/{}.pack", TARGET.as_str()), pack.bytes.clone());
+        releases.push(fx.release(v, &[(TARGET, &bytes)], None));
+    }
+    mac.world.publish_feed(seq, releases);
+}
+
+/// Release `v` dragged to `at` exactly as released (a `.zip` extracted into an apps folder),
+/// durably: every folder from the root down is synced, so a crash test's recovered disk has it.
+fn drag(mac: &Mac, at: &Path, v: &str) {
+    for (path, bytes) in release_files(mac, v) {
+        let file = at.join(path);
+        write_file(&mac.fs, &file, &bytes);
+        for dir in file.ancestors().skip(1) {
+            mac.fs.sync_dir(dir).expect("sync");
+        }
+    }
+}
+
+/// Everything under `dir` by relative path: its kind, and a file's bytes (nothing followed).
+fn dump(fs: &dyn Fs, dir: &Path) -> Vec<(String, FileKind, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), String::new())];
+    while let Some((d, prefix)) = stack.pop() {
+        for e in fs.list_dir(&d).expect("list") {
+            let name = e.name.to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let path = d.join(&e.name);
+            let bytes = match e.kind {
+                FileKind::File => fs.read_capped(&path, 1 << 20).expect("read"),
+                FileKind::Dir => {
+                    stack.push((path, rel.clone()));
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            };
+            out.push((rel, e.kind, bytes));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn updater_of(mac: &Mac, inst: &Installation) -> lunepack::Updater {
+    inst.updater_builder()
+        .expect("builder")
+        .transport(Arc::clone(&mac.world.transport))
+        .codec(Arc::new(FakeCodec::new()))
+        .clock(Arc::clone(&mac.world.clock) as Arc<dyn lunepack_core::Clock>)
+        .workers(2)
+        .build()
+        .expect("build")
+}
+
+fn check_with(
+    mac: &Mac,
+    inst: &Installation,
+    options: CheckOptions,
+) -> Result<CheckOutcome, Error> {
+    block_on(updater_of(mac, inst).check_with(options))
+}
+
+fn record_at(fs: &MemFs, layout: &UserLayout) -> Option<InstallState> {
+    UserScope {
+        dir: layout.state_dir(),
+        app_id: app_id(),
+    }
+    .load(fs, &FakeHasher)
+    .expect("load")
+    .record
+}
+
+fn pointer_at(fs: &MemFs, layout: &UserLayout) -> Option<String> {
+    fs.read_link(&layout.root().join("bundle")).ok()
+}
+
+/// The end state of an adoption of `v` at `bundle` (M8-D9): the record names `v` current, the
+/// pointer and the identity name `bundle`, the integration was applied to it, the bundle is
+/// exactly the release, and the bundle is found installed. `events` are the lifecycle events
+/// still queued or already delivered by a start.
+fn assert_adopted(mac: &Mac, bundle: &Path, v: &str, events: &[LifecycleEvent]) {
+    let layout = mac.layout();
+    let rec = record_at(&mac.fs, &layout).expect("record");
+    assert_eq!(rec.current.as_ref().expect("current").version, version(v));
+    assert_eq!(
+        events,
+        [
+            LifecycleEvent::Installed {
+                version: version(v)
+            },
+            LifecycleEvent::FirstRun {
+                version: version(v)
+            },
+        ]
+    );
+    assert_eq!(
+        pointer_at(&mac.fs, &layout).as_deref(),
+        bundle.to_str(),
+        "the pointer names the bundle"
+    );
+    let facts = mac.fs.place(bundle).expect("place");
+    assert_eq!(
+        read_bundle_identity(&mac.fs, &layout).expect("identity"),
+        Some((facts.device, facts.inode))
+    );
+    assert!(
+        mac.integration
+            .calls()
+            .iter()
+            .any(|c| c.op == IntegrationOp::Apply && c.install_root == bundle),
+        "the integration is rooted at the bundle"
+    );
+    let mut want: Vec<(String, FileKind, Vec<u8>)> = release_files(mac, v)
+        .into_iter()
+        .map(|(p, b)| (p.to_owned(), FileKind::File, b))
+        .collect();
+    for d in ["Contents", "Contents/MacOS", "Contents/Resources"] {
+        want.push((d.to_owned(), FileKind::Dir, Vec::new()));
+    }
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        dump(&mac.fs, bundle),
+        want,
+        "the bundle is the release, untouched"
+    );
+    let inst = mac.open(bundle, None).expect("installation");
+    assert!(inst.is_installed() && !inst.adoptable() && !inst.moved());
+}
+
+fn queued(mac: &Mac) -> Vec<LifecycleEvent> {
+    record_at(&mac.fs, &mac.layout())
+        .and_then(|r| r.lifecycle)
+        .map(|l| l.events)
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_dragged_bundle_is_adopted_by_its_first_check_which_then_finds_the_update() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    publish_all(&mac, 1, &[V100, V110]);
+    drag(&mac, &mac.bundle(), V100);
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    assert!(!inst.is_installed() && inst.adoptable());
+    // Nothing was written by finding it.
+    assert!(
+        mac.fs
+            .symlink_metadata(&mac.data_home())
+            .unwrap_or(None)
+            .is_none()
+    );
+
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&phases);
+    let options = CheckOptions {
+        progress: Some(Box::new(move |p| {
+            seen.lock().expect("phases").push(p.clone())
+        })),
+        cancel: None,
+    };
+    let outcome = check_with(&mac, &inst, options).expect("check");
+    assert!(outcome.adopted);
+    assert_eq!(
+        outcome.update.as_ref().map(|u| u.version().clone()),
+        Some(version(V110)),
+        "the same check reports the newer release"
+    );
+    let phases = phases.lock().expect("phases").clone();
+    assert!(!phases.is_empty() && phases.iter().all(|p| p.phase == Phase::Adopt));
+    let last = phases.last().expect("last");
+    assert_eq!(last.done, last.total);
+    assert_adopted(&mac, &mac.bundle(), V100, &queued(&mac));
+    let rec = mac.record();
+    assert!(rec.previous.is_none() && rec.pending.is_none());
+    assert_eq!(rec.floors.feed_seq.get(&channel()), Some(&1));
+
+    // The next start is an installed one and gets the install events; a later check is plain.
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    let start = startup_for(&inst, Vec::new()).expect("startup");
+    assert_eq!(start.events.len(), 2);
+    let again = check_with(&mac, &inst, CheckOptions::default()).expect("check");
+    assert!(!again.adopted);
+    assert_eq!(
+        again.update.map(|u| u.version().clone()),
+        Some(version(V110))
+    );
+    common::workers_stopped();
+}
+
+#[test]
+fn a_failed_adoption_leaves_the_bundle_alone_and_records_no_current_version() {
+    let _serial = common::serial();
+    type Setup = Box<dyn Fn(&Mac)>;
+    let cases: Vec<(&str, Setup, Box<dyn Fn(&Error) -> bool>)> = vec![
+        (
+            "transport failure",
+            Box::new(|mac: &Mac| {
+                publish_all(mac, 1, &[V100]);
+                mac.world
+                    .origin
+                    .set_faults(vec![TransportFault::ErrorAfter(0)]);
+            }),
+            Box::new(|e| matches!(e, Error::Transport(_))),
+        ),
+        (
+            "the bundle's version is not in the feed",
+            Box::new(|mac: &Mac| publish_all(mac, 1, &[V110])),
+            Box::new(|e| matches!(e, Error::NoRelease)),
+        ),
+        (
+            "one file tampered with",
+            Box::new(|mac: &Mac| {
+                publish_all(mac, 1, &[V100]);
+                let path = mac.bundle().join("Contents/Resources/share.txt");
+                let mut bytes = b"shared".repeat(20);
+                bytes[7] ^= 1;
+                mac.fs.remove_file(&path).expect("remove");
+                write_file(&mac.fs, &path, &bytes);
+            }),
+            Box::new(|e| matches!(e, Error::Verify(_))),
+        ),
+    ];
+    for (what, setup, want) in cases {
+        let mac = Mac::new();
+        drag(&mac, &mac.bundle(), V100);
+        setup(&mac);
+        let before = dump(&mac.fs, &mac.bundle());
+        let inst = mac.open(&mac.bundle(), None).expect("installation");
+        assert!(inst.adoptable(), "{what}");
+        let got = check_with(&mac, &inst, CheckOptions::default());
+        assert!(got.as_ref().is_err_and(|e| want(e)), "{what}: {got:?}");
+        assert_eq!(
+            dump(&mac.fs, &mac.bundle()),
+            before,
+            "{what}: the bundle changed"
+        );
+        let layout = mac.layout();
+        assert!(
+            record_at(&mac.fs, &layout).is_none_or(|r| r.current.is_none()),
+            "{what}: a current version was recorded"
+        );
+        assert_eq!(pointer_at(&mac.fs, &layout), None, "{what}");
+        assert_eq!(
+            read_bundle_identity(&mac.fs, &layout).expect("id"),
+            None,
+            "{what}"
+        );
+        assert!(
+            !mac.integration
+                .calls()
+                .iter()
+                .any(|c| c.op == IntegrationOp::Apply),
+            "{what}: the integration was applied"
+        );
+        // A development run, still adoptable by the next check.
+        let again = mac.open(&mac.bundle(), None).expect("installation");
+        assert!(!again.is_installed() && again.adoptable(), "{what}");
+        common::workers_stopped();
+    }
+}
+
+#[test]
+fn an_orphaned_install_is_adopted_with_its_floors_and_a_new_install_id() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    publish_all(&mac, 1, &[V100]);
+    let boot = bootstrap(&mac, V100);
+    install(&mac, &boot).expect("install");
+    let before = mac.record();
+    // The app goes to the Trash; a newer one is dragged into /Applications.
+    mac.fs
+        .remove_dir_all_nofollow(&mac.bundle())
+        .expect("trash");
+    publish_all(&mac, 2, &[V100, V110]);
+    let other = PathBuf::from("/Applications/Hello.app");
+    drag(&mac, &other, V110);
+    let inst = mac.open(&other, None).expect("installation");
+    assert!(inst.adoptable());
+    let outcome = check_with(&mac, &inst, CheckOptions::default()).expect("check");
+    assert!(outcome.adopted && outcome.update.is_none());
+    assert_adopted(&mac, &other, V110, &queued(&mac));
+    let rec = mac.record();
+    assert_ne!(rec.install_id, before.install_id, "a new install id");
+    assert!(rec.previous.is_none() && rec.pending.is_none() && rec.bad.is_empty());
+    assert_eq!(rec.floors.root, before.floors.root);
+    assert_eq!(rec.floors.keyset_version, before.floors.keyset_version);
+    assert_eq!(rec.floors.feed_seq.get(&channel()), Some(&2));
+    common::workers_stopped();
+}
+
+#[test]
+fn an_orphaned_install_refuses_a_replayed_older_feed() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    publish_all(&mac, 1, &[V100]);
+    let old_feed = mac.world.feed_bytes();
+    publish_all(&mac, 2, &[V100]);
+    let boot = bootstrap(&mac, V100);
+    install(&mac, &boot).expect("install");
+    let before = mac.record();
+    mac.fs
+        .remove_dir_all_nofollow(&mac.bundle())
+        .expect("trash");
+    // A mirror replays the older feed, which still lists the dragged release.
+    mac.world
+        .origin
+        .put(&format!("feed-{SUITE_CHANNEL}.json"), old_feed);
+    let other = PathBuf::from("/Applications/Hello.app");
+    drag(&mac, &other, V100);
+    let inst = mac.open(&other, None).expect("installation");
+    assert!(inst.adoptable());
+    let got = check_with(&mac, &inst, CheckOptions::default());
+    assert!(matches!(got, Err(Error::Verify(_))), "{got:?}");
+    assert_eq!(mac.record(), before, "the orphaned record is untouched");
+    assert_eq!(mac.pointer(), mac.bundle().to_str().expect("utf-8"));
+    common::workers_stopped();
+}
+
+#[test]
+fn a_live_install_makes_an_adoptable_copy_not_installed_with_no_request() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    publish_all(&mac, 1, &[V100]);
+    drag(&mac, &mac.bundle(), V100);
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    assert!(inst.adoptable());
+    // Meanwhile the app is installed by its installer (the dragged name is taken, so the live
+    // bundle gets the other name).
+    let boot = bootstrap(&mac, V100);
+    install(&mac, &boot).expect("install");
+    let live = mac
+        .apps()
+        .join(format!("Hello ({}).app", app_id().as_str()));
+    assert_eq!(mac.pointer(), live.to_str().expect("utf-8"));
+    let before = mac.record();
+    let requests = mac.world.origin.requests().len();
+    let dragged = dump(&mac.fs, &mac.bundle());
+
+    let got = check_with(&mac, &inst, CheckOptions::default());
+    assert!(matches!(got, Err(Error::NotInstalled)), "{got:?}");
+    assert_eq!(mac.world.origin.requests().len(), requests, "no request");
+    assert_eq!(mac.record(), before);
+    assert_eq!(mac.pointer(), live.to_str().expect("utf-8"));
+    assert_eq!(dump(&mac.fs, &mac.bundle()), dragged);
+    // A new look finds the copy not installed and not adoptable.
+    let again = mac.open(&mac.bundle(), None).expect("installation");
+    assert!(!again.is_installed() && !again.adoptable());
+    common::workers_stopped();
+}
+
+#[test]
+fn an_install_committed_while_the_bundle_is_hashed_is_never_overwritten() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    publish_all(&mac, 1, &[V100]);
+    drag(&mac, &mac.bundle(), V100);
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    // Another writer commits a live install while the proof runs (between the hashing and the
+    // commit; the progress callback runs on the polling thread in between).
+    let fs = mac.fs.clone();
+    let layout = mac.layout();
+    let injected = Arc::new(std::sync::Mutex::new(None));
+    let slot = Arc::clone(&injected);
+    let options = CheckOptions {
+        progress: Some(Box::new(move |_| {
+            let mut slot = slot.lock().expect("slot");
+            if slot.is_none() {
+                let store = UserScope {
+                    dir: layout.state_dir(),
+                    app_id: app_id(),
+                };
+                let loaded = store.load(&fs, &FakeHasher).expect("load");
+                let now = loaded.record.clone().expect("record");
+                let live = lunepack_core::install_first(&now, version(V100), 10, INSTALL_ID)
+                    .expect("install");
+                *slot = Some(commit(&fs, &layout, &live));
+            }
+        })),
+        cancel: None,
+    };
+    let got = check_with(&mac, &inst, options);
+    assert!(matches!(got, Err(Error::NotInstalled)), "{got:?}");
+    let injected = injected.lock().expect("slot").clone().expect("injected");
+    assert_eq!(mac.record(), injected, "the other install's record stands");
+    let layout = mac.layout();
+    assert_eq!(pointer_at(&mac.fs, &layout), None);
+    assert_eq!(read_bundle_identity(&mac.fs, &layout).expect("id"), None);
+    assert!(
+        !mac.integration
+            .calls()
+            .iter()
+            .any(|c| c.op == IntegrationOp::Apply)
+    );
+    common::workers_stopped();
+}
+
+/// A crash at every write of the adopting check, under both recovery modes: the next start (an
+/// install committed but not yet pointed at, found by its identity as moved) or the next check
+/// (anything earlier: still adoptable) reaches the end state.
+#[test]
+fn a_crash_at_any_write_of_an_adoption_ends_adopted_after_the_next_start_or_check() {
+    let _serial = common::serial();
+    let world = |mac: &Mac| {
+        publish_all(mac, 1, &[V100]);
+        drag(mac, &mac.bundle(), V100);
+    };
+    // One clean run to learn how many writes it makes.
+    let mac = Mac::new();
+    world(&mac);
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    let base = mac.fs.op_count();
+    check_with(&mac, &inst, CheckOptions::default()).expect("check");
+    let writes = mac.fs.op_count() - base;
+    assert!(writes > 4, "{writes}");
+    common::workers_stopped();
+
+    let mut seen = std::collections::BTreeSet::new();
+    for mode in [RecoverMode::DropVolatile, RecoverMode::KeepVolatile] {
+        for n in 0..writes {
+            let mac = Mac::new();
+            world(&mac);
+            let inst = mac.open(&mac.bundle(), None).expect("installation");
+            mac.fs.crash_after(mac.fs.op_count() + n);
+            let crashed = check_with(&mac, &inst, CheckOptions::default());
+            assert!(crashed.is_err(), "write {n}: the crashed check succeeded");
+            common::workers_stopped();
+            let disk = mac.fs.recover(mode);
+            let mac = mac.with_fs(disk);
+
+            let inst = mac.open(&mac.bundle(), None).expect("installation");
+            let (how, events) = if inst.moved() {
+                let start = startup_for(&inst, Vec::new()).expect("next start");
+                ("start", start.events)
+            } else if inst.adoptable() {
+                let outcome = check_with(&mac, &inst, CheckOptions::default())
+                    .unwrap_or_else(|e| panic!("write {n}: next check: {e:?}"));
+                assert!(outcome.adopted, "write {n}");
+                ("check", queued(&mac))
+            } else {
+                assert!(inst.is_installed(), "write {n}");
+                let start = startup_for(&inst, Vec::new()).expect("next start");
+                ("installed", start.events)
+            };
+            seen.insert(how);
+            assert_adopted(&mac, &mac.bundle(), V100, &events);
+            common::workers_stopped();
+        }
+    }
+    // Every path was taken: cut before the record (check), after it (start).
+    assert!(seen.contains("check") && seen.contains("start"), "{seen:?}");
 }
