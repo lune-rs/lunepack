@@ -1,7 +1,46 @@
 //! Windows install, shortcut, autostart and process-restart adapter.
 //!
 //! Today it holds the reduce-motion reader (M6-D8): [`prefers_reduced_motion`] reads the OS's
-//! client-area animation setting through `SystemParametersInfoW` (user32, no window stack).
+//! client-area animation setting through `SystemParametersInfoW` (user32, no window stack), and the
+//! small Windows helpers of M7: the DLL search hardening ([`harden_dll_search`]) and the shell
+//! helpers of [`shell`] (known folders, a message box, the app user model id, the foreground right),
+//! and, on Windows only, [`WindowsProcess`] (M7 step 5): the core's `Process` over the Win32 process
+//! APIs, and [`WindowsIntegration`] (M7 steps 6 and 7): the core's `OsIntegration` (the launcher
+//! stub at the install root, the uninstall entry, the hidden `.lunepack` directory, the Start-menu
+//! shortcut with its app user model id, and the file types, URL schemes and autostart the app
+//! declares) with [`remove_stub_leftovers`] for the GC; and the launcher stub's two helpers
+//! ([`raw_command_line`], [`ignore_console_interrupts`]).
+//! The public API is safe and builds on every OS; off Windows the helpers are no-ops or
+//! `Unsupported`.
+
+#[cfg(windows)]
+mod classes;
+mod harden;
+#[cfg(windows)]
+mod integration;
+mod launcher;
+#[cfg(windows)]
+mod process;
+#[cfg(windows)]
+mod registry;
+mod shell;
+#[cfg(windows)]
+mod shortcut;
+#[cfg(windows)]
+mod stub_place;
+
+pub use harden::harden_dll_search;
+#[cfg(windows)]
+pub use integration::{MARKER_VALUE, UNINSTALL_KEY, WinScope, WindowsIntegration};
+pub use launcher::{ignore_console_interrupts, raw_command_line};
+#[cfg(windows)]
+pub use process::WindowsProcess;
+pub use shell::{
+    MessageKind, allow_set_foreground, message_box, process_aumid, set_process_aumid,
+    start_menu_programs, user_program_files,
+};
+#[cfg(windows)]
+pub use stub_place::remove_stub_leftovers;
 
 /// Whether the user asked for reduced motion: `Some(true)` when the "show animations in Windows"
 /// setting is off, `Some(false)` when it is on, `None` when it cannot be read (and always `None`

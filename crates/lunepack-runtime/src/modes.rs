@@ -279,13 +279,39 @@ pub enum Mode {
         /// `--silent`: no UI and no prompt (D41).
         silent: bool,
     },
-    /// `uninstall [--silent]`: removes the install this runtime belongs to.
+    /// `uninstall [--silent]`: removes the install this runtime belongs to (on Windows: phase 1,
+    /// the hand-off to a copy outside the install, M7-D5).
     Uninstall {
-        /// `--silent`: no UI and no prompt (D41).
+        /// `--silent` (or `/S` on Windows): no UI and no prompt (D41).
         silent: bool,
     },
+    /// Windows only: `uninstall --install-root <R> --wait-pid <u32> --wait-start <u64>
+    /// [--silent | /S]`, phase 2 of the hand-off, accepted only from the uninstaller's own temp
+    /// copy (checked before any action, M7-D5).
+    UninstallHandOff(HandOffArgs),
     /// An app-facing command (`check`, `download`, `startup`, `confirm`).
     Command(crate::cli::args::Parsed),
+}
+
+/// The arguments of phase 2 of the Windows uninstall hand-off.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HandOffArgs {
+    /// The install root phase 1 derived from its own path; validated again before any action.
+    pub install_root: std::path::PathBuf,
+    /// Phase 1, waited for before anything changes.
+    pub wait: ProcessId,
+    /// No UI and no prompt.
+    pub silent: bool,
+}
+
+impl std::fmt::Debug for HandOffArgs {
+    /// Shows no path.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandOffArgs")
+            .field("wait", &self.wait)
+            .field("silent", &self.silent)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The arguments do not follow the grammar. Carries nothing about them.
@@ -299,7 +325,10 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
         Some("apply") => parse_apply(rest).map(Mode::Apply),
         // Only `--silent`: everything they use is derived, nothing comes from argv (M5-D10).
         Some("install") => silent_only(rest).map(|silent| Mode::Install { silent }),
-        Some("uninstall") => silent_only(rest).map(|silent| Mode::Uninstall { silent }),
+        Some("uninstall") if HAND_OFF && rest.iter().any(|a| a == "--install-root") => {
+            parse_hand_off(rest).map(Mode::UninstallHandOff)
+        }
+        Some("uninstall") => silent_or_s(rest).map(|silent| Mode::Uninstall { silent }),
         Some(word) => match crate::cli::args::Command::named(word) {
             Some(command) => crate::cli::args::parse(command, rest).map(Mode::Command),
             None => Err(UsageError),
@@ -308,17 +337,79 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
     }
 }
 
-/// The arguments of a setup file's run (M6 step 7): nothing, or `--silent` once; anything else is
-/// a usage error.
+/// The arguments of a setup file's run (M6 step 7): nothing, or `--silent` (or `/S` on Windows)
+/// once; anything else is a usage error.
 pub fn parse_setup(args: &[OsString]) -> Result<bool, UsageError> {
-    silent_only(args)
+    silent_or_s(args)
 }
 
-/// The options of `install` and `uninstall`: nothing, or `--silent` once.
+/// Whether `uninstall` has a phase 2 (`--install-root`): Windows only (M7-D5).
+const HAND_OFF: bool = cfg!(windows);
+
+/// Whether `flag` asks for a silent run: `--silent`, or on Windows also `/S` (M7).
+fn is_silent_flag(flag: &OsStr) -> bool {
+    flag == "--silent" || (cfg!(windows) && flag == "/S")
+}
+
+/// The options of `install`: nothing, or `--silent` once.
 fn silent_only(rest: &[OsString]) -> Result<bool, UsageError> {
     match rest {
         [] => Ok(false),
         [flag] if flag == "--silent" => Ok(true),
+        _ => Err(UsageError),
+    }
+}
+
+/// The options of `uninstall` and a setup run: nothing, or one silent flag ([`is_silent_flag`]).
+fn silent_or_s(rest: &[OsString]) -> Result<bool, UsageError> {
+    match rest {
+        [] => Ok(false),
+        [flag] if is_silent_flag(flag) => Ok(true),
+        _ => Err(UsageError),
+    }
+}
+
+/// Phase 2's options, in any order, each once: `--install-root <path>` (non-empty),
+/// `--wait-pid <u32>` (not 0), `--wait-start <u64>`, and at most one silent flag.
+fn parse_hand_off(args: &[OsString]) -> Result<HandOffArgs, UsageError> {
+    let mut root: Option<std::path::PathBuf> = None;
+    let mut pid: Option<u32> = None;
+    let mut start: Option<u64> = None;
+    let mut silent = false;
+    let mut i = 0;
+    while i < args.len() {
+        if is_silent_flag(&args[i]) {
+            if silent {
+                return Err(UsageError);
+            }
+            silent = true;
+            i += 1;
+            continue;
+        }
+        let name = args[i].to_str().ok_or(UsageError)?;
+        let value = args.get(i + 1).ok_or(UsageError)?;
+        match name {
+            "--install-root" if root.is_none() && !value.is_empty() => {
+                root = Some(std::path::PathBuf::from(value));
+            }
+            "--wait-pid" if pid.is_none() => {
+                let p: u32 = decimal(value)?;
+                if p == 0 {
+                    return Err(UsageError);
+                }
+                pid = Some(p);
+            }
+            "--wait-start" if start.is_none() => start = Some(decimal(value)?),
+            _ => return Err(UsageError),
+        }
+        i += 2;
+    }
+    match (root, pid, start) {
+        (Some(install_root), Some(pid), Some(start_ticks)) => Ok(HandOffArgs {
+            install_root,
+            wait: ProcessId { pid, start_ticks },
+            silent,
+        }),
         _ => Err(UsageError),
     }
 }
@@ -575,6 +666,139 @@ mod tests {
             parse(&os(&["uninstall", "--silent"])),
             Ok(Mode::Uninstall { silent: true })
         );
+    }
+
+    #[test]
+    fn slash_s_is_silent_for_setup_and_uninstall_on_windows_only() {
+        let s = os(&["/S"]);
+        let uninstall = parse(&os(&["uninstall", "/S"]));
+        if cfg!(windows) {
+            assert_eq!(parse_setup(&s), Ok(true));
+            assert_eq!(uninstall, Ok(Mode::Uninstall { silent: true }));
+        } else {
+            assert_eq!(parse_setup(&s), Err(UsageError));
+            assert_eq!(uninstall, Err(UsageError));
+        }
+        assert_eq!(parse_setup(&os(&["--silent"])), Ok(true));
+        assert_eq!(parse_setup(&os(&[])), Ok(false));
+        for bad in [
+            &["/s"][..],
+            &["/S", "/S"],
+            &["/S", "--silent"],
+            &["--silent", "/S"],
+            &["/Silent"],
+            &["S"],
+        ] {
+            assert_eq!(parse_setup(&os(bad)), Err(UsageError), "{bad:?}");
+            let mut args = vec!["uninstall"];
+            args.extend_from_slice(bad);
+            assert_eq!(parse(&os(&args)), Err(UsageError), "{bad:?}");
+        }
+        // `install` keeps `--silent` only.
+        assert_eq!(parse(&os(&["install", "/S"])), Err(UsageError));
+    }
+
+    #[test]
+    fn the_hand_off_grammar_is_windows_only_and_closed() {
+        let good = os(&[
+            "uninstall",
+            "--wait-start",
+            "2",
+            "--install-root",
+            r"C:\Users\a\Programs\App",
+            "--wait-pid",
+            "1",
+            "/S",
+        ]);
+        let parsed = parse(&good);
+        if !cfg!(windows) {
+            assert_eq!(parsed, Err(UsageError));
+            return;
+        }
+        let Ok(Mode::UninstallHandOff(args)) = parsed else {
+            panic!("not the hand-off");
+        };
+        assert_eq!(
+            args.wait,
+            ProcessId {
+                pid: 1,
+                start_ticks: 2
+            }
+        );
+        assert!(args.silent);
+        assert_eq!(
+            args.install_root,
+            std::path::PathBuf::from(r"C:\Users\a\Programs\App")
+        );
+        assert!(!format!("{args:?}").contains("Programs"), "a path in Debug");
+        let base = [
+            "--install-root",
+            "R",
+            "--wait-pid",
+            "1",
+            "--wait-start",
+            "2",
+        ];
+        let with = |extra: &[&str]| {
+            let mut v = vec!["uninstall"];
+            v.extend_from_slice(&base);
+            v.extend_from_slice(extra);
+            os(&v)
+        };
+        assert!(matches!(
+            parse(&with(&["--silent"])),
+            Ok(Mode::UninstallHandOff(HandOffArgs { silent: true, .. }))
+        ));
+        let bad: Vec<Vec<OsString>> = vec![
+            with(&["--silent", "/S"]),
+            with(&["--install-root", "R"]),
+            with(&["--wait-pid", "1"]),
+            with(&["--version", "1.0.0"]),
+            with(&["extra"]),
+            os(&["uninstall", "--install-root", "R", "--wait-pid", "1"]),
+            os(&["uninstall", "--install-root", "R", "--wait-start", "2"]),
+            os(&[
+                "uninstall",
+                "--install-root",
+                "",
+                "--wait-pid",
+                "1",
+                "--wait-start",
+                "2",
+            ]),
+            os(&[
+                "uninstall",
+                "--install-root",
+                "R",
+                "--wait-pid",
+                "0",
+                "--wait-start",
+                "2",
+            ]),
+            os(&[
+                "uninstall",
+                "--install-root",
+                "R",
+                "--wait-pid",
+                "01",
+                "--wait-start",
+                "2",
+            ]),
+            os(&[
+                "uninstall",
+                "--install-root",
+                "R",
+                "--wait-pid",
+                "1",
+                "--wait-start",
+                "-2",
+            ]),
+            os(&["uninstall", "--install-root"]),
+            os(&["uninstall", "--silent", "--install-root", "R"]),
+        ];
+        for args in bad {
+            assert_eq!(parse(&args), Err(UsageError), "{args:?}");
+        }
     }
 
     #[test]

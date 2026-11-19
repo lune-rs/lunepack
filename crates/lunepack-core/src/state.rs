@@ -942,11 +942,12 @@ fn unframe<'a>(bytes: &'a [u8], hasher: &dyn Hasher) -> Result<Option<&'a [u8]>,
     Ok(Some(&bytes[HEADER_LEN..end]))
 }
 
-/// One record file's bytes, judged against the seq of its name and the expected app id.
+/// One record file's bytes, judged against the seq of its name and the expected app id (`None`:
+/// any app id, for [`load_any`] only).
 fn classify<T: Record>(
     bytes: &[u8],
     name_seq: u64,
-    app_id: &AppId,
+    app_id: Option<&AppId>,
     hasher: &dyn Hasher,
 ) -> Result<Class<T>, StateError> {
     let Some(payload) = unframe(bytes, hasher)? else {
@@ -960,7 +961,7 @@ fn classify<T: Record>(
 fn parse_payload<T: Record>(
     payload: &[u8],
     name_seq: Option<u64>,
-    app_id: &AppId,
+    app_id: Option<&AppId>,
 ) -> Result<Option<T>, StateError> {
     check_strict(payload).map_err(|e| StateError::Invalid(Untrusted::new(&e.to_string())))?;
     let map: BTreeMap<String, Value> = serde_json::from_slice(payload)
@@ -986,7 +987,7 @@ fn parse_payload<T: Record>(
         return Err(invalid("record kind does not match"));
     }
     let record_app: AppId = fields.take("app_id")?;
-    if record_app != *app_id {
+    if app_id.is_some_and(|want| record_app != *want) {
         return Err(invalid("app id does not match"));
     }
     T::from_fields(seq, record_app, critical, fields).map(Some)
@@ -1042,6 +1043,14 @@ fn name_seq(name: &std::ffi::OsStr) -> Option<u64> {
     digits.parse::<u64>().ok().filter(|&s| s <= MAX_JSON_INT)
 }
 
+/// Whether `name` is shaped like a record file, `<20 digits>.rec` (FORMAT.md 12.4), whatever the
+/// seq: what a state directory may hold besides the lock without being foreign.
+pub fn is_record_name(name: &str) -> bool {
+    name.strip_suffix(NAME_SUFFIX).is_some_and(|digits| {
+        digits.len() == NAME_DIGITS && digits.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
 fn record_name(seq: u64) -> String {
     format!("{seq:0width$}{NAME_SUFFIX}", width = NAME_DIGITS)
 }
@@ -1069,7 +1078,7 @@ fn read_one<T: Record>(
     dir: &Path,
     seq: u64,
     is_file: bool,
-    app_id: &AppId,
+    app_id: Option<&AppId>,
     hasher: &dyn Hasher,
 ) -> Result<Class<T>, StateError> {
     if !is_file {
@@ -1100,7 +1109,7 @@ pub fn load<T: Record>(
     let files = record_files(fs, dir)?;
     let next_seq = files.first().map_or(1, |&(seq, _)| seq + 1);
     for &(seq, is_file) in &files {
-        if let Class::Valid(record) = read_one::<T>(fs, dir, seq, is_file, app_id, hasher)? {
+        if let Class::Valid(record) = read_one::<T>(fs, dir, seq, is_file, Some(app_id), hasher)? {
             return Ok(Loaded {
                 record: Some(record),
                 next_seq,
@@ -1113,6 +1122,23 @@ pub fn load<T: Record>(
         next_seq,
         app_id: app_id.clone(),
     })
+}
+
+/// The newest whole record of `dir`, whatever app id it carries: [`load`]'s rules in every other
+/// respect (the same skips and the same stops), read only. For finding which app an install
+/// directory belongs to (M7-D16) and never as the record a commit follows: a writer loads with
+/// its own app id.
+pub fn load_any<T: Record>(
+    fs: &dyn Fs,
+    dir: &Path,
+    hasher: &dyn Hasher,
+) -> Result<Option<T>, StateError> {
+    for (seq, is_file) in record_files(fs, dir)? {
+        if let Class::Valid(record) = read_one::<T>(fs, dir, seq, is_file, None, hasher)? {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
 }
 
 /// Commits `next` as the record after `loaded` (FORMAT.md 12.5), then prunes. Returns the record
@@ -1146,7 +1172,7 @@ pub fn commit<T: Record>(
     }
     let bytes = encode(&next, hasher)?;
     // The writer writes only what its own reader accepts.
-    match classify::<T>(&bytes, next.seq(), &loaded.app_id, hasher)? {
+    match classify::<T>(&bytes, next.seq(), Some(&loaded.app_id), hasher)? {
         Class::Valid(_) => {}
         Class::Torn => return Err(invalid("the record does not read back")),
     }
@@ -1226,7 +1252,7 @@ fn prune<T: Record>(fs: &dyn Fs, dir: &Path, newest: u64, app_id: &AppId, hasher
         if !is_file {
             continue;
         }
-        let remove = match read_one::<T>(fs, dir, seq, true, app_id, hasher) {
+        let remove = match read_one::<T>(fs, dir, seq, true, Some(app_id), hasher) {
             Ok(Class::Torn) => true,
             Ok(Class::Valid(_)) => {
                 valid_kept += 1;
@@ -1370,14 +1396,14 @@ fn expect_scope(loaded: &Loaded<InstallState>, scope: Scope) -> Result<(), State
 /// record of either kind.
 pub(crate) fn fuzz_run(data: &[u8], name_seq: u64, app_id: &AppId, hasher: &dyn Hasher) -> bool {
     let state = matches!(
-        classify::<InstallState>(data, name_seq, app_id, hasher),
+        classify::<InstallState>(data, name_seq, Some(app_id), hasher),
         Ok(Class::Valid(_))
     );
     let counters = matches!(
-        classify::<InstallCounters>(data, name_seq, app_id, hasher),
+        classify::<InstallCounters>(data, name_seq, Some(app_id), hasher),
         Ok(Class::Valid(_))
     );
-    let _ = parse_payload::<InstallState>(data, None, app_id);
-    let _ = parse_payload::<InstallCounters>(data, None, app_id);
+    let _ = parse_payload::<InstallState>(data, None, Some(app_id));
+    let _ = parse_payload::<InstallCounters>(data, None, Some(app_id));
     state || counters
 }

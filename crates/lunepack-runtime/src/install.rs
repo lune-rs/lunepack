@@ -28,7 +28,7 @@ use std::ffi::OsString;
 
 use lunepack::{
     ChildStdio, DownloadOptions, HEALTH_TOKEN_VAR, Installation, Phase, Progress, SpawnSpec,
-    UserLayout, Version,
+    Version,
 };
 use lunepack_core::ui::{ChoiceValue, Outcome, PromptKind, StepItem};
 
@@ -91,8 +91,8 @@ pub fn run_install(
 /// Starts the installed version's entry (from its own config), detached, with no arguments and
 /// without a health token; a failure is a warning.
 fn launch(ad: &Adapters, boot: &Installation, version: &Version, events: &Events) {
-    let started = boot.install_root().ok().and_then(|root| {
-        let tree = UserLayout::from_root(root).version_dir(version);
+    let started = boot.install_layout().ok().and_then(|layout| {
+        let tree = layout.version_dir(version);
         let entry = boot
             .meta()
             .entry

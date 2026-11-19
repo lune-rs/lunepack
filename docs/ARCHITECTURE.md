@@ -4,7 +4,7 @@ How the workspace is split and how the split is enforced. Crate roles and the bo
 are the current design; thirteen traits are defined (below). The wire
 format is `docs/FORMAT.md` and its threat model `docs/THREAT-MODEL.md`. Decisions behind this are in
 `docs/DECISIONS.md` (D1, D6, D14, D17, D23, D26, D28, D30, D31, D33, D35 to D41, M2-D1 to M2-D9,
-M3-D1 to M3-D13, M4-D1 to M4-D23, M5-D2 to M5-D20, M6-D1 to M6-D12).
+M3-D1 to M3-D13, M4-D1 to M4-D23, M5-D2 to M5-D20, M6-D1 to M6-D15, M7-D1 to M7-D22).
 
 ## Crates
 
@@ -16,11 +16,13 @@ M3-D1 to M3-D13, M4-D1 to M4-D23, M5-D2 to M5-D20, M6-D1 to M6-D12).
 | `lunepack-codec-lzma` | Compression adapter over `lzma-rust2` (confined to this crate, M3-D11): the `Codec` decoder with limits from the signed descriptor, and the `Encoder` at the 9e settings for all five codec ids (stored, LZMA2, BCJ x86 and ARM64 + LZMA2, BCJ2). Delta coding comes later. | core |
 | `lunepack-fs` | Filesystem adapter: `StdFs`, the `Fs` implementation over `std::fs` (it refuses symlink components when it creates directories, and syncs files and directories), and the OS lock behind `Fs::try_lock` through `fs4` (released by the OS when its holder dies). May lift `unsafe_code`; documents that Windows directory durability is an unverified assumption. | core |
 | `lunepack-http` | Release source and network adapter: `UreqTransport`, the default `BlockingTransport` (ureq 3.5 with the OS platform verifier for TLS and the system proxy: environment first, then WinINET on Windows and the system proxy through hyper-util on macOS; no content decoding, `User-Agent: lunepack` only) and `DirSource`, which serves `file:` URLs under one root with Range support. The only crate that reaches `ring` (below). It also holds an `os_trust` example that CI runs through the real adapter. | core |
-| `lunepack-os-windows`, `lunepack-os-macos` | OS install, shortcut, autostart and process adapters (empty until M7 and M8, except for the reduce-motion reader of M6-D8: `prefers_reduced_motion() -> Option<bool>`, through `windows-sys` on Windows and `defaults` on macOS). | core |
+| `lunepack-os-windows` | The Windows adapters (M7), through `windows-sys` and, for the Start-menu shortcut's COM interfaces, the `windows` crate (M7-D4; reachable only through this crate and the UI adapter). `WindowsProcess` implements `Process` over the Win32 process APIs (spawn without a shell, detach, wait by pid and start time, terminate only its own child, the in-use scan of a tree). `WindowsIntegration` implements `OsIntegration`: the launcher stub at the install root (replaced in one rename, or the running copy renamed aside; `remove_stub_leftovers` for the collection), the hidden `.lunepack` directory, the `HKCU` uninstall entry, the Start-menu shortcut with the app's app user model id, and the file types, URL schemes and autostart value the app declares; each entry carries a marker and anything without it is a conflict, never overwritten. Safe helpers that build on every OS (no-ops or `Unsupported` off Windows): the DLL search hardening every shipped Windows binary calls first in `main` (`harden_dll_search`), known folders, a native message box, the process's app user model id, the foreground right, and the launcher's raw command line and console-interrupt helpers, plus the reduce-motion reader of M6-D8. One of the crates that may lift `unsafe_code`, each block with a `// SAFETY:` comment. | core |
+| `lunepack-os-macos` | The macOS adapter (empty until M8, except for the reduce-motion reader of M6-D8, through `defaults`). | core |
+| `lunepack-stub` | Binaries `lunepack-stub` (Windows subsystem) and `lunepack-stub-console` (console subsystem; M7-D7): the launcher the packager stamps and places beside a Windows app's entry, and that the runtime copies to the install root. It implements the launch contract of `docs/FORMAT.md` 15 over the core's read path (`launch_target`) and starts the app. It links the core, the filesystem adapter, the Windows helpers and `lunepack-crypto` only for SHA-256 of the install record's checksum (M7-D20), and nothing else: no facade, no network, no codec, no UI; the boundary check holds the list (`DEPENDS_ONLY_ON`). Off Windows both binaries print one line and exit 2, so the workspace builds everywhere. | core, adapters |
 | `lunepack-os-linux` | The Linux adapters (M5): `LinuxProcess` implements `Process` over `/proc` and `libc` (spawn without a shell, detach, wait by pid and start time so a reused pid is not mistaken for the original, terminate only its own child, the in-use scan of a tree), and `XdgIntegration` implements `OsIntegration` (the desktop entry `<data home>/applications/<app id>.desktop` built fail-closed from the update configuration, the command link in `~/.local/bin`, removal checked by a marker). `LinuxProcess` also starts a child with piped standard input and output for the UI channel (`ChildStdio::Piped`; the parent's ends are close-on-exec, M6-D1), and `prefers_reduced_motion` reads `gsettings` (M6-D8). One of the crates that may lift `unsafe_code`, each block with a `// SAFETY:` comment. | core |
-| `lunepack` | The app-facing facade and the composition root for apps that embed lunepack: `UpdaterBuilder` wires the default adapters (`WorkerTransport` over `UreqTransport` for `http(s)`, `DirSource` for `file:`, `StdFs`, the LZMA codec, SHA-256 and Ed25519 from `lunepack-crypto`, `SystemClock`), each swappable. `Updater` offers `check`, `download`, `stage` as `Send + 'static` futures that need no particular executor, the synchronous `installed` and `staged`, and `lunepack::blocking` for apps without a runtime. Under it, std-only task plumbing (worker jobs, bounded pipes, a built-in `block_on`, `WorkerTransport` that runs any `BlockingTransport` on worker threads, progress coalescing) and the fetch engine (documents, feed URLs, the cache, Range runs, pack resume, the full-pack fallback) (M4-D1 to M4-D3). Also `SystemClock` (M3-D5), the only wall-clock `Clock`. Since M5 it also finds an installed app from its own executable (`Installation`, which reads the update configuration of the tree and derives the install root `R`) and offers the lifecycle calls over the core's transitions: `startup`, `confirm_healthy`, `apply_and_restart` and `Updater::install` (M5-D2 to M5-D8), and since M6 `Updater::install_from_payload`, the first install from a setup file's own frames with no feed and no network (M6-D4), and the `UiChoice` of `apply_and_restart` (D41); it wires the Linux process and integration adapters in `Platform::native`. | core, adapters |
-| `lunepack-runtime` | Binary, static musl on Linux, one per version tree and placed beside the app's entry by the packager (D28, M5-D7). Its composition root (`main.rs`) wires the Linux adapters and runs a mode named on its command line: `apply` (started detached by `apply_and_restart`: wait for the app to exit, commit the staged version, flip `current`, start it with a health token, supervise it, roll it back if it fails or does not confirm in time, then collect old trees), `install` (the first install from a bootstrap tree) and `uninstall`. Progress and results are schema-1 JSON events on its log (`R/logs/runtime.log`) or stderr; every outcome has a stable exit code. It does its work through the facade, and the same calls back the app-facing command line of D42 (`check`, `download`, `startup`, `confirm`: JSON Lines schema 1 and stable exit codes, `docs/RUNTIME.md`). Since M6 it also owns the engine's side of the UI channel (`UiHost`, below) and the setup mode (a runtime that carries a setup trailer installs its own payload, `docs/RUNTIME.md`). The service is a later milestone. | core, adapters, facade |
-| `lunepack-cli` | Binary `lunepack` and the packager's composition root: `init`, `keys`, `pack`, `feed add` and `refresh`, `verify` and `inspect` (`docs/CLI.md`). It holds the I/O the core must not have: `lunepack.toml`, signer specs, the release-directory walk, the pack pipeline (assemble a temporary copy, code-sign, hash, pack on a worker pool within a memory budget, sign), self-verification of every output with the core verifiers, and placement by temp file and rename; since M6 also `pack --ui` and `setup`, which builds a Linux setup file. Pure rules (codec choice, layout, manifest, signing, document writers) stay in the core (M3-D1). | core, adapters, facade |
+| `lunepack` | The app-facing facade and the composition root for apps that embed lunepack: `UpdaterBuilder` wires the default adapters (`WorkerTransport` over `UreqTransport` for `http(s)`, `DirSource` for `file:`, `StdFs`, the LZMA codec, SHA-256 and Ed25519 from `lunepack-crypto`, `SystemClock`), each swappable. `Updater` offers `check`, `download`, `stage` as `Send + 'static` futures that need no particular executor, the synchronous `installed` and `staged`, and `lunepack::blocking` for apps without a runtime. Under it, std-only task plumbing (worker jobs, bounded pipes, a built-in `block_on`, `WorkerTransport` that runs any `BlockingTransport` on worker threads, progress coalescing) and the fetch engine (documents, feed URLs, the cache, Range runs, pack resume, the full-pack fallback) (M4-D1 to M4-D3). Also `SystemClock` (M3-D5), the only wall-clock `Clock`. Since M5 it also finds an installed app from its own executable (`Installation`, which reads the update configuration of the tree and derives the install root `R`) and offers the lifecycle calls over the core's transitions: `startup`, `confirm_healthy`, `apply_and_restart` and `Updater::install` (M5-D2 to M5-D8), and since M6 `Updater::install_from_payload`, the first install from a setup file's own frames with no feed and no network (M6-D4), and the `UiChoice` of `apply_and_restart` (D41); it wires the Linux process and integration adapters, and on Windows (M7) `WindowsProcess`, `WindowsIntegration`, the programs folder and the Windows layout scheme, in `Platform::native`, and sets the process's app user model id in `startup`. | core, adapters |
+| `lunepack-runtime` | Binary, static musl on Linux and a Windows-subsystem binary with a static C runtime on Windows (M7-D6, M7-D10), one per version tree and placed beside the app's entry by the packager (D28, M5-D7). Its composition root (`main.rs`) wires the Linux adapters and runs a mode named on its command line: `apply` (started detached by `apply_and_restart`: wait for the app to exit, commit the staged version, flip `current`, start it with a health token, supervise it, roll it back if it fails or does not confirm in time, then collect old trees), `install` (the first install from a bootstrap tree) and `uninstall`. Progress and results are schema-1 JSON events on its log (`R/logs/runtime.log`) or stderr; every outcome has a stable exit code. It does its work through the facade, and the same calls back the app-facing command line of D42 (`check`, `download`, `startup`, `confirm`: JSON Lines schema 1 and stable exit codes, `docs/RUNTIME.md`). Since M6 it also owns the engine's side of the UI channel (`UiHost`, below) and the setup mode (a runtime that carries a setup trailer installs its own payload, `docs/RUNTIME.md`). The service is a later milestone. | core, adapters, facade |
+| `lunepack-cli` | Binary `lunepack` and the packager's composition root: `init`, `keys`, `pack`, `feed add` and `refresh`, `verify` and `inspect` (`docs/CLI.md`). It holds the I/O the core must not have: `lunepack.toml`, signer specs, the release-directory walk, the pack pipeline (assemble a temporary copy, code-sign, hash, pack on a worker pool within a memory budget, sign), self-verification of every output with the core verifiers, and placement by temp file and rename; since M6 also `pack --ui` and `setup`, which builds a Linux setup file, and since M7 `pack --stub` and the Windows setup file: it stamps the stub's and the setup runtime's icon and version information with `editpe` (confined to this crate, M7-D22) and checks that the stamp kept the hardening. Pure rules (codec choice, layout, manifest, signing, document writers) stay in the core (M3-D1). | core, adapters, facade |
 | `lunepack-ui-luneui` | The UI adapter (M6): the screens of the install, update and uninstall flows, drawn with LuneUI (the "B revised" look with its motion, keyboard and accessibility tree, in opaque material on Linux). It holds a pure model over the core's reducers (`UiModel`; a frame is a pure function of the model and the time, so every screen and every animation step renders headless at a fixed time), the screens, the icon decoder (PNG only, capped, M6-D11), the bundled RznSans fonts, the headless renderer the golden tests use, and the demo example. It decides nothing, reads no file and starts no process; the engine does every one of those. The only crate that may depend on `lune-ui`, the one dependency from a git source (D39 (b)); the GPU and window stack under it (`wgpu`, `winit`, AccessKit) is reachable only through it (below). `publish = false`. | core |
 | `lunepack-ui` | Binary `lunepack-ui` (M6): the separate process the runtime spawns to show those screens (`--engine` is its only mode). It owns the winit event loop, the window and the GPU surface, the AccessKit bridge, and the two channel threads: a reader that decodes the frames on standard input and posts them to the loop, and a writer that sends the answers on standard output and writes nothing else. It reads the OS's reduce-motion setting (M6-D8) and ends with a typed exit code (below). The only crate that depends on `lunepack-ui-luneui`, and no crate depends on it. `publish = false`. | core, adapters |
 | `xtask` | Repository tooling: the boundary check, the key-container file check and the optional denylist scan. | nothing in the workspace |
@@ -91,14 +93,15 @@ Owned by the core, implemented by adapters, faked in the testkit. Defined today:
 `Clock` is implemented by `lunepack::SystemClock` and by the testkit's fake; the CLI adds a fixed
 clock for `SOURCE_DATE_EPOCH`. Each trait has a contract suite in the testkit that the real
 implementation's `tests/` runs, and a fake in the testkit. `LinuxProcess` and `XdgIntegration`
-(M5 steps 5 and 6) run `run_process_suite` and `run_integration_suite`; the Windows and macOS
-implementations come with M7 and M8.
+(M5 steps 5 and 6) run `run_process_suite` and `run_integration_suite`; the Windows adapters run the
+same suites since M7 (the integration suite with hooks for the registry and the staged stub); the macOS
+implementations come with M8.
 
 ## Layouts and the current tree
 
 The facade takes its locations from the app (M4-D4, amended): a `Layout` with the state, cache and
 versions directories, and optionally an explicit current tree. Per-OS discovery comes with the
-installers (Linux per user in M5, Windows in M7, macOS in M8). The rule they must place trees by:
+installers (Linux per user in M5, Windows per user in M7, macOS in M8). The rule they must place trees by:
 
 - version `V`'s tree is `<versions dir>/<V's version text>`; `stage` builds it there, as
   `<V>.partial` renamed into place once every file is verified (M4-D18);
@@ -131,6 +134,32 @@ set, absolute and UTF-8, else `$HOME/.local/share`):
 An executable finds its own tree by walking up from its resolved path to the nearest
 `lunepack-update.json`; the tree is installed when it is `R/versions/<its version>` with a record of
 the same app id at `R/state`. A tree anywhere else is a bootstrap (or a development run).
+
+### The layout scheme (M7)
+
+One value in the core, `LayoutScheme`, names everything an OS's layout decides, so the same code serves both:
+how `R` is named (`RootNaming::AppId` or `DisplayName`), the names of the versions, state, cache and logs
+directories (each possibly several components), and whether a `current` link is projected
+(`Projection`). `LayoutScheme::XDG` is the Linux layout above. `LayoutScheme::WINDOWS` is `R` named after the
+display name, `app`, `.lunepack/state`, `.lunepack/cache`, `.lunepack/logs` and no link. A composition root
+picks the scheme with the platform adapters (`Platform::layout_scheme`, in the facade and the runtime);
+nothing in the core knows which OS it runs on (the core has no `cfg`). `resolve_root` finds an install of an
+app id under a data home (for the Windows scheme by reading the records of the data home's folders, read
+only; for the XDG scheme it is the path `<data home>/<app id>` with no listing) and chooses the folder of a
+first install; `root_valid_for_uninstall` is the uninstall's check of the root its own path names;
+`windows_name_ok` is the display-name rule (`docs/FORMAT.md` 13.4); `launch_target` is the stub's read path
+(`docs/FORMAT.md` 15).
+
+### The Windows per-user layout (M7-D2, M7-D16)
+
+`R` is a folder of the per-user programs folder (`FOLDERID_UserProgramFiles`, by default
+`%LOCALAPPDATA%\Programs`) named after the app's display name at its first install and found by the install
+record afterwards, so a later display name does not move the install. Inside it: the stub at
+`R\<entry file name>`, `app\<version>\` (one tree per version, the same contents as on Linux), and a hidden
+`.lunepack\` holding `state`, `cache` and `logs`. There is no `current` link (Windows symlinks need a
+privilege): the stub and the runtime read the install record for the current version. The runtime starts
+from `R\app\<version>\` and finds `R` from its own path as on Linux. `docs/FORMAT.md` 16 states the layout
+as a cross-version contract, and `docs/RUNTIME.md` ("Windows") what an app has to know.
 
 ## The installer UI (M6)
 
@@ -244,6 +273,15 @@ check does not recognise is a violation, and an internal error exits 2, never 0.
     with `-` or `_`) are reachable only through `lunepack-ui-luneui`
     (`REACH_FAMILIES_ONLY_THROUGH`, the walk of M4-D16 over the lock graph). So the only crates
     whose dependency closure holds `wgpu` or `winit` are `lunepack-ui-luneui` and `lunepack-ui`.
+
+- the Windows stack (M7): the `windows` crate (the COM interfaces of the shortcut) is reachable only through
+  `lunepack-os-windows` and `lunepack-ui-luneui` (`REACH_ONLY_THROUGH`, which takes several allowed crates
+  and matches by exact package name, so `windows-sys` and `windows-core` are other packages); `editpe` is
+  confined to `lunepack-cli` and pinned `=0.2.4` with `default-features = false` (`CONFINED`, `EXACT_PINS`;
+  its one `unsafe` block is accepted by D17); and `lunepack-stub` may depend only on the core, the
+  filesystem adapter, `lunepack-crypto` and `lunepack-os-windows` (`DEPENDS_ONLY_ON`, normal and build
+  dependencies; a dev-dependency or another binary is not held), so no network, codec or UI code reaches the
+  launcher whose contract is frozen.
 
 Adding a crate is one line in `ROLES` in `xtask/src/boundaries.rs`.
 

@@ -15,7 +15,7 @@ use std::fmt;
 use lunepack_core::state::{InstallState, Loaded, UserScope};
 use lunepack_core::{
     AttemptOutcome, ChildStdio, ConfirmOutcome, FileKind, IntegrationRequest, LifecycleEvent,
-    ProcessId, Scope, SpawnSpec, TokenCheck, UserLayout, Version, reconcile_current,
+    ProcessId, Scope, SpawnSpec, TokenCheck, UserLayout, Version,
 };
 
 use crate::Error;
@@ -159,7 +159,8 @@ fn commit_if_changed(
 }
 
 fn reconcile(inst: &Installation, layout: &UserLayout, record: &InstallState) -> Result<(), Error> {
-    reconcile_current(&*inst.platform.fs, layout.root(), record)
+    layout
+        .reconcile(&*inst.platform.fs, record)
         .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))
 }
 
@@ -176,9 +177,21 @@ pub fn startup() -> Result<Startup, Error> {
     startup_for(&inst, std::env::args_os().skip(1).collect())
 }
 
-/// The start of `inst`'s version, which was started with `args` (M5-D5, M5-D6). Under the lock:
+/// Gives this process the app id as its app user model id before anything can show a window
+/// (M7-D9), so the taskbar groups the app's windows under the Start-menu shortcut that carries
+/// the same id. Windows only, best effort: an id the system refuses leaves the process as it was.
+fn set_process_aumid(inst: &Installation) {
+    #[cfg(windows)]
+    let _ = lunepack_os_windows::set_process_aumid(inst.app_id().as_str());
+    #[cfg(not(windows))]
+    let _ = inst;
+}
+
+/// The start of `inst`'s version, which was started with `args` (M5-D5, M5-D6). On Windows it
+/// first sets the process's app user model id to the app id (M7-D9). Under the lock:
 ///
-/// 1. the `current` link is reconciled with the record;
+/// 1. the `current` link is reconciled with the record (no link exists under the Windows
+///    scheme, M7-D2);
 /// 2. when this version is pending its health check, a start that carries a well-formed health
 ///    token is supervised and counts nothing; any other start counts an attempt, and the one
 ///    after the third rolls back: the previous version becomes current again, the desktop
@@ -191,6 +204,7 @@ pub fn startup() -> Result<Startup, Error> {
 /// A tree that is not installed, or an install with no current version yet, continues with no
 /// events.
 pub fn startup_for(inst: &Installation, args: Vec<OsString>) -> Result<Startup, Error> {
+    set_process_aumid(inst);
     let Some(layout) = inst.layout() else {
         return Ok(Startup::go_on(Vec::new(), false));
     };
@@ -277,7 +291,9 @@ fn roll_back(
     let request = IntegrationRequest {
         app_id: inst.app_id().clone(),
         install_root: layout.root().to_path_buf(),
+        version: previous.tree_version().clone(),
         meta: previous.meta().clone(),
+        previous: Some(inst.meta().clone()),
         stale_bins,
     };
     let _ = p.integration.apply(Scope::User, &request);

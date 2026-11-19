@@ -4,9 +4,9 @@
 //! (M5-D2).
 //!
 //! The adapters the lifecycle calls use are a [`Platform`]: the native one wires the default
-//! filesystem, crypto and randomness everywhere, and the Linux process and desktop integration
-//! adapters on Linux. On other platforms the process and integration calls are
-//! [`Error::Unsupported`] until their adapters exist.
+//! filesystem, crypto and randomness everywhere, the Linux process and desktop integration
+//! adapters on Linux and the Windows ones (per-user, M7) on Windows. On other platforms the
+//! process and integration calls are [`Error::Unsupported`] until their adapters exist.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use lunepack_core::state::UserScope;
 use lunepack_core::update_config::{MAX_UPDATE_CONFIG_BYTES, runtime_file};
 use lunepack_core::{
-    AppId, Discovery, FeedKind, FileKind, Fs, FsErrorKind, Hasher, InstallMeta, LockGuard,
-    OsIntegration, Process, RelPath, Rng, UPDATE_CONFIG_FILE, UpdateConfig, UpdateConfigError,
-    UserLayout, Verifier, Version, discover, tree_candidates, version_config_path,
+    AppId, Discovery, FeedKind, FileKind, Fs, FsErrorKind, Hasher, InstallMeta, LayoutScheme,
+    LockGuard, OsIntegration, Process, RelPath, Rng, UPDATE_CONFIG_FILE, UpdateConfig,
+    UpdateConfigError, UserLayout, Verifier, Version, discover, resolve_root, tree_candidates,
 };
 
 use crate::{Error, Layout, UpdaterBuilder, check_config_feed};
@@ -48,6 +48,7 @@ pub struct Platform {
     pub(crate) rng: Arc<dyn Rng>,
     pub(crate) health_token: Option<OsString>,
     pub(crate) data_home: Option<PathBuf>,
+    pub(crate) layout_scheme: LayoutScheme,
     pub(crate) busy_wait: Duration,
 }
 
@@ -57,6 +58,7 @@ impl fmt::Debug for Platform {
         f.debug_struct("Platform")
             .field("native_fs", &self.native_fs)
             .field("health_token", &self.health_token.is_some())
+            .field("layout_scheme", &self.layout_scheme)
             .field("busy_wait", &self.busy_wait)
             .finish_non_exhaustive()
     }
@@ -78,6 +80,7 @@ impl Platform {
             rng: Arc::new(lunepack_crypto::OsRng),
             health_token: std::env::var_os(HEALTH_TOKEN_VAR),
             data_home: None,
+            layout_scheme: native_layout_scheme(),
             busy_wait: DEFAULT_BUSY_WAIT,
         }
     }
@@ -127,10 +130,25 @@ impl Platform {
     }
 
     /// The data home, instead of the environment's (`XDG_DATA_HOME`, else
-    /// `$HOME/.local/share`): a not-installed tree installs into `<data home>/<app id>`.
+    /// `$HOME/.local/share` on Linux; the user's program files folder on Windows): a
+    /// not-installed tree installs into the root the layout scheme resolves there
+    /// (`<data home>/<app id>` under [`LayoutScheme::XDG`]).
     pub fn with_data_home(mut self, data_home: PathBuf) -> Platform {
         self.data_home = Some(data_home);
         self
+    }
+
+    /// The per-user layout scheme (M7-D2): which names an install root has and how it is found.
+    /// Independent of the data home, so a test can use [`LayoutScheme::WINDOWS`] in a temporary
+    /// data home on any OS.
+    pub fn with_layout_scheme(mut self, scheme: LayoutScheme) -> Platform {
+        self.layout_scheme = scheme;
+        self
+    }
+
+    /// The per-user layout scheme.
+    pub fn layout_scheme(&self) -> LayoutScheme {
+        self.layout_scheme
     }
 
     /// How long a held install lock is retried before [`Error::Busy`] (default 2 s).
@@ -139,12 +157,22 @@ impl Platform {
         self
     }
 
-    /// The per-user data home: the override, else the environment's (Linux).
+    /// The per-user data home: the override, else the native one (Linux, Windows).
     fn data_home(&self) -> Result<PathBuf, Error> {
         if let Some(home) = &self.data_home {
             return Ok(home.clone());
         }
         native_data_home()
+    }
+}
+
+/// The native layout scheme: [`LayoutScheme::WINDOWS`] on Windows (M7-D2), [`LayoutScheme::XDG`]
+/// everywhere else.
+fn native_layout_scheme() -> LayoutScheme {
+    if cfg!(windows) {
+        LayoutScheme::WINDOWS
+    } else {
+        LayoutScheme::XDG
     }
 }
 
@@ -164,23 +192,40 @@ fn native_data_home() -> Result<PathBuf, Error> {
     Ok(dirs.data_home().to_path_buf())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn default_process() -> Arc<dyn Process> {
+    Arc::new(lunepack_os_windows::WindowsProcess::new())
+}
+
+#[cfg(windows)]
+pub(crate) fn default_integration() -> Arc<dyn OsIntegration> {
+    Arc::new(lunepack_os_windows::WindowsIntegration::current_user())
+}
+
+/// The per-user program files folder, the parent of an install root (M7-D2).
+#[cfg(windows)]
+fn native_data_home() -> Result<PathBuf, Error> {
+    lunepack_os_windows::user_program_files()
+        .map_err(|_| Error::Config("the per-user program files folder is not available"))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn default_process() -> Arc<dyn Process> {
     Arc::new(unsupported::Unsupported)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub(crate) fn default_integration() -> Arc<dyn OsIntegration> {
     Arc::new(unsupported::Unsupported)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn native_data_home() -> Result<PathBuf, Error> {
     Err(Error::Unsupported)
 }
 
 /// The stand-in adapters of a platform without its own yet: every call is unsupported.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 mod unsupported {
     use core::time::Duration;
     use std::path::{Path, PathBuf};
@@ -356,8 +401,9 @@ impl Installation {
     ///   config's entry directory is [`Error::UpdateConfig`], and no directory further up is
     ///   tried.
     /// - No directory holds one: [`Error::NoUpdateConfig`].
-    /// - An installed tree (`R/versions/<its version>`) also has its install state at `R/state`
-    ///   loaded, which must carry the config's app id.
+    /// - An installed tree (`R/versions/<its version>` under [`LayoutScheme::XDG`],
+    ///   `R\app\<its version>` under [`LayoutScheme::WINDOWS`], whatever `R` is named) also has
+    ///   its install state under `R` loaded, which must carry the config's app id.
     pub fn from_exe_with(exe: &Path, platform: Platform) -> Result<Installation, Error> {
         // The native filesystem refuses symlinked components: resolve the exe (a launch through
         // `R/current` or a command link lands in its real tree).
@@ -370,8 +416,9 @@ impl Installation {
             let Some(config) = read_config(&*platform.fs, &tree.join(UPDATE_CONFIG_FILE))? else {
                 continue;
             };
-            let layout = match discover(&exe, &tree, k, &config) {
-                Ok(Discovery::Installed { root, .. }) => Some(UserLayout::from_root(root)),
+            let scheme = platform.layout_scheme;
+            let layout = match discover(&exe, &tree, k, &config, scheme) {
+                Ok(Discovery::Installed { root, .. }) => Some(UserLayout::from_root(root, scheme)),
                 Ok(Discovery::NotInstalled) => None,
                 Err(_) => {
                     return Err(config_rule(
@@ -397,11 +444,11 @@ impl Installation {
         Err(Error::NoUpdateConfig)
     }
 
-    /// Another version `version` of the same install, from `R/versions/<version>`'s config (no
+    /// Another version `version` of the same install, from that version's tree's config (no
     /// walk, M5-D17). Its config must name this app id and that version.
     pub fn version_installation(&self, version: &Version) -> Result<Installation, Error> {
         let layout = self.layout.as_ref().ok_or(Error::NotInstalled)?;
-        let path = version_config_path(layout.root(), version);
+        let path = layout.version_config_path(version);
         let config = read_config(&*self.platform.fs, &path)?.ok_or(Error::NoUpdateConfig)?;
         if config.app_id != self.config.app_id {
             return Err(Error::UpdateConfig(UpdateConfigError::RootMismatch(
@@ -471,13 +518,32 @@ impl Installation {
         &self.config
     }
 
-    /// The install root `R`: the installed tree's, else where this tree installs per user,
-    /// `<data home>/<app id>` (M5-D2; the data home from the platform or the environment).
+    /// The install root `R`: the installed tree's, else where this tree installs per user, as
+    /// [`resolve_root`] finds it under the platform's layout scheme (`<data home>/<app id>` under
+    /// [`LayoutScheme::XDG`], M5-D2; under [`LayoutScheme::WINDOWS`] the folder of an existing
+    /// install of this app id, else one named after the display name, M7-D16, M7-D17). The data
+    /// home comes from the platform or the environment.
     pub fn install_root(&self) -> Result<PathBuf, Error> {
-        match &self.layout {
-            Some(layout) => Ok(layout.root().to_path_buf()),
-            None => Ok(self.platform.data_home()?.join(self.config.app_id.as_str())),
+        Ok(self.install_layout()?.root().to_path_buf())
+    }
+
+    /// The install's layout: the installed tree's, else the one under
+    /// [`Installation::install_root`] with the platform's layout scheme.
+    pub fn install_layout(&self) -> Result<UserLayout, Error> {
+        if let Some(layout) = &self.layout {
+            return Ok(layout.clone());
         }
+        let p = &self.platform;
+        let root = resolve_root(
+            &*p.fs,
+            &*p.hasher,
+            &p.data_home()?,
+            &self.config.app_id,
+            &self.config.install.name,
+            p.layout_scheme,
+        )
+        .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))?;
+        Ok(UserLayout::from_root(root.into_path(), p.layout_scheme))
     }
 
     /// An [`UpdaterBuilder`] for this install, from the config alone: its trusted root, feed and
@@ -502,7 +568,7 @@ impl Installation {
         let layout = match &self.layout {
             Some(layout) => Layout::user(layout),
             None => {
-                let user = UserLayout::from_root(self.install_root()?);
+                let user = self.install_layout()?;
                 Layout::User {
                     state_dir: user.state_dir(),
                     cache_dir: user.cache_dir(),
@@ -574,6 +640,113 @@ mod tests {
         assert!(matches!(
             check_config_feed("http://10.0.0.1/"),
             Err(UpdateConfigError::Feed(FeedRule::HttpNotLoopback))
+        ));
+    }
+
+    fn windows_platform(fs: &Arc<MemFs>, data_home: &Path) -> Platform {
+        Platform::native()
+            .with_fs(Arc::clone(fs) as Arc<dyn Fs>)
+            .with_hasher(Arc::new(FakeHasher))
+            .with_verifier(Arc::new(FakeVerifier))
+            .with_data_home(data_home.to_path_buf())
+            .with_layout_scheme(LayoutScheme::WINDOWS)
+    }
+
+    /// Writes `config` as the tree at `tree` and returns its entry's path.
+    fn put_tree(fs: &MemFs, tree: &Path, config: &UpdateConfig) -> PathBuf {
+        use std::io::Write as _;
+        fs.create_dir_all(tree).unwrap();
+        let mut f = fs.create_new(&tree.join(UPDATE_CONFIG_FILE)).unwrap();
+        f.write_all(&config.to_bytes().unwrap()).unwrap();
+        f.sync().unwrap();
+        join_rel(tree, &config.install.entry)
+    }
+
+    /// Commits a first record of `config`'s app id under `root`'s Windows state directory.
+    fn put_record(fs: &MemFs, root: &Path, config: &UpdateConfig) {
+        let layout = UserLayout::from_root(root.to_path_buf(), LayoutScheme::WINDOWS);
+        fs.create_dir_all(&layout.state_dir()).unwrap();
+        let store = UserScope {
+            dir: layout.state_dir(),
+            app_id: config.app_id.clone(),
+        };
+        let loaded = store.load(fs, &FakeHasher).unwrap();
+        let record = lunepack_core::InstallState::new(
+            1,
+            config.app_id.clone(),
+            lunepack_core::Scope::User,
+            [3; 16],
+            config.target,
+        );
+        store.commit(fs, &loaded, &record, &FakeHasher).unwrap();
+    }
+
+    /// Under the Windows scheme a bootstrap's install root is resolved by record (M7-D16): an
+    /// install under an older display name is found, else a folder named after the app.
+    #[test]
+    fn a_bootstrap_resolves_its_root_by_record_under_the_windows_scheme() {
+        let fs = Arc::new(MemFs::new());
+        let dh = lunepack_testkit::abs_path("/Programs");
+        let config = sample_update_config();
+        let exe = put_tree(&fs, &lunepack_testkit::abs_path("/Downloads/boot"), &config);
+        let inst = Installation::from_exe_with(&exe, windows_platform(&fs, &dh)).unwrap();
+        assert!(!inst.is_installed());
+        assert_eq!(inst.install_root().unwrap(), dh.join(&config.install.name));
+        let layout = inst.install_layout().unwrap();
+        assert_eq!(layout.scheme(), LayoutScheme::WINDOWS);
+
+        put_record(&fs, &dh.join("Old Name"), &config);
+        assert_eq!(inst.install_root().unwrap(), dh.join("Old Name"));
+        assert_eq!(
+            inst.updater_builder()
+                .map(|_| ())
+                .err()
+                .map(|e| e.to_string()),
+            None
+        );
+    }
+
+    /// An installed tree under the Windows scheme is `R\app\<version>`, whatever `R` is named; the
+    /// same tree under a `versions` directory is a bootstrap.
+    #[test]
+    fn an_installed_tree_is_found_under_app_by_the_windows_scheme() {
+        let fs = Arc::new(MemFs::new());
+        let dh = lunepack_testkit::abs_path("/Programs");
+        let config = sample_update_config();
+        let root = dh.join("Any Folder Name");
+        let tree = root.join("app").join(config.version.to_string());
+        let exe = put_tree(&fs, &tree, &config);
+        put_record(&fs, &root, &config);
+        let inst = Installation::from_exe_with(&exe, windows_platform(&fs, &dh)).unwrap();
+        let layout = inst.layout().expect("installed");
+        assert_eq!(layout.root(), root);
+        assert_eq!(layout.state_dir(), root.join(".lunepack").join("state"));
+        assert_eq!(inst.install_root().unwrap(), root);
+
+        let other = dh
+            .join("X")
+            .join("versions")
+            .join(config.version.to_string());
+        let exe = put_tree(&fs, &other, &config);
+        let inst = Installation::from_exe_with(&exe, windows_platform(&fs, &dh)).unwrap();
+        assert!(!inst.is_installed());
+    }
+
+    /// A display name the Windows rule refuses is an update-config error (exit `config`).
+    #[test]
+    fn a_name_the_windows_rule_refuses_is_an_update_config_error() {
+        let fs = Arc::new(MemFs::new());
+        let dh = lunepack_testkit::abs_path("/Programs");
+        let mut config = sample_update_config();
+        config.install.name = "CON".to_owned();
+        let exe = put_tree(&fs, &lunepack_testkit::abs_path("/Downloads/boot"), &config);
+        let inst = Installation::from_exe_with(&exe, windows_platform(&fs, &dh)).unwrap();
+        assert!(matches!(
+            inst.install_root(),
+            Err(Error::UpdateConfig(UpdateConfigError::Invalid {
+                field: "name",
+                ..
+            }))
         ));
     }
 }

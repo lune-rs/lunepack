@@ -25,6 +25,7 @@ use crate::keyset::verify_key_set;
 use crate::limits::Limits;
 use crate::manifest::{VerifiedManifest, read_entry, verify_payload_manifest};
 use crate::path::RelPath;
+use crate::pe::PeHeaders;
 use crate::root::TrustedRoot;
 use crate::state::RootParts;
 use crate::target::Target;
@@ -104,6 +105,120 @@ fn malformed(what: &'static str) -> Error {
 /// Whether `tail` (the last bytes of a file, at least the magic's length) ends with the magic.
 pub fn has_magic(tail: &[u8]) -> bool {
     tail.len() >= TRAILER_MAGIC.len() && tail[tail.len() - TRAILER_MAGIC.len()..] == TRAILER_MAGIC
+}
+
+/// How many bytes from the start of a file the locator reads for the PE headers.
+pub const HEAD_SIZE: u64 = 4096;
+
+/// Where a file's setup data ends, if it is a setup file (M7-D11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Located {
+    /// No trailer magic at either candidate end: an ordinary file (an ordinary runtime).
+    None,
+    /// A setup file whose trailer is the [`TRAILER_SIZE`] bytes before `end`; `end` is the file's
+    /// length, or the start of a signed PE's certificate table. [`SetupTrailer::parse`] takes
+    /// those bytes with `end` as the file size.
+    Setup {
+        /// The end of the setup data.
+        end: u64,
+    },
+    /// The magic, and a layout no setup writer makes (exit 7 `verify`, never an ordinary run).
+    Malformed,
+}
+
+/// The certificate table's start, when `head` (the first [`HEAD_SIZE`] bytes of a file of
+/// `file_len` bytes, or all of a shorter one) is a PE whose security directory is non-zero with
+/// an offset in `[TRAILER_SIZE, file_len)`: the second candidate end (M7-D11 (1)). The caller
+/// reads the [`TRAILER_SIZE`] bytes before it for [`locate`].
+pub fn table_candidate(head: &[u8], file_len: u64) -> Option<u64> {
+    let headers = PeHeaders::parse(head, file_len).ok()?;
+    let table = headers.security();
+    let offset = u64::from(table.address);
+    (!table.is_zero() && offset >= TRAILER_SIZE && offset < file_len).then_some(offset)
+}
+
+/// Finds a setup file's trailer (M7-D11). `head` is the
+/// file's first [`HEAD_SIZE`] bytes (all of a shorter file), `tail_at_end` its last
+/// [`TRAILER_SIZE`] bytes, `tail_at_table` the [`TRAILER_SIZE`] bytes before
+/// [`table_candidate`]'s offset (`None` without one).
+///
+/// 1. No magic at either candidate end: [`Located::None`], whatever the headers or the
+///    certificate table look like.
+/// 2. The magic before the certificate table: the table must start 8-aligned, be at least 8 bytes
+///    long and end exactly at the end of the file, and the trailer must lie after the PE's headers
+///    and section data; anything else is [`Located::Malformed`].
+/// 3. The magic at the end of a file whose PE security directory is non-zero (bytes appended after
+///    a signature), or of an `MZ` file whose PE headers do not read: [`Located::Malformed`].
+/// 4. The magic at the end of any other file (an unsigned PE, an ELF): a setup ending there.
+pub fn locate(
+    head: &[u8],
+    tail_at_end: &[u8],
+    tail_at_table: Option<&[u8]>,
+    file_len: u64,
+) -> Located {
+    let full = |tail: &[u8]| tail.len() as u64 == TRAILER_SIZE && has_magic(tail);
+    let at_end = full(tail_at_end);
+    let at_table = tail_at_table.is_some_and(full);
+    if !at_end && !at_table {
+        return Located::None;
+    }
+    let headers = if head.starts_with(b"MZ") {
+        match PeHeaders::parse(head, file_len) {
+            Ok(h) => Some(h),
+            Err(_) => return Located::Malformed,
+        }
+    } else {
+        None
+    };
+    let security = headers
+        .as_ref()
+        .map(PeHeaders::security)
+        .unwrap_or_default();
+    if at_table {
+        // `tail_at_table` exists only beside a candidate, which only a PE has.
+        let Some(headers) = &headers else {
+            return Located::Malformed;
+        };
+        let offset = u64::from(security.address);
+        let size = u64::from(security.size);
+        let valid = offset == table_candidate(head, file_len).unwrap_or(u64::MAX)
+            && offset.is_multiple_of(PART_ALIGN)
+            && size >= 8
+            && offset.checked_add(size) == Some(file_len)
+            && offset - TRAILER_SIZE >= headers.image_end();
+        return if valid {
+            Located::Setup { end: offset }
+        } else {
+            Located::Malformed
+        };
+    }
+    if !security.is_zero() {
+        return Located::Malformed;
+    }
+    Located::Setup { end: file_len }
+}
+
+/// [`locate`] over an open file: reads the head, the tail at the end and, for a PE with a
+/// certificate table, the tail before the table. A file shorter than a trailer is
+/// [`Located::None`].
+pub fn locate_file(file: &dyn ReadAt) -> std::result::Result<Located, FsError> {
+    let len = file.size()?;
+    if len < TRAILER_SIZE {
+        return Ok(Located::None);
+    }
+    let mut head = vec![0u8; usize::try_from(len.min(HEAD_SIZE)).unwrap_or(0)];
+    file.read_exact_at(0, &mut head)?;
+    let mut at_end = vec![0u8; TRAILER_SIZE as usize];
+    file.read_exact_at(len - TRAILER_SIZE, &mut at_end)?;
+    let at_table = match table_candidate(&head, len) {
+        Some(offset) => {
+            let mut tail = vec![0u8; TRAILER_SIZE as usize];
+            file.read_exact_at(offset - TRAILER_SIZE, &mut tail)?;
+            Some(tail)
+        }
+        None => None,
+    };
+    Ok(locate(&head, &at_end, at_table.as_deref(), len))
 }
 
 fn body_bytes(root: &TrustedRoot, version: &Version, target: Target) -> Vec<u8> {

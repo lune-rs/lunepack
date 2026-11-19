@@ -21,9 +21,17 @@ lunepack-crypto.workspace = true
 # The frame decoder for the setup mode's single-entry reads (M6 step 7).
 lunepack-codec-lzma.workspace = true
 
+# The DLL search hardening, first in `main` (M7-D10); the Windows integration joins in step 10.
+[target.'cfg(windows)'.dependencies]
+lunepack-os-windows.workspace = true
+
 [dev-dependencies]
 lunepack-testkit.workspace = true
 tempfile = { workspace = true }
+
+# The `file:` feed URL of a Windows path (cli tests).
+[target.'cfg(windows)'.dev-dependencies]
+url = { workspace = true }
 
 # Own main: the test binary is also the helper app the applier launches (its first argument
 # names the helper mode), and the cases run one after another.

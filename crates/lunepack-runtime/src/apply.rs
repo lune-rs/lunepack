@@ -127,7 +127,9 @@ fn refresh_integration(
     let request = IntegrationRequest {
         app_id: to.app_id().clone(),
         install_root: layout.root().to_path_buf(),
+        version: to.tree_version().clone(),
         meta: to.meta().clone(),
+        previous: from.map(|f| f.meta().clone()),
         stale_bins: stale_bins(from, to),
     };
     match ad.integration.apply(Scope::User, &request) {
@@ -144,7 +146,7 @@ fn refresh_integration(
 }
 
 fn reconcile(ad: &Adapters, layout: &UserLayout, record: &InstallState, events: &Events) {
-    if lunepack_core::reconcile_current(&*ad.fs, layout.root(), record).is_err() {
+    if layout.reconcile(&*ad.fs, record).is_err() {
         events.emit(&Event::warning(Warning::ReconcileFailed, None));
     }
 }

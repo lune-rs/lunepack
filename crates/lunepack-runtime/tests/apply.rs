@@ -12,32 +12,38 @@
 //! it notes whether it had a health token, never the token itself (one case saves the token to a
 //! test-only file, to grep every output for it).
 //!
-//! The cases run one after another. Linux only.
+//! The cases run one after another. Linux and Windows (M7 step 10); a case that needs a Linux
+//! mechanism (procfs, signals, shell scripts, the desktop entry and the command link, the
+//! `current` link) is gated per case with its reason in `LINUX_ONLY` below.
 
 // The sink fan-out, compiled into this test so a UI-sink fake can be plugged in (the binary never
 // constructs one in M5).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[allow(dead_code)]
 #[path = "../src/events.rs"]
 mod events;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some(linux::HELPER_ARG) {
-        linux::helper(&args[1..]);
+    if args.first().map(String::as_str) == Some(native::HELPER_ARG) {
+        native::helper(&args[1..]);
         return;
     }
-    linux::run_all(&args);
+    if args.first().map(String::as_str) == Some(native::SLEEP_ARG) {
+        native::sleep(&args[1..]);
+        return;
+    }
+    native::run_all(&args);
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn main() {
-    println!("lunepack-runtime apply tests: Linux only, skipped");
+    println!("lunepack-runtime apply tests: Linux and Windows only, skipped");
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", windows))]
+mod native {
     use std::ffi::OsString;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -49,15 +55,25 @@ mod linux {
         ConfirmOutcome, HEALTH_TOKEN_VAR, InstallMeta, Installation, Phase, ProcessId, Progress,
         RelPath, StartupAction, Target, UpdateConfig, Version,
     };
-    use lunepack_core::Hasher;
     use lunepack_core::state::{InstallState, Scope, StagedRef, UserScope};
+    use lunepack_core::{Hasher, LayoutScheme, UserLayout};
     use lunepack_crypto::Sha256Hasher;
-    use lunepack_os_linux::LinuxProcess;
+    #[cfg(target_os = "linux")]
+    use lunepack_os_linux::LinuxProcess as NativeProcess;
+    #[cfg(windows)]
+    use lunepack_os_windows::WindowsProcess as NativeProcess;
     use lunepack_testkit::sample_update_config;
 
     use crate::events::{Event, Events, LogSink, Sink, SinkFailed};
 
     pub const HELPER_ARG: &str = "helper-app";
+    /// A helper mode of this binary: `sleep-for <seconds>`, a process to wait for.
+    pub const SLEEP_ARG: &str = "sleep-for";
+    /// The layout scheme of this OS (what the runtime's platform picks).
+    #[cfg(windows)]
+    const SCHEME: LayoutScheme = LayoutScheme::WINDOWS;
+    #[cfg(not(windows))]
+    const SCHEME: LayoutScheme = LayoutScheme::XDG;
     /// Where the helper writes its notes (set on the runtime, inherited by the apps it starts).
     const OUT_VAR: &str = "LUNEPACK_APPLY_TEST_OUT";
     const RUNTIME: &str = env!("CARGO_BIN_EXE_lunepack-runtime");
@@ -68,10 +84,46 @@ mod linux {
     /// A bound on any one runtime run in a case.
     const RUN_LIMIT: Duration = Duration::from_secs(60);
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     const TARGET: Target = Target::LinuxAarch64;
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
     const TARGET: Target = Target::LinuxX86_64;
+    #[cfg(all(windows, target_arch = "aarch64"))]
+    const TARGET: Target = Target::WindowsAarch64;
+    #[cfg(all(windows, not(target_arch = "aarch64")))]
+    const TARGET: Target = Target::WindowsX86_64;
+
+    /// The runtime's file name beside the entry.
+    #[cfg(windows)]
+    const RUNTIME_FILE: &str = "lunepack-runtime.exe";
+    #[cfg(not(windows))]
+    const RUNTIME_FILE: &str = "lunepack-runtime";
+
+    /// An entry path as this OS names an executable (`bin/app` is `bin/app.exe` on Windows).
+    fn exe(entry: &str) -> String {
+        if cfg!(windows) {
+            format!("{entry}.exe")
+        } else {
+            entry.to_owned()
+        }
+    }
+
+    /// The cases that need a Linux-only mechanism, each with why; they are skipped on Windows.
+    #[cfg(windows)]
+    const LINUX_ONLY: &[(&str, &str)] = &[
+        (
+            "the_wait_target_is_never_signalled",
+            "waits on a shell script that traps POSIX signals",
+        ),
+        (
+            "a_zombie_wait_target_counts_as_exited",
+            "a zombie is a procfs state",
+        ),
+        (
+            "the_entry_directory_may_change_between_versions",
+            "reads the desktop entry and the command link the Linux integration writes",
+        ),
+    ];
 
     type Case = fn(&Lab);
 
@@ -170,6 +222,11 @@ mod linux {
             if filter.is_some_and(|f| !name.contains(f.as_str())) {
                 continue;
             }
+            #[cfg(windows)]
+            if let Some((_, why)) = LINUX_ONLY.iter().find(|(n, _)| n == name) {
+                println!("test {name} ... skipped on Windows ({why})");
+                continue;
+            }
             let lab = Lab::new();
             let started = Instant::now();
             let result = std::panic::catch_unwind(|| test(&lab));
@@ -206,7 +263,7 @@ mod linux {
         let token = std::env::var_os(HEALTH_TOKEN_VAR);
         let inst = Installation::from_current_exe().expect("installation");
         let v = inst.tree_version().to_string();
-        let exe = std::fs::read_link("/proc/self/exe").expect("exe");
+        let exe = std::env::current_exe().expect("exe");
         let mode = match rest.first() {
             Some(mode) => mode.clone(),
             None => std::fs::read_to_string(inst.tree_root().join("marker"))
@@ -220,7 +277,15 @@ mod linux {
             exe.display()
         ));
         if let Some(token) = &token {
-            let cmdline = std::fs::read("/proc/self/cmdline").expect("cmdline");
+            // The whole command line, as bytes (the argument vector on Linux, the arguments
+            // joined by a space elsewhere: the token is 64 hex digits, never split by one).
+            let cmdline: Vec<u8> = std::env::args_os()
+                .flat_map(|a| {
+                    let mut bytes = a.as_encoded_bytes().to_vec();
+                    bytes.push(b' ');
+                    bytes
+                })
+                .collect();
             let needle = token.as_encoded_bytes();
             let in_argv = cmdline.windows(needle.len()).any(|w| w == needle);
             note(&format!("{v} argv-has-token={in_argv}"));
@@ -229,6 +294,7 @@ mod linux {
                 std::fs::write(Path::new(&out).join("planted-token"), needle).expect("plant");
             }
         }
+        #[cfg(target_os = "linux")]
         if mode == "report" {
             report_integration(&inst, &v);
         }
@@ -264,7 +330,14 @@ mod linux {
         }
     }
 
+    /// A process that sleeps `<seconds>` (the wait target of a case).
+    pub fn sleep(rest: &[String]) {
+        let secs: f64 = rest.first().and_then(|s| s.parse().ok()).expect("seconds");
+        std::thread::sleep(Duration::from_secs_f64(secs));
+    }
+
     /// Notes where the command link and the desktop entry's `Exec` point.
+    #[cfg(target_os = "linux")]
     fn report_integration(inst: &Installation, v: &str) {
         let home = PathBuf::from(std::env::var_os("HOME").expect("home"));
         let bin = inst.meta().bin.clone().expect("bin");
@@ -291,6 +364,16 @@ mod linux {
         data: PathBuf,
         root: PathBuf,
         out: PathBuf,
+    }
+
+    /// `path` without Windows' `\\?\` prefix (a canonical path there), so it equals the path an
+    /// app reports for itself.
+    fn plain(path: PathBuf) -> PathBuf {
+        let text = path.to_string_lossy().into_owned();
+        match text.strip_prefix(r"\\?\") {
+            Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+            _ => path,
+        }
     }
 
     fn version(text: &str) -> Version {
@@ -329,6 +412,7 @@ mod linux {
                 .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
                 .expect("tmp");
             let base = std::fs::canonicalize(tmp.path()).expect("canonical");
+            let base = plain(base);
             let home = base.join("home");
             let data = home.join(".local/share");
             let app = sample_update_config().app_id;
@@ -346,8 +430,12 @@ mod linux {
             }
         }
 
+        fn layout(&self) -> UserLayout {
+            UserLayout::from_root(self.root.clone(), SCHEME)
+        }
+
         fn tree_dir(&self, v: &str) -> PathBuf {
-            self.root.join("versions").join(v)
+            self.layout().versions_dir().join(v)
         }
 
         fn config(&self, v: &str, entry: &str, timeout: u64) -> UpdateConfig {
@@ -364,6 +452,9 @@ mod linux {
                 bin: Some("lp-apply-test".to_owned()),
                 terminal: false,
                 publisher: None,
+                file_types: Vec::new(),
+                url_schemes: Vec::new(),
+                autostart: false,
             };
             cfg
         }
@@ -373,6 +464,8 @@ mod linux {
         fn tree(&self, v: &str, entry: &str, marker: &str, timeout: u64) -> PathBuf {
             let dir = self.tree_dir(v);
             std::fs::create_dir_all(&dir).expect("dirs");
+            let entry = exe(entry);
+            let entry = entry.as_str();
             let cfg = self.config(v, entry, timeout);
             std::fs::write(
                 dir.join("lunepack-update.json"),
@@ -383,7 +476,7 @@ mod linux {
             place(&std::env::current_exe().expect("exe"), &entry_path);
             place(
                 Path::new(RUNTIME),
-                &entry_path.parent().expect("dir").join("lunepack-runtime"),
+                &entry_path.parent().expect("dir").join(RUNTIME_FILE),
             );
             std::fs::write(dir.join("marker"), marker).expect("marker");
             dir
@@ -391,7 +484,7 @@ mod linux {
 
         fn store(&self) -> UserScope {
             UserScope {
-                dir: self.root.join("state"),
+                dir: self.layout().state_dir(),
                 app_id: sample_update_config().app_id,
             }
         }
@@ -454,7 +547,7 @@ mod linux {
             v: &str,
             restart: &[&str],
         ) -> Child {
-            let runtime = self.tree_dir(from).join(entry_dir).join("lunepack-runtime");
+            let runtime = self.tree_dir(from).join(entry_dir).join(RUNTIME_FILE);
             self.command(&runtime)
                 .args([
                     "apply",
@@ -486,14 +579,18 @@ mod linux {
         }
 
         fn log(&self) -> String {
-            let logs = self.root.join("logs");
+            let logs = self.layout().logs_dir();
             let mut text = std::fs::read_to_string(logs.join("runtime.log.1")).unwrap_or_default();
             text.push_str(&std::fs::read_to_string(logs.join("runtime.log")).unwrap_or_default());
             text
         }
 
-        fn current_link(&self) -> PathBuf {
-            std::fs::read_link(self.root.join("current")).expect("current")
+        /// The `current` link points at `v` (Linux; the Windows layout has no link, M7-D2).
+        fn assert_link(&self, v: &str) {
+            if self.layout().current_link().is_some() {
+                let link = std::fs::read_link(self.root.join("current")).expect("current");
+                assert_eq!(link, Path::new("versions").join(v));
+            }
         }
     }
 
@@ -531,8 +628,11 @@ mod linux {
 
     /// A process that runs for `secs` (reaped by a thread), and its id.
     fn target(secs: &str) -> ProcessId {
-        let mut child = Command::new("sleep").arg(secs).spawn().expect("sleep");
-        let id = LinuxProcess::new()
+        let mut child = Command::new(std::env::current_exe().expect("exe"))
+            .args([SLEEP_ARG, secs])
+            .spawn()
+            .expect("sleep");
+        let id = NativeProcess::new()
             .process_id(child.id())
             .expect("probe")
             .expect("running");
@@ -548,7 +648,7 @@ mod linux {
         assert!(r.pending.is_none(), "pending after rollback");
         assert!(r.health.is_none(), "health after rollback");
         assert!(r.bad.contains(&version(V110)), "1.1.0 not marked bad");
-        assert_eq!(lab.current_link(), Path::new("versions/1.0.0"));
+        lab.assert_link("1.0.0");
     }
 
     fn assert_confirmed(lab: &Lab) {
@@ -561,7 +661,7 @@ mod linux {
         assert!(r.pending.is_none(), "still pending");
         assert!(r.health.is_none(), "health left");
         assert!(r.bad.is_empty(), "marked bad");
-        assert_eq!(lab.current_link(), Path::new("versions/1.1.0"));
+        lab.assert_link("1.1.0");
     }
 
     fn log_has(lab: &Lab, needle: &str) -> bool {
@@ -586,7 +686,7 @@ mod linux {
         lab.tree(V110, "bin/app", "confirm", 5);
         lab.install(V110);
         let before = lab.record();
-        let runtime = lab.tree_dir(V100).join("bin/lunepack-runtime");
+        let runtime = lab.tree_dir(V100).join("bin").join(RUNTIME_FILE);
         for args in [
             vec![],
             vec!["apply"],
@@ -619,7 +719,10 @@ mod linux {
             assert_eq!(out.stderr, b"lunepack-runtime: usage error\n");
         }
         assert_eq!(lab.record(), before);
-        assert!(!lab.root.join("logs").exists(), "a usage error wrote a log");
+        assert!(
+            !lab.layout().logs_dir().exists(),
+            "a usage error wrote a log"
+        );
         assert!(lab.notes().is_empty(), "a usage error started something");
     }
 
@@ -627,9 +730,10 @@ mod linux {
         let old = lab.tree_dir(V090);
         std::fs::create_dir_all(old.join("bin")).expect("0.9.0");
         std::fs::write(old.join("bin/app"), b"old").expect("old file");
-        // Not version trees: a non-canonical name, a symlink, a file.
-        let versions = lab.root.join("versions");
+        // Not version trees: a non-canonical name, a symlink (Unix), a file.
+        let versions = lab.layout().versions_dir();
         std::fs::create_dir_all(versions.join("v0.8.0")).expect("odd dir");
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&old, versions.join("0.7.0")).expect("link");
         std::fs::write(versions.join("0.6.0"), b"file").expect("file");
         lab.tree(V100, "bin/app", "exit0", 30);
@@ -643,6 +747,7 @@ mod linux {
         assert!(!old.exists(), "GC kept 0.9.0");
         assert!(lab.tree_dir(V100).exists() && lab.tree_dir(V110).exists());
         assert!(versions.join("v0.8.0").exists());
+        #[cfg(unix)]
         assert!(std::fs::symlink_metadata(versions.join("0.7.0")).is_ok());
         assert!(versions.join("0.6.0").exists());
         for phase in ["wait", "apply", "launch", "confirm"] {
@@ -652,9 +757,12 @@ mod linux {
             );
         }
         assert!(log_has(lab, "\"outcome\":\"confirmed\""));
-        // The bin link and the desktop entry point through current.
-        let link = std::fs::read_link(lab.home.join(".local/bin/lp-apply-test")).expect("link");
-        assert_eq!(link, lab.root.join("current/bin/app"));
+        // The bin link and the desktop entry point through current (Linux).
+        #[cfg(target_os = "linux")]
+        {
+            let link = std::fs::read_link(lab.home.join(".local/bin/lp-apply-test")).expect("link");
+            assert_eq!(link, lab.root.join("current/bin/app"));
+        }
     }
 
     fn crash_rolls_back_marks_bad_and_relaunches_old_without_token(lab: &Lab) {
@@ -694,7 +802,7 @@ mod linux {
             Some(version(V110))
         );
         let second = lab
-            .command(&lab.tree_dir(V110).join("bin/app"))
+            .command(&lab.tree_dir(V110).join(exe("bin/app")))
             .args([HELPER_ARG, "confirm"])
             .output()
             .expect("second");
@@ -766,7 +874,7 @@ mod linux {
             .args(["-c", &script])
             .spawn()
             .expect("target");
-        let id = LinuxProcess::new()
+        let id = NativeProcess::new()
             .process_id(child.id())
             .expect("probe")
             .expect("running");
@@ -787,7 +895,7 @@ mod linux {
         lab.tree(V110, "bin/app", "confirm", 30);
         lab.install(V110);
         let mut zombie = Command::new("sleep").arg("0.2").spawn().expect("sleep");
-        let id = LinuxProcess::new()
+        let id = NativeProcess::new()
             .process_id(zombie.id())
             .expect("probe")
             .expect("running");
@@ -866,7 +974,7 @@ mod linux {
         );
         assert!(lab.notes().contains("1.0.0 start token=no"));
         // Its own startup reconciled `current`, to the version that is still current.
-        assert_eq!(lab.current_link(), Path::new("versions/1.0.0"));
+        lab.assert_link("1.0.0");
         assert!(!lab.notes().contains("1.1.0 start"), "1.1.0 was started");
         assert!(!lab.notes().contains("token=yes"));
     }
@@ -1054,7 +1162,7 @@ mod linux {
             Some(version(V110))
         );
         assert!(r.bad.is_empty(), "marked bad");
-        assert_eq!(lab.current_link(), Path::new("versions/1.0.0"));
+        lab.assert_link("1.0.0");
     }
 
     /// F19 with the pending version's supervisor still running: started with its token, 1.0.0
@@ -1109,7 +1217,7 @@ mod linux {
             r.staged.as_ref().map(|s| s.version.clone()),
             Some(version(V110))
         );
-        assert_eq!(lab.current_link(), Path::new("versions/1.0.0"));
+        lab.assert_link("1.0.0");
     }
 
     fn a_missing_previous_config_leaves_it_pending(lab: &Lab) {
@@ -1140,7 +1248,7 @@ mod linux {
     fn a_spawn_failure_rolls_back(lab: &Lab) {
         lab.tree(V100, "bin/app", "exit0", 30);
         let new = lab.tree(V110, "bin/app", "confirm", 30);
-        std::fs::remove_file(new.join("bin/app")).expect("remove entry");
+        std::fs::remove_file(new.join(exe("bin/app"))).expect("remove entry");
         lab.install(V110);
         let (code, _) = lab.apply(V100, target("0.1"), V110);
         assert_eq!(code, 20);
@@ -1152,11 +1260,23 @@ mod linux {
     fn gc_keeps_a_tree_in_use_as_cwd(lab: &Lab) {
         let old = lab.tree_dir(V090);
         std::fs::create_dir_all(&old).expect("0.9.0");
+        // A process that uses the old tree: on Linux one whose working directory is in it, on
+        // Windows (which scans image paths) a copy of the test binary running from it.
+        #[cfg(not(windows))]
         let mut user = Command::new("sleep")
             .arg("30")
             .current_dir(&old)
             .spawn()
             .expect("sleep");
+        #[cfg(windows)]
+        let mut user = {
+            let copy = old.join("user.exe");
+            std::fs::copy(std::env::current_exe().expect("exe"), &copy).expect("copy");
+            Command::new(&copy)
+                .args([SLEEP_ARG, "30"])
+                .spawn()
+                .expect("user")
+        };
         lab.tree(V100, "bin/app", "exit0", 30);
         lab.tree(V110, "bin/app", "confirm", 30);
         lab.install(V110);
@@ -1190,8 +1310,9 @@ mod linux {
             .collect();
         let mut haystacks: Vec<(String, Vec<u8>)> = vec![("runtime output".into(), printed)];
         haystacks.push(("notes".into(), lab.notes().into_bytes()));
-        for dir in ["logs", "state"] {
-            for entry in std::fs::read_dir(lab.root.join(dir)).expect("dir") {
+        let layout = lab.layout();
+        for dir in [layout.logs_dir(), layout.state_dir()] {
+            for entry in std::fs::read_dir(&dir).expect("dir") {
                 let path = entry.expect("entry").path();
                 if path.is_file() {
                     haystacks.push((

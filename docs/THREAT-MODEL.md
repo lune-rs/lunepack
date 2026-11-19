@@ -4,7 +4,7 @@ Status: **draft**, awaiting approval together with `docs/FORMAT.md`.
 
 What lunepack's update and install path defends against, and what it does not. The format rules
 referred to here are in `docs/FORMAT.md`; the decisions in `docs/DECISIONS.md` (D7, D17, D21, D24,
-D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12).
+D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12, M7-D1 to M7-D22).
 
 ## Assets
 
@@ -523,6 +523,123 @@ success and in each reachable error, and fails if a planted token, install id, f
 unique path component appears in plain, JSON-escaped or hex form in stdout, stderr or the log (it
 first plants one in a known output to prove the check can see it, and its failure message names the
 stream and the item, never the value).
+
+## Windows per-user (M7)
+
+The Windows per-user install (`docs/FORMAT.md` 15 and 16, `docs/RUNTIME.md` "Windows") adds a launcher stub,
+registry entries, a Start-menu shortcut, a setup file that is an executable and may be signed, a
+user-chosen display name used as a folder name, and an uninstaller that copies itself to the temp directory.
+Class 4 (a process of the same user) is out of scope as before: it can already edit the tree, the
+records and the registry keys under `HKCU`. What the pieces below add is that lunepack acts only on
+paths it derived itself or read from a signed tree, and fails toward keeping files.
+
+- **DLL planting from the download folder (M7-D10).** A `Setup.exe` is run from a folder (typically
+  Downloads) in which another program can have put a DLL with a system DLL's name, and Windows looks in the
+  executable's own folder first for a DLL it does not find among its known set. Every shipped Windows binary
+  (the stubs, the runtime and the UI) therefore links the C runtime statically, carries a manifest and sets
+  `DependentLoadFlags` to `0x800` (static imports come from System32 only), and calls
+  `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)` as the first statement of `main`. Step 0 measured
+  that `DependentLoadFlags` covers the static imports only and that a later `LoadLibrary` still searches the
+  application's folder unless that call has been made, so both are needed. The end-to-end suite
+  (`scripts/e2e-windows.ps1`, row 9; `scripts/ci/plant-dll-test.ps1`) copies the setup file, the runtime
+  and the console stub into a fresh folder that also holds files named after DLLs none of them imports
+  statically; the files hold garbage, so a binary that loaded one fails to start with a loader error, and the
+  test requires that each starts and ends with its own exit code. This is the garbage-file form: the
+  module-sampling instrument of step 0 (it saw which DLLs a process loaded, and had a working control, an
+  unhardened binary that did load planted DLLs from its folder) is not part of the suite. The first run of that test found that the runtime
+  and the UI loaded `cryptbase.dll` from the planted folder through a static import of `advapi32.dll`
+  (resolved before `main` can call anything); both now delay-load `advapi32`, and the packager refuses a
+  Windows stub, runtime or UI that imports it statically (`StaticAdvapi32`), that imports a C runtime DLL
+  (`vcruntime*`, `msvcp*`, `api-ms-win-crt-*`, `ucrtbase`), or that lacks the flag or the manifest. Packing
+  also checks that stamping the icon and version information kept those fields. Not covered: a DLL a
+  third-party library loads by a path of its own, and the aarch64 build, which has not been run.
+- **The trailer locator (M7-D11, `docs/FORMAT.md` 14.3).** A signed `Setup.exe` has its trailer before the
+  certificate table, so the locator reads a second candidate end, taken from the PE headers of the file's
+  own first 4096 bytes. It is fail-closed in the right direction: only a file that carries the trailer's
+  magic at a candidate end can be refused (the runtime starts this way every time, so a layout that was
+  refused before the magic was found would break every start), a file with the magic and a layout no writer
+  makes (bytes after the table, a misaligned or overlapping table) is exit 7 and never runs as an ordinary
+  runtime, and the trailer lies inside the bytes the signature covers, so flipping one byte there fails
+  `signtool verify` and the setup. The end-to-end suite signs a setup file with a throwaway certificate on a
+  disposable runner and checks all three claims (it installs when signed; a flipped trailer byte and an
+  appended byte each exit 7). A timestamped signature is a longer certificate table at the end, which the
+  locator accepts unchanged; a real timestamp authority is not exercised before code signing (M9).
+- **The stub reads untrusted local state (M7-D7).** The stub runs with the user's rights and starts what the
+  install record and the configuration name, so it takes `R` from its own resolved path only (no argument,
+  environment variable or registry value), reads the record read only with its checksum and the
+  configuration with the same reader the runtime uses, refuses a symbolic link or reparse point anywhere
+  below `R` and a configuration that does not name the record's version and app, and shows a fixed message
+  with no value read from the install. It cannot be made to start another app by editing the state
+  without also editing the tree, which class 4 can do anyway. It carries no network, codec or UI code
+  (the boundary check, `DEPENDS_ONLY_ON`), and it sets no working directory (a long one fails to start a
+  process on Windows, measured, error 267).
+- **Registry and shortcut values from configuration strings (M7-D3, M7-D15).** The names, version, publisher
+  and file-type names come from the signed update configuration and are written into registry values and a
+  shortcut. None may hold a control character (refused as an unsafe field, never written), every command
+  quotes the stub's path (a folder name has spaces and non-ASCII letters), a URL scheme is checked against
+  the deny-list of `docs/FORMAT.md` 13.4 and an extension against `[a-z0-9]{1,16}`, and no file type or
+  scheme is made the default handler: the user's own choice and the extension's default value are never
+  read or written. Each key, value and shortcut that lunepack writes carries a marker, and one without
+  it is left alone and reported as a conflict, so lunepack never overwrites or removes another program's
+  entry that happens to have the same name. A scheme or ProgID that another program registered per machine
+  (`HKLM\Software\Classes`, read only) is a conflict too, because the per-user key would shadow it in the
+  merged view.
+- **A user-chosen name as a path component (M7-D15).** The display name becomes a folder name under the
+  user's programs folder, so it is validated, never rewritten: at most 64 UTF-16 code units, no
+  character Windows forbids, no leading or trailing dot or space (a leading dot is lunepack's own
+  namespace beside `R`: tombstones) and no device name. A name that fails is refused by the packager and
+  again by the install. `windows_name_ok` is the one function for the folder and the shortcut.
+- **Finding an install reads other folders (M7-D16, M7-D17).** To find the install of an app id the
+  runtime lists the programs folder (at most 4096 entries, else it refuses) and reads the newest record of
+  each folder that holds `.lunepack\state`, read only, through the store reader and without following any
+  link. It writes nothing there, never reads a registry value for this (`InstallLocation` is written for
+  Windows and never read), refuses when two folders hold the app's record, and a folder that is in the
+  way of a first install (a file, a non-empty folder, another program's install) is never touched: the
+  install takes `<name> (<app id>)` or is refused. Under the install lock a writer first checks that the state
+  directory holds no record of another app id, so two apps with one display name cannot take one folder.
+- **The uninstaller's root and hand-off (M7-D5, M7-D16, M7-D21).** `uninstall` takes `R` from its own
+  path, never from a registry value, and requires a real directory that is not a reparse point, whose
+  canonical parent is the programs folder and which holds a record of this app. Phase 1 of the hand-off
+  copies only its own executable and a regular-file UI into a new directory under the temp directory and
+  deletes nothing. Phase 2 accepts `--install-root` only when it runs from such a directory (named exactly
+  `lunepack-uninstall-<16 lowercase hex>`, directly under the temp directory, with a marker naming the
+  same app); anywhere else the argument is a usage error before any action. Both phases check the root
+  again, and a root of another app, a junction, or a root whose parent is not the programs folder is refused
+  with nothing deleted. A cleanup of stale copies removes only a real directory of exactly that name form
+  whose strict marker names a process that is no longer running and from which nothing runs.
+- **Temp directories (M7-D5, M7-D13).** The uninstaller's copy and a setup's UI directory are created new
+  under the temp directory with a marker and are removed at the end of the run when possible. The copy of
+  a finished uninstall stays (a running image cannot be deleted, and a self-delete technique is a
+  known malware pattern that antivirus engines watch) until a later run of any lunepack app, or Windows,
+  removes it; about 16 MB per uninstalled app may stay in the temp directory until then. Nothing else
+  outside the temp directory is left by an uninstall (`R`, the shortcut, the registry entries and the
+  declarations are removed).
+- **File deletion and antivirus locks (M7-D8, M7-D12, M7-D21).** A transient lock by an antivirus scanner or
+  indexer on a file being renamed or removed is retried for at most about two seconds per operation (access
+  denied, sharing violation and lock violation only; not-found and already-exists never), with the last
+  error reported unchanged; the budget is shared by the steps of one removal. Garbage collection walks
+  `R\app` only and removes a tree only when no process runs from it, and the leftover copy of a replaced
+  stub (`.<name>.old-<hex>`) is removed only when its name has exactly that form, it is a regular file
+  directly in `R`, and it is not running. A stub that cannot be replaced because it runs is renamed aside, which
+  Windows allows; deleting it is refused until it exits. The uninstall releases the install lock just
+  before it renames `R` to its tombstone, because every process holding the lock keeps a file under `R`
+  open and would make the rename fail: the window between the release and the rename is not exclusive, but
+  a lunepack process that locks in it either holds an open file and makes the rename fail (nothing is
+  deleted) or finds no install. A DLL of an old tree loaded by an unrelated program could see a partly
+  deleted tree; no lunepack component does this.
+- **Process spawning.** The stub starts the app with `CreateProcess` and no shell, passing the command line
+  through unchanged and with no job object (a job would kill the detached applier). The runtime starts the
+  applier and the uninstall phase 2 detached, by path, without a shell. The runtime is a Windows-subsystem
+  binary, so no console appears, whatever flags an app starts it with; the end-to-end suite checks that no
+  console host child appears under it.
+- **Antivirus engines.** Writing and starting executables from a temp directory (the uninstaller's copy, a
+  setup's UI) resembles what droppers do. Whether Windows Defender flags any lunepack binary is not yet
+  measured; the CI job `e2e-windows-defender` runs the whole suite with Defender on, proves Defender
+  works with a control that must be detected, and records any detection by threat name. The answer to a
+  flagged binary is code signing (M9), not an exclusion.
+- **Renaming the install folder** is unsupported (`docs/FORMAT.md` 16): the launcher still works from the
+  renamed folder, the shortcut no longer matches the install's marker and is left alone, and updates
+  report it as a conflict. Nothing is overwritten or removed that is not lunepack's.
 
 ## Denial-of-service bounds
 

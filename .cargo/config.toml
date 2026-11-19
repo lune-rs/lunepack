@@ -1,0 +1,8 @@
+# Windows hardening (M7-D10): the C runtime is linked statically, so a shipped binary imports no
+# vcruntime or api-ms-win-crt DLL that a planted copy next to it could replace. The two msvc targets
+# only; every other target is untouched.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

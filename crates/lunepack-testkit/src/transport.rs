@@ -68,6 +68,10 @@ pub enum TransportFault {
     /// The body fails after this many bytes: an I/O error in the fakes, a closed connection over
     /// the loopback server.
     ErrorAfter(u64),
+    /// The loopback server sends this many body bytes, then neither sends more nor closes the
+    /// connection until the client goes away or the server stops: a download that can never
+    /// finish. The in-memory fakes ignore it.
+    StallAfter(u64),
 }
 
 /// One request the origin saw (one per hop: a followed redirect logs two).
@@ -119,6 +123,8 @@ pub(crate) struct Reply {
     pub(crate) error_after: Option<u64>,
     pub(crate) chunk: usize,
     pub(crate) pending_forever: bool,
+    /// [`TransportFault::StallAfter`]; only the loopback server acts on it.
+    pub(crate) stall_after: Option<u64>,
 }
 
 impl Reply {
@@ -131,6 +137,7 @@ impl Reply {
             error_after: None,
             chunk: CHUNK,
             pending_forever: false,
+            stall_after: None,
         }
     }
 
@@ -461,6 +468,7 @@ fn file_reply(
     ));
 
     let mut reply_flags = (false, None, CHUNK, false);
+    let mut stall_after = None;
     for fault in faults {
         match fault {
             TransportFault::GzipEncoded => {
@@ -481,6 +489,7 @@ fn file_reply(
             TransportFault::ErrorAfter(n) => reply_flags.1 = Some(*n),
             TransportFault::SlowChunks => reply_flags.2 = 1,
             TransportFault::PendingForever => reply_flags.3 = true,
+            TransportFault::StallAfter(n) => stall_after = Some(*n),
             _ => {}
         }
     }
@@ -509,6 +518,7 @@ fn file_reply(
         error_after: reply_flags.1,
         chunk: reply_flags.2,
         pending_forever: reply_flags.3,
+        stall_after,
     }
 }
 

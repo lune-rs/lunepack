@@ -12,8 +12,8 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use lunepack_core::{
-    AppId, InstallMeta, IntegrationError, IntegrationItem, IntegrationRequest, OsIntegration,
-    RelPath, Scope,
+    AppId, FileType, InstallMeta, IntegrationError, IntegrationItem, IntegrationRequest,
+    OsIntegration, RelPath, Scope, Version,
 };
 use lunepack_os_linux::{XdgEnv, XdgIntegration, xdg_dirs};
 
@@ -43,6 +43,7 @@ fn env(home: &Path) -> XdgEnv {
     XdgEnv {
         home: Some(home.as_os_str().to_owned()),
         xdg_data_home: None,
+        xdg_config_home: None,
     }
 }
 
@@ -56,6 +57,9 @@ fn meta(entry: &str, bin: Option<&str>) -> InstallMeta {
         bin: bin.map(str::to_owned),
         terminal: false,
         publisher: None,
+        file_types: Vec::new(),
+        url_schemes: Vec::new(),
+        autostart: false,
     }
 }
 
@@ -63,7 +67,9 @@ fn request(home: &Path, id: &str, m: InstallMeta) -> IntegrationRequest {
     IntegrationRequest {
         app_id: AppId::parse(id).unwrap(),
         install_root: home.join(".local/share").join(id),
+        version: Version::parse("1.0.0").unwrap(),
         meta: m,
+        previous: None,
         stale_bins: vec![],
     }
 }
@@ -216,6 +222,7 @@ fn an_unsafe_data_home_is_refused() {
     let integration = XdgIntegration::new(XdgEnv {
         home: Some(s.path().as_os_str().to_owned()),
         xdg_data_home: Some(data.as_os_str().to_owned()),
+        xdg_config_home: None,
     });
     let mut req = request(s.path(), "app", meta("bin/app", None));
     req.install_root = s.path().join("safe-root");
@@ -251,6 +258,7 @@ fn a_relative_xdg_data_home_is_ignored_and_an_absolute_one_is_used() {
     let relative = xdg_dirs(&XdgEnv {
         home: Some(home.as_os_str().to_owned()),
         xdg_data_home: Some(OsString::from("relative/share")),
+        xdg_config_home: None,
     })
     .unwrap();
     assert_eq!(relative.data_home(), home.join(".local/share"));
@@ -258,6 +266,7 @@ fn a_relative_xdg_data_home_is_ignored_and_an_absolute_one_is_used() {
         let dirs = xdg_dirs(&XdgEnv {
             home: Some(home.as_os_str().to_owned()),
             xdg_data_home: Some(ignored),
+            xdg_config_home: None,
         })
         .unwrap();
         assert_eq!(dirs.data_home(), home.join(".local/share"));
@@ -272,6 +281,7 @@ fn a_relative_xdg_data_home_is_ignored_and_an_absolute_one_is_used() {
     let dirs = xdg_dirs(&XdgEnv {
         home: Some(home.as_os_str().to_owned()),
         xdg_data_home: Some(data.as_os_str().to_owned()),
+        xdg_config_home: None,
     })
     .unwrap();
     assert_eq!(dirs.data_home(), data);
@@ -282,6 +292,7 @@ fn a_relative_xdg_data_home_is_ignored_and_an_absolute_one_is_used() {
     let integration = XdgIntegration::new(XdgEnv {
         home: Some(home.as_os_str().to_owned()),
         xdg_data_home: Some(data.as_os_str().to_owned()),
+        xdg_config_home: None,
     });
     let mut req = request(home, "app", meta("bin/app", None));
     req.install_root = data.join("app");
@@ -303,6 +314,7 @@ fn a_missing_relative_or_non_utf8_home_is_an_error() {
         let env = XdgEnv {
             home,
             xdg_data_home: None,
+            xdg_config_home: None,
         };
         assert!(
             matches!(xdg_dirs(&env), Err(IntegrationError::Home)),
@@ -698,6 +710,41 @@ fn unsafe_fields_are_refused_without_writing() {
     with("a leading dot in bin", &|r| {
         r.meta.bin = Some(".x".to_owned())
     });
+    with("a semicolon in a mime type", &|r| {
+        r.meta.file_types = vec![file_type("ex", "text/plain;x-evil/x")];
+    });
+    with("a mime type with a parameter", &|r| {
+        r.meta.file_types = vec![file_type("ex", "text/plain; charset=utf-8")];
+    });
+    with("an uppercase extension", &|r| {
+        r.meta.file_types = vec![file_type("EX", "text/plain")];
+    });
+    with("an extension twice", &|r| {
+        r.meta.file_types = vec![file_type("ex", "text/plain"), file_type("ex", "text/x-ex")];
+    });
+    with("33 file types", &|r| {
+        r.meta.file_types = (0..33)
+            .map(|i| file_type(&format!("e{i}"), "text/plain"))
+            .collect();
+    });
+    with("a newline in a file type name", &|r| {
+        r.meta.file_types = vec![FileType {
+            name: "a\nExec=x".to_owned(),
+            ..file_type("ex", "text/plain")
+        }];
+    });
+    with("a denied URL scheme", &|r| {
+        r.meta.url_schemes = vec!["mailto".to_owned()];
+    });
+    with("an ms- URL scheme", &|r| {
+        r.meta.url_schemes = vec!["ms-settings".to_owned()];
+    });
+    with("a URL scheme with a semicolon", &|r| {
+        r.meta.url_schemes = vec!["a;b".to_owned()];
+    });
+    with("9 URL schemes", &|r| {
+        r.meta.url_schemes = (0..9).map(|i| format!("app{i}")).collect();
+    });
     with("a relative install root", &|r| {
         r.install_root = PathBuf::from("relative/app");
     });
@@ -711,9 +758,146 @@ fn unsafe_fields_are_refused_without_writing() {
         assert_eq!(snapshot(home), before, "{what}: wrote something");
     }
     assert!(
-        !home.join(".local").exists(),
+        !home.join(".local").exists() && !home.join(".config").exists(),
         "a refusal created directories"
     );
+}
+
+fn file_type(ext: &str, mime: &str) -> FileType {
+    FileType {
+        ext: ext.to_owned(),
+        mime: mime.to_owned(),
+        name: "Example file".to_owned(),
+    }
+}
+
+fn autostart(home: &Path, id: &str) -> PathBuf {
+    home.join(".config/autostart").join(format!("{id}.desktop"))
+}
+
+#[test]
+fn declared_types_and_schemes_become_one_mime_type_line() {
+    let s = Scratch::new("mimetype");
+    let home = s.path();
+    let integration = XdgIntegration::new(env(home));
+    let mut m = meta("bin/app", None);
+    m.file_types = vec![
+        file_type("ex", "application/x-example"),
+        file_type("exz", "application/x-example"),
+        file_type("png", "image/png"),
+    ];
+    m.url_schemes = vec!["example".to_owned(), "ex+tra".to_owned()];
+    let req = request(home, "org.example.app", m);
+    integration.apply(Scope::User, &req).unwrap();
+    let root = home.join(".local/share/org.example.app");
+    let expected = format!(
+        "[Desktop Entry]\nType=Application\nVersion=1.5\nName=Example App\n\
+         Exec=\"{r}/current/bin/app\" %U\nTerminal=false\n\
+         MimeType=application/x-example;image/png;x-scheme-handler/example;x-scheme-handler/ex+tra;\n\
+         X-Lunepack-App-Id=org.example.app\n",
+        r = root.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(desktop(home, "org.example.app")).unwrap(),
+        expected
+    );
+    assert!(
+        !autostart(home, "org.example.app").exists(),
+        "no autostart was declared"
+    );
+}
+
+#[test]
+fn autostart_writes_its_own_marked_entry_and_dropping_it_removes_it() {
+    let s = Scratch::new("autostart");
+    let home = s.path();
+    let integration = XdgIntegration::new(env(home));
+    let mut m = meta("bin/app", None);
+    m.autostart = true;
+    m.file_types = vec![file_type("ex", "application/x-example")];
+    let on = request(home, "org.example.app", m);
+    integration.apply(Scope::User, &on).unwrap();
+    let root = home.join(".local/share/org.example.app");
+    let expected = format!(
+        "[Desktop Entry]\nType=Application\nVersion=1.5\nName=Example App\n\
+         Exec=\"{r}/current/bin/app\"\nTerminal=false\nX-Lunepack-App-Id=org.example.app\n",
+        r = root.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(autostart(home, "org.example.app")).unwrap(),
+        expected,
+        "the autostart entry has no MimeType and no field code"
+    );
+    let applied = snapshot(home);
+    integration.apply(Scope::User, &on).unwrap();
+    assert_eq!(snapshot(home), applied, "a second apply changed something");
+
+    let mut off = on.clone();
+    off.meta.autostart = false;
+    off.previous = Some(on.meta.clone());
+    let report = integration.apply(Scope::User, &off).unwrap();
+    assert!(report.kept.is_empty());
+    assert!(!autostart(home, "org.example.app").exists());
+    assert!(desktop(home, "org.example.app").exists());
+
+    integration.apply(Scope::User, &on).unwrap();
+    assert!(autostart(home, "org.example.app").exists());
+    let report = integration.remove(Scope::User, &on).unwrap();
+    assert!(report.kept.is_empty());
+    assert!(!autostart(home, "org.example.app").exists());
+    assert!(!desktop(home, "org.example.app").exists());
+}
+
+#[test]
+fn a_foreign_autostart_entry_is_a_conflict_or_kept_and_never_touched() {
+    let s = Scratch::new("autostart-foreign");
+    let home = s.path();
+    let integration = XdgIntegration::new(env(home));
+    let path = autostart(home, "app");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "[Desktop Entry]\nName=Mine\n").unwrap();
+    let foreign = std::fs::read(&path).unwrap();
+
+    // Declared: `check` and `apply` refuse, and write nothing.
+    let mut m = meta("bin/app", None);
+    m.autostart = true;
+    let on = request(home, "app", m);
+    let before = snapshot(home);
+    assert!(matches!(
+        integration.check(Scope::User, &on),
+        Err(IntegrationError::Conflict(IntegrationItem::Autostart))
+    ));
+    assert!(matches!(
+        integration.apply(Scope::User, &on),
+        Err(IntegrationError::Conflict(IntegrationItem::Autostart))
+    ));
+    assert_eq!(snapshot(home), before);
+
+    // Not declared: apply and remove leave it and report it kept.
+    let off = request(home, "app", meta("bin/app", None));
+    let report = integration.apply(Scope::User, &off).unwrap();
+    assert_eq!(report.kept, vec![IntegrationItem::Autostart]);
+    let report = integration.remove(Scope::User, &off).unwrap();
+    assert_eq!(report.kept, vec![IntegrationItem::Autostart]);
+    assert_eq!(std::fs::read(&path).unwrap(), foreign);
+}
+
+#[test]
+fn autostart_goes_under_an_absolute_xdg_config_home() {
+    let s = Scratch::new("autostart-config-home");
+    let home = s.path();
+    let config = home.join("cfg");
+    let integration = XdgIntegration::new(XdgEnv {
+        xdg_config_home: Some(config.as_os_str().to_owned()),
+        ..env(home)
+    });
+    let mut m = meta("bin/app", None);
+    m.autostart = true;
+    integration
+        .apply(Scope::User, &request(home, "app", m))
+        .unwrap();
+    assert!(config.join("autostart/app.desktop").is_file());
+    assert!(!home.join(".config").exists());
 }
 
 #[test]

@@ -91,6 +91,7 @@ pub const HARNESSES: &[(&str, Harness)] = &[
     ("http", http),
     ("state", state),
     ("update_config", update_config),
+    ("setup", setup),
 ];
 
 /// Runs the harness `name` and reports whether `data` got all the way through it (`None`: no such
@@ -110,6 +111,7 @@ pub fn accepts(name: &str, data: &[u8]) -> Option<bool> {
         "http" => http_run(data),
         "state" => state_run(data),
         "update_config" => crate::update_config::fuzz_run(data),
+        "setup" => setup_run(data),
         _ => return None,
     })
 }
@@ -210,6 +212,12 @@ pub fn state(data: &[u8]) {
 /// writer.
 pub fn update_config(data: &[u8]) {
     let _ = crate::update_config::fuzz_run(data);
+}
+
+/// `data` as a whole executable: the setup locator (M7-D11), then the trailer it found, parsed with
+/// the fake scheme; and the PE reader over the same bytes. Accepted: a trailer was found and parses.
+pub fn setup(data: &[u8]) {
+    let _ = setup_run(data);
 }
 
 // ---- scaffolding: fake hasher, fake signatures, clock, codec -------------------------------------
@@ -723,4 +731,22 @@ fn state_run(data: &[u8]) -> bool {
         return false;
     };
     crate::state::fuzz_run(data, STATE_NAME_SEQ, &app, &FuzzHasher)
+}
+
+fn setup_run(data: &[u8]) -> bool {
+    let _ = crate::pe::PeImage::parse(data);
+    let len = data.len() as u64;
+    let trailer = crate::setup::TRAILER_SIZE;
+    if len < trailer {
+        return false;
+    }
+    let head = &data[..data.len().min(crate::setup::HEAD_SIZE as usize)];
+    let tail = |end: u64| &data[(end - trailer) as usize..end as usize];
+    let at_table = crate::setup::table_candidate(head, len).map(tail);
+    match crate::setup::locate(head, tail(len), at_table, len) {
+        crate::setup::Located::Setup { end } => {
+            crate::setup::SetupTrailer::parse(tail(end), end, &FuzzHasher, &FuzzVerifier).is_ok()
+        }
+        crate::setup::Located::None | crate::setup::Located::Malformed => false,
+    }
 }

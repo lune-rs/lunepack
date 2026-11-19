@@ -31,7 +31,10 @@ pub use docs::{
 };
 pub use hasher::FakeHasher;
 pub use http_server::LoopbackServer;
-pub use integration::{FakeIntegration, IntegrationCall, IntegrationOp, run_integration_suite};
+pub use integration::{
+    FakeIntegration, IntegrationCall, IntegrationOp, SuiteHooks, run_integration_suite,
+    run_integration_suite_with,
+};
 pub use memfs::{MemFs, RecoverMode};
 pub use process::{
     ChildScript, FakeChildPipes, FakePipeReader, FakePipeWriter, FakeProcess, SpawnRecord,
