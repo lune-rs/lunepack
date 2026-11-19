@@ -68,7 +68,7 @@ pub use integration::{
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use layout::{
     BundleDiscovery, BundleProbe, Discovery, LayoutScheme, LocationReason, NameRule, Projection,
-    RootChoice, RootNaming, UserLayout, check_place, discover, discover_bundle,
+    RootChoice, RootNaming, UserLayout, bundle_orphaned, check_place, discover, discover_bundle,
     ensure_no_foreign_record, is_tombstone_of, macos_name_ok, read_bundle_identity,
     reconcile_bundle, reconcile_current, remove_tombstones, resolve_bundle_target, resolve_root,
     root_valid_for_uninstall, set_bundle_pointer, tombstone_name, tree_candidates,
@@ -95,7 +95,10 @@ pub use process::{
 };
 pub use progress::{FileProgress, Phase, Progress, Source};
 pub use root::{RootDocument, TrustedRoot, advance_root};
-pub use stage::{SourceFor, StageEnv, StageInput, StagedVersion, scan, stage};
+pub use stage::{
+    SourceFor, StageEnv, StageInput, StagedVersion, TreeDifference, TreeMismatch, scan, stage,
+    verify_tree,
+};
 pub use state::{
     CurrentRef, Floors, Health, InstallCounters, InstallState, Lifecycle, LifecycleEvent, Loaded,
     MachineScope, PendingRef, PreviousRef, Record, RootParts, Scope, StagedIssued, StagedRef,

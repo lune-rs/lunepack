@@ -196,6 +196,7 @@ pub fn phase_name(phase: Phase) -> &'static str {
         Phase::Confirm => "confirm",
         Phase::Rollback => "rollback",
         Phase::Uninstall => "uninstall",
+        Phase::Adopt => "adopt",
         _ => "other",
     }
 }

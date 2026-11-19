@@ -500,6 +500,27 @@ impl Fs for StdFs {
         }
     }
 
+    fn is_exec(&self, path: &Path) -> Result<bool, FsError> {
+        let Some(meta) = lstat(path)? else {
+            return Err(FsError::new(FsErrorKind::NotFound, path, None).during("is_exec"));
+        };
+        if meta.file_type().is_symlink() {
+            return Err(FsError::new(FsErrorKind::IsSymlink, path, None).during("is_exec"));
+        }
+        if !meta.is_file() {
+            return Err(other(path, "not a regular file").during("is_exec"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            Ok(meta.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+    }
+
     fn create_dir_private(&self, path: &Path) -> Result<(), FsError> {
         #[cfg(unix)]
         {

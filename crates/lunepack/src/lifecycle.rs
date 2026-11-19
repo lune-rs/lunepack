@@ -201,10 +201,11 @@ fn follow_move_locked(
         .current
         .as_ref()
         .is_some_and(|c| same_version(&c.version, own));
-    // The pointer must still be there and its target still gone.
+    // The pointer's target must still be gone. A missing pointer counts as gone: an adoption cut
+    // off after its record commit and before its pointer (M8-D9) leaves exactly that.
     let gone = match layout.bundle_path(fs).map_err(layout_err)? {
         Some(target) => fs.symlink_metadata(&target)?.is_none(),
-        None => false,
+        None => true,
     };
     let facts = fs.place(tree)?;
     let same_bundle =

@@ -44,3 +44,5 @@
 {"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"unsupported_location","exit_code":28,"reason":"other_volume"}
 {"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"unsupported_location","exit_code":28,"reason":"not_owned"}
 {"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"unsupported_location","exit_code":28,"reason":"not_writable"}
+{"schema":1,"type":"result","command":"check","tree_version":"1.0.0","update":null,"adopted":true}
+{"schema":1,"type":"result","command":"check","tree_version":"1.0.0","update":{"version":"1.1.0","download_size_max":123456,"time_checked":true},"adopted":true}

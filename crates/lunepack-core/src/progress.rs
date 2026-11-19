@@ -29,6 +29,8 @@ pub enum Phase {
     Rollback,
     /// Removing the install.
     Uninstall,
+    /// Proving a bundle the user placed equal to its signed release before adopting it (M8-D9).
+    Adopt,
 }
 
 /// Where the bytes of one file come from.

@@ -340,6 +340,15 @@ pub trait Fs: Send + Sync {
         Err(FsError::new(FsErrorKind::Unsupported, path, None).during("place"))
     }
 
+    /// Whether the regular file at `path` has an execute permission bit set (Unix
+    /// `mode & 0o111 != 0`, the packager's rule); `false` where the OS has no such bit. A final
+    /// symlink is not followed: a symlink at `path` is [`FsErrorKind::IsSymlink`], a missing path
+    /// [`FsErrorKind::NotFound`], anything but a regular file [`FsErrorKind::Other`]. The default
+    /// is [`FsErrorKind::Unsupported`], which a caller that needs the bit treats as a refusal.
+    fn is_exec(&self, path: &Path) -> Result<bool, FsError> {
+        Err(FsError::new(FsErrorKind::Unsupported, path, None).during("is_exec"))
+    }
+
     /// Creates the one directory `path`, readable, writable and searchable by its owner only
     /// (mode `0700` on Unix), whose parent must exist; an existing entry at `path` is
     /// [`FsErrorKind::AlreadyExists`] and is never changed. Volatile until [`Fs::sync_dir`] of the

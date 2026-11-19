@@ -74,6 +74,11 @@ pub const TRANSLOCATION_COMPONENT: &str = "AppTranslocation";
 pub const TRANSLOCATION_FS_TYPE: &str = "nullfs";
 /// The Trash under the home directory; a bundle in it is never adopted (M8-D16, M8-D17).
 pub const TRASH_DIR: &str = ".Trash";
+/// The user's apps folder under the home directory (M8-D2); a bundle directly in it may be
+/// adopted (M8-D9).
+pub const USER_APPS_DIR: &str = "Applications";
+/// The system's apps folder; a bundle directly in it may be adopted too (M8-D9).
+pub const SYSTEM_APPS_DIR: &str = "/Applications";
 /// Most UTF-8 bytes of an app's display name used as a bundle name (M8-D1, step 1).
 pub const MAX_MACOS_NAME_BYTES: usize = 200;
 /// Most bytes of a file name on the volumes macOS installs to (`NAME_MAX`).
@@ -1291,6 +1296,14 @@ pub enum BundleDiscovery {
         /// The tree's version (the record's current version).
         version: Version,
     },
+    /// A bundle the user placed directly in an apps folder while this app has no live install
+    /// for the user (M8-D9): no record, a record with no current version, or an orphaned one
+    /// ([`bundle_orphaned`]). The update check may adopt it after proving it equal to its signed
+    /// release; until then it is a development run.
+    Adoptable {
+        /// The install root `R`.
+        root: PathBuf,
+    },
     /// Any other copy: a development run.
     NotInstalled,
 }
@@ -1305,14 +1318,21 @@ pub enum BundleDiscovery {
 /// 3. With `R = <data home>/<config's app id>`: a tree that is a real directory directly in
 ///    `R/versions` named by its config's version text is an old instance,
 ///    [`BundleDiscovery::Installed`].
-/// 4. `R/bundle` is read ([`UserLayout::bundle_path`], refused when not canonical). Missing:
-///    [`BundleDiscovery::NotInstalled`]. Equal to the tree byte for byte:
-///    [`BundleDiscovery::Installed`]. Its target exists: another copy,
-///    [`BundleDiscovery::NotInstalled`].
-/// 5. The target is gone: [`BundleDiscovery::MovedFrom`] only when the tree is not under
-///    `<home>/.Trash`, its device and inode are those `R/bundle.id` records, and the install
-///    record (read only) is this app's, per user, with the tree's version current; otherwise
-///    [`BundleDiscovery::NotInstalled`].
+/// 4. `R/bundle` is read ([`UserLayout::bundle_path`], refused when not canonical). Equal to the
+///    tree byte for byte: [`BundleDiscovery::Installed`]. Its target exists: another copy of a
+///    live install, [`BundleDiscovery::NotInstalled`] (one install per app id per user).
+/// 5. The pointer is missing or its target is gone, and the tree is not under `<home>/.Trash`
+///    ([`BundleDiscovery::NotInstalled`] otherwise). [`BundleDiscovery::MovedFrom`] when the
+///    tree's device and inode are those `R/bundle.id` records and the install record (read only)
+///    is this app's, per user, with the tree's version current. (A missing pointer is followed
+///    too: an adoption cut off after its commit and before its pointer leaves exactly that.)
+/// 6. [`BundleDiscovery::Adoptable`] when the tree's parent is, byte for byte, `<home>/`
+///    [`USER_APPS_DIR`] or [`SYSTEM_APPS_DIR`], and `R` holds no record, a record of this app per
+///    user with no current version, or an orphaned one ([`bundle_orphaned`]). A record that does
+///    not load, or is another app's or scope's, is never adopted over.
+/// 7. Otherwise [`BundleDiscovery::NotInstalled`].
+///
+/// Nothing here writes, follows a link in the tree or touches the network.
 pub fn discover_bundle(
     fs: &dyn Fs,
     hasher: &dyn Hasher,
@@ -1336,34 +1356,92 @@ pub fn discover_bundle(
         return Ok(installed());
     }
 
-    let Some(bundle) = layout.bundle_path(fs)? else {
-        return Ok(BundleDiscovery::NotInstalled);
-    };
-    if bundle.as_os_str() == probe.tree.as_os_str() {
-        return Ok(installed());
-    }
-    if lstat(fs, &bundle)?.is_some() {
-        return Ok(BundleDiscovery::NotInstalled);
+    let pointer = layout.bundle_path(fs)?;
+    if let Some(bundle) = &pointer {
+        if bundle.as_os_str() == probe.tree.as_os_str() {
+            return Ok(installed());
+        }
+        if lstat(fs, bundle)?.is_some() {
+            return Ok(BundleDiscovery::NotInstalled);
+        }
     }
     if probe.tree.starts_with(probe.home.join(TRASH_DIR)) {
         return Ok(BundleDiscovery::NotInstalled);
     }
-    if read_bundle_identity(fs, &layout)? != Some((probe.facts.device, probe.facts.inode)) {
-        return Ok(BundleDiscovery::NotInstalled);
-    }
-    let current = match load_any::<InstallState>(fs, &layout.state_dir(), hasher) {
+    let record = match load_any::<InstallState>(fs, &layout.state_dir(), hasher) {
         Ok(Some(record)) if record.app_id == config.app_id && record.scope == Scope::User => {
-            record.current.map(|c| c.version)
+            Some(record)
         }
-        _ => None,
+        Ok(None) => None,
+        // Unreadable, another app's or another scope's: never followed, never adopted over.
+        _ => return Ok(BundleDiscovery::NotInstalled),
     };
-    if current.is_some_and(|c| same_version(&c, &config.version)) {
+    let current = record.as_ref().and_then(|r| r.current.as_ref());
+    if read_bundle_identity(fs, &layout)? == Some((probe.facts.device, probe.facts.inode))
+        && current.is_some_and(|c| same_version(&c.version, &config.version))
+    {
         return Ok(BundleDiscovery::MovedFrom {
             root,
             version: config.version.clone(),
         });
     }
+    if !in_apps_folder(probe.tree, probe.home) {
+        return Ok(BundleDiscovery::NotInstalled);
+    }
+    let free = match &record {
+        None => true,
+        Some(record) if record.current.is_none() => true,
+        Some(record) => pointer.is_some() && bundle_orphaned(fs, &layout, record),
+    };
+    if free {
+        return Ok(BundleDiscovery::Adoptable { root });
+    }
     Ok(BundleDiscovery::NotInstalled)
+}
+
+/// Whether `tree`'s parent is, byte for byte, `<home>/Applications` or `/Applications` (M8-D9's
+/// place rule; both sides are canonical, so a link or another spelling is never a match).
+fn in_apps_folder(tree: &Path, home: &Path) -> bool {
+    let Some(parent) = tree.parent() else {
+        return false;
+    };
+    let user = home.join(USER_APPS_DIR);
+    parent.as_os_str() == user.as_os_str()
+        || parent.as_os_str() == Path::new(SYSTEM_APPS_DIR).as_os_str()
+}
+
+/// Whether `record` is orphaned under `layout` (M8-D16), read only: it names a current version,
+/// `R/bundle` names a bundle that is gone, and none of `<versions>/<current>`, the swap slot and
+/// the out slot holds that version of this app (by its own config, nothing followed). A missing
+/// pointer, a pointer that is not canonical, a bundle that exists, or a tree that cannot be read
+/// is not orphaned: only the state reconcile would answer [`LayoutError::Orphaned`] for is.
+pub fn bundle_orphaned(fs: &dyn Fs, layout: &UserLayout, record: &InstallState) -> bool {
+    let Some(current) = &record.current else {
+        return false;
+    };
+    let bundle = match layout.bundle_path(fs) {
+        Ok(Some(bundle)) => bundle,
+        _ => return false,
+    };
+    if !matches!(lstat(fs, &bundle), Ok(None)) {
+        return false;
+    }
+    let scheme = layout.scheme();
+    for path in [
+        layout.out_slot(),
+        layout.swap_slot(),
+        layout.version_dir(&current.version),
+    ] {
+        match tree_of(fs, scheme, &path) {
+            Ok(None) => {}
+            Ok(Some(tree))
+                if tree.app_id == record.app_id
+                    && !same_version(&tree.version, &current.version) => {}
+            // It holds the current version, is another app's, or cannot be judged.
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// What a bundle tree's own config says it is.
