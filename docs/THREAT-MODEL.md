@@ -581,7 +581,9 @@ paths it derived itself or read from a signed tree, and fails toward keeping fil
   scheme is made the default handler: the user's own choice and the extension's default value are never
   read or written. Each key, value and shortcut that lunepack writes carries a marker, and one without
   it is left alone and reported as a conflict, so lunepack never overwrites or removes another program's
-  entry that happens to have the same name.
+  entry that happens to have the same name. A scheme or ProgID that another program registered per machine
+  (`HKLM\Software\Classes`, read only) is a conflict too, because the per-user key would shadow it in the
+  merged view.
 - **A user-chosen name as a path component (M7-D15).** The display name becomes a folder name under the
   user's programs folder, so it is validated, never rewritten: at most 64 UTF-16 code units, no
   character Windows forbids, no leading or trailing dot or space (a leading dot is lunepack's own
