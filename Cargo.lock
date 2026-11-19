@@ -2232,7 +2232,9 @@ dependencies = [
 name = "lunepack-os-macos"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "lunepack-core",
+ "lunepack-testkit",
 ]
 
 [[package]]

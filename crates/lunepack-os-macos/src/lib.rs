@@ -1,8 +1,18 @@
 //! macOS install, shortcut, autostart and process-restart adapter.
 //!
-//! Today it holds the reduce-motion reader (M6-D8): [`prefers_reduced_motion`] runs `defaults`
+//! It holds [`MacProcess`] (the core's `Process` over libproc and kqueue, M8 step 3) and the
+//! reduce-motion reader (M6-D8): [`prefers_reduced_motion`] runs `defaults`
 //! (no shell) to read the "Reduce motion" accessibility setting, so the runtime's graph gets no
 //! window-stack library.
+
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub mod libproc;
+#[cfg(target_os = "macos")]
+mod process;
+
+#[cfg(target_os = "macos")]
+pub use process::MacProcess;
 
 use std::io::Read;
 use std::process::{Command, Stdio};
