@@ -262,7 +262,11 @@ launch contract (`docs/FORMAT.md` 15): 90 not installed, 91 install state unread
 unreadable, 93 the executable is missing, 94 a link where a file or folder belongs, 95 the app could not be
 started; `--lunepack-uninstall` (optionally with `/S`) runs the uninstall of the current version. An app that
 needs to know whether it was started by the stub need not: the stub passes its command line, environment and
-working directory through unchanged.
+working directory through unchanged. For the same reason an app that declares `url_schemes` must treat only
+the first argument of such a launch as the URL, and only when it starts with one of its own schemes and `:`.
+The registered command is `"<stub>" "%1"`, and a launcher that does not escape `"` in a URL can split it
+into several arguments (`docs/FORMAT.md` 13.4): the app ignores or refuses the rest and never reads them as
+flags.
 
 **Uninstall.** A running executable cannot be deleted, so `uninstall`, started from inside `R`, is the first
 of two phases. Phase 1 derives `R` from its own path and checks it as `docs/FORMAT.md` 16 says, copies its own
