@@ -6,7 +6,7 @@
 //! unknown paths) and injects the origin's [`crate::TransportFault`]s on the wire: a body whose
 //! length differs from the file's has no `content-length` and ends when the connection closes, a
 //! truncated or failing body closes the connection early, `SlowChunks` writes one byte per
-//! segment. Dropping the server stops every thread (within 1 s, even with a stalled or endless
+//! segment, `StallAfter` holds the connection open after its bytes. Dropping the server stops every thread (within 1 s, even with a stalled or endless
 //! connection open).
 
 use std::io::{self, Read, Write};
@@ -176,6 +176,19 @@ fn write_all(stream: &mut TcpStream, mut buf: &[u8], stop: &AtomicBool) -> bool 
     true
 }
 
+/// Keeps a stalled connection open, sending nothing, until the peer closes it or the server stops.
+fn hold_open(stream: &mut TcpStream, stop: &AtomicBool) {
+    let mut sink = [0u8; 256];
+    while !stop.load(Ordering::SeqCst) {
+        match stream.read(&mut sink) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if is_retry(e.kind()) => {}
+            Err(_) => return,
+        }
+    }
+}
+
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -235,6 +248,7 @@ fn handle_connection(mut stream: TcpStream, origin: &FakeOrigin, stop: &AtomicBo
             error_after: None,
             chunk: 8192,
             pending_forever: false,
+            stall_after: None,
         }
     };
 
@@ -250,8 +264,18 @@ fn handle_connection(mut stream: TcpStream, origin: &FakeOrigin, stop: &AtomicBo
         return;
     }
     let mut body = reply.body_state(target);
-    while let Ok(Some(chunk)) = body.next() {
+    let mut sent: u64 = 0;
+    while let Ok(Some(mut chunk)) = body.next() {
+        if let Some(limit) = reply.stall_after {
+            chunk.truncate(usize::try_from(limit.saturating_sub(sent)).unwrap_or(usize::MAX));
+        }
         if !write_all(&mut stream, &chunk, stop) {
+            return;
+        }
+        sent = sent.saturating_add(chunk.len() as u64);
+        if reply.stall_after.is_some_and(|limit| sent >= limit) {
+            let _ = stream.flush();
+            hold_open(&mut stream, stop);
             return;
         }
     }

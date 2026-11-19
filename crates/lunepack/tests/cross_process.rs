@@ -243,6 +243,10 @@ fn pack_part_len(cache_dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Where the pack's body stalls in [`hard_kill`]: past the 4 KiB the test waits for, short of the
+/// whole pack.
+const STALL_AT: u64 = 64 * 1024;
+
 fn hard_kill() {
     let baseline = Baseline::new();
     let site = baseline.fresh();
@@ -262,9 +266,14 @@ fn hard_kill() {
     let rx = lines_of(&mut child);
     let outcome = catch_unwind(std::panic::AssertUnwindSafe(|| {
         expect_line(&rx, "checked", Duration::from_secs(120));
-        // From here the pack arrives one byte per segment: the child cannot finish before it is
-        // killed, and the cache holds a part.
-        server.origin().add_fault(TransportFault::SlowChunks);
+        // From here a body stops after STALL_AT bytes and the connection stays open: the child
+        // can never finish the pack before it is killed, and the cache holds a part. (SlowChunks
+        // was not enough: one byte per write still moves the whole 200 KiB pack in well under a
+        // second, so a busy runner could see the part complete, but not yet renamed, at the kill,
+        // and the resumed download then needed no request at all.)
+        server
+            .origin()
+            .add_fault(TransportFault::StallAfter(STALL_AT));
         child
             .stdin
             .as_mut()
@@ -294,6 +303,11 @@ fn hard_kill() {
     }
     let part = pack_part_len(&site.cache_dir);
     assert!(part >= 4096, "the part is {part} bytes");
+    let pack_size = fixture().pack_sizes[V110];
+    assert!(
+        part <= STALL_AT && STALL_AT < pack_size,
+        "the part is {part} bytes of a {pack_size}-byte pack stalled at {STALL_AT}"
+    );
 
     // The child's request was the whole pack (no Range); remember how many requests it made.
     let pack_url = format!("/{}", pack_path(V110));
