@@ -116,9 +116,12 @@ mod native {
 
     impl Lab {
         fn new() -> Lab {
+            // Not under the target directory: a Docker bind mount of the working tree makes its VM
+            // process (the user's) hold descriptors on what the container looked at, and the
+            // in-use scan counts that process (see `tests/common`'s `scratch`).
             let tmp = tempfile::Builder::new()
                 .prefix("uninstmac-")
-                .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .tempdir()
                 .expect("tmp");
             let base = std::fs::canonicalize(tmp.path()).expect("canonical");
             let home = base.join("home");
@@ -199,10 +202,10 @@ mod native {
                 dir.join("Contents/MacOS/app"),
             )
             .expect("entry");
+            // A copy, never a hard link: the kernel names a hard-linked executable by whichever
+            // of its paths it looked up last (see `tests/common`'s `place`).
             let runtime = dir.join("Contents/MacOS/lunepack-runtime");
-            if std::fs::hard_link(RUNTIME, &runtime).is_err() {
-                std::fs::copy(RUNTIME, &runtime).expect("runtime");
-            }
+            std::fs::copy(RUNTIME, &runtime).expect("runtime");
         }
 
         /// 1.0.0 live in the bundle, an old 0.9.0 tree in `versions`, the pointer, the identity,
