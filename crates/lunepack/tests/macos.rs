@@ -1344,3 +1344,229 @@ fn a_crash_at_any_write_of_an_adoption_ends_adopted_after_the_next_start_or_chec
     // Every path was taken: cut before the record (check), after it (start).
     assert!(seen.contains("check") && seen.contains("start"), "{seen:?}");
 }
+
+// ---- a bundle replaced at the live bundle's own path (M8-D16 amended, Revision 4) ----------------
+
+const V120: &str = "1.2.0";
+
+/// A live install of 1.0.0 (installed through the installer path), whose bundle the user then
+/// replaced at its own path by release `v` (Finder's Replace: a new directory). Returns the
+/// record before the replacement.
+fn replaced_install(mac: &Mac, v: &str) -> InstallState {
+    publish_all(mac, 1, &[V100]);
+    let boot = bootstrap(mac, V100);
+    install(mac, &boot).expect("install");
+    let before = mac.record();
+    mac.fs
+        .remove_dir_all_nofollow(&mac.bundle())
+        .expect("replace");
+    drag(mac, &mac.bundle(), v);
+    before
+}
+
+fn applies(mac: &Mac) -> usize {
+    mac.integration
+        .calls()
+        .iter()
+        .filter(|c| c.op == IntegrationOp::Apply)
+        .count()
+}
+
+#[test]
+fn a_bundle_replaced_by_a_newer_release_starts_and_is_adopted_by_its_first_check() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    let before = replaced_install(&mac, V110);
+    let pointer = mac.pointer();
+    publish_all(&mac, 2, &[V100, V110, V120]);
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    assert!(!inst.is_installed() && inst.adoptable());
+    // The start no longer fails: a development run until the check adopts it.
+    let start = startup_for(&inst, Vec::new()).expect("startup");
+    assert_eq!(start.action, StartupAction::Continue);
+    assert!(start.events.is_empty());
+    assert_eq!(
+        updater_of(&mac, &inst).installed().expect("installed"),
+        None
+    );
+
+    let applied_before = applies(&mac);
+    let outcome = check_with(&mac, &inst, CheckOptions::default()).expect("check");
+    assert!(outcome.adopted);
+    assert_eq!(
+        outcome.update.map(|u| u.version().clone()),
+        Some(version(V120)),
+        "the same check finds the newer release"
+    );
+    assert_adopted(&mac, &mac.bundle(), V110, &queued(&mac));
+    assert!(
+        applies(&mac) > applied_before,
+        "the integration was applied"
+    );
+    let rec = mac.record();
+    assert_ne!(rec.install_id, before.install_id, "a new install id");
+    assert_eq!(rec.floors.root, before.floors.root);
+    assert_eq!(rec.floors.keyset_version, before.floors.keyset_version);
+    assert_eq!(rec.floors.feed_seq.get(&channel()), Some(&2));
+    assert_eq!(mac.pointer(), pointer, "R/bundle unchanged");
+
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    assert!(inst.is_installed());
+    let again = check_with(&mac, &inst, CheckOptions::default()).expect("check");
+    assert!(!again.adopted);
+    assert_eq!(
+        again.update.map(|u| u.version().clone()),
+        Some(version(V120))
+    );
+    common::workers_stopped();
+}
+
+#[test]
+fn a_replaced_bundle_that_does_not_verify_is_left_alone() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    let before = replaced_install(&mac, V110);
+    let path = mac.bundle().join("Contents/Resources/share.txt");
+    let mut bytes = b"shared".repeat(20);
+    bytes[3] ^= 1;
+    mac.fs.remove_file(&path).expect("remove");
+    write_file(&mac.fs, &path, &bytes);
+    publish_all(&mac, 2, &[V100, V110]);
+    let dragged = dump(&mac.fs, &mac.bundle());
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    let got = check_with(&mac, &inst, CheckOptions::default());
+    assert!(matches!(got, Err(Error::Verify(_))), "{got:?}");
+    let rec = mac.record();
+    assert_eq!(rec.current, before.current, "the old current stands");
+    assert_eq!(rec.install_id, before.install_id);
+    assert_eq!(
+        dump(&mac.fs, &mac.bundle()),
+        dragged,
+        "the bundle is untouched"
+    );
+    // Still a development run that starts.
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    assert!(!inst.is_installed() && inst.adoptable());
+    let start = startup_for(&inst, Vec::new()).expect("startup");
+    assert_eq!(start.action, StartupAction::Continue);
+    common::workers_stopped();
+}
+
+#[test]
+fn a_same_version_copy_dragged_back_is_installed_with_no_request() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    let before = replaced_install(&mac, V100);
+    let requests = mac.world.origin.requests().len();
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    assert!(inst.is_installed() && !inst.adoptable());
+    startup_for(&inst, Vec::new()).expect("startup");
+    assert_eq!(mac.world.origin.requests().len(), requests, "no request");
+    let rec = mac.record();
+    assert_eq!(rec.install_id, before.install_id, "no adoption");
+    assert_eq!(rec.current, before.current);
+    // The start's reconcile recorded the new directory.
+    let facts = mac.fs.place(&mac.bundle()).expect("place");
+    assert_eq!(
+        read_bundle_identity(&mac.fs, &mac.layout()).expect("identity"),
+        Some((facts.device, facts.inode))
+    );
+    common::workers_stopped();
+}
+
+#[test]
+fn a_replaced_bundle_whose_install_finishes_meanwhile_is_never_overwritten() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    replaced_install(&mac, V110);
+    // The same feed sequence: no floor rises, so the record is byte for byte what it was.
+    publish_all(&mac, 1, &[V100, V110]);
+    let before = mac.record();
+    let dragged = dump(&mac.fs, &mac.bundle());
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    assert!(inst.adoptable());
+    // While the bundle is hashed, a tree holding the record's current version appears in
+    // `versions` (an update of the install finishing its swap): the install is not replaced any
+    // more.
+    let fs = mac.fs.clone();
+    let tree = mac.layout().version_dir(&version(V100));
+    let cfg = config(&mac.world, V100);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&done);
+    let options = CheckOptions {
+        progress: Some(Box::new(move |_| {
+            if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                write_bundle(&fs, &tree, &cfg);
+            }
+        })),
+        cancel: None,
+    };
+    let got = check_with(&mac, &inst, options);
+    assert!(
+        done.load(std::sync::atomic::Ordering::SeqCst),
+        "the hook ran"
+    );
+    assert!(matches!(got, Err(Error::NotInstalled)), "{got:?}");
+    assert_eq!(mac.record(), before, "the record is unchanged");
+    assert_eq!(
+        dump(&mac.fs, &mac.bundle()),
+        dragged,
+        "the bundle is unchanged"
+    );
+    common::workers_stopped();
+}
+
+/// A crash at every write of the adopting check of a replaced bundle, under both recovery modes:
+/// the next check (cuts before the record) or the next start (after it: `Installed` by version)
+/// reaches the end state.
+#[test]
+fn a_crash_at_any_write_of_a_replaced_bundles_adoption_ends_adopted() {
+    let _serial = common::serial();
+    let world = |mac: &Mac| {
+        let before = replaced_install(mac, V110);
+        publish_all(mac, 2, &[V100, V110]);
+        before
+    };
+    let mac = Mac::new();
+    world(&mac);
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    let base = mac.fs.op_count();
+    check_with(&mac, &inst, CheckOptions::default()).expect("check");
+    let writes = mac.fs.op_count() - base;
+    assert!(writes > 4, "{writes}");
+    common::workers_stopped();
+
+    let mut seen = std::collections::BTreeSet::new();
+    for mode in [RecoverMode::DropVolatile, RecoverMode::KeepVolatile] {
+        for n in 0..writes {
+            let mac = Mac::new();
+            let before = world(&mac);
+            let inst = mac.open(&mac.bundle(), None).expect("installation");
+            assert!(inst.adoptable(), "write {n}");
+            mac.fs.crash_after(mac.fs.op_count() + n);
+            let crashed = check_with(&mac, &inst, CheckOptions::default());
+            assert!(crashed.is_err(), "write {n}: the crashed check succeeded");
+            common::workers_stopped();
+            let disk = mac.fs.recover(mode);
+            let mac = mac.with_fs(disk);
+
+            let inst = mac.open(&mac.bundle(), None).expect("installation");
+            let (how, events) = if inst.adoptable() {
+                let outcome = check_with(&mac, &inst, CheckOptions::default())
+                    .unwrap_or_else(|e| panic!("write {n}: next check: {e:?}"));
+                assert!(outcome.adopted, "write {n}");
+                ("check", queued(&mac))
+            } else {
+                assert!(inst.is_installed() && !inst.moved(), "write {n}");
+                let start = startup_for(&inst, Vec::new())
+                    .unwrap_or_else(|e| panic!("write {n}: next start: {e:?}"));
+                ("start", start.events)
+            };
+            seen.insert(how);
+            assert_adopted(&mac, &mac.bundle(), V110, &events);
+            assert_ne!(mac.record().install_id, before.install_id, "write {n}");
+            common::workers_stopped();
+        }
+    }
+    assert!(seen.contains("check") && seen.contains("start"), "{seen:?}");
+}

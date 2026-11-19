@@ -1030,11 +1030,11 @@ impl Updater {
     /// release's signed manifest file by file ([`lunepack_core::verify_tree`]: nothing missing,
     /// nothing extra, sizes, hashes, executable bits and link targets; the bundle is never
     /// written, moved or removed), and only then is it recorded as the install's current
-    /// version (events `installed` and `first_run`; an orphaned install keeps its floors and gets
-    /// a new install id). The check then goes on as an installed one. A failure leaves the
-    /// bundle as it was, at most a record with no current version and floors raised from
-    /// verified documents, and the next check tries again. A live install makes it
-    /// [`Error::NotInstalled`] with no request made. See [`Updater::check_with`].
+    /// version (events `installed` and `first_run`; an orphaned install, or one whose live bundle
+    /// the user replaced at its own path, keeps its floors and gets a new install id). The check
+    /// then goes on as an installed one. A failure leaves the bundle as it was, at most a record
+    /// with no current version and floors raised from verified documents, and the next check
+    /// tries again. A live install makes it [`Error::NotInstalled`] with no request made. See [`Updater::check_with`].
     pub fn check(
         &self,
     ) -> impl Future<Output = Result<Option<UpdateInfo>, Error>> + Send + 'static {
@@ -1149,6 +1149,9 @@ impl Updater {
     }
 
     /// The installed version; `Ok(None)` in a development run (no install state). Takes no lock.
+    /// An updater of an adoptable bundle ([`crate::Installation::adoptable`]) is a development
+    /// run until its check adopted the bundle: `Ok(None)` while the record is not the bundle's
+    /// (none, no current version, orphaned, or replaced by this bundle).
     pub fn installed(&self) -> Result<Option<InstalledVersion>, Error> {
         let snap = match self.inner.load() {
             Ok(snap) => snap,
@@ -1156,6 +1159,21 @@ impl Updater {
             Err(e) => return Err(e),
         };
         let record = snap.record();
+        if let (
+            Some(bundle),
+            Layout::User {
+                state_dir,
+                versions_dir,
+                ..
+            },
+        ) = (&self.inner.adopt, &self.inner.layout)
+        {
+            let root = install_root_of(state_dir, versions_dir, scheme_of(&self.inner))?;
+            let fs = &*self.inner.fs;
+            if !names_bundle(fs, &root, bundle) || taken_over(fs, &root, record, bundle) {
+                return Ok(None);
+            }
+        }
         Ok(record.current.as_ref().map(|c| InstalledVersion {
             version: c.version.clone(),
             issued: c.issued,
@@ -2024,12 +2042,20 @@ fn names_bundle(fs: &dyn Fs, root: &UserLayout, bundle: &Path) -> bool {
         && is_real_dir(fs, bundle).unwrap_or(false)
 }
 
+/// Whether an adoption of `bundle` may take over `record`, which names a current version: it is
+/// orphaned (M8-D16), or `bundle` replaced the live bundle at its own path (M8-D16 amended). One
+/// predicate for the start check and the commit re-check, as discovery uses at the pointer.
+fn taken_over(fs: &dyn Fs, root: &UserLayout, record: &InstallState, bundle: &Path) -> bool {
+    lunepack_core::bundle_orphaned(fs, root, record)
+        || lunepack_core::bundle_replaced(fs, root, record, bundle)
+}
+
 /// The check of an updater whose running bundle is adoptable (M8-D9; see [`Updater::check`]).
 ///
 /// Order: before the lock, the bundle's config (this app), its place (M8-D4), the integration
 /// preflight and the install root's owner (as `install`); under the lock, the record is created
-/// when missing, kept when it has no current version or is orphaned, and a live install is
-/// [`Error::NotInstalled`] before any request; the documents are verified from the record's
+/// when missing, kept when it has no current version, is orphaned or is replaced, and a live
+/// install is [`Error::NotInstalled`] before any request; the documents are verified from the record's
 /// floors and the bundle's release is selected exactly; its manifest is verified and the floors
 /// are raised; the bundle is proved equal to it ([`lunepack_core::verify_tree`]); then, after the
 /// record is read again, the commit runs in the crash-safe order of M8-D9: `R/bundle.id`, the
@@ -2098,13 +2124,15 @@ async fn check_adopting(
                 }
                 Some(record) if record.current.is_none() => {}
                 Some(record) => {
-                    if names_bundle(fs, &start_root, &start_bundle) {
+                    let taken_over = taken_over(fs, &start_root, record, &start_bundle);
+                    if names_bundle(fs, &start_root, &start_bundle) && !taken_over {
                         let snap = inner.load()?;
                         let current = record.current.clone().ok_or(Error::NotInstalled)?;
                         return Ok(AdoptStart::Installed(snap, current));
                     }
-                    // One install per app id per user: only an orphaned one is taken over.
-                    if !lunepack_core::bundle_orphaned(fs, &start_root, record) {
+                    // One install per app id per user: only an orphaned or replaced one is
+                    // taken over.
+                    if !taken_over {
                         return Err(Error::NotInstalled);
                     }
                 }
@@ -2207,7 +2235,7 @@ async fn check_adopting(
             let record = loaded.record.clone().ok_or(Error::NotInstalled)?;
             let orphaned = match &record.current {
                 None => false,
-                Some(_) if lunepack_core::bundle_orphaned(fs, &commit_root, &record) => true,
+                Some(_) if taken_over(fs, &commit_root, &record, &commit_bundle) => true,
                 // Installed meanwhile: never overwritten.
                 Some(_) => return Err(Error::NotInstalled),
             };

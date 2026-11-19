@@ -1297,8 +1297,9 @@ pub enum BundleDiscovery {
         version: Version,
     },
     /// A bundle the user placed directly in an apps folder while this app has no live install
-    /// for the user (M8-D9): no record, a record with no current version, or an orphaned one
-    /// ([`bundle_orphaned`]). The update check may adopt it after proving it equal to its signed
+    /// for the user (M8-D9): no record, a record with no current version, an orphaned one
+    /// ([`bundle_orphaned`]), or one this bundle replaced at the live bundle's own path
+    /// ([`bundle_replaced`]). The update check may adopt it after proving it equal to its signed
     /// release; until then it is a development run.
     Adoptable {
         /// The install root `R`.
@@ -1319,8 +1320,12 @@ pub enum BundleDiscovery {
 ///    `R/versions` named by its config's version text is an old instance,
 ///    [`BundleDiscovery::Installed`].
 /// 4. `R/bundle` is read ([`UserLayout::bundle_path`], refused when not canonical). Equal to the
-///    tree byte for byte: [`BundleDiscovery::Installed`]. Its target exists: another copy of a
-///    live install, [`BundleDiscovery::NotInstalled`] (one install per app id per user).
+///    tree byte for byte: [`BundleDiscovery::Installed`], unless the install record (read only;
+///    one that does not load, or is another app's or scope's, leaves it `Installed`) is
+///    replaced by this tree ([`bundle_replaced`], M8-D16 amended): then
+///    [`BundleDiscovery::Adoptable`] when the tree is directly in an apps folder (rule 6's place
+///    rule), else [`BundleDiscovery::NotInstalled`]. Its target exists: another copy of a live
+///    install, [`BundleDiscovery::NotInstalled`] (one install per app id per user).
 /// 5. The pointer is missing or its target is gone, and the tree is not under `<home>/.Trash`
 ///    ([`BundleDiscovery::NotInstalled`] otherwise). [`BundleDiscovery::MovedFrom`] when the
 ///    tree's device and inode are those `R/bundle.id` records and the install record (read only)
@@ -1359,7 +1364,24 @@ pub fn discover_bundle(
     let pointer = layout.bundle_path(fs)?;
     if let Some(bundle) = &pointer {
         if bundle.as_os_str() == probe.tree.as_os_str() {
-            return Ok(installed());
+            // A bundle put over the live one at its own path, at another version, while no tree
+            // of `R` holds the current one (M8-D16 amended): not the install until adopted.
+            let replaced = match load_any::<InstallState>(fs, &layout.state_dir(), hasher) {
+                Ok(Some(record))
+                    if record.app_id == config.app_id && record.scope == Scope::User =>
+                {
+                    bundle_replaced(fs, &layout, &record, probe.tree)
+                }
+                // No record, or one that cannot be judged: as before.
+                _ => false,
+            };
+            return Ok(match replaced {
+                false => installed(),
+                true if in_apps_folder(probe.tree, probe.home) => {
+                    BundleDiscovery::Adoptable { root }
+                }
+                true => BundleDiscovery::NotInstalled,
+            });
         }
         if lstat(fs, bundle)?.is_some() {
             return Ok(BundleDiscovery::NotInstalled);
@@ -1426,17 +1448,55 @@ pub fn bundle_orphaned(fs: &dyn Fs, layout: &UserLayout, record: &InstallState) 
     if !matches!(lstat(fs, &bundle), Ok(None)) {
         return false;
     }
+    no_tree_holds(fs, layout, record, &current.version)
+}
+
+/// Whether `record` is replaced by `tree` under `layout` (M8-D16 amended), read only: it names a
+/// current version, `R/bundle` names `tree` byte for byte, `tree`'s own config is this app at
+/// another version, and none of the out slot, the swap slot and `<versions>/<current>` holds the
+/// current version ([`bundle_orphaned`]'s test). Every read error, an unreadable `tree` and a
+/// tree of another app answer `false`; nothing is followed. This is the state reconcile answers
+/// [`LayoutError::BundleMissing`] for: a bundle the user put over the live one at its path.
+pub fn bundle_replaced(
+    fs: &dyn Fs,
+    layout: &UserLayout,
+    record: &InstallState,
+    tree: &Path,
+) -> bool {
+    let Some(current) = &record.current else {
+        return false;
+    };
+    match layout.bundle_path(fs) {
+        Ok(Some(bundle)) if bundle.as_os_str() == tree.as_os_str() => {}
+        _ => return false,
+    }
+    match tree_of(fs, layout.scheme(), tree) {
+        Ok(Some(id))
+            if id.app_id == record.app_id && !same_version(&id.version, &current.version) => {}
+        _ => return false,
+    }
+    no_tree_holds(fs, layout, record, &current.version)
+}
+
+/// Whether none of the out slot, the swap slot and `<versions>/<current>` holds `current` of
+/// `record`'s app: each is empty, or holds this app at another version. Another app's tree, or
+/// one that cannot be read, answers `false` (it cannot be judged).
+fn no_tree_holds(
+    fs: &dyn Fs,
+    layout: &UserLayout,
+    record: &InstallState,
+    current: &Version,
+) -> bool {
     let scheme = layout.scheme();
     for path in [
         layout.out_slot(),
         layout.swap_slot(),
-        layout.version_dir(&current.version),
+        layout.version_dir(current),
     ] {
         match tree_of(fs, scheme, &path) {
             Ok(None) => {}
             Ok(Some(tree))
-                if tree.app_id == record.app_id
-                    && !same_version(&tree.version, &current.version) => {}
+                if tree.app_id == record.app_id && !same_version(&tree.version, current) => {}
             // It holds the current version, is another app's, or cannot be judged.
             _ => return false,
         }
