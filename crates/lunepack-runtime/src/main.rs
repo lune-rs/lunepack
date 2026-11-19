@@ -293,7 +293,13 @@ fn conclude(events: Events, last: &Event) {
 enum Operation {
     Install,
     Uninstall,
+    /// A setup run that ended before it knew the app (no name to show): its title is fixed.
+    Setup,
 }
+
+/// The title of a native notice for a setup run that failed before the app's name was verified.
+#[cfg(any(target_os = "linux", windows))]
+const SETUP_TITLE: &str = "Setup";
 
 /// The fixed text of a native notice: the app's validated display name, what happened and the
 /// closed result code (D36). Never a path, a value or an error's own text.
@@ -302,6 +308,7 @@ fn notice_text(name: &str, operation: Operation, kind: Kind) -> String {
     let (done, failed) = match operation {
         Operation::Install => ("was installed.", "could not be installed"),
         Operation::Uninstall => ("was uninstalled.", "could not be uninstalled"),
+        Operation::Setup => ("finished.", "could not finish"),
     };
     if kind == Kind::Ok {
         format!("{name} {done}")
@@ -524,6 +531,10 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         setup::Detect::None => return None,
         setup::Detect::Malformed => {
             conclude(stderr_events(), &setup::failed(Kind::Verify, None));
+            // The arguments are not validated here: a usage error is its own exit, so only
+            // `--silent` or `/S` matters for the notice.
+            let quiet = modes::parse_setup(args).unwrap_or(false);
+            notice(quiet, false, SETUP_TITLE, Operation::Setup, Kind::Verify);
             return Some(Kind::Verify);
         }
         setup::Detect::Setup(found) => found,
@@ -535,7 +546,11 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
     Some(run(|ad| {
         let data_home = match data_home() {
             Ok(dir) => dir,
-            Err(kind) => return headless_fail(setup::COMMAND, kind),
+            Err(kind) => {
+                let kind = headless_fail(setup::COMMAND, kind);
+                notice(silent, false, SETUP_TITLE, Operation::Setup, kind);
+                return kind;
+            }
         };
         let env = |name: &str| std::env::var_os(name);
         let want_ui = ui_host::ui_wanted(silent, &env);
@@ -552,7 +567,11 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
             &alive,
         ) {
             Ok(prepared) => prepared,
-            Err(kind) => return headless_fail(setup::COMMAND, kind),
+            Err(kind) => {
+                let kind = headless_fail(setup::COMMAND, kind);
+                notice(silent, false, SETUP_TITLE, Operation::Setup, kind);
+                return kind;
+            }
         };
         let (app, details) = setup::welcome(&prepared);
         let ui = match prepared.ui_dir() {
@@ -575,9 +594,11 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
         ui.report(&events);
         let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui);
+        let seen = ui.outcome_acknowledged();
         ui.close(&events);
         prepared.cleanup(&*ad.fs);
         conclude(events, &last);
+        notice(silent, seen, prepared.name(), Operation::Install, kind);
         kind
     }))
 }
@@ -664,6 +685,10 @@ mod tests {
         assert_eq!(
             notice_text("My App", Operation::Install, Kind::Fs),
             "My App could not be installed (code 9)."
+        );
+        assert_eq!(
+            notice_text("Setup", Operation::Setup, Kind::Verify),
+            "Setup could not finish (code 7)."
         );
         assert_eq!(
             notice_text("My App", Operation::Uninstall, Kind::Ok),

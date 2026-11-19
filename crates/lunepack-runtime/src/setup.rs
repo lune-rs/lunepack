@@ -147,6 +147,11 @@ impl Prepared {
         &self.found.trailer.version
     }
 
+    /// The app's display name, from the verified config.
+    pub fn name(&self) -> &str {
+        &self.verified.config.install.name
+    }
+
     /// The UI's directory, when the UI was extracted.
     pub fn ui_dir(&self) -> Option<&Path> {
         self.ui_dir.as_deref()
