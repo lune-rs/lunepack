@@ -1476,9 +1476,128 @@ fn fs_cases(fs: &dyn Fs, root: &Path, base: &Path, symlinks: bool) {
     assert!(again.is_some(), "the lock is free after the guard dropped");
     drop((again, second));
 
+    fs_exchange_cases(fs, base);
+    fs_place_cases(fs, base, symlinks);
+    fs_private_dir_cases(fs, base);
+
     if symlinks {
         fs_symlink_cases(fs, base);
     }
+}
+
+/// The names in the directory `dir`, sorted.
+fn sorted_names(fs: &dyn Fs, dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs
+        .list_dir(dir)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// `exchange` (M8-D3): two directories swap names (their contents follow the names), and a
+/// missing side is `NotFound` with nothing changed. An adapter or volume with no atomic swap
+/// answers `Unsupported`, which the contract allows; the cases are then skipped.
+fn fs_exchange_cases(fs: &dyn Fs, base: &Path) {
+    let a = base.join("ex-a");
+    let b = base.join("ex-b");
+    fs.create_dir_all(&a).unwrap();
+    fs.create_dir_all(&b).unwrap();
+    write_file(fs, &a.join("from-a"), b"a");
+    write_file(fs, &b.join("from-b"), b"b");
+    match fs.exchange(&a, &b) {
+        Ok(()) => {}
+        Err(e) if e.kind == FsErrorKind::Unsupported => return,
+        Err(e) => panic!("exchange of two directories: {e:?}"),
+    }
+    assert_eq!(sorted_names(fs, &a), vec!["from-b".to_owned()]);
+    assert_eq!(sorted_names(fs, &b), vec!["from-a".to_owned()]);
+    assert_eq!(fs.read_capped(&a.join("from-b"), 10).unwrap(), b"b");
+    fs.sync_dir(base).expect("sync after exchange");
+
+    let missing = base.join("ex-missing");
+    assert_eq!(
+        fs_kind(fs.exchange(&a, &missing), "exchange with a missing side"),
+        FsErrorKind::NotFound
+    );
+    assert_eq!(
+        fs_kind(fs.exchange(&missing, &b), "exchange from a missing side"),
+        FsErrorKind::NotFound
+    );
+    assert_eq!(sorted_names(fs, &a), vec!["from-b".to_owned()]);
+    assert_eq!(fs.symlink_metadata(&missing).unwrap(), None);
+}
+
+/// `place` (M8-D4, M8-D17): two entries of one directory are on one device and have different
+/// inodes, an entry keeps its inode when renamed, the suite's own directory is the caller's and
+/// writable on a writable volume, the type name is at most 15 bytes, and a missing path is
+/// `NotFound` (a symlink, when symlinks are tested, `IsSymlink`). An adapter with no such query
+/// answers `Unsupported`; the cases are then skipped.
+fn fs_place_cases(fs: &dyn Fs, base: &Path, symlinks: bool) {
+    let dir = base.join("place");
+    fs.create_dir_all(&dir.join("one")).unwrap();
+    write_file(fs, &dir.join("two"), b"2");
+    let one = match fs.place(&dir.join("one")) {
+        Ok(facts) => facts,
+        Err(e) if e.kind == FsErrorKind::Unsupported => return,
+        Err(e) => panic!("place of a directory: {e:?}"),
+    };
+    let two = fs.place(&dir.join("two")).expect("place of a file");
+    assert_eq!(one.device, two.device, "one directory, one device");
+    assert_ne!(one.inode, two.inode, "two entries, two inodes");
+    assert!(one.fs_type.len() <= 15, "fs type over 15 bytes");
+    let here = fs.place(&dir).expect("place of the suite directory");
+    assert!(here.owned_by_caller, "the suite's own directory");
+    assert!(here.writable, "the suite's own directory is writable");
+    assert!(!here.read_only, "the suite runs on a writable volume");
+    fs.rename(&dir.join("one"), &dir.join("one-moved")).unwrap();
+    assert_eq!(
+        fs.place(&dir.join("one-moved")).unwrap().inode,
+        one.inode,
+        "a rename keeps the inode"
+    );
+    assert_eq!(
+        fs_kind(fs.place(&dir.join("none")), "place of a missing path"),
+        FsErrorKind::NotFound
+    );
+    if symlinks {
+        fs.symlink(&dir.join("two").to_string_lossy(), &dir.join("link"))
+            .unwrap();
+        assert_eq!(
+            fs_kind(fs.place(&dir.join("link")), "place of a symlink"),
+            FsErrorKind::IsSymlink
+        );
+    }
+}
+
+/// `create_dir_private`: one new directory under an existing parent; an existing entry is
+/// `AlreadyExists` and a missing parent `NotFound`. `Unsupported` skips the cases.
+fn fs_private_dir_cases(fs: &dyn Fs, base: &Path) {
+    let dir = base.join("private");
+    match fs.create_dir_private(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind == FsErrorKind::Unsupported => return,
+        Err(e) => panic!("create_dir_private: {e:?}"),
+    }
+    assert_eq!(
+        fs.symlink_metadata(&dir).unwrap().map(|m| m.kind),
+        Some(FileKind::Dir)
+    );
+    write_file(fs, &dir.join("inside"), b"x");
+    assert_eq!(
+        fs_kind(fs.create_dir_private(&dir), "create_dir_private again"),
+        FsErrorKind::AlreadyExists
+    );
+    assert_eq!(sorted_names(fs, &dir), vec!["inside".to_owned()]);
+    assert_eq!(
+        fs_kind(
+            fs.create_dir_private(&base.join("no-parent/private")),
+            "create_dir_private under a missing parent"
+        ),
+        FsErrorKind::NotFound
+    );
 }
 
 fn fs_symlink_cases(fs: &dyn Fs, base: &Path) {

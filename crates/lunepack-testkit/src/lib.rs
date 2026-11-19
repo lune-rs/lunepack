@@ -35,7 +35,7 @@ pub use integration::{
     FakeIntegration, IntegrationCall, IntegrationOp, SuiteHooks, run_integration_suite,
     run_integration_suite_with,
 };
-pub use memfs::{MemFs, RecoverMode};
+pub use memfs::{MemFs, MemPlace, RecoverMode};
 pub use process::{
     ChildScript, FakeChildPipes, FakePipeReader, FakePipeWriter, FakeProcess, SpawnRecord,
     run_process_suite,
