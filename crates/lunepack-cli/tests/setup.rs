@@ -471,7 +471,8 @@ fn the_runtime_check_refuses_a_tampered_truncated_or_overlapping_file() {
     }
     // Truncated: a byte short, or the trailer gone.
     assert!(check(&bytes[..bytes.len() - 1]).is_err());
-    let mut cut = bytes[..bytes.len() - TRAILER_SIZE as usize - 1].to_vec();
+    // (The pack's last byte, and the alignment padding after it, are gone.)
+    let mut cut = bytes[..(t.pack.offset + t.pack.length - 1) as usize].to_vec();
     cut.extend_from_slice(&bytes[bytes.len() - TRAILER_SIZE as usize..]);
     assert!(check(&cut).is_err(), "a payload byte short");
     // Overlapping parts: the manifest moved into the key set.
@@ -620,6 +621,60 @@ fn windows_setup_stamps_the_runtime_and_reads_back() {
     assert_ok(&w.setup(&again, &[]), "again");
     let strings = version_strings(&fs::read(&again).unwrap());
     assert_eq!(strings["OriginalFilename"], "again.exe");
+}
+
+/// F5: signtool zero-pads to 8 before the certificate table, so a setup file whose length is not a
+/// multiple of 8 stops ending at its trailer once signed. The writer aligns the trailer: every
+/// setup file is a multiple of 8 long, whatever the pack's length (FORMAT.md 14).
+#[test]
+fn every_setup_file_is_a_multiple_of_8_long() {
+    // Incompressible bytes, so the pack's length moves with the file's.
+    let noise = |n: usize| -> Vec<u8> {
+        let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    };
+    let mut residues = std::collections::BTreeSet::new();
+    let mut lens = Vec::new();
+    for extra in 0..8usize {
+        let w = World::windows(Windows {
+            files: vec![("data/noise.bin", noise(4_000 + extra))],
+            ..plain_windows()
+        });
+        let out_path = w.dir.path().join("s.exe");
+        assert_ok(&w.setup(&out_path, &[]), "windows setup");
+        let bytes = fs::read(&out_path).unwrap();
+        let t = trailer_of(&bytes);
+        residues.insert((t.pack.offset + t.pack.length) % 8);
+        lens.push(bytes.len());
+        // signtool pads to 8 before the table: a multiple of 8 means it adds nothing.
+        assert!(
+            bytes.len().is_multiple_of(8),
+            "setup file {extra} is not 8-aligned"
+        );
+        assert_eq!(
+            locate_file(&Bytes(bytes.clone())).unwrap(),
+            Located::Setup {
+                end: bytes.len() as u64
+            }
+        );
+    }
+    // The inputs did reach unaligned pack ends, so the test would have caught the old writer.
+    assert!(
+        residues.iter().any(|r| *r != 0),
+        "every pack ended 8-aligned: the test proves nothing ({residues:?})"
+    );
+    // And the Linux file too.
+    let w = World::new();
+    let out_path = w.dir.path().join("s");
+    assert_ok(&w.setup(&out_path, &[]), "linux setup");
+    assert!(fs::read(&out_path).unwrap().len().is_multiple_of(8));
 }
 
 /// A PNG `install.icon` is read from the pack through its signed frame and stamped; an SVG stamps

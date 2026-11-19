@@ -278,6 +278,10 @@ pub fn build(
     let keys_part = place(&mut out, &keys_bytes);
     let manifest_part = place(&mut out, &manifest_bytes);
     let pack_part = place(&mut out, &pack);
+    // The trailer starts 8-aligned, so the file's length is a multiple of 8 (the trailer's size is):
+    // signtool zero-pads to 8 before the certificate table, and that padding must be none or the
+    // trailer is no longer the last bytes the table follows (FORMAT.md 14).
+    align(&mut out);
     let trailer = SetupTrailer {
         keys: keys_part,
         manifest: manifest_part,
