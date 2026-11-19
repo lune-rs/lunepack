@@ -94,6 +94,36 @@ pub fn helper_info_plist(app_id: &AppId, name: &str, icon: bool) -> Result<Vec<u
     render(&mut entries)
 }
 
+/// The bundle identifier of the installer app: the app id with `_` written as `-`, then
+/// `.lunepack-installer` (M8-D7).
+pub fn installer_bundle_id(app_id: &AppId) -> String {
+    format!("{}.lunepack-installer", app_id.as_str().replace('_', "-"))
+}
+
+/// The `Info.plist` of the installer app `Install <name>.app` (M8-D7): the UI as its main
+/// executable, `Install <name>` as its name and, when the release has an icon, the icon's file
+/// name (`icon_name`, without the extension).
+pub fn installer_info_plist(
+    app_id: &AppId,
+    name: &str,
+    icon_name: Option<&str>,
+) -> Result<Vec<u8>> {
+    let id = installer_bundle_id(app_id);
+    let title = format!("Install {name}");
+    let mut entries = vec![
+        ("CFBundleExecutable", Value::String(UI_FILE)),
+        ("CFBundleIdentifier", Value::String(&id)),
+        ("CFBundleName", Value::String(&title)),
+        ("CFBundlePackageType", Value::String("APPL")),
+        ("LSMinimumSystemVersion", Value::String(MIN_SYSTEM_VERSION)),
+        ("NSHighResolutionCapable", Value::Bool(true)),
+    ];
+    if let Some(icon) = icon_name {
+        entries.push(("CFBundleIconFile", Value::String(icon)));
+    }
+    render(&mut entries)
+}
+
 /// Checks `bytes` as an `.icns` file: the `icns` magic and a big-endian length that equals the
 /// file's, at least the 8-byte header. Carries no byte of the file.
 pub fn check_icns(bytes: &[u8]) -> std::result::Result<(), &'static str> {
@@ -142,6 +172,27 @@ mod tests {
 </dict>\n\
 </plist>\n";
         assert_eq!(String::from_utf8(got).unwrap(), want);
+    }
+
+    #[test]
+    fn the_installer_plist_names_the_installer_and_escapes_the_name() {
+        let got = installer_info_plist(&id(), "A & B", Some("lunepack-installer")).unwrap();
+        let text = String::from_utf8(got).unwrap();
+        for needle in [
+            "<key>CFBundleExecutable</key>\n\t<string>lunepack-ui</string>",
+            "<string>org.example.my-app.lunepack-installer</string>",
+            "<key>CFBundleName</key>\n\t<string>Install A &amp; B</string>",
+            "<key>CFBundleIconFile</key>\n\t<string>lunepack-installer</string>",
+        ] {
+            assert!(text.contains(needle), "{needle}\n{text}");
+        }
+        let bare = installer_info_plist(&id(), "A", None).unwrap();
+        assert!(
+            !String::from_utf8(bare)
+                .unwrap()
+                .contains("CFBundleIconFile")
+        );
+        assert!(installer_info_plist(&id(), "a\u{1}b", None).is_err());
     }
 
     #[test]
