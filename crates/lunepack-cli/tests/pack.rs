@@ -1598,20 +1598,15 @@ fn update_pack_other_targets() {
     let err = assert_fails(&out, 1, "a runtime importing the C runtime DLL");
     assert!(err.contains("C runtime"), "{err:?}");
 
-    // macOS: the config sits under Contents/Resources (assumed until M8).
+    // macOS: the entry is Contents/MacOS/<file> and the config sits under Contents/Resources
+    // (M8-D1); the full cases are in the macOS section below.
     let w = World::new(1, 1);
-    w.append_config(&UPDATE_TOML.replace("bin/app", "App.app/Contents/MacOS/app"));
+    w.append_config(MACOS_TOML);
     let dir = w.release_dir("rel", &[]);
     let input = tempfile::tempdir().unwrap();
-    write(
-        input.path(),
-        "App.app/Contents/MacOS/app",
-        &exe_headers::macho(0x0100_000C, false, 8_000),
-    );
-    set_mode(&input.path().join("App.app/Contents/MacOS/app"), 0o755);
-    write(input.path(), "assets/icon.svg", b"<svg/>");
+    mac_app(input.path());
     let macho = w.dir.path().join("runtime.macho");
-    fs::write(&macho, exe_headers::macho(0x0100_000C, false, 4_096)).unwrap();
+    fs::write(&macho, macho_image(ARM64)).unwrap();
     assert_ok(
         &pack_update(
             &w,
@@ -1624,7 +1619,7 @@ fn update_pack_other_targets() {
         "macos-aarch64",
     );
     let (_, files) = w.verify(&dir, "1.0.0", Target::MacosAarch64);
-    assert!(files.contains_key("App.app/Contents/MacOS/lunepack-runtime"));
+    assert!(files.contains_key("Contents/MacOS/lunepack-runtime"));
     assert!(files.contains_key("Contents/Resources/lunepack-update.json"));
 }
 
@@ -2143,4 +2138,845 @@ fn windows_pack_refusals_name_the_field_not_the_value() {
         let err = assert_fails(&app.pack(&dir, "1.0.0", Some(&app.stub)), 1, at);
         assert!(err.contains("reserved"), "{at}: {err:?}");
     }
+}
+
+// ---- macOS targets (M8 step 7) ------------------------------------------------------------------
+
+#[cfg(unix)]
+const ARM64: u32 = 0x0100_000C;
+#[cfg(unix)]
+const X86_64: u32 = 0x0100_0007;
+
+#[cfg(unix)]
+const MACOS_TOML: &str = r#"
+[update]
+feed = "https://updates.example.com/hello"
+
+[install]
+entry = "Contents/MacOS/Hello"
+name = "Hello"
+"#;
+
+#[cfg(unix)]
+fn macho_image(cputype: u32) -> Vec<u8> {
+    exe_headers::macho(cputype, false, 4_096)
+}
+
+/// A bundle input: an `Info.plist`, the entry, a framework with `Versions/Current` symlinks and an
+/// executable helper tool.
+#[cfg(unix)]
+fn mac_app(root: &Path) {
+    write(root, "Contents/Info.plist", b"<plist/>");
+    write(
+        root,
+        "Contents/MacOS/Hello",
+        &exe_headers::macho(ARM64, false, 20_000),
+    );
+    set_mode(&root.join("Contents/MacOS/Hello"), 0o755);
+    write(root, "Contents/Resources/readme.txt", &text(3_000));
+    let fw = "Contents/Frameworks/Foo.framework";
+    write(
+        root,
+        &format!("{fw}/Versions/A/Foo"),
+        &exe_headers::macho(ARM64, false, 9_000),
+    );
+    set_mode(&root.join(format!("{fw}/Versions/A/Foo")), 0o755);
+    write(
+        root,
+        &format!("{fw}/Versions/A/Resources/Info.plist"),
+        b"<plist/>",
+    );
+    std::os::unix::fs::symlink("A", root.join(format!("{fw}/Versions/Current"))).unwrap();
+    // FORMAT 10.2: a link's target never passes through another link, so the usual
+    // `Foo -> Versions/Current/Foo` is written `Foo -> Versions/A/Foo`.
+    std::os::unix::fs::symlink("Versions/A/Foo", root.join(format!("{fw}/Foo"))).unwrap();
+    write(root, "Contents/Helpers/Updater", &text(500));
+    set_mode(&root.join("Contents/Helpers/Updater"), 0o755);
+}
+
+#[cfg(unix)]
+fn icns(payload: &[u8]) -> Vec<u8> {
+    let mut v = b"icns".to_vec();
+    v.extend_from_slice(&(8 + payload.len() as u32).to_be_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+/// The runtime and UI files of a macOS pack.
+#[cfg(unix)]
+struct MacBins {
+    runtime: PathBuf,
+    ui: PathBuf,
+}
+
+#[cfg(unix)]
+fn mac_bins(w: &World) -> MacBins {
+    let (runtime, ui) = (w.dir.path().join("runtime"), w.dir.path().join("ui"));
+    fs::write(&runtime, macho_image(ARM64)).unwrap();
+    let mut ui_bytes = macho_image(ARM64);
+    ui_bytes.extend_from_slice(b"ui");
+    fs::write(&ui, ui_bytes).unwrap();
+    MacBins { runtime, ui }
+}
+
+#[cfg(unix)]
+const HELPER: &str = "Contents/Helpers/lunepack-update.app";
+
+/// The runtime goes beside the entry, the config under `Contents/Resources` and, with `--ui`, the
+/// helper app (executable, `Info.plist`, icon); the manifest covers all of it and keeps the
+/// framework's symlink targets and exec bits.
+#[cfg(unix)]
+#[test]
+fn macos_pack_places_the_runtime_the_config_and_the_helper_app() {
+    let w = World::new(1, 1);
+    w.append_config(MACOS_TOML);
+    w.append_config("\n[macos]\nicon = \"app.icns\"\n");
+    let icon = icns(b"pixels");
+    fs::write(w.dir.path().join("app.icns"), &icon).unwrap();
+    let dir = w.release_dir("rel", &[]);
+    let input = tempfile::tempdir().unwrap();
+    mac_app(input.path());
+    let bins = mac_bins(&w);
+
+    let out = pack_update_ui(
+        &w,
+        input.path(),
+        &dir,
+        Some(&bins.runtime),
+        Some(&bins.ui),
+        "1.0.0",
+        "macos-aarch64",
+    );
+    assert_ok(&out, "macos pack with --ui");
+    // The input is never touched.
+    assert!(
+        !input
+            .path()
+            .join("Contents/MacOS/lunepack-runtime")
+            .exists()
+    );
+    assert!(!input.path().join(HELPER).exists());
+
+    let (m, files) = w.verify(&dir, "1.0.0", Target::MacosAarch64);
+    assert_eq!(
+        files["Contents/MacOS/lunepack-runtime"],
+        fs::read(&bins.runtime).unwrap()
+    );
+    assert!(exec_of(&m, "Contents/MacOS/lunepack-runtime"));
+    let ui = format!("{HELPER}/Contents/MacOS/lunepack-ui");
+    assert_eq!(files[&ui], fs::read(&bins.ui).unwrap());
+    assert!(exec_of(&m, &ui));
+    assert!(
+        !files.contains_key("Contents/MacOS/lunepack-ui"),
+        "nothing but the runtime beside the entry"
+    );
+    let plist = String::from_utf8(files[&format!("{HELPER}/Contents/Info.plist")].clone()).unwrap();
+    for needle in [
+        "<key>CFBundleExecutable</key>\n\t<string>lunepack-ui</string>",
+        "<string>org.example.hello.lunepack-update</string>",
+        "<key>CFBundleName</key>\n\t<string>Hello</string>",
+        "<key>CFBundleIconFile</key>\n\t<string>lunepack-update</string>",
+        "<key>LSMinimumSystemVersion</key>\n\t<string>10.15</string>",
+    ] {
+        assert!(plist.contains(needle), "{needle}\n{plist}");
+    }
+    let icon_at = format!("{HELPER}/Contents/Resources/lunepack-update.icns");
+    assert_eq!(files[&icon_at], icon);
+    assert!(!exec_of(&m, &icon_at));
+
+    let config_at = "Contents/Resources/lunepack-update.json";
+    let doc = lunepack_core::UpdateConfig::parse(&files[config_at]).unwrap();
+    assert_eq!(doc.target, Target::MacosAarch64);
+    assert_eq!(doc.install.entry.as_str(), "Contents/MacOS/Hello");
+    assert_eq!(
+        sha_of(&m, config_at),
+        Sha256Hasher.sha256(&files[config_at]),
+        "the manifest covers the config"
+    );
+
+    // Exec bits and symlink targets survive into the manifest.
+    let fw = "Contents/Frameworks/Foo.framework";
+    assert!(exec_of(&m, "Contents/MacOS/Hello"));
+    assert!(exec_of(&m, &format!("{fw}/Versions/A/Foo")));
+    assert!(exec_of(&m, "Contents/Helpers/Updater"));
+    assert!(!exec_of(&m, "Contents/Info.plist"));
+    for (path, want) in [
+        (format!("{fw}/Versions/Current"), "A"),
+        (format!("{fw}/Foo"), "Versions/A/Foo"),
+    ] {
+        assert!(
+            m.entries().iter().any(|e| matches!(e,
+                VerifiedEntry::Symlink { path: p, target } if p.as_str() == path && target == want)),
+            "{path} -> {want}"
+        );
+    }
+}
+
+/// Without `--ui` there is no helper app; without `[macos] icon` the helper has no icon and its
+/// `Info.plist` names none. A universal target packs too.
+#[cfg(unix)]
+#[test]
+fn macos_pack_without_ui_or_icon() {
+    let w = World::new(1, 1);
+    w.append_config(MACOS_TOML);
+    let dir = w.release_dir("rel", &[]);
+    let input = tempfile::tempdir().unwrap();
+    mac_app(input.path());
+    let bins = mac_bins(&w);
+
+    assert_ok(
+        &pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&bins.runtime),
+            "1.0.0",
+            "macos-aarch64",
+        ),
+        "macos pack without --ui",
+    );
+    let (_, files) = w.verify(&dir, "1.0.0", Target::MacosAarch64);
+    assert!(files.keys().all(|p| !p.contains("lunepack-update.app")));
+
+    assert_ok(
+        &pack_update_ui(
+            &w,
+            input.path(),
+            &dir,
+            Some(&bins.runtime),
+            Some(&bins.ui),
+            "1.0.1",
+            "macos-aarch64",
+        ),
+        "macos pack with --ui and no icon",
+    );
+    let (_, files) = w.verify(&dir, "1.0.1", Target::MacosAarch64);
+    let plist = String::from_utf8(files[&format!("{HELPER}/Contents/Info.plist")].clone()).unwrap();
+    assert!(!plist.contains("CFBundleIconFile"), "{plist}");
+    assert!(files.keys().all(|p| !p.ends_with(".icns")));
+
+    // macos-universal: a fat runtime with both slices.
+    let fat = w.dir.path().join("fat");
+    fs::write(&fat, exe_headers::fat(&[X86_64, ARM64], 4_096)).unwrap();
+    assert_ok(
+        &pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&fat),
+            "1.0.2",
+            "macos-universal",
+        ),
+        "macos-universal",
+    );
+    let out = pack_update(
+        &w,
+        input.path(),
+        &dir,
+        Some(&bins.runtime),
+        "1.0.3",
+        "macos-universal",
+    );
+    assert_fails(&out, 1, "a thin runtime for macos-universal");
+}
+
+/// The same inputs give the same pack and manifest; another icon or another name gives another one.
+#[cfg(unix)]
+#[test]
+fn macos_pack_is_deterministic() {
+    let w = World::new(1, 1);
+    w.append_config(MACOS_TOML);
+    w.append_config("\n[macos]\nicon = \"app.icns\"\n");
+    fs::write(w.dir.path().join("app.icns"), icns(b"one")).unwrap();
+    let input = tempfile::tempdir().unwrap();
+    mac_app(input.path());
+    let bins = mac_bins(&w);
+    let (a, b) = (w.release_dir("a", &[]), w.release_dir("b", &[]));
+    for dir in [&a, &b] {
+        assert_ok(
+            &pack_update_ui(
+                &w,
+                input.path(),
+                dir,
+                Some(&bins.runtime),
+                Some(&bins.ui),
+                "1.0.0",
+                "macos-aarch64",
+            ),
+            "pack",
+        );
+    }
+    for name in [
+        "1.0.0/macos-aarch64.pack",
+        "1.0.0/macos-aarch64.manifest.json",
+    ] {
+        assert_eq!(
+            fs::read(a.join(name)).unwrap(),
+            fs::read(b.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+    fs::write(w.dir.path().join("app.icns"), icns(b"two")).unwrap();
+    let c = w.release_dir("c", &[]);
+    assert_ok(
+        &pack_update_ui(
+            &w,
+            input.path(),
+            &c,
+            Some(&bins.runtime),
+            Some(&bins.ui),
+            "1.0.0",
+            "macos-aarch64",
+        ),
+        "pack with another icon",
+    );
+    assert_ne!(
+        fs::read(a.join("1.0.0/macos-aarch64.manifest.json")).unwrap(),
+        fs::read(c.join("1.0.0/macos-aarch64.manifest.json")).unwrap()
+    );
+}
+
+/// Every macOS refusal exits 1, names the field or path and never a value, writes nothing and
+/// leaves no work dir.
+#[cfg(unix)]
+#[test]
+fn macos_pack_refusals() {
+    let w = World::new(1, 1);
+    w.append_config(MACOS_TOML);
+    let dir = w.release_dir("rel", &[]);
+    let bins = mac_bins(&w);
+    let refused = |input: &Path, ui: bool, needle: &str| {
+        let out = pack_update_ui(
+            &w,
+            input,
+            &dir,
+            Some(&bins.runtime),
+            ui.then_some(bins.ui.as_path()),
+            "1.0.0",
+            "macos-aarch64",
+        );
+        let err = assert_fails(&out, 1, needle);
+        assert!(err.contains(needle), "{err:?} lacks {needle:?}");
+        assert!(!dir.join("1.0.0/macos-aarch64.manifest.json").exists());
+        assert!(!dir.join("1.0.0/macos-aarch64.pack").exists());
+        assert_eq!(w.work_dirs(), 0, "{needle}: no work dir is left");
+        err
+    };
+
+    // No Info.plist, and one that is not a regular file.
+    let input = tempfile::tempdir().unwrap();
+    mac_app(input.path());
+    fs::remove_file(input.path().join("Contents/Info.plist")).unwrap();
+    refused(input.path(), false, "Contents/Info.plist");
+    fs::create_dir(input.path().join("Contents/Info.plist")).unwrap();
+    refused(input.path(), false, "Contents/Info.plist");
+    fs::remove_dir(input.path().join("Contents/Info.plist")).unwrap();
+    std::os::unix::fs::symlink(
+        "Resources/readme.txt",
+        input.path().join("Contents/Info.plist"),
+    )
+    .unwrap();
+    refused(input.path(), false, "Contents/Info.plist");
+
+    // Reserved paths: the helper app (at any case, a directory or a file), the installer's payload,
+    // the config at any depth, and the runtime and UI names beside the entry.
+    for (rel, is_dir) in [
+        ("Contents/Helpers/lunepack-update.app", true),
+        ("Contents/Helpers/Lunepack-Update.app", true),
+        (
+            "Contents/Helpers/lunepack-update.app/Contents/Info.plist",
+            false,
+        ),
+        ("Contents/Resources/lunepack-setup.payload", false),
+        ("Contents/Resources/Lunepack-Setup.Payload", false),
+        ("Contents/Resources/lunepack-update.json", false),
+        ("Contents/Resources/deep/lunepack-update.json", false),
+        ("Contents/MacOS/lunepack-runtime", false),
+        ("Contents/MacOS/lunepack-ui", false),
+    ] {
+        let input = tempfile::tempdir().unwrap();
+        mac_app(input.path());
+        if is_dir {
+            fs::create_dir_all(input.path().join(rel)).unwrap();
+        } else {
+            write(input.path(), rel, b"x");
+        }
+        refused(input.path(), true, "reserved");
+    }
+    // A name that only starts like the helper's is an ordinary file.
+    let input = tempfile::tempdir().unwrap();
+    mac_app(input.path());
+    write(
+        input.path(),
+        "Contents/Helpers/lunepack-update.app2/x",
+        b"x",
+    );
+    write(
+        input.path(),
+        "Contents/Resources/lunepack-setup.payload2",
+        b"x",
+    );
+    assert_ok(
+        &pack_update_ui(
+            &w,
+            input.path(),
+            &dir,
+            Some(&bins.runtime),
+            None,
+            "1.0.0",
+            "macos-aarch64",
+        ),
+        "names that only start like reserved ones",
+    );
+
+    // A Linux runtime, a runtime for the other CPU, and an ELF as the UI.
+    let input = tempfile::tempdir().unwrap();
+    mac_app(input.path());
+    let elf = w.dir.path().join("elf");
+    fs::write(&elf, runtime_elf(183, false)).unwrap();
+    let x86 = w.dir.path().join("x86");
+    fs::write(&x86, macho_image(X86_64)).unwrap();
+    for (rt, ui, needle) in [
+        (&elf, None, "--runtime is not a runtime for macos-aarch64"),
+        (&x86, None, "another architecture"),
+        (
+            &bins.runtime,
+            Some(&elf),
+            "--ui is not a UI for macos-aarch64",
+        ),
+    ] {
+        let out = pack_update_ui(
+            &w,
+            input.path(),
+            &dir,
+            Some(rt),
+            ui.map(PathBuf::as_path),
+            "1.0.1",
+            "macos-aarch64",
+        );
+        let err = assert_fails(&out, 1, needle);
+        assert!(err.contains(needle), "{err:?}");
+    }
+    // `--stub` is for Windows targets only.
+    let stub = w.dir.path().join("stub.exe");
+    fs::write(&stub, hardened_pe(0x8664, 2)).unwrap();
+    let out = w.pack(&Pack {
+        input: input.path(),
+        version: "1.0.2",
+        target: "macos-aarch64",
+        release_dir: &dir,
+        signers: w.all_signers(),
+        epoch: T0,
+        extra: vec!["--runtime", s(&bins.runtime), "--stub", s(&stub)],
+    });
+    assert!(assert_fails(&out, 1, "--stub on macos").contains("--stub is only for windows-*"));
+}
+
+/// The entry must be `Contents/MacOS/<file>`, and nothing about the entry's value is echoed.
+#[cfg(unix)]
+#[test]
+fn macos_entry_must_sit_in_contents_macos() {
+    for entry in [
+        "bin/Hello",
+        "Contents/Hello",
+        "Contents/MacOS/sub/Hello",
+        "Contents/macos/Hello",
+    ] {
+        let w = World::new(1, 1);
+        w.append_config(&MACOS_TOML.replace("Contents/MacOS/Hello", entry));
+        let dir = w.release_dir("rel", &[]);
+        let input = tempfile::tempdir().unwrap();
+        mac_app(input.path());
+        write(
+            input.path(),
+            entry,
+            &exe_headers::macho(ARM64, false, 9_000),
+        );
+        set_mode(&input.path().join(entry), 0o755);
+        let bins = mac_bins(&w);
+        let out = pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&bins.runtime),
+            "1.0.0",
+            "macos-aarch64",
+        );
+        let err = assert_fails(&out, 1, entry);
+        assert!(err.contains("[install] entry"), "{err:?}");
+        assert!(!err.contains(entry), "the value is not echoed: {err:?}");
+        assert!(!dir.join("1.0.0").exists());
+    }
+}
+
+/// `[macos] icon`: read only with `--ui` on a macOS target, checked as an `.icns` file, and the
+/// refusal names the option and never the file.
+#[cfg(unix)]
+#[test]
+fn macos_icon_is_checked_only_when_a_helper_is_built() {
+    let w = World::new(1, 1);
+    w.append_config(MACOS_TOML);
+    w.append_config("\n[macos]\nicon = \"app.icns\"\n");
+    let dir = w.release_dir("rel", &[]);
+    let input = tempfile::tempdir().unwrap();
+    mac_app(input.path());
+    let bins = mac_bins(&w);
+    let with_ui = |version: &'static str| {
+        pack_update_ui(
+            &w,
+            input.path(),
+            &dir,
+            Some(&bins.runtime),
+            Some(&bins.ui),
+            version,
+            "macos-aarch64",
+        )
+    };
+    // Missing, not an icns file, and an icns file whose header length is wrong.
+    let err = assert_fails(&with_ui("1.0.0"), 1, "a missing icon");
+    assert!(err.contains("[macos] icon"), "{err:?}");
+    fs::write(w.dir.path().join("app.icns"), b"PRIVATE-MARKER not an icon").unwrap();
+    let err = assert_fails(&with_ui("1.0.0"), 1, "not an icns file");
+    assert!(err.contains("[macos] icon"), "{err:?}");
+    assert!(!err.contains("PRIVATE-MARKER"), "{err:?}");
+    let mut bad = icns(b"pixels");
+    bad.push(0);
+    fs::write(w.dir.path().join("app.icns"), &bad).unwrap();
+    let err = assert_fails(&with_ui("1.0.0"), 1, "a wrong length");
+    assert!(err.contains("[macos] icon"), "{err:?}");
+    assert!(!dir.join("1.0.0").exists());
+
+    // Not read without `--ui`, and not read for another target.
+    assert_ok(
+        &pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&bins.runtime),
+            "1.0.1",
+            "macos-aarch64",
+        ),
+        "no helper, no icon read",
+    );
+    let lin = tempfile::tempdir().unwrap();
+    write(
+        lin.path(),
+        "Contents/MacOS/Hello",
+        &exe_headers::elf(62, false, 9_000),
+    );
+    set_mode(&lin.path().join("Contents/MacOS/Hello"), 0o755);
+    let elf = w.dir.path().join("elf");
+    fs::write(&elf, runtime_elf(62, false)).unwrap();
+    assert_ok(
+        &pack_update(&w, lin.path(), &dir, Some(&elf), "1.0.2", "linux-x86_64"),
+        "a Linux pack ignores [macos]",
+    );
+}
+
+/// A name that cannot be a bundle name still packs, with a warning on stderr that names the rule
+/// and not the name; a usable name warns of nothing.
+#[cfg(unix)]
+#[test]
+fn macos_pack_warns_when_the_name_cannot_be_a_bundle_name() {
+    for (name, warns) in [
+        ("Hello", false),
+        (".Secret", true),
+        ("A:B", true),
+        ("A/B", true),
+    ] {
+        let w = World::new(1, 1);
+        w.append_config(&MACOS_TOML.replace("name = \"Hello\"", &format!("name = \"{name}\"")));
+        let dir = w.release_dir("rel", &[]);
+        let input = tempfile::tempdir().unwrap();
+        mac_app(input.path());
+        let bins = mac_bins(&w);
+        let out = pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&bins.runtime),
+            "1.0.0",
+            "macos-aarch64",
+        );
+        assert_ok(&out, "pack");
+        let err = stderr(&out);
+        assert_eq!(err.contains("warning"), warns, "{name}: {err:?}");
+        if warns {
+            assert!(err.contains("bundle name"), "{err:?}");
+            assert!(!err.contains(name), "the name is not echoed: {err:?}");
+        }
+    }
+    // Other targets never warn about it.
+    let w = World::new(1, 1);
+    w.append_config(&UPDATE_TOML.replace("name = \"Hello\"", "name = \".Secret\""));
+    let dir = w.release_dir("rel", &[]);
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    let rt = w.dir.path().join("rt");
+    fs::write(&rt, runtime_elf(62, false)).unwrap();
+    let out = pack_update(&w, input.path(), &dir, Some(&rt), "1.0.0", "linux-x86_64");
+    assert_ok(&out, "linux pack");
+    assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
+}
+
+/// `pack --assemble` writes the tree to sign; a signed bundle is packed unchanged when it holds
+/// everything `pack` would place, and refused, naming the path, when it does not (M8-D8).
+#[cfg(unix)]
+#[test]
+fn macos_assemble_and_the_signed_bundle_rule() {
+    let w = World::new(1, 1);
+    w.append_config(MACOS_TOML);
+    w.append_config("\n[macos]\nicon = \"app.icns\"\n");
+    fs::write(w.dir.path().join("app.icns"), icns(b"pixels")).unwrap();
+    let dir = w.release_dir("rel", &[]);
+    let input = tempfile::tempdir().unwrap();
+    mac_app(input.path());
+    let bins = mac_bins(&w);
+    let epoch = T0.to_string();
+    let assemble = |input: &Path, dest: &Path, target: &str| {
+        w.run(
+            &[
+                "pack",
+                "--input",
+                s(input),
+                "--version",
+                "1.0.0",
+                "--target",
+                target,
+                "--runtime",
+                s(&bins.runtime),
+                "--ui",
+                s(&bins.ui),
+                "--assemble",
+                s(dest),
+            ],
+            &[("SOURCE_DATE_EPOCH", &epoch)],
+        )
+    };
+
+    // Assemble: the placed files are there, the input is untouched, an existing dir is refused.
+    let out_dir = w.dir.path().join("assembled");
+    let out = assemble(input.path(), &out_dir, "macos-aarch64");
+    assert_ok(&out, "assemble");
+    assert!(stdout(&out).contains("assembled:"), "{}", stdout(&out));
+    for rel in [
+        "Contents/MacOS/lunepack-runtime",
+        "Contents/Resources/lunepack-update.json",
+        &format!("{HELPER}/Contents/MacOS/lunepack-ui"),
+        &format!("{HELPER}/Contents/Info.plist"),
+        &format!("{HELPER}/Contents/Resources/lunepack-update.icns"),
+        "Contents/MacOS/Hello",
+    ] {
+        assert!(out_dir.join(rel).is_file(), "{rel}");
+    }
+    assert!(!input.path().join(HELPER).exists());
+    assert!(
+        !dir.join("1.0.0").exists(),
+        "nothing was written to the release"
+    );
+    assert_eq!(w.work_dirs(), 0);
+    let before = fs::read(out_dir.join("Contents/MacOS/lunepack-runtime")).unwrap();
+    let err = assert_fails(
+        &assemble(input.path(), &out_dir, "macos-aarch64"),
+        1,
+        "an existing output dir",
+    );
+    assert!(err.contains("cannot create"), "{err:?}");
+    assert_eq!(
+        fs::read(out_dir.join("Contents/MacOS/lunepack-runtime")).unwrap(),
+        before,
+        "the existing dir is left alone"
+    );
+
+    // An unsigned pack of the input and a pack of the signed copy hold the same files, the signed
+    // one plus its signature.
+    let unsigned = w.release_dir("unsigned", &[]);
+    let pack_with = |input: &Path, dir: &Path| {
+        pack_update_ui(
+            &w,
+            input,
+            dir,
+            Some(&bins.runtime),
+            Some(&bins.ui),
+            "1.0.0",
+            "macos-aarch64",
+        )
+    };
+    assert_ok(&pack_with(input.path(), &unsigned), "unsigned pack");
+    // "Sign": add the signature directory, as `codesign` does.
+    write(&out_dir, "Contents/_CodeSignature/CodeResources", b"seal");
+    let signed = w.release_dir("signed", &[]);
+    assert_ok(&pack_with(&out_dir, &signed), "pack of the signed bundle");
+    let (_, plain) = w.verify(&unsigned, "1.0.0", Target::MacosAarch64);
+    let (m, sealed) = w.verify(&signed, "1.0.0", Target::MacosAarch64);
+    assert_eq!(sealed["Contents/_CodeSignature/CodeResources"], b"seal");
+    for (path, bytes) in &plain {
+        assert_eq!(&sealed[path], bytes, "{path}");
+    }
+    assert_eq!(sealed.len(), plain.len() + 1);
+    assert!(exec_of(&m, "Contents/MacOS/lunepack-runtime"));
+    // The signed tree was packed as it was.
+    assert_eq!(
+        fs::read(out_dir.join("Contents/MacOS/lunepack-runtime")).unwrap(),
+        before
+    );
+
+    // A signed input with a missing or different placement is refused, naming the path, before
+    // anything is written.
+    let round = std::cell::Cell::new(0);
+    let refuse = |input: &Path, path: &str| {
+        round.set(round.get() + 1);
+        let d = w.release_dir(&format!("refused-{}", round.get()), &[]);
+        let err = assert_fails(&pack_with(input, &d), 1, path);
+        assert!(err.contains(path), "{err:?} lacks {path:?}");
+        assert!(err.contains("--assemble"), "{err:?}");
+        assert!(!d.join("1.0.0").exists());
+        assert_eq!(w.work_dirs(), 0);
+    };
+    // Different bytes, a different size, a different exec bit, a missing file, a symlink.
+    let rt = out_dir.join("Contents/MacOS/lunepack-runtime");
+    let mut other = before.clone();
+    *other.last_mut().unwrap() ^= 0xFF;
+    fs::write(&rt, &other).unwrap();
+    refuse(&out_dir, "Contents/MacOS/lunepack-runtime");
+    other.push(0);
+    fs::write(&rt, &other).unwrap();
+    refuse(&out_dir, "Contents/MacOS/lunepack-runtime");
+    fs::write(&rt, &before).unwrap();
+    set_mode(&rt, 0o644);
+    refuse(&out_dir, "Contents/MacOS/lunepack-runtime");
+    set_mode(&rt, 0o755);
+    let plist = out_dir.join(HELPER).join("Contents/Info.plist");
+    let plist_bytes = fs::read(&plist).unwrap();
+    fs::remove_file(&plist).unwrap();
+    refuse(&out_dir, &format!("{HELPER}/Contents/Info.plist"));
+    std::os::unix::fs::symlink("../../../../Resources/lunepack-update.json", &plist).unwrap();
+    refuse(&out_dir, &format!("{HELPER}/Contents/Info.plist"));
+    fs::remove_file(&plist).unwrap();
+    fs::write(&plist, &plist_bytes).unwrap();
+    assert_ok(
+        &pack_with(&out_dir, &w.release_dir("again", &[])),
+        "restored",
+    );
+    // The config for another version differs.
+    let out = pack_update_ui(
+        &w,
+        &out_dir,
+        &w.release_dir("v2", &[]),
+        Some(&bins.runtime),
+        Some(&bins.ui),
+        "1.0.1",
+        "macos-aarch64",
+    );
+    let err = assert_fails(&out, 1, "the config of another version");
+    assert!(
+        err.contains("Contents/Resources/lunepack-update.json"),
+        "{err:?}"
+    );
+    // A signed bundle without the helper pack would place: packing without `--ui` leaves the
+    // helper app in the input, which is reserved.
+    let out = pack_update(
+        &w,
+        &out_dir,
+        &w.release_dir("noui", &[]),
+        Some(&bins.runtime),
+        "1.0.0",
+        "macos-aarch64",
+    );
+    assert!(assert_fails(&out, 1, "signed bundle with an extra helper").contains("reserved"));
+    // A signed input that holds none of the placements names the first one.
+    let bare = tempfile::tempdir().unwrap();
+    mac_app(bare.path());
+    write(
+        bare.path(),
+        "Contents/_CodeSignature/CodeResources",
+        b"seal",
+    );
+    refuse(bare.path(), "Contents/MacOS/lunepack-runtime");
+
+    // `--assemble` refuses a signed input, a non-macOS target, a missing `[update]`, and leaves no
+    // output dir behind when it fails.
+    let dest = w.dir.path().join("never");
+    let err = assert_fails(
+        &assemble(bare.path(), &dest, "macos-aarch64"),
+        1,
+        "signed input",
+    );
+    assert!(err.contains("_CodeSignature"), "{err:?}");
+    assert!(!dest.exists());
+    let err = assert_fails(
+        &assemble(input.path(), &dest, "linux-x86_64"),
+        1,
+        "linux target",
+    );
+    assert!(err.contains("only for macos-*"), "{err:?}");
+    assert!(!dest.exists());
+    let broken = tempfile::tempdir().unwrap();
+    mac_app(broken.path());
+    fs::remove_file(broken.path().join("Contents/Info.plist")).unwrap();
+    assert_fails(
+        &assemble(broken.path(), &dest, "macos-aarch64"),
+        1,
+        "no Info.plist",
+    );
+    assert!(!dest.exists(), "a failed assemble leaves nothing");
+    // Usage: a release directory or a signer next to `--assemble` is a usage error.
+    let out = w.run(
+        &[
+            "pack",
+            "--input",
+            s(input.path()),
+            "--version",
+            "1.0.0",
+            "--target",
+            "macos-aarch64",
+            "--assemble",
+            s(&dest),
+            "--release-dir",
+            s(&dir),
+        ],
+        &[],
+    );
+    assert_fails(&out, 2, "--assemble with --release-dir");
+    // Without `--assemble` the release directory and the signer stay required.
+    let out = w.run(
+        &[
+            "pack",
+            "--input",
+            s(input.path()),
+            "--version",
+            "1.0.0",
+            "--target",
+            "macos-aarch64",
+        ],
+        &[],
+    );
+    assert_fails(&out, 2, "no release dir");
+}
+
+/// `--assemble` for an app without `[update]` has nothing to assemble.
+#[cfg(unix)]
+#[test]
+fn assemble_needs_update() {
+    let w = World::new(1, 1);
+    let input = tempfile::tempdir().unwrap();
+    mac_app(input.path());
+    let dest = w.dir.path().join("out");
+    let out = w.run(
+        &[
+            "pack",
+            "--input",
+            s(input.path()),
+            "--version",
+            "1.0.0",
+            "--target",
+            "macos-aarch64",
+            "--assemble",
+            s(&dest),
+        ],
+        &[],
+    );
+    let err = assert_fails(&out, 1, "no [update]");
+    assert!(err.contains("--assemble needs [update]"), "{err:?}");
+    assert!(!dest.exists());
 }
