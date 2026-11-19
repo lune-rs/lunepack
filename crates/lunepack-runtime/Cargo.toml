@@ -43,11 +43,6 @@ url = { workspace = true }
 name = "apply"
 harness = false
 
-# The apply mode on the macOS bundle layout (M8): the same shape, own main, the test binary is the app.
-[[test]]
-name = "apply_macos"
-harness = false
-
 # The uninstall mode on the macOS bundle layout (M8 step 6b): own main, the test binary is a running app.
 [[test]]
 name = "uninstall_macos"

@@ -12,18 +12,24 @@
 //! it notes whether it had a health token, never the token itself (one case saves the token to a
 //! test-only file, to grep every output for it).
 //!
-//! The cases run one after another. Linux and Windows (M7 step 10); a case that needs a Linux
-//! mechanism (procfs, signals, shell scripts, the desktop entry and the command link, the
-//! `current` link) is gated per case with its reason in `LINUX_ONLY` below.
+//! The cases run one after another, on Linux, Windows and macOS (M8 step 6e). Everything that
+//! depends on the OS's layout scheme (the trees' entry and config paths, where the live version
+//! is after a swap, `R/current` or the live bundle `B`) comes from `tests/common`; a case that
+//! needs a mechanism one OS lacks is skipped on it, by name and with its reason, in `SKIPPED`
+//! below. The macOS cases of the old `apply_macos.rs` (a folder the user cannot write, a
+//! translocated runtime) are here too, skipped elsewhere.
 
 // The sink fan-out, compiled into this test so a UI-sink fake can be plugged in (the binary never
 // constructs one in M5).
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod common;
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[allow(dead_code)]
 #[path = "../src/events.rs"]
 mod events;
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some(native::HELPER_ARG) {
@@ -37,12 +43,12 @@ fn main() {
     native::run_all(&args);
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn main() {
-    println!("lunepack-runtime apply tests: Linux and Windows only, skipped");
+    println!("lunepack-runtime apply tests: Linux, macOS and Windows only, skipped");
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod native {
     use std::ffi::OsString;
     use std::io::Write;
@@ -53,30 +59,29 @@ mod native {
 
     use lunepack::{
         ConfirmOutcome, HEALTH_TOKEN_VAR, InstallMeta, Installation, Phase, ProcessId, Progress,
-        RelPath, StartupAction, Target, UpdateConfig, Version,
+        RelPath, StartupAction, UpdateConfig, Version,
     };
     use lunepack_core::state::{InstallState, Scope, StagedRef, UserScope};
-    use lunepack_core::{Hasher, LayoutScheme, UserLayout};
+    use lunepack_core::{Hasher, UserLayout};
     use lunepack_crypto::Sha256Hasher;
     #[cfg(target_os = "linux")]
     use lunepack_os_linux::LinuxProcess as NativeProcess;
+    #[cfg(target_os = "macos")]
+    use lunepack_os_macos::MacProcess as NativeProcess;
     #[cfg(windows)]
     use lunepack_os_windows::WindowsProcess as NativeProcess;
     use lunepack_testkit::sample_update_config;
 
+    use crate::common::{
+        self, ENTRY, ENTRY_DIR, OS_NAME, OTHER_ENTRY, RUNTIME_FILE, SCHEME, TARGET, exe,
+    };
     use crate::events::{Event, Events, LogSink, Sink, SinkFailed};
 
     pub const HELPER_ARG: &str = "helper-app";
     /// A helper mode of this binary: `sleep-for <seconds>`, a process to wait for.
     pub const SLEEP_ARG: &str = "sleep-for";
-    /// The layout scheme of this OS (what the runtime's platform picks).
-    #[cfg(windows)]
-    const SCHEME: LayoutScheme = LayoutScheme::WINDOWS;
-    #[cfg(not(windows))]
-    const SCHEME: LayoutScheme = LayoutScheme::XDG;
     /// Where the helper writes its notes (set on the runtime, inherited by the apps it starts).
     const OUT_VAR: &str = "LUNEPACK_APPLY_TEST_OUT";
-    const RUNTIME: &str = env!("CARGO_BIN_EXE_lunepack-runtime");
     const INSTALL_ID: [u8; 16] = [3; 16];
     const V090: &str = "0.9.0";
     const V100: &str = "1.0.0";
@@ -84,33 +89,14 @@ mod native {
     /// A bound on any one runtime run in a case.
     const RUN_LIMIT: Duration = Duration::from_secs(60);
 
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    const TARGET: Target = Target::LinuxAarch64;
-    #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
-    const TARGET: Target = Target::LinuxX86_64;
-    #[cfg(all(windows, target_arch = "aarch64"))]
-    const TARGET: Target = Target::WindowsAarch64;
-    #[cfg(all(windows, not(target_arch = "aarch64")))]
-    const TARGET: Target = Target::WindowsX86_64;
+    /// The two cases of the macOS bundle layout (an apps folder the user cannot write, a
+    /// translocated runtime), skipped on the other OSes.
+    #[cfg(not(target_os = "macos"))]
+    const MACOS_ONLY: &str = "the macOS bundle layout (exit 28 unsupported_location)";
 
-    /// The runtime's file name beside the entry.
+    /// The cases an OS skips, each with why; `run_all` prints the reason.
     #[cfg(windows)]
-    const RUNTIME_FILE: &str = "lunepack-runtime.exe";
-    #[cfg(not(windows))]
-    const RUNTIME_FILE: &str = "lunepack-runtime";
-
-    /// An entry path as this OS names an executable (`bin/app` is `bin/app.exe` on Windows).
-    fn exe(entry: &str) -> String {
-        if cfg!(windows) {
-            format!("{entry}.exe")
-        } else {
-            entry.to_owned()
-        }
-    }
-
-    /// The cases that need a Linux-only mechanism, each with why; they are skipped on Windows.
-    #[cfg(windows)]
-    const LINUX_ONLY: &[(&str, &str)] = &[
+    const SKIPPED: &[(&str, &str)] = &[
         (
             "the_wait_target_is_never_signalled",
             "waits on a shell script that traps POSIX signals",
@@ -123,7 +109,28 @@ mod native {
             "the_entry_directory_may_change_between_versions",
             "reads the desktop entry and the command link the Linux integration writes",
         ),
+        (
+            "an_apps_folder_the_user_cannot_write_is_exit_28_and_the_app_comes_back",
+            MACOS_ONLY,
+        ),
+        (
+            "a_translocated_runtime_is_exit_28_before_anything_else",
+            MACOS_ONLY,
+        ),
     ];
+    #[cfg(target_os = "linux")]
+    const SKIPPED: &[(&str, &str)] = &[
+        (
+            "an_apps_folder_the_user_cannot_write_is_exit_28_and_the_app_comes_back",
+            MACOS_ONLY,
+        ),
+        (
+            "a_translocated_runtime_is_exit_28_before_anything_else",
+            MACOS_ONLY,
+        ),
+    ];
+    #[cfg(target_os = "macos")]
+    const SKIPPED: &[(&str, &str)] = &[];
 
     type Case = fn(&Lab);
 
@@ -213,6 +220,14 @@ mod native {
             "the_log_rotates_at_one_mebibyte",
             the_log_rotates_at_one_mebibyte,
         ),
+        (
+            "an_apps_folder_the_user_cannot_write_is_exit_28_and_the_app_comes_back",
+            an_apps_folder_the_user_cannot_write_is_exit_28_and_the_app_comes_back,
+        ),
+        (
+            "a_translocated_runtime_is_exit_28_before_anything_else",
+            a_translocated_runtime_is_exit_28_before_anything_else,
+        ),
     ];
 
     pub fn run_all(args: &[String]) {
@@ -222,9 +237,8 @@ mod native {
             if filter.is_some_and(|f| !name.contains(f.as_str())) {
                 continue;
             }
-            #[cfg(windows)]
-            if let Some((_, why)) = LINUX_ONLY.iter().find(|(n, _)| n == name) {
-                println!("test {name} ... skipped on Windows ({why})");
+            if let Some((_, why)) = SKIPPED.iter().find(|(n, _)| n == name) {
+                println!("test {name} ... skipped on {OS_NAME} ({why})");
                 continue;
             }
             let lab = Lab::new();
@@ -325,6 +339,11 @@ mod native {
                     std::thread::sleep(Duration::from_millis(ms));
                     confirm(&v);
                 }
+                if let Some(ms) = other.strip_prefix("crash-after-") {
+                    let ms: u64 = ms.parse().expect("ms");
+                    std::thread::sleep(Duration::from_millis(ms));
+                    std::process::exit(3);
+                }
                 // "exit0" and anything else: exit 0 without confirming.
             }
         }
@@ -360,20 +379,11 @@ mod native {
 
     struct Lab {
         _tmp: tempfile::TempDir,
+        base: PathBuf,
         home: PathBuf,
         data: PathBuf,
         root: PathBuf,
         out: PathBuf,
-    }
-
-    /// `path` without Windows' `\\?\` prefix (a canonical path there), so it equals the path an
-    /// app reports for itself.
-    fn plain(path: PathBuf) -> PathBuf {
-        let text = path.to_string_lossy().into_owned();
-        match text.strip_prefix(r"\\?\") {
-            Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
-            _ => path,
-        }
     }
 
     fn version(text: &str) -> Version {
@@ -394,38 +404,17 @@ mod native {
         .expect("ms")
     }
 
-    /// Places `from` at `to`: a hard link when possible, else a copy.
-    fn place(from: &Path, to: &Path) {
-        std::fs::create_dir_all(to.parent().expect("parent")).expect("dirs");
-        // Never copy over an existing link: that would write into the linked binary.
-        assert!(std::fs::symlink_metadata(to).is_err(), "already placed");
-        if std::fs::hard_link(from, to).is_err() {
-            std::fs::copy(from, to).expect("copy");
-        }
-    }
-
     impl Lab {
         fn new() -> Lab {
-            // Under the target directory: the binaries can be hard-linked from there.
-            let tmp = tempfile::Builder::new()
-                .prefix("apply-")
-                .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-                .expect("tmp");
-            let base = std::fs::canonicalize(tmp.path()).expect("canonical");
-            let base = plain(base);
-            let home = base.join("home");
-            let data = home.join(".local/share");
-            let app = sample_update_config().app_id;
-            let root = data.join(app.as_str());
-            let out = base.join("out");
-            for d in [&home, &data, &root, &out] {
-                std::fs::create_dir_all(d).expect("dirs");
-            }
+            let h = common::Home::new("apply-", sample_update_config().app_id.as_str(), None, true);
+            let out = h.base.join("out");
+            std::fs::create_dir_all(&out).expect("out");
             Lab {
-                _tmp: tmp,
-                home,
-                data,
-                root,
+                _tmp: h.tmp,
+                base: h.base,
+                home: h.home,
+                data: h.data,
+                root: h.root,
                 out,
             }
         }
@@ -434,8 +423,24 @@ mod native {
             UserLayout::from_root(self.root.clone(), SCHEME)
         }
 
+        /// `R/versions/<v>`: where a tree is written, and where it is parked.
         fn tree_dir(&self, v: &str) -> PathBuf {
             self.layout().versions_dir().join(v)
+        }
+
+        /// Where the tree holding `v` is now: the live bundle on macOS once it holds `v`.
+        fn tree_of(&self, v: &str) -> PathBuf {
+            common::tree_of(&self.layout(), v)
+        }
+
+        /// The tree an app of `v` is started from.
+        fn run_tree(&self, v: &str) -> PathBuf {
+            common::run_tree(&self.layout(), v)
+        }
+
+        /// Where the live bundle goes when `R/bundle` does not exist yet (macOS).
+        fn bundle_default(&self) -> PathBuf {
+            self.home.join("Applications/Hello.app")
         }
 
         fn config(&self, v: &str, entry: &str, timeout: u64) -> UpdateConfig {
@@ -463,23 +468,19 @@ mod native {
         /// beside it, and the marker.
         fn tree(&self, v: &str, entry: &str, marker: &str, timeout: u64) -> PathBuf {
             let dir = self.tree_dir(v);
-            std::fs::create_dir_all(&dir).expect("dirs");
+            self.tree_at(&dir, v, entry, marker, timeout);
+            dir
+        }
+
+        /// The tree of `v` at `dir`, wherever that is.
+        fn tree_at(&self, dir: &Path, v: &str, entry: &str, marker: &str, timeout: u64) {
+            std::fs::create_dir_all(dir).expect("dirs");
             let entry = exe(entry);
             let entry = entry.as_str();
             let cfg = self.config(v, entry, timeout);
-            std::fs::write(
-                dir.join("lunepack-update.json"),
-                cfg.to_bytes().expect("config bytes"),
-            )
-            .expect("config");
-            let entry_path = dir.join(entry);
-            place(&std::env::current_exe().expect("exe"), &entry_path);
-            place(
-                Path::new(RUNTIME),
-                &entry_path.parent().expect("dir").join(RUNTIME_FILE),
-            );
+            common::write_config(dir, &cfg.to_bytes().expect("config bytes"));
+            common::place_app(dir, entry);
             std::fs::write(dir.join("marker"), marker).expect("marker");
-            dir
         }
 
         fn store(&self) -> UserScope {
@@ -507,9 +508,18 @@ mod native {
                 .expect("record")
         }
 
-        /// 1.0.0 installed and `staged` staged (bound), with the core's real writer.
+        /// [`Lab::commit`], then the record's current version is the live one: on macOS its tree
+        /// is moved to the live bundle and the pointer and identity are written (the core's
+        /// writers); elsewhere the runtime projects it at its first start.
+        fn commit_live(&self, next: impl FnOnce(Option<&InstallState>) -> InstallState) {
+            self.commit(next);
+            let current = self.record().current.expect("a current version").version;
+            common::project(&self.layout(), &self.bundle_default(), &current.to_string());
+        }
+
+        /// 1.0.0 installed (live) and `staged` staged (bound), with the core's real writer.
         fn install(&self, staged: &str) {
-            self.commit(|_| {
+            self.commit_live(|_| {
                 let app = sample_update_config().app_id;
                 InstallState::new(1, app, Scope::User, INSTALL_ID, TARGET)
                     .install(version(V100), 10, TARGET, INSTALL_ID)
@@ -529,6 +539,7 @@ mod native {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            common::quiet_ui(&mut cmd);
             cmd
         }
 
@@ -547,7 +558,7 @@ mod native {
             v: &str,
             restart: &[&str],
         ) -> Child {
-            let runtime = self.tree_dir(from).join(entry_dir).join(RUNTIME_FILE);
+            let runtime = self.tree_of(from).join(entry_dir).join(RUNTIME_FILE);
             self.command(&runtime)
                 .args([
                     "apply",
@@ -566,7 +577,7 @@ mod native {
 
         /// Runs the apply to its end; returns its exit code and everything it printed.
         fn apply(&self, from: &str, wait: ProcessId, v: &str) -> (i32, Vec<u8>) {
-            let child = self.start_apply(from, "bin", wait, v);
+            let child = self.start_apply(from, ENTRY_DIR, wait, v);
             finish(child)
         }
 
@@ -585,12 +596,15 @@ mod native {
             text
         }
 
-        /// The `current` link points at `v` (Linux; the Windows layout has no link, M7-D2).
-        fn assert_link(&self, v: &str) {
-            if self.layout().current_link().is_some() {
-                let link = std::fs::read_link(self.root.join("current")).expect("current");
-                assert_eq!(link, Path::new("versions").join(v));
-            }
+        /// The live version is `v`: `R/current` names it (Linux), the live bundle holds it and
+        /// `R/current` does not exist (macOS), and the live tree's own config names `v`.
+        fn assert_live(&self, v: &str) {
+            common::assert_live(&self.layout(), v);
+        }
+
+        /// `R/versions/<v>` holds the tree of `v`.
+        fn assert_parked(&self, v: &str) {
+            common::assert_parked(&self.layout(), v);
         }
     }
 
@@ -648,7 +662,7 @@ mod native {
         assert!(r.pending.is_none(), "pending after rollback");
         assert!(r.health.is_none(), "health after rollback");
         assert!(r.bad.contains(&version(V110)), "1.1.0 not marked bad");
-        lab.assert_link("1.0.0");
+        lab.assert_live("1.0.0");
     }
 
     fn assert_confirmed(lab: &Lab) {
@@ -661,7 +675,7 @@ mod native {
         assert!(r.pending.is_none(), "still pending");
         assert!(r.health.is_none(), "health left");
         assert!(r.bad.is_empty(), "marked bad");
-        lab.assert_link("1.1.0");
+        lab.assert_live("1.1.0");
     }
 
     fn log_has(lab: &Lab, needle: &str) -> bool {
@@ -682,11 +696,11 @@ mod native {
     // ---- the cases ------------------------------------------------------------------------------
 
     fn bad_argv_exits_2_and_does_nothing(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 5);
-        lab.tree(V110, "bin/app", "confirm", 5);
+        lab.tree(V100, ENTRY, "exit0", 5);
+        lab.tree(V110, ENTRY, "confirm", 5);
         lab.install(V110);
         let before = lab.record();
-        let runtime = lab.tree_dir(V100).join("bin").join(RUNTIME_FILE);
+        let runtime = lab.tree_of(V100).join(ENTRY_DIR).join(RUNTIME_FILE);
         for args in [
             vec![],
             vec!["apply"],
@@ -736,16 +750,32 @@ mod native {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&old, versions.join("0.7.0")).expect("link");
         std::fs::write(versions.join("0.6.0"), b"file").expect("file");
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "confirm", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "confirm", 30);
         lab.install(V110);
-        let (code, _) = lab.apply(V100, target("0.2"), V110);
+        let (code, output) = lab.apply(V100, target("0.2"), V110);
         assert_eq!(code, 0);
         assert_confirmed(lab);
-        assert!(lab.notes().contains("1.1.0 start token=yes"));
-        assert!(lab.notes().contains("1.1.0 confirm confirmed"));
+        let notes = lab.notes();
+        assert!(notes.contains("1.1.0 start token=yes"), "{notes}");
+        assert!(notes.contains("1.1.0 confirm confirmed"), "{notes}");
+        // The new version ran from where the layout runs a version from (the live bundle on
+        // macOS), with the token in the environment and never in its arguments.
+        let want_exe = common::join_rel(&lab.run_tree(V110), &exe(ENTRY));
+        assert!(
+            notes.contains(&format!("1.1.0 start token=yes exe={}", want_exe.display())),
+            "want {}: {notes}",
+            want_exe.display()
+        );
+        assert!(notes.contains("1.1.0 argv-has-token=false"), "{notes}");
         assert!(!old.exists(), "GC kept 0.9.0");
-        assert!(lab.tree_dir(V100).exists() && lab.tree_dir(V110).exists());
+        // The kept trees stay: 1.1.0 live, 1.0.0 the previous version.
+        lab.assert_parked(V100);
+        assert!(lab.tree_of(V110).exists());
+        assert!(
+            !String::from_utf8_lossy(&output).contains("token"),
+            "the output names the token"
+        );
         assert!(versions.join("v0.8.0").exists());
         #[cfg(unix)]
         assert!(std::fs::symlink_metadata(versions.join("0.7.0")).is_ok());
@@ -766,8 +796,8 @@ mod native {
     }
 
     fn crash_rolls_back_marks_bad_and_relaunches_old_without_token(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "crash", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "crash", 30);
         lab.install(V110);
         let (code, _) = lab.apply(V100, target("0.2"), V110);
         assert_eq!(code, 20);
@@ -782,15 +812,15 @@ mod native {
         assert!(log_has(lab, "\"phase\":\"rollback\""));
         assert!(log_has(lab, "\"reason\":\"crashed\""));
         assert!(log_has(lab, "\"outcome\":\"rolled_back\""));
-        // The bad tree is no longer kept.
+        // The bad tree is no longer kept (rolled back, it was parked under its version first).
         assert!(!lab.tree_dir(V110).exists(), "GC kept the bad tree");
     }
 
     fn exit_0_then_a_second_process_confirms(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "exit0", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "exit0", 30);
         lab.install(V110);
-        let runtime = lab.start_apply(V100, "bin", target("0.2"), V110);
+        let runtime = lab.start_apply(V100, ENTRY_DIR, target("0.2"), V110);
         assert!(
             lab.wait_note("1.1.0 startup continue", Duration::from_secs(10)),
             "the first start did not run"
@@ -802,7 +832,7 @@ mod native {
             Some(version(V110))
         );
         let second = lab
-            .command(&lab.tree_dir(V110).join(exe("bin/app")))
+            .command(&lab.tree_of(V110).join(exe(ENTRY)))
             .args([HELPER_ARG, "confirm"])
             .output()
             .expect("second");
@@ -817,8 +847,8 @@ mod native {
     }
 
     fn slow_confirm_is_terminated_and_rolled_back(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 5);
-        lab.tree(V110, "bin/app", "confirm-after-8000", 5);
+        lab.tree(V100, ENTRY, "exit0", 5);
+        lab.tree(V110, ENTRY, "confirm-after-8000", 5);
         lab.install(V110);
         let started = Instant::now();
         let (code, _) = lab.apply(V100, target("0.1"), V110);
@@ -839,8 +869,8 @@ mod native {
     fn confirm_racing_the_timeout_has_one_outcome(_: &Lab) {
         for offset in ["4950", "5000", "5050"] {
             let lab = &Lab::new();
-            lab.tree(V100, "bin/app", "exit0", 5);
-            lab.tree(V110, "bin/app", &format!("confirm-after-{offset}"), 5);
+            lab.tree(V100, ENTRY, "exit0", 5);
+            lab.tree(V110, ENTRY, &format!("confirm-after-{offset}"), 5);
             lab.install(V110);
             let (code, _) = lab.apply(V100, target("0.1"), V110);
             // Let a confirm that was under way finish (or be ended).
@@ -862,8 +892,8 @@ mod native {
     }
 
     fn the_wait_target_is_never_signalled(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "confirm", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "confirm", 30);
         lab.install(V110);
         let done = lab.out.join("target-done");
         let script = format!(
@@ -878,7 +908,7 @@ mod native {
             .process_id(child.id())
             .expect("probe")
             .expect("running");
-        let runtime = lab.start_apply(V100, "bin", id, V110);
+        let runtime = lab.start_apply(V100, ENTRY_DIR, id, V110);
         let status = child.wait().expect("target wait");
         let exited_at = now_ms();
         assert!(status.success(), "the target was disturbed: {status:?}");
@@ -891,8 +921,8 @@ mod native {
     }
 
     fn a_zombie_wait_target_counts_as_exited(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "confirm", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "confirm", 30);
         lab.install(V110);
         let mut zombie = Command::new("sleep").arg("0.2").spawn().expect("sleep");
         let id = NativeProcess::new()
@@ -901,8 +931,7 @@ mod native {
             .expect("running");
         // Not reaped: it stays a zombie of this process.
         std::thread::sleep(Duration::from_millis(600));
-        let stat = std::fs::read_to_string(format!("/proc/{}/stat", id.pid)).expect("stat");
-        assert!(stat.contains(") Z "), "not a zombie: {stat}");
+        assert!(common::is_zombie(id.pid), "not a zombie");
         let (code, _) = lab.apply(V100, id, V110);
         assert_eq!(code, 0);
         let waited = log_time(lab, "\"phase\":\"apply\"") - log_time(lab, "\"phase\":\"wait\"");
@@ -912,30 +941,38 @@ mod native {
     }
 
     fn the_entry_directory_may_change_between_versions(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "app", "report", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, OTHER_ENTRY, "report", 30);
         lab.install(V110);
         let (code, _) = lab.apply(V100, target("0.1"), V110);
         assert_eq!(code, 20);
         let notes = lab.notes();
-        let new_exe = lab.tree_dir(V110).join("app");
+        let new_exe = common::join_rel(&lab.run_tree(V110), OTHER_ENTRY);
         assert!(
             notes.contains(&format!("1.1.0 start token=yes exe={}", new_exe.display())),
             "{notes}"
         );
+        // The desktop entry and the command link point through `R/current` (Linux only).
+        #[cfg(target_os = "linux")]
         let current = lab.root.join("current");
-        assert!(
-            notes.contains(&format!("1.1.0 link={}", current.join("app").display())),
-            "{notes}"
-        );
-        assert!(
-            notes.contains(&format!(
-                "1.1.0 desktop Exec=\"{}\"",
-                current.join("app").display()
-            )),
-            "{notes}"
-        );
-        let old_exe = lab.tree_dir(V100).join("bin/app");
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                notes.contains(&format!(
+                    "1.1.0 link={}",
+                    current.join(OTHER_ENTRY).display()
+                )),
+                "{notes}"
+            );
+            assert!(
+                notes.contains(&format!(
+                    "1.1.0 desktop Exec=\"{}\"",
+                    current.join(OTHER_ENTRY).display()
+                )),
+                "{notes}"
+            );
+        }
+        let old_exe = common::join_rel(&lab.run_tree(V100), ENTRY);
         assert!(
             lab.wait_note(
                 &format!("1.0.0 start token=no exe={}", old_exe.display()),
@@ -946,20 +983,23 @@ mod native {
         );
         assert_rolled_back(lab);
         // The integration followed the rollback.
-        let link = std::fs::read_link(lab.home.join(".local/bin/lp-apply-test")).expect("link");
-        assert_eq!(link, current.join("bin/app"));
-        let desktop = std::fs::read_to_string(lab.data.join("applications").join(format!(
-            "{}.desktop",
-            sample_update_config().app_id.as_str()
-        )))
-        .expect("desktop entry");
-        assert!(desktop.contains(&format!("Exec=\"{}\"", current.join("bin/app").display())));
+        #[cfg(target_os = "linux")]
+        {
+            let link = std::fs::read_link(lab.home.join(".local/bin/lp-apply-test")).expect("link");
+            assert_eq!(link, current.join(ENTRY));
+            let desktop = std::fs::read_to_string(lab.data.join("applications").join(format!(
+                "{}.desktop",
+                sample_update_config().app_id.as_str()
+            )))
+            .expect("desktop entry");
+            assert!(desktop.contains(&format!("Exec=\"{}\"", current.join(ENTRY).display())));
+        }
     }
 
     fn a_missing_new_config_changes_nothing(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        let new = lab.tree(V110, "bin/app", "confirm", 30);
-        std::fs::remove_file(new.join("lunepack-update.json")).expect("remove config");
+        lab.tree(V100, ENTRY, "exit0", 30);
+        let new = lab.tree(V110, ENTRY, "confirm", 30);
+        std::fs::remove_file(common::config_in(&new)).expect("remove config");
         lab.install(V110);
         let before = lab.record();
         let (code, _) = lab.apply(V100, target("0.1"), V110);
@@ -974,15 +1014,15 @@ mod native {
         );
         assert!(lab.notes().contains("1.0.0 start token=no"));
         // Its own startup reconciled `current`, to the version that is still current.
-        lab.assert_link("1.0.0");
+        lab.assert_live("1.0.0");
         assert!(!lab.notes().contains("1.1.0 start"), "1.1.0 was started");
         assert!(!lab.notes().contains("token=yes"));
     }
 
     fn nothing_staged_relaunches_the_current_version(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "confirm", 30);
-        lab.commit(|r| {
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "confirm", 30);
+        lab.commit_live(|r| {
             let app = sample_update_config().app_id;
             assert!(r.is_none());
             InstallState::new(1, app, Scope::User, INSTALL_ID, TARGET).install(
@@ -1011,8 +1051,8 @@ mod native {
     /// F17: another applier for the same version (a second app instance, or `apply-and-restart`
     /// called twice) committed it first and launched it; this one is refused and starts nothing.
     fn an_apply_another_applier_made_starts_nothing_more(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "confirm", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "confirm", 30);
         lab.install(V110);
         lab.commit(|r| {
             lunepack_core::apply(
@@ -1042,8 +1082,8 @@ mod native {
     /// F17: the record names another current version and nothing pending (the update was applied
     /// and confirmed elsewhere): the outgoing version is not started again.
     fn a_record_that_moved_on_starts_nothing_more(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "confirm", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "confirm", 30);
         lab.install(V110);
         lab.commit(|r| {
             let applied =
@@ -1071,8 +1111,8 @@ mod native {
     /// this applier's commit window. The record is back where the app left it (1.0.0 current,
     /// nothing pending) except that 1.1.0 is bad: this applier is refused and starts nothing more.
     fn an_apply_another_applier_rolled_back_starts_nothing_more(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "crash", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "crash", 30);
         lab.install(V110);
         lab.commit(|r| {
             let applied = lunepack_core::apply(
@@ -1127,11 +1167,11 @@ mod native {
     /// is pending; the record did not move on, so that version starts again without the token,
     /// and the start counts as an unconfirmed one.
     fn an_unconfirmed_version_that_exits_to_apply_starts_again(lab: &Lab) {
-        lab.tree(V090, "bin/app", "exit0", 30);
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "confirm", 30);
+        lab.tree(V090, ENTRY, "exit0", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "confirm", 30);
         let gone = sha(b"a supervisor that is gone");
-        lab.commit(|_| {
+        lab.commit_live(|_| {
             let pending =
                 lunepack_core::apply(&installed_090(V100), &version(V100), gone).expect("apply");
             staging(&pending, V110)
@@ -1162,7 +1202,7 @@ mod native {
             Some(version(V110))
         );
         assert!(r.bad.is_empty(), "marked bad");
-        lab.assert_link("1.0.0");
+        lab.assert_live("1.0.0");
     }
 
     /// F19 with the pending version's supervisor still running: started with its token, 1.0.0
@@ -1170,11 +1210,11 @@ mod native {
     /// the token, it confirms, so its supervisor ends confirmed instead of rolling a healthy
     /// version back at its timeout.
     fn a_supervised_version_that_exits_to_apply_is_not_rolled_back(lab: &Lab) {
-        lab.tree(V090, "bin/app", "exit0", 30);
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "confirm", 30);
-        lab.commit(|_| installed_090(V100));
-        let supervisor = lab.start_apply(V090, "bin", target("0.1"), V100);
+        lab.tree(V090, ENTRY, "exit0", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "confirm", 30);
+        lab.commit_live(|_| installed_090(V100));
+        let supervisor = lab.start_apply(V090, ENTRY_DIR, target("0.1"), V100);
         assert!(
             lab.wait_note("1.0.0 startup continue", Duration::from_secs(10)),
             "1.0.0 did not start: {}",
@@ -1183,8 +1223,13 @@ mod native {
         assert!(lab.notes().contains("1.0.0 start token=yes"));
         // 1.1.0 is staged meanwhile, and 1.0.0 asks for it before it confirms.
         lab.commit(|r| staging(r.expect("record"), V110));
-        let applier =
-            lab.start_apply_with(V100, "bin", target("0.1"), V110, &[HELPER_ARG, "confirm"]);
+        let applier = lab.start_apply_with(
+            V100,
+            ENTRY_DIR,
+            target("0.1"),
+            V110,
+            &[HELPER_ARG, "confirm"],
+        );
         let (code, _) = finish(applier);
         assert_eq!(code, 7);
         let (code, _) = finish(supervisor);
@@ -1217,22 +1262,43 @@ mod native {
             r.staged.as_ref().map(|s| s.version.clone()),
             Some(version(V110))
         );
-        lab.assert_link("1.0.0");
+        lab.assert_live("1.0.0");
     }
 
     fn a_missing_previous_config_leaves_it_pending(lab: &Lab) {
-        let old = lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "crash", 30);
-        lab.install(V110);
-        let runtime = lab.start_apply(V100, "bin", target("1.5"), V110);
-        assert!(
-            wait_until(Duration::from_secs(5), || log_has(
-                lab,
-                "\"phase\":\"wait\""
-            )),
-            "no wait phase"
+        // When the previous version's config goes missing. Linux and Windows: while the applier
+        // waits for its target. macOS: 1.0.0's tree is the live bundle until the swap, and a
+        // bundle that holds no config is no bundle (the swap refuses it, exit 7, nothing
+        // started), so it goes missing from the parked tree once 1.1.0 runs, the moment a
+        // rollback reads it; 1.1.0 then crashes 1.5 s later.
+        let macos = cfg!(target_os = "macos");
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(
+            V110,
+            ENTRY,
+            if macos { "crash-after-1500" } else { "crash" },
+            30,
         );
-        std::fs::remove_file(old.join("lunepack-update.json")).expect("remove config");
+        lab.install(V110);
+        let runtime = lab.start_apply(V100, ENTRY_DIR, target("1.5"), V110);
+        if macos {
+            assert!(
+                lab.wait_note("1.1.0 startup continue", Duration::from_secs(10)),
+                "1.1.0 did not start: {}",
+                lab.notes()
+            );
+            lab.assert_parked(V100);
+            std::fs::remove_file(common::config_in(&lab.tree_dir(V100))).expect("remove config");
+        } else {
+            assert!(
+                wait_until(Duration::from_secs(5), || log_has(
+                    lab,
+                    "\"phase\":\"wait\""
+                )),
+                "no wait phase"
+            );
+            std::fs::remove_file(common::config_in(&lab.tree_of(V100))).expect("remove config");
+        }
         let (code, _) = finish(runtime);
         assert_eq!(code, 22);
         let r = lab.record();
@@ -1246,9 +1312,9 @@ mod native {
     }
 
     fn a_spawn_failure_rolls_back(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        let new = lab.tree(V110, "bin/app", "confirm", 30);
-        std::fs::remove_file(new.join(exe("bin/app"))).expect("remove entry");
+        lab.tree(V100, ENTRY, "exit0", 30);
+        let new = lab.tree(V110, ENTRY, "confirm", 30);
+        std::fs::remove_file(new.join(exe(ENTRY))).expect("remove entry");
         lab.install(V110);
         let (code, _) = lab.apply(V100, target("0.1"), V110);
         assert_eq!(code, 20);
@@ -1277,8 +1343,8 @@ mod native {
                 .spawn()
                 .expect("user")
         };
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "confirm", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "confirm", 30);
         lab.install(V110);
         let (code, _) = lab.apply(V100, target("0.1"), V110);
         let _ = user.kill();
@@ -1289,8 +1355,8 @@ mod native {
     }
 
     fn the_token_never_reaches_any_output(lab: &Lab) {
-        lab.tree(V100, "bin/app", "exit0", 30);
-        lab.tree(V110, "bin/app", "save-token", 30);
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "save-token", 30);
         lab.install(V110);
         let (code, printed) = lab.apply(V100, target("0.1"), V110);
         assert_eq!(code, 0);
@@ -1459,5 +1525,89 @@ mod native {
             .map(|e| e.expect("entry").file_name())
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    /// macOS: the apps folder the live bundle is in is not writable by the user. The apply is
+    /// refused before anything moves (exit 28, `not_writable`), the record is as it was, and the
+    /// app that exited for the apply comes back as the version it was.
+    #[cfg(unix)]
+    fn an_apps_folder_the_user_cannot_write_is_exit_28_and_the_app_comes_back(lab: &Lab) {
+        use std::os::unix::fs::PermissionsExt;
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "confirm", 30);
+        lab.install(V110);
+        let apps = lab.home.join("Applications");
+        std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let before = lab.record();
+        let (code, printed) = lab.apply(V100, target("0.3"), V110);
+        // Restore, so the temporary directory can be removed.
+        std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let is_root = Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0");
+        if code != 28 && is_root {
+            println!("note: running as root, the folder is writable to it; case not applicable");
+            return;
+        }
+        // `apply` of an installed app writes its events to the install's log.
+        let output = format!("{}{}", String::from_utf8_lossy(&printed), lab.log());
+        assert_eq!(code, 28, "{output}");
+        assert!(
+            output.contains("\"kind\":\"unsupported_location\"")
+                && output.contains("\"reason\":\"not_writable\""),
+            "{output}"
+        );
+        assert_eq!(lab.record(), before, "nothing was committed");
+        lab.assert_live(V100);
+        lab.assert_parked(V110);
+        // No path in the output.
+        assert!(
+            !output.contains(&lab.base.display().to_string()),
+            "{output}"
+        );
+        // The app exited for this apply, so it comes back as the version it was.
+        assert!(
+            lab.wait_note("1.0.0 start token=no", Duration::from_secs(20)),
+            "{}",
+            lab.notes()
+        );
+    }
+
+    #[cfg(not(unix))]
+    fn an_apps_folder_the_user_cannot_write_is_exit_28_and_the_app_comes_back(_: &Lab) {
+        unreachable!("skipped: {MACOS_ONLY}");
+    }
+
+    /// macOS: the runtime of a copy of the app under an `AppTranslocation` folder, as Gatekeeper
+    /// runs a quarantined app from, is refused first of all (exit 28, `translocated`), even by a
+    /// plain `check`, and nothing is written.
+    fn a_translocated_runtime_is_exit_28_before_anything_else(lab: &Lab) {
+        let copy = lab.base.join("AppTranslocation/ID/d/Hello.app");
+        lab.tree_at(&copy, V100, ENTRY, "exit0", 30);
+        let runtime = copy.join(ENTRY_DIR).join(RUNTIME_FILE);
+        let out = lab
+            .command(&runtime)
+            .args(["check", "--json"])
+            .output()
+            .expect("run");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(28), "{text}");
+        assert!(
+            text.contains("\"kind\":\"unsupported_location\"")
+                && text.contains("\"reason\":\"translocated\""),
+            "{text}"
+        );
+        assert!(!text.contains(&lab.base.display().to_string()), "{text}");
+        // Nothing was written: `R` holds nothing.
+        assert_eq!(
+            std::fs::read_dir(&lab.root).expect("R").count(),
+            0,
+            "something was written under R"
+        );
     }
 }
