@@ -200,6 +200,7 @@ pub struct UpdaterBuilder {
     policy: FetchPolicy,
     timeouts: Timeouts,
     bundle: Option<BundleSetup>,
+    adopt: Option<PathBuf>,
 }
 
 /// The macOS bundle layout of an install (M8-D1, D2): where the first install puts the live
@@ -247,6 +248,7 @@ impl UpdaterBuilder {
             policy: FetchPolicy::default(),
             timeouts: Timeouts::default(),
             bundle: None,
+            adopt: None,
         }
     }
 
@@ -257,6 +259,14 @@ impl UpdaterBuilder {
     /// layout must be that of an install root under that scheme.
     pub fn bundle_layout(mut self, apps_dir: PathBuf) -> Self {
         self.bundle = Some(BundleSetup { apps_dir });
+        self
+    }
+
+    /// The check may adopt the bundle at `bundle` (M8-D9): the running bundle, which the facade's
+    /// discovery found adoptable ([`crate::Installation::adoptable`]), with a
+    /// [`UpdaterBuilder::bundle_layout`] layout whose current tree it is.
+    pub(crate) fn adopt_bundle(mut self, bundle: PathBuf) -> Self {
+        self.adopt = Some(bundle);
         self
     }
 
@@ -402,6 +412,7 @@ impl UpdaterBuilder {
                 budget: self.budget,
                 policy: self.policy,
                 bundle: self.bundle,
+                adopt: self.adopt,
             }),
         })
     }
@@ -636,6 +647,36 @@ impl fmt::Debug for DownloadOptions {
     }
 }
 
+/// Options of [`Updater::check_with`].
+#[derive(Default)]
+pub struct CheckOptions {
+    /// Called with coalesced progress events on the polling thread. Only an adoption reports
+    /// any (phase [`Phase::Adopt`], M8-D9).
+    pub progress: Option<ProgressCallback>,
+    /// Cancels the operation (dropping its future does too).
+    pub cancel: Option<CancelToken>,
+}
+
+impl fmt::Debug for CheckOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckOptions")
+            .field("progress", &self.progress.is_some())
+            .field("cancel", &self.cancel)
+            .finish()
+    }
+}
+
+/// What [`Updater::check_with`] found.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CheckOutcome {
+    /// The update, or none.
+    pub update: Option<UpdateInfo>,
+    /// Whether this check adopted the running bundle before it checked (M8-D9); `true` in that
+    /// one check only.
+    pub adopted: bool,
+}
+
 /// A completed download, the input of [`Updater::stage`].
 pub struct Downloaded {
     info: UpdateInfo,
@@ -741,6 +782,8 @@ struct Inner {
     budget: u64,
     policy: FetchPolicy,
     bundle: Option<BundleSetup>,
+    /// The bundle the check adopts when the app has no live install (M8-D9).
+    adopt: Option<PathBuf>,
 }
 
 /// The loaded state of either scope.
@@ -979,11 +1022,38 @@ impl Updater {
     /// and the embedded root, verifies the key set and the feed against the floors, selects the
     /// candidate and fetches and verifies its manifest. Then the floors are raised (user record,
     /// or this user's counters for a machine install). A failing check changes no state.
+    ///
+    /// An updater of a macOS bundle that is not installed but adoptable
+    /// ([`crate::Installation::adoptable`], M8-D9) adopts it first, when the app has no live
+    /// install for the user: the bundle's own release (exactly its config's version and target)
+    /// is verified from the bundle's own root as above, the bundle is proved equal to that
+    /// release's signed manifest file by file ([`lunepack_core::verify_tree`]: nothing missing,
+    /// nothing extra, sizes, hashes, executable bits and link targets; the bundle is never
+    /// written, moved or removed), and only then is it recorded as the install's current
+    /// version (events `installed` and `first_run`; an orphaned install keeps its floors and gets
+    /// a new install id). The check then goes on as an installed one. A failure leaves the
+    /// bundle as it was, at most a record with no current version and floors raised from
+    /// verified documents, and the next check tries again. A live install makes it
+    /// [`Error::NotInstalled`] with no request made. See [`Updater::check_with`].
     pub fn check(
         &self,
     ) -> impl Future<Output = Result<Option<UpdateInfo>, Error>> + Send + 'static {
         let inner = Arc::clone(&self.inner);
-        async move { check(inner).await }
+        async move {
+            check(inner, CheckOptions::default())
+                .await
+                .map(|outcome| outcome.update)
+        }
+    }
+
+    /// [`Updater::check`] with progress and a cancel token, also saying whether it adopted the
+    /// running bundle ([`CheckOutcome::adopted`]).
+    pub fn check_with(
+        &self,
+        options: CheckOptions,
+    ) -> impl Future<Output = Result<CheckOutcome, Error>> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        async move { check(inner, options).await }
     }
 
     /// Downloads what staging `info` needs that the current tree and the cache lack: scan (phase
@@ -1126,15 +1196,22 @@ impl Updater {
     }
 }
 
-async fn check(inner: Arc<Inner>) -> Result<Option<UpdateInfo>, Error> {
-    let cancel = CancelToken::new();
+async fn check(inner: Arc<Inner>, options: CheckOptions) -> Result<CheckOutcome, Error> {
+    if let Some(bundle) = inner.adopt.clone() {
+        return check_adopting(inner, bundle, options).await;
+    }
+    let cancel = options.cancel.unwrap_or_default();
     let lock = take_lock(&inner, &cancel).await?;
     let snap = on_job(&inner, Some(&lock), &cancel, "state-load", |inner, _| {
         inner.load()
     })
     .await?;
     let current = snap.record().current.clone().ok_or(Error::NotInstalled)?;
-    check_from(&inner, &lock, &cancel, snap, Some(current)).await
+    let update = check_from(&inner, &lock, &cancel, snap, Some(current)).await?;
+    Ok(CheckOutcome {
+        update,
+        adopted: false,
+    })
 }
 
 /// The check of [`Updater::install`]: the record exists and has no current version, so there is
@@ -1179,38 +1256,8 @@ async fn check_from(
     let transport_arc = inner.transport.for_op(lock);
     let transport = &*transport_arc;
 
-    // Root walk (FORMAT.md 5.2) from the higher of the stored and the embedded root.
-    let mut root = match &floors.root {
-        Some(parts) if parts.version > inner.root.version() => {
-            parts.to_trusted(inner.app_id.clone(), hasher, verifier)?
-        }
-        _ => inner.root.clone(),
-    };
-    for _ in 0..MAX_ROOT_STEPS {
-        let url = inner.urls.root(root.version().saturating_add(1))?;
-        match fetch::fetch_root_doc(transport, &url, Limits::V1.root_doc_bytes).await? {
-            None => break,
-            Some(bytes) => root = advance_root(&root, &bytes, hasher, verifier)?,
-        }
-    }
-    if root.app_id() != &inner.app_id {
-        return Err(Error::Verify(lunepack_core::Error::AppIdMismatch));
-    }
-    let floor = floors.to_rollback_floor();
-    let keys_bytes =
-        fetch::fetch_document(transport, &inner.urls.keys()?, Limits::V1.keys_doc_bytes).await?;
-    let keys = verify_key_set(&root, &keys_bytes, &floor, &clock, hasher, verifier)?;
-    let feed_bytes =
-        fetch::fetch_document(transport, &inner.feed_url, Limits::V1.feed_doc_bytes).await?;
-    let feed = verify_feed(
-        &keys,
-        &feed_bytes,
-        &inner.app_id,
-        &inner.channel,
-        &floor,
-        &clock,
-        verifier,
-    )?;
+    let Documents { root, keys, feed } =
+        verify_documents(inner, transport, &floors, &clock).await?;
     let candidate = select_candidate(
         &feed,
         current.as_ref().map(|c| &c.version),
@@ -1245,12 +1292,7 @@ async fn check_from(
             })
         }
     };
-    let mut raised = Floors {
-        root: Some(RootParts::from_trusted(&root)),
-        keyset_version: keys.version(),
-        ..Floors::default()
-    };
-    raised.feed_seq.insert(inner.channel.clone(), feed.seq());
+    let raised = raised_floors(inner, &root, &keys, &feed);
     on_job(
         inner,
         Some(lock),
@@ -1260,6 +1302,75 @@ async fn check_from(
     )
     .await?;
     Ok(info)
+}
+
+/// The signed documents a check verified: the root it walked to, the key set and the feed.
+struct Documents {
+    root: TrustedRoot,
+    keys: lunepack_core::VerifiedKeySet,
+    feed: lunepack_core::VerifiedFeed,
+}
+
+/// The documents of a check, in FORMAT.md 11.1 order: the root walk (FORMAT.md 5.2) from the
+/// higher of the stored (`floors`) and the embedded root, then the key set and the feed against
+/// `floors` and `clock`. Nothing is committed.
+async fn verify_documents(
+    inner: &Inner,
+    transport: &dyn Transport,
+    floors: &Floors,
+    clock: &ClockReading,
+) -> Result<Documents, Error> {
+    let hasher = &*inner.hasher;
+    let verifier = &*inner.verifier;
+    let mut root = match &floors.root {
+        Some(parts) if parts.version > inner.root.version() => {
+            parts.to_trusted(inner.app_id.clone(), hasher, verifier)?
+        }
+        _ => inner.root.clone(),
+    };
+    for _ in 0..MAX_ROOT_STEPS {
+        let url = inner.urls.root(root.version().saturating_add(1))?;
+        match fetch::fetch_root_doc(transport, &url, Limits::V1.root_doc_bytes).await? {
+            None => break,
+            Some(bytes) => root = advance_root(&root, &bytes, hasher, verifier)?,
+        }
+    }
+    if root.app_id() != &inner.app_id {
+        return Err(Error::Verify(lunepack_core::Error::AppIdMismatch));
+    }
+    let floor = floors.to_rollback_floor();
+    let keys_bytes =
+        fetch::fetch_document(transport, &inner.urls.keys()?, Limits::V1.keys_doc_bytes).await?;
+    let keys = verify_key_set(&root, &keys_bytes, &floor, clock, hasher, verifier)?;
+    let feed_bytes =
+        fetch::fetch_document(transport, &inner.feed_url, Limits::V1.feed_doc_bytes).await?;
+    let feed = verify_feed(
+        &keys,
+        &feed_bytes,
+        &inner.app_id,
+        &inner.channel,
+        &floor,
+        clock,
+        verifier,
+    )?;
+    Ok(Documents { root, keys, feed })
+}
+
+/// The floors verified documents raise: the root's parts, the key set's version and this
+/// channel's feed `seq`.
+fn raised_floors(
+    inner: &Inner,
+    root: &TrustedRoot,
+    keys: &lunepack_core::VerifiedKeySet,
+    feed: &lunepack_core::VerifiedFeed,
+) -> Floors {
+    let mut raised = Floors {
+        root: Some(RootParts::from_trusted(root)),
+        keyset_version: keys.version(),
+        ..Floors::default()
+    };
+    raised.feed_seq.insert(inner.channel.clone(), feed.seq());
+    raised
 }
 
 /// Re-loads the state under the lock and refuses an update that is no longer newer, or bad.
@@ -1693,20 +1804,6 @@ fn scheme_of(inner: &Inner) -> Option<LayoutScheme> {
 /// it) is not read-only, is on the volume the install's versions will be on (the nearest existing
 /// folder above `versions_dir`) and the user can create entries in it.
 fn check_bundle_place(fs: &dyn Fs, setup: &BundleSetup, versions_dir: &Path) -> Result<(), Error> {
-    fn nearest(fs: &dyn Fs, path: &Path) -> Result<lunepack_core::PlaceFacts, Error> {
-        let mut at = path.to_path_buf();
-        loop {
-            match fs.place(&at) {
-                Ok(facts) => return Ok(facts),
-                Err(e) if e.kind == lunepack_core::FsErrorKind::NotFound => {
-                    if !at.pop() {
-                        return Err(Error::from(e));
-                    }
-                }
-                Err(e) => return Err(Error::from(e)),
-            }
-        }
-    }
     let refuse = |reason| Error::UnsupportedLocation { reason };
     let apps = nearest(fs, &setup.apps_dir)?;
     let versions = nearest(fs, versions_dir)?;
@@ -1720,6 +1817,53 @@ fn check_bundle_place(fs: &dyn Fs, setup: &BundleSetup, versions_dir: &Path) -> 
         return Err(refuse(LocationReason::OtherVolume));
     }
     if !apps.writable {
+        return Err(refuse(LocationReason::NotWritable));
+    }
+    Ok(())
+}
+
+/// [`Fs::place`] of `path`, or of the nearest folder above it that exists.
+fn nearest(fs: &dyn Fs, path: &Path) -> Result<lunepack_core::PlaceFacts, Error> {
+    let mut at = path.to_path_buf();
+    loop {
+        match fs.place(&at) {
+            Ok(facts) => return Ok(facts),
+            Err(e) if e.kind == lunepack_core::FsErrorKind::NotFound => {
+                if !at.pop() {
+                    return Err(Error::from(e));
+                }
+            }
+            Err(e) => return Err(Error::from(e)),
+        }
+    }
+}
+
+/// The location rules of M8-D4 for a bundle to adopt, read only and in [`lunepack_core::check_place`]'s
+/// order, before anything is written: neither `bundle` nor its folder translocated or read-only,
+/// the folder on the volume the install's versions are on (the nearest existing folder above
+/// `versions_dir`), `bundle` the caller's, and the folder writable by the caller.
+fn check_adopt_place(fs: &dyn Fs, bundle: &Path, versions_dir: &Path) -> Result<(), Error> {
+    let refuse = |reason| Error::UnsupportedLocation { reason };
+    let folder = bundle
+        .parent()
+        .ok_or(Error::Config("a bundle to adopt has a folder"))?;
+    let folder = fs.place(folder)?;
+    let own = fs.place(bundle)?;
+    for facts in [&folder, &own] {
+        if facts.fs_type == lunepack_core::layout::TRANSLOCATION_FS_TYPE {
+            return Err(refuse(LocationReason::Translocated));
+        }
+        if facts.read_only {
+            return Err(refuse(LocationReason::ReadOnly));
+        }
+    }
+    if nearest(fs, versions_dir)?.device != folder.device {
+        return Err(refuse(LocationReason::OtherVolume));
+    }
+    if !own.owned_by_caller {
+        return Err(refuse(LocationReason::NotOwned));
+    }
+    if !folder.writable {
         return Err(refuse(LocationReason::NotWritable));
     }
     Ok(())
@@ -1862,6 +2006,246 @@ fn tree_config(
         )));
     }
     Ok(config)
+}
+
+// ---- adoption (M8-D9) ----------------------------------------------------------------------------
+
+/// What the install is when an adopting check takes the lock.
+enum AdoptStart {
+    /// No live install: adopt, from this snapshot (the record exists now).
+    Adopt(Snapshot),
+    /// The bundle is the install's already (an earlier check on this updater adopted it).
+    Installed(Snapshot, CurrentRef),
+}
+
+/// Whether `R/bundle` names `bundle`, which exists (the install's live bundle).
+fn names_bundle(fs: &dyn Fs, root: &UserLayout, bundle: &Path) -> bool {
+    matches!(root.bundle_path(fs), Ok(Some(b)) if b.as_os_str() == bundle.as_os_str())
+        && is_real_dir(fs, bundle).unwrap_or(false)
+}
+
+/// The check of an updater whose running bundle is adoptable (M8-D9; see [`Updater::check`]).
+///
+/// Order: before the lock, the bundle's config (this app), its place (M8-D4), the integration
+/// preflight and the install root's owner (as `install`); under the lock, the record is created
+/// when missing, kept when it has no current version or is orphaned, and a live install is
+/// [`Error::NotInstalled`] before any request; the documents are verified from the record's
+/// floors and the bundle's release is selected exactly; its manifest is verified and the floors
+/// are raised; the bundle is proved equal to it ([`lunepack_core::verify_tree`]); then, after the
+/// record is read again, the commit runs in the crash-safe order of M8-D9: `R/bundle.id`, the
+/// integration, the record, `R/bundle`, and a reconcile that moves nothing. The lock is held from
+/// the record to the end, so nothing else commits in between; the record is read again anyway.
+async fn check_adopting(
+    inner: Arc<Inner>,
+    bundle: PathBuf,
+    mut options: CheckOptions,
+) -> Result<CheckOutcome, Error> {
+    let cancel = options.cancel.clone().unwrap_or_default();
+    let Layout::User {
+        state_dir,
+        versions_dir,
+        ..
+    } = &inner.layout
+    else {
+        return Err(Error::MachineScope);
+    };
+    let scheme = scheme_of(&inner).ok_or(Error::Config(
+        "adoption needs the macOS bundle layout of an install root",
+    ))?;
+    let root = install_root_of(state_dir, versions_dir, Some(scheme))?;
+
+    // Read only, before the first write (the lock): the bundle's own config, its place, the
+    // integration preflight and the install root's owner.
+    let (pre_root, pre_bundle) = (root.clone(), bundle.clone());
+    let config = on_job(&inner, None, &cancel, "adopt-preflight", move |inner, _| {
+        let config = tree_config(&*inner.fs, &inner.app_id, &pre_bundle, pre_root.scheme())?;
+        check_adopt_place(&*inner.fs, &pre_bundle, &pre_root.versions_dir())?;
+        let request = integration_request(&inner.app_id, &pre_bundle, &config);
+        inner.integration.check(Scope::User, &request)?;
+        clear_tombstones(inner, &pre_root);
+        adoptable(inner, &pre_root)?;
+        Ok(config)
+    })
+    .await?;
+
+    let lock = take_lock(&inner, &cancel).await?;
+    let (start_root, start_bundle, target) = (root.clone(), bundle.clone(), config.target);
+    let start = on_job(
+        &inner,
+        Some(&lock),
+        &cancel,
+        "adopt-state",
+        move |inner, _| {
+            let fs = &*inner.fs;
+            refuse_foreign_record(inner, &start_root.state_dir())?;
+            let store = UserScope {
+                dir: start_root.state_dir(),
+                app_id: inner.app_id.clone(),
+            };
+            let loaded = store.load(fs, &*inner.hasher)?;
+            match &loaded.record {
+                None => {
+                    let mut install_id = [0u8; lunepack_core::policy::INSTALL_ID_BYTES];
+                    inner.rng.fill(&mut install_id)?;
+                    let record = InstallState::new(
+                        loaded.next_seq,
+                        inner.app_id.clone(),
+                        lunepack_core::Scope::User,
+                        install_id,
+                        target,
+                    );
+                    store.commit(fs, &loaded, &record, &*inner.hasher)?;
+                }
+                Some(record) if record.current.is_none() => {}
+                Some(record) => {
+                    if names_bundle(fs, &start_root, &start_bundle) {
+                        let snap = inner.load()?;
+                        let current = record.current.clone().ok_or(Error::NotInstalled)?;
+                        return Ok(AdoptStart::Installed(snap, current));
+                    }
+                    // One install per app id per user: only an orphaned one is taken over.
+                    if !lunepack_core::bundle_orphaned(fs, &start_root, record) {
+                        return Err(Error::NotInstalled);
+                    }
+                }
+            }
+            let snap = inner.load()?;
+            if snap.record().target != target {
+                return Err(Error::NotInstalled);
+            }
+            Ok(AdoptStart::Adopt(snap))
+        },
+    )
+    .await?;
+    let snap = match start {
+        AdoptStart::Installed(snap, current) => {
+            let update = check_from(&inner, &lock, &cancel, snap, Some(current)).await?;
+            return Ok(CheckOutcome {
+                update,
+                adopted: false,
+            });
+        }
+        AdoptStart::Adopt(snap) => snap,
+    };
+
+    // The bundle's own release, verified as a check verifies (no floor time: nothing is current).
+    let floors = snap.floors();
+    let clock = ClockReading::read(&*inner.clock, None);
+    let transport_arc = inner.transport.for_op(&lock);
+    let transport = &*transport_arc;
+    let Documents {
+        root: trusted,
+        keys,
+        feed,
+    } = verify_documents(&inner, transport, &floors, &clock).await?;
+    let version_text = config.version.to_string();
+    let entry = feed
+        .releases()
+        .iter()
+        .position(|r| r.version() == &config.version && r.version_text() == version_text)
+        .and_then(|i| feed.target_entry(i, config.target))
+        .ok_or(Error::NoRelease)?;
+    let reference = entry.reference();
+    let url = inner.urls.reference(reference)?;
+    let bytes = fetch::fetch_document(transport, &url, reference.size()).await?;
+    let manifest = verify_manifest(&keys, &entry, &bytes, &*inner.hasher, &*inner.verifier)?;
+    let issued = manifest.issued();
+    let raised = raised_floors(&inner, &trusted, &keys, &feed);
+    on_job(
+        &inner,
+        Some(&lock),
+        &cancel,
+        "state-commit",
+        move |inner, _| inner.commit_floors(&snap, &raised),
+    )
+    .await?;
+
+    // The proof: the bundle is exactly the signed release (phase `Adopt`).
+    let (sink, mut pump) = progress(Phase::Adopt, 0);
+    let mut callback = options.progress.take();
+    let verify_bundle = bundle.clone();
+    with_progress(
+        &mut pump,
+        &mut callback,
+        on_job(
+            &inner,
+            Some(&lock),
+            &cancel,
+            "adopt-verify",
+            move |inner, job| {
+                let last = AtomicU64::new(0);
+                lunepack_core::verify_tree(
+                    &manifest,
+                    &verify_bundle,
+                    &*inner.fs,
+                    &*inner.hasher,
+                    job,
+                    &|p| forward(&sink, &last, &p),
+                )
+                .map_err(|e| Error::from(lunepack_core::Error::from(e)))
+            },
+        ),
+    )
+    .await?;
+
+    // The commit: id, integration, record, pointer, reconcile (M8-D9).
+    let (commit_root, commit_bundle) = (root.clone(), bundle.clone());
+    let version = config.version.clone();
+    on_job(
+        &inner,
+        Some(&lock),
+        &cancel,
+        "adopt-commit",
+        move |inner, _| {
+            let fs = &*inner.fs;
+            let layout_err = |e: LayoutError| Error::from(lunepack_core::Error::Layout(e));
+            let store = UserScope {
+                dir: commit_root.state_dir(),
+                app_id: inner.app_id.clone(),
+            };
+            let loaded = store.load(fs, &*inner.hasher)?;
+            let record = loaded.record.clone().ok_or(Error::NotInstalled)?;
+            let orphaned = match &record.current {
+                None => false,
+                Some(_) if lunepack_core::bundle_orphaned(fs, &commit_root, &record) => true,
+                // Installed meanwhile: never overwritten.
+                Some(_) => return Err(Error::NotInstalled),
+            };
+            if record.target != config.target {
+                return Err(Error::NotInstalled);
+            }
+            lunepack_core::write_bundle_identity(fs, &commit_root, &commit_bundle)
+                .map_err(layout_err)?;
+            let request = integration_request(&inner.app_id, &commit_bundle, &config);
+            inner.integration.check(Scope::User, &request)?;
+            inner.integration.apply(Scope::User, &request)?;
+            let next = if orphaned {
+                let mut install_id = [0u8; lunepack_core::policy::INSTALL_ID_BYTES];
+                inner.rng.fill(&mut install_id)?;
+                lunepack_core::reinstall_orphaned(&record, version, issued, install_id)?
+            } else {
+                lunepack_core::install_first(&record, version, issued, record.install_id)?
+            };
+            let committed = store.commit(fs, &loaded, &next, &*inner.hasher)?;
+            lunepack_core::set_bundle_pointer(fs, &commit_root, &commit_bundle)
+                .map_err(layout_err)?;
+            commit_root.reconcile(fs, &committed).map_err(layout_err)?;
+            Ok(())
+        },
+    )
+    .await?;
+
+    // Then the check of an installed bundle.
+    let snap = on_job(&inner, Some(&lock), &cancel, "state-load", |inner, _| {
+        inner.load()
+    })
+    .await?;
+    let current = snap.record().current.clone().ok_or(Error::NotInstalled)?;
+    let update = check_from(&inner, &lock, &cancel, snap, Some(current)).await?;
+    Ok(CheckOutcome {
+        update,
+        adopted: true,
+    })
 }
 
 async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<InstalledVersion, Error> {

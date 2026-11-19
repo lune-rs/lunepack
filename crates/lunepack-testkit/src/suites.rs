@@ -1376,7 +1376,25 @@ fn fs_cases(fs: &dyn Fs, root: &Path, base: &Path, symlinks: bool) {
         .and_then(|mut f| f.sync())
         .expect("sync a copied file");
     fs.set_exec(&copy, true).expect("set_exec on");
+    if cfg!(unix) {
+        assert!(
+            fs.is_exec(&copy).expect("is_exec"),
+            "is_exec after set_exec on"
+        );
+    }
     fs.set_exec(&copy, false).expect("set_exec off");
+    assert!(
+        !fs.is_exec(&copy).expect("is_exec"),
+        "is_exec after set_exec off"
+    );
+    assert_eq!(
+        fs_kind(fs.is_exec(&missing), "is_exec of a missing file"),
+        FsErrorKind::NotFound
+    );
+    assert!(
+        fs.is_exec(&base.join("a")).is_err(),
+        "is_exec of a directory"
+    );
     assert_eq!(
         fs_kind(fs.set_exec(&missing, true), "set_exec of a missing file"),
         FsErrorKind::NotFound

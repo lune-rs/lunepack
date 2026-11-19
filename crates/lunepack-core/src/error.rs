@@ -898,4 +898,14 @@ pub enum Error {
     /// A layout rule refused.
     #[error("layout: {0}")]
     Layout(#[from] LayoutError),
+    /// A tree on disk is not exactly its signed manifest ([`crate::verify_tree`], M8-D9): the
+    /// kind of difference and the manifest index of the entry (none for an entry the manifest does
+    /// not list). No path or content is carried.
+    #[error("the tree differs from its signed manifest ({difference:?}, entry {entry:?})")]
+    TreeDiffers {
+        /// What differs.
+        difference: crate::stage::TreeDifference,
+        /// The manifest entry it differs at.
+        entry: Option<usize>,
+    },
 }

@@ -1840,9 +1840,10 @@ mod bundle {
     fn a_copy_with_another_inode_is_not_installed_even_with_the_pointer_dangling() {
         let (fs, l) = installed(Some("1.0.0"), &[]);
         store(&fs, &l, &record("1.0.0"));
-        // A re-extracted zip: the same content, a new directory.
+        // A re-extracted zip: the same content, a new directory (outside an apps folder, so
+        // not adoptable either, M8-D9).
         fs.rename(&bundle(), &home().join("gone")).unwrap();
-        let copy = apps().join("Other.app");
+        let copy = home().join("Downloads").join("Other.app");
         put_tree(&fs, &copy, "1.0.0");
         assert_eq!(
             discover_real(&fs, &copy, "1.0.0").unwrap(),
@@ -1863,6 +1864,168 @@ mod bundle {
             discover_real(&fs, &copy, "1.0.0").unwrap(),
             BundleDiscovery::NotInstalled
         );
+    }
+
+    // ---- adoption (M8-D9 (b), Revision 2) ---------------------------------------------------
+
+    fn adoptable() -> BundleDiscovery {
+        BundleDiscovery::Adoptable {
+            root: layout().root().to_path_buf(),
+        }
+    }
+
+    /// An orphaned install (M8-D16): the record names 1.0.0, the pointer dangles and no tree
+    /// holds 1.0.0.
+    fn orphaned() -> (MemFs, UserLayout) {
+        let (fs, l) = installed(Some("1.0.0"), &[]);
+        store(&fs, &l, &record("1.0.0"));
+        fs.remove_dir_all_nofollow(&bundle()).unwrap();
+        (fs, l)
+    }
+
+    #[test]
+    fn a_bundle_in_an_apps_folder_with_no_install_root_is_adoptable() {
+        for tree in [bundle(), abs_path("/Applications/Hello.app")] {
+            let fs = MemFs::new();
+            put_tree(&fs, &tree, "1.0.0");
+            let ops = fs.op_count();
+            assert_eq!(
+                discover_real(&fs, &tree, "1.0.0").unwrap(),
+                adoptable(),
+                "{tree:?}"
+            );
+            // Discovery wrote nothing.
+            assert_eq!(fs.op_count(), ops);
+        }
+    }
+
+    #[test]
+    fn a_bundle_over_a_record_with_no_current_version_is_adoptable() {
+        let fs = MemFs::new();
+        let l = layout();
+        fs.create_dir_all(&l.state_dir()).unwrap();
+        store(
+            &fs,
+            &l,
+            &InstallState::new(1, app(), Scope::User, [0; 16], Target::MacosAarch64),
+        );
+        put_tree(&fs, &bundle(), "1.0.0");
+        assert_eq!(discover_real(&fs, &bundle(), "1.0.0").unwrap(), adoptable());
+    }
+
+    #[test]
+    fn a_bundle_over_an_orphaned_record_is_adoptable() {
+        // The same version, and another one, dragged in as a new directory. (At the old
+        // bundle's own path the pointer names it, which is the step-1 rule for `Installed`.)
+        let other = abs_path("/Applications/Hello.app");
+        for version in ["1.0.0", "1.1.0"] {
+            let (fs, _) = orphaned();
+            put_tree(&fs, &other, version);
+            assert_eq!(
+                discover_real(&fs, &other, version).unwrap(),
+                adoptable(),
+                "{version}"
+            );
+        }
+        // Not orphaned when a version tree still holds the current version.
+        let (fs, l) = orphaned();
+        put_tree(&fs, &l.version_dir(&v("1.0.0")), "1.0.0");
+        put_tree(&fs, &other, "1.1.0");
+        assert_eq!(
+            discover_real(&fs, &other, "1.1.0").unwrap(),
+            BundleDiscovery::NotInstalled
+        );
+        // Nor when a slot does.
+        let (fs, l) = orphaned();
+        put_tree(&fs, &l.swap_slot(), "1.0.0");
+        put_tree(&fs, &other, "1.1.0");
+        assert_eq!(
+            discover_real(&fs, &other, "1.1.0").unwrap(),
+            BundleDiscovery::NotInstalled
+        );
+    }
+
+    #[test]
+    fn a_bundle_outside_an_apps_folder_is_never_adoptable() {
+        for tree in [
+            home().join("Desktop").join("Hello.app"),
+            home().join(".Trash").join("Hello.app"),
+            apps().join("Sub").join("Hello.app"),
+            home().join("Downloads").join("Hello.app"),
+        ] {
+            let fs = MemFs::new();
+            put_tree(&fs, &tree, "1.0.0");
+            assert_eq!(
+                discover_real(&fs, &tree, "1.0.0").unwrap(),
+                BundleDiscovery::NotInstalled,
+                "{tree:?}"
+            );
+            // And over an orphaned record.
+            let (fs, _) = orphaned();
+            put_tree(&fs, &tree, "1.0.0");
+            assert_eq!(
+                discover_real(&fs, &tree, "1.0.0").unwrap(),
+                BundleDiscovery::NotInstalled,
+                "{tree:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bundle_beside_a_live_install_is_not_installed() {
+        let (fs, l) = installed(Some("1.0.0"), &[]);
+        store(&fs, &l, &record("1.0.0"));
+        let other = abs_path("/Applications/Hello.app");
+        put_tree(&fs, &other, "1.0.0");
+        assert_eq!(
+            discover_real(&fs, &other, "1.0.0").unwrap(),
+            BundleDiscovery::NotInstalled
+        );
+        // A record of another app is never adopted over.
+        let fs = MemFs::new();
+        let l = layout();
+        fs.create_dir_all(&l.state_dir()).unwrap();
+        let other = AppId::parse("com.other.app").unwrap();
+        let mut foreign = record("1.0.0");
+        foreign.app_id = other.clone();
+        let loaded =
+            lunepack_core::state::load::<InstallState>(&fs, &l.state_dir(), &other, &FakeHasher)
+                .unwrap();
+        lunepack_core::state::commit(&fs, &l.state_dir(), &loaded, &foreign, &FakeHasher).unwrap();
+        put_tree(&fs, &bundle(), "1.0.0");
+        assert_eq!(
+            discover_real(&fs, &bundle(), "1.0.0").unwrap(),
+            BundleDiscovery::NotInstalled
+        );
+    }
+
+    #[test]
+    fn the_location_comes_before_adoption() {
+        let fs = MemFs::new();
+        put_tree(&fs, &bundle(), "1.0.0");
+        fs.set_place(&bundle(), place(|p| p.read_only = true));
+        assert!(matches!(
+            discover_real(&fs, &bundle(), "1.0.0"),
+            Err(LayoutError::Location(LocationReason::ReadOnly))
+        ));
+    }
+
+    #[test]
+    fn a_move_into_an_apps_folder_is_followed_not_adopted() {
+        let (fs, l) = installed(Some("1.0.0"), &[]);
+        store(&fs, &l, &record("1.0.0"));
+        let moved = abs_path("/Applications/Hello.app");
+        fs.create_dir_all(moved.parent().unwrap()).unwrap();
+        fs.rename(&bundle(), &moved).unwrap();
+        let moved_from = BundleDiscovery::MovedFrom {
+            root: l.root().to_path_buf(),
+            version: v("1.0.0"),
+        };
+        assert_eq!(discover_real(&fs, &moved, "1.0.0").unwrap(), moved_from);
+        // An adoption cut off after its commit, before its pointer: the pointer is missing and
+        // the identity names the tree; it is followed the same way.
+        fs.remove_file(&l.bundle_link().unwrap()).unwrap();
+        assert_eq!(discover_real(&fs, &moved, "1.0.0").unwrap(), moved_from);
     }
 
     #[test]

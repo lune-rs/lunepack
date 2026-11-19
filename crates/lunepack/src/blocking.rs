@@ -52,6 +52,16 @@ impl Updater {
         run(cancel, self.inner.check())
     }
 
+    /// [`crate::Updater::check_with`], blocking; `cancel` replaces the options' token.
+    pub fn check_with(
+        &self,
+        mut options: crate::CheckOptions,
+        cancel: &CancelToken,
+    ) -> Result<crate::CheckOutcome, Error> {
+        options.cancel = Some(cancel.clone());
+        run(cancel, self.inner.check_with(options))
+    }
+
     /// [`crate::Updater::download`], blocking; `cancel` replaces the options' token.
     pub fn download(
         &self,

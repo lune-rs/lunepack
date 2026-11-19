@@ -359,16 +359,17 @@ pub(crate) fn scheme_config_path(tree: &Path, scheme: LayoutScheme) -> PathBuf {
     out
 }
 
-/// Where the running bundle `tree` stands under [`LayoutScheme::MACOS`] (M8-D1, M8-D4, M8-D17):
-/// the install's layout, when it is the install's (and whether it was found moved), `None` when
-/// it is another copy. A refused place is [`Error::UnsupportedLocation`].
+/// Where the running bundle `tree` stands under [`LayoutScheme::MACOS`] (M8-D1, M8-D4, M8-D9,
+/// M8-D17): the install's layout, when it is the install's, and how it was found
+/// ([`Found`]). `None` with [`Found::Adoptable`] for a bundle the update check may adopt, and
+/// with [`Found::Plain`] for any other copy. A refused place is [`Error::UnsupportedLocation`].
 fn bundle_layout(
     platform: &Platform,
     exe: &Path,
     tree: &Path,
     k: usize,
     config: &UpdateConfig,
-) -> Result<(Option<UserLayout>, bool), Error> {
+) -> Result<(Option<UserLayout>, Found), Error> {
     let facts = platform.fs.place(tree)?;
     let data_home = platform.data_home()?;
     let home = platform.home()?;
@@ -384,18 +385,30 @@ fn bundle_layout(
     let scheme = platform.layout_scheme;
     match discover_bundle(&*platform.fs, &*platform.hasher, &probe) {
         Ok(BundleDiscovery::Installed { root, .. }) => {
-            Ok((Some(UserLayout::from_root(root, scheme)), false))
+            Ok((Some(UserLayout::from_root(root, scheme)), Found::Plain))
         }
         Ok(BundleDiscovery::MovedFrom { root, .. }) => {
-            Ok((Some(UserLayout::from_root(root, scheme)), true))
+            Ok((Some(UserLayout::from_root(root, scheme)), Found::Moved))
         }
-        Ok(BundleDiscovery::NotInstalled) => Ok((None, false)),
+        Ok(BundleDiscovery::Adoptable { .. }) => Ok((None, Found::Adoptable)),
+        Ok(BundleDiscovery::NotInstalled) => Ok((None, Found::Plain)),
         Err(LayoutError::NotThisTree) => Err(config_rule(
             "install.entry",
             "the executable is not in the entry's directory",
         )),
         Err(e) => Err(Error::from(lunepack_core::Error::Layout(e))),
     }
+}
+
+/// How a macOS bundle was found beside its layout (M8-D9, M8-D17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Found {
+    /// Where its layout says (or a copy that is not the install's).
+    Plain,
+    /// The install's bundle, moved on its volume.
+    Moved,
+    /// Not installed, and adoptable by the update check.
+    Adoptable,
 }
 
 /// An update-config rule broken by where the file is, not by its bytes.
@@ -477,6 +490,8 @@ pub struct Installation {
     /// The running bundle is the install's, found where it was moved to (M8-D17): the install
     /// follows it under the lock ([`Installation::follow_move`], and `startup_for`).
     moved: bool,
+    /// The running bundle is not installed and the update check may adopt it (M8-D9).
+    adoptable: bool,
 }
 
 impl fmt::Debug for Installation {
@@ -486,6 +501,7 @@ impl fmt::Debug for Installation {
             .field("app_id", &self.config.app_id.as_str())
             .field("version", &self.config.version.to_string())
             .field("installed", &self.layout.is_some())
+            .field("adoptable", &self.adoptable)
             .finish_non_exhaustive()
     }
 }
@@ -524,7 +540,9 @@ impl Installation {
     ///   translocated by Gatekeeper, or on a read-only volume (a mounted disk image), is
     ///   [`Error::UnsupportedLocation`], whatever else is true of it. The tree is then the
     ///   install's when `R/bundle` names it or it is an old instance in `R/versions`; a bundle
-    ///   moved on its volume is the install's too ([`Installation::moved`], M8-D17); any other
+    ///   moved on its volume is the install's too ([`Installation::moved`], M8-D17). A bundle
+    ///   directly in `~/Applications` or `/Applications` while the app has no live install for
+    ///   the user is not installed but adoptable ([`Installation::adoptable`], M8-D9); any other
     ///   copy is not installed.
     pub fn from_exe_with(exe: &Path, platform: Platform) -> Result<Installation, Error> {
         // The native filesystem refuses symlinked components: resolve the exe (a launch through
@@ -540,7 +558,7 @@ impl Installation {
             let Some(config) = read_config(&*platform.fs, &config_path)? else {
                 continue;
             };
-            let (layout, moved) = if scheme.projection == Projection::Bundle {
+            let (layout, found) = if scheme.projection == Projection::Bundle {
                 bundle_layout(&platform, &exe, &tree, k, &config)?
             } else {
                 let layout = match discover(&exe, &tree, k, &config, scheme) {
@@ -555,7 +573,7 @@ impl Installation {
                         ));
                     }
                 };
-                (layout, false)
+                (layout, Found::Plain)
             };
             if let Some(layout) = &layout {
                 let store = UserScope {
@@ -569,7 +587,8 @@ impl Installation {
                 tree,
                 config,
                 layout,
-                moved,
+                moved: found == Found::Moved,
+                adoptable: found == Found::Adoptable,
             });
         }
         Err(Error::NoUpdateConfig)
@@ -598,6 +617,7 @@ impl Installation {
             config,
             layout: Some(layout.clone()),
             moved: false,
+            adoptable: false,
         })
     }
 
@@ -619,6 +639,16 @@ impl Installation {
     /// The install's layout, when the tree is installed.
     pub fn layout(&self) -> Option<&UserLayout> {
         self.layout.as_ref()
+    }
+
+    /// Whether this macOS bundle, not installed, may be adopted by the update check (M8-D9): it
+    /// lies directly in `~/Applications` or `/Applications`, and the app has no live install for
+    /// the user (no record, one with no current version, or an orphaned one).
+    /// [`Updater::check`](crate::Updater::check) on its updater proves the bundle equal to its
+    /// signed release and makes it the install; [`Installation::is_installed`] stays `false`
+    /// for this value, and a new one is found installed once that check has run.
+    pub fn adoptable(&self) -> bool {
+        self.adoptable
     }
 
     /// Whether this macOS bundle is the install's, found where the user moved it (M8-D17): the
@@ -779,6 +809,10 @@ impl Installation {
         if p.layout_scheme.projection == Projection::Bundle {
             builder = builder.bundle_layout(p.home()?.join("Applications"));
         }
+        // M8-D9: the check adopts the running bundle, which is the bootstrap's current tree.
+        if self.adoptable {
+            builder = builder.adopt_bundle(self.tree.clone());
+        }
         if kind == FeedKind::HttpLoopback {
             let options = lunepack_http::UreqOptions {
                 direct: true,
@@ -820,6 +854,7 @@ mod tests {
                 config,
                 layout: None,
                 moved: false,
+                adoptable: false,
             };
             let got = inst.updater_builder();
             assert!(

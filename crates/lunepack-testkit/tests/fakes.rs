@@ -1274,6 +1274,9 @@ fn the_fs_suite_catches_a_fs_that_follows_symlinks_on_create() {
         fn set_exec(&self, p: &Path, e: bool) -> Result<(), lunepack_core::FsError> {
             self.0.set_exec(p, e)
         }
+        fn is_exec(&self, p: &Path) -> Result<bool, lunepack_core::FsError> {
+            self.0.is_exec(p)
+        }
         fn symlink(&self, t: &str, l: &Path) -> Result<(), lunepack_core::FsError> {
             self.0.symlink(t, l)
         }

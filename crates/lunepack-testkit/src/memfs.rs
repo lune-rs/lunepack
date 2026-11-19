@@ -790,6 +790,22 @@ impl Fs for MemFs {
         }
     }
 
+    fn is_exec(&self, path: &Path) -> Result<bool, FsError> {
+        let st = lock(&self.state);
+        st.alive(path)?;
+        let walk = st.walk(path, false)?;
+        match walk.node.and_then(|id| st.nodes.get(&id)) {
+            None => Err(FsError::new(FsErrorKind::NotFound, path, None)),
+            Some(Node::File { exec, .. }) => Ok(*exec),
+            Some(Node::Symlink(_)) => Err(FsError::new(FsErrorKind::IsSymlink, path, None)),
+            _ => Err(FsError::new(
+                FsErrorKind::Other,
+                path,
+                Some(io::Error::other("not a regular file")),
+            )),
+        }
+    }
+
     fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
         let mut st = lock(&self.state);
         st.begin_op(link_path)?;
