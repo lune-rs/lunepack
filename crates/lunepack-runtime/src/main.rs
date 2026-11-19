@@ -310,11 +310,21 @@ fn notice_text(name: &str, operation: Operation, kind: Kind) -> String {
         Operation::Uninstall => ("was uninstalled.", "could not be uninstalled"),
         Operation::Setup => ("finished.", "could not finish"),
     };
-    if kind == Kind::Ok {
-        format!("{name} {done}")
-    } else {
-        format!("{name} {failed} (code {}).", kind.code())
+    match (operation, kind) {
+        (_, Kind::Ok) => format!("{name} {done}"),
+        // A setup rerun over the installed app repaired its integration; nothing failed.
+        (Operation::Install, Kind::AlreadyInstalled) => format!("{name} is already installed."),
+        _ => format!("{name} {failed} (code {}).", kind.code()),
     }
+}
+
+/// Whether a native notice reports a normal end (the information icon) rather than a failure.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn notice_is_info(operation: Operation, kind: Kind) -> bool {
+    matches!(
+        (operation, kind),
+        (_, Kind::Ok) | (Operation::Install, Kind::AlreadyInstalled)
+    )
 }
 
 /// Windows: an interactive install or uninstall that ended without a UI that showed its outcome
@@ -328,7 +338,7 @@ fn notice(quiet: bool, seen: bool, name: &str, operation: Operation, kind: Kind)
     if seen || kind == Kind::Cancelled || !ui_host::ui_wanted(quiet, &env) {
         return;
     }
-    let level = if kind == Kind::Ok {
+    let level = if notice_is_info(operation, kind) {
         lunepack_os_windows::MessageKind::Info
     } else {
         lunepack_os_windows::MessageKind::Error
@@ -698,6 +708,24 @@ mod tests {
             notice_text("My App", Operation::Uninstall, Kind::InUse),
             "My App could not be uninstalled (code 25)."
         );
+    }
+
+    /// A setup rerun over the installed app (exit 23) is a normal end, not a failed install.
+    #[test]
+    fn an_already_installed_app_is_reported_as_installed_with_the_information_icon() {
+        assert_eq!(
+            notice_text("My App", Operation::Install, Kind::AlreadyInstalled),
+            "My App is already installed."
+        );
+        assert!(notice_is_info(Operation::Install, Kind::AlreadyInstalled));
+        assert!(notice_is_info(Operation::Install, Kind::Ok));
+        assert!(notice_is_info(Operation::Uninstall, Kind::Ok));
+        assert!(!notice_is_info(Operation::Install, Kind::Fs));
+        assert!(!notice_is_info(Operation::Setup, Kind::Verify));
+        assert!(!notice_is_info(
+            Operation::Uninstall,
+            Kind::AlreadyInstalled
+        ));
     }
 
     #[cfg(windows)]

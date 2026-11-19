@@ -284,7 +284,8 @@ only while none does. A failed rename reports the error and deletes nothing.
 **Outcome notice.** An interactive install, setup or uninstall that ends with no window that showed its
 outcome (no `lunepack-ui.exe`, one that failed to start or was lost) shows one native message box, because the
 process has no console to say it on. A setup that fails before it has read the app's name (a refused
-payload, a taken folder) shows the same box titled `Setup`, with the closed result code only. It appears only after the outcome is committed and never under
+payload, a taken folder) shows the same box titled `Setup`, with the closed result code only. A setup rerun over
+the installed app (exit 23) says the app is already installed, as a normal end, not a failure. It appears only after the outcome is committed and never under
 `/S` or `--silent`, `--no-ui`, `LUNEPACK_NO_UI`, nor for a cancellation the user chose.
 
 **The application user model id.** The Start-menu shortcut carries the app id as its application user model
