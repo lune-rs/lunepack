@@ -135,6 +135,10 @@ pub fn error_line(command: Option<&str>, tree_version: Option<&Version>, kind: K
     out.push_str(",\"kind\":");
     json_str(&mut out, kind.name());
     let _ = write!(out, ",\"exit_code\":{}", kind.code());
+    if let Some(reason) = kind.reason() {
+        out.push_str(",\"reason\":");
+        json_str(&mut out, reason);
+    }
     out.push('}');
     out
 }
@@ -163,9 +167,10 @@ pub fn human_result(command: &str, body: &Body) -> String {
 
 /// The one human line of an error.
 pub fn human_error(command: Option<&str>, kind: Kind) -> String {
+    let reason = kind.reason().map(|r| format!(", {r}")).unwrap_or_default();
     match command {
-        Some(c) => format!("{c}: error: {} (exit {})", kind.name(), kind.code()),
-        None => format!("error: {} (exit {})", kind.name(), kind.code()),
+        Some(c) => format!("{c}: error: {} (exit {}{reason})", kind.name(), kind.code()),
+        None => format!("error: {} (exit {}{reason})", kind.name(), kind.code()),
     }
 }
 
@@ -249,6 +254,7 @@ mod tests {
         for kind in Kind::ALL.into_iter().filter(|k| *k != Kind::Ok) {
             lines.push(error_line(Some("check"), Some(&tree), kind));
         }
+
         // apply-and-restart (step 13): its result and the two errors a caller acts on.
         lines.push(result_line(
             "apply-and-restart",
@@ -265,6 +271,15 @@ mod tests {
             Some(&tree),
             Kind::UnexpectedVersion,
         ));
+        // The other reasons of exit 28 (the representative in the loop above carries the first).
+        // Last, so the lines the integration tests address by number keep their places.
+        for place in crate::modes::Place::ALL.into_iter().skip(1) {
+            lines.push(error_line(
+                Some("check"),
+                Some(&tree),
+                Kind::UnsupportedLocation(place),
+            ));
+        }
         let mut text = lines.join("\n");
         text.push('\n');
         text
@@ -340,6 +355,14 @@ mod tests {
             tree_version: None,
             kind: "integration",
             exit_code: 24,
+            reason: None,
+        });
+        events.push(Event::Error {
+            command: "install",
+            tree_version: None,
+            kind: "unsupported_location",
+            exit_code: 28,
+            reason: Some("other_volume"),
         });
         let mut text: Vec<String> = events.iter().map(to_json_line).collect();
         text.push(String::new());
@@ -374,5 +397,12 @@ mod tests {
             "download: error: unexpected_version (exit 15)"
         );
         assert_eq!(human_error(None, Kind::Usage), "error: usage (exit 2)");
+        assert_eq!(
+            human_error(
+                Some("check"),
+                Kind::UnsupportedLocation(crate::modes::Place::ReadOnly)
+            ),
+            "check: error: unsupported_location (exit 28, read_only)"
+        );
     }
 }

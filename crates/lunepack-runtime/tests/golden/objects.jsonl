@@ -35,7 +35,12 @@
 {"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"in_use","exit_code":25}
 {"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"install_mismatch","exit_code":26}
 {"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"no_release","exit_code":27}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"unsupported_location","exit_code":28,"reason":"translocated"}
 {"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"internal","exit_code":70}
 {"schema":1,"type":"result","command":"apply-and-restart","tree_version":"1.0.0","version":"1.1.0","scheduled":true}
 {"schema":1,"type":"error","command":"apply-and-restart","tree_version":"1.0.0","kind":"nothing_staged","exit_code":12}
 {"schema":1,"type":"error","command":"apply-and-restart","tree_version":"1.0.0","kind":"unexpected_version","exit_code":15}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"unsupported_location","exit_code":28,"reason":"read_only"}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"unsupported_location","exit_code":28,"reason":"other_volume"}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"unsupported_location","exit_code":28,"reason":"not_owned"}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"unsupported_location","exit_code":28,"reason":"not_writable"}

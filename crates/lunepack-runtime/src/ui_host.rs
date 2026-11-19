@@ -153,14 +153,32 @@ pub fn ui_wanted(quiet: bool, env: &dyn Fn(&str) -> Option<OsString>) -> bool {
     true
 }
 
+/// The update window's helper app inside a bundle (macOS, M8-D6), relative to the bundle's
+/// `Contents` directory.
+#[cfg(target_os = "macos")]
+const HELPER_UI: &str = "Helpers/lunepack-update.app/Contents/MacOS/lunepack-ui";
+
 /// The UI binary of the runtime at `runtime_exe` (its resolved path): `lunepack-ui` in the same
-/// directory, and only when it is a regular file there (not a link).
+/// directory, and only when it is a regular file there (not a link). On macOS an installed
+/// bundle's runtime finds it first as the helper app nested in the bundle,
+/// `Contents/Helpers/lunepack-update.app/Contents/MacOS/lunepack-ui` (M8-D6); the installer app
+/// keeps it beside its runtime (M8-D7).
 pub fn ui_program(fs: &dyn Fs, runtime_exe: &Path) -> Option<PathBuf> {
-    let program = runtime_exe.parent()?.join(UI_FILE);
-    match fs.symlink_metadata(&program) {
-        Ok(Some(meta)) if meta.kind == FileKind::File => Some(program),
-        _ => None,
+    let is_file =
+        |p: &Path| matches!(fs.symlink_metadata(p), Ok(Some(m)) if m.kind == FileKind::File);
+    let dir = runtime_exe.parent()?;
+    #[cfg(target_os = "macos")]
+    {
+        // `<bundle>/Contents/MacOS/lunepack-runtime`: `Contents` is the directory above.
+        if let Some(contents) = dir.parent() {
+            let helper = contents.join(HELPER_UI);
+            if is_file(&helper) {
+                return Some(helper);
+            }
+        }
     }
+    let program = dir.join(UI_FILE);
+    is_file(&program).then_some(program)
 }
 
 /// What the stop log says.
@@ -986,6 +1004,35 @@ mod tests {
         assert!(s.env_set.is_empty());
         assert_eq!(s.env_remove, vec![OsString::from(HEALTH_TOKEN_VAR)]);
         assert_eq!(s.stdio, ChildStdio::Piped);
+    }
+
+    /// An installed bundle's runtime finds the update window as the helper app nested in the
+    /// bundle (M8-D6); the installer app's UI beside the runtime is the fallback (M8-D7); a linked
+    /// or absent helper is none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_runtime_of_a_bundle_finds_the_helper_app_first() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let contents = tmp.path().join("Hello.app/Contents");
+        let macos = contents.join("MacOS");
+        let helper_dir = contents.join("Helpers/lunepack-update.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).expect("dirs");
+        std::fs::create_dir_all(&helper_dir).expect("dirs");
+        let exe = macos.join("lunepack-runtime");
+        std::fs::write(&exe, b"").expect("exe");
+        let fs = lunepack_fs::StdFs::new();
+        assert!(ui_program(&fs, &exe).is_none(), "nothing to start yet");
+        // The installer's layout: the UI beside the runtime.
+        std::fs::write(macos.join(UI_FILE), b"").expect("sibling");
+        assert_eq!(ui_program(&fs, &exe), Some(macos.join(UI_FILE)));
+        // The helper app wins when the bundle has one.
+        let helper = helper_dir.join("lunepack-ui");
+        std::fs::write(&helper, b"").expect("helper");
+        assert_eq!(ui_program(&fs, &exe), Some(helper.clone()));
+        // A helper that is a link is not started; the sibling is.
+        std::fs::remove_file(&helper).expect("remove");
+        std::os::unix::fs::symlink("/bin/true", &helper).expect("link");
+        assert_eq!(ui_program(&fs, &exe), Some(macos.join(UI_FILE)));
     }
 
     #[test]

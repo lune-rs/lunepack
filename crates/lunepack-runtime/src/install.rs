@@ -92,7 +92,11 @@ pub fn run_install(
 /// without a health token; a failure is a warning.
 fn launch(ad: &Adapters, boot: &Installation, version: &Version, events: &Events) {
     let started = boot.install_layout().ok().and_then(|layout| {
-        let tree = layout.version_dir(version);
+        // The bundle layout (macOS) puts the installed version in the live bundle.
+        let tree = match layout.bundle_path(&*ad.fs) {
+            Ok(Some(bundle)) => bundle,
+            _ => layout.version_dir(version),
+        };
         let entry = boot
             .meta()
             .entry
@@ -132,6 +136,7 @@ fn report(boot: &Installation, result: Result<Version, Kind>) -> (Kind, Event) {
                 tree_version,
                 kind: kind.name(),
                 exit_code: kind.code(),
+                reason: kind.reason(),
             },
         ),
     }

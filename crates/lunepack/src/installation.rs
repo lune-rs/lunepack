@@ -169,6 +169,13 @@ impl Platform {
         self
     }
 
+    /// The per-user data home an install root lives in: the override, else the native one
+    /// (`XDG_DATA_HOME` or `$HOME/.local/share` on Linux, `$HOME/Library/Application Support`
+    /// on macOS, the user's program files folder on Windows).
+    pub fn data_home_dir(&self) -> Result<PathBuf, Error> {
+        self.data_home()
+    }
+
     /// The per-user data home: the override, else the native one (Linux, macOS, Windows).
     fn data_home(&self) -> Result<PathBuf, Error> {
         if let Some(home) = &self.data_home {
@@ -768,6 +775,10 @@ impl Installation {
         .verifier(Arc::clone(&p.verifier))
         .rng(Arc::clone(&p.rng))
         .integration(Arc::clone(&p.integration));
+        // macOS (M8-D2): a first install puts the live bundle in the user's `~/Applications`.
+        if p.layout_scheme.projection == Projection::Bundle {
+            builder = builder.bundle_layout(p.home()?.join("Applications"));
+        }
         if kind == FeedKind::HttpLoopback {
             let options = lunepack_http::UreqOptions {
                 direct: true,

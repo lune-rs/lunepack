@@ -21,6 +21,10 @@ lunepack-crypto.workspace = true
 # The frame decoder for the setup mode's single-entry reads (M6 step 7).
 lunepack-codec-lzma.workspace = true
 
+# The macOS process and per-user integration adapters, and the native notice (M8).
+[target.'cfg(target_os = "macos")'.dependencies]
+lunepack-os-macos.workspace = true
+
 # The DLL search hardening, first in `main` (M7-D10); the Windows integration joins in step 10.
 [target.'cfg(windows)'.dependencies]
 lunepack-os-windows.workspace = true
@@ -37,6 +41,11 @@ url = { workspace = true }
 # names the helper mode), and the cases run one after another.
 [[test]]
 name = "apply"
+harness = false
+
+# The apply mode on the macOS bundle layout (M8): the same shape, own main, the test binary is the app.
+[[test]]
+name = "apply_macos"
 harness = false
 
 # The UI host against a fake UI (M6): own main, the test binary is also the fake UI and the app.

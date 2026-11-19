@@ -180,6 +180,37 @@ pub fn reinstall_orphaned(
     Ok(out)
 }
 
+/// The record of an orphaned install (M8-D16) made ready for a first install: only the
+/// anti-rollback floors (root parts, key-set version, feed seq) carry over; `current`, `previous`,
+/// `pending`, `staged` (with `staged_issued`), `bad`, `health` and the queued lifecycle events are
+/// cleared and the install id is `install_id`. The app id, scope, target, `critical` and unknown
+/// members are the record's. The result has no current version, so the first install resumes from
+/// it as from any record a cut-off run left, and ends in [`install_first`]: the same record
+/// [`reinstall_orphaned`] gives, reached in two commits when the version to install is not known
+/// yet (a release that is not newer than the orphaned current version cannot be staged over it).
+///
+/// A record with no current version is [`LifecycleError::NotInstalled`]: it is not orphaned.
+pub fn reset_orphaned(
+    s: &InstallState,
+    install_id: [u8; INSTALL_ID_BYTES],
+) -> Result<InstallState, LifecycleError> {
+    user_only(s)?;
+    if s.current.is_none() {
+        return Err(LifecycleError::NotInstalled);
+    }
+    let mut out = s.next();
+    out.current = None;
+    out.previous = None;
+    out.pending = None;
+    out.staged = None;
+    out.staged_issued = None;
+    out.bad = Vec::new();
+    out.health = None;
+    out.install_id = install_id;
+    out.lifecycle = lifecycle_of(Vec::new());
+    Ok(out)
+}
+
 /// Applies the staged `version` (C4): the old current becomes `previous`, `version` becomes
 /// current with the staged manifest's `issued` (so the floor time of FORMAT.md 11.3 is the
 /// running release's), and it is pending its health check with `token_sha256` recorded for its

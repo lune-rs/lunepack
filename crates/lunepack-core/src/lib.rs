@@ -76,7 +76,7 @@ pub use layout::{
 };
 pub use lifecycle::{
     AttemptOutcome, ConfirmOutcome, TokenCheck, apply, confirm, count_attempt, deliver_events,
-    gc_keep, install_first, reinstall_orphaned, rollback,
+    gc_keep, install_first, reinstall_orphaned, reset_orphaned, rollback,
 };
 pub use limits::Limits;
 pub use manifest::{

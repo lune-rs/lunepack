@@ -134,6 +134,7 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 25 | `in_use` | (uninstall) a process still runs from the install |
 | 26 | `install_mismatch` | (install, uninstall) the install is not the one this environment derives; for install also an existing `R` that is not lunepack's (not a real directory, or holding files it did not make) |
 | 27 | `no_release` | (install) the channel offers no release for this install yet (none, none whose rollout admits it, or none at or above the bootstrap's own version); nothing was installed, retry later |
+| 28 | `unsupported_location` | (macOS, every mode) the running app or the install's bundle is somewhere lunepack does not update: the error object carries `reason`, one of `translocated`, `read_only`, `other_volume`, `not_owned`, `not_writable`; move the app to the Applications folder of the user and open it from there |
 | 70 | `internal` | anything else (a worker panic, a library error this build does not know) |
 
 The table lives in one place in the runtime (`crates/lunepack-runtime/src/modes.rs`) and is pinned

@@ -37,6 +37,7 @@ use lunepack_core::{
     Version, advance_root, read_entry, select_candidate, verify_feed, verify_key_set,
     verify_manifest, verify_payload_manifest,
 };
+use lunepack_core::{LayoutError, LayoutScheme, LocationReason};
 
 use crate::cache::{Cache, CacheKind, PartTools};
 use crate::fetch::{self, FeedUrls, FetchCtx, FrameNeed, PackTarget, cancellable};
@@ -198,6 +199,16 @@ pub struct UpdaterBuilder {
     budget: u64,
     policy: FetchPolicy,
     timeouts: Timeouts,
+    bundle: Option<BundleSetup>,
+}
+
+/// The macOS bundle layout of an install (M8-D1, D2): where the first install puts the live
+/// bundle. Without it the install root's directories are read as the first scheme that names
+/// them (XDG, then Windows).
+#[derive(Debug, Clone)]
+struct BundleSetup {
+    /// The apps folder (canonical): `~/Applications`.
+    apps_dir: PathBuf,
 }
 
 impl fmt::Debug for UpdaterBuilder {
@@ -235,7 +246,18 @@ impl UpdaterBuilder {
             budget: DEFAULT_BUDGET,
             policy: FetchPolicy::default(),
             timeouts: Timeouts::default(),
+            bundle: None,
         }
+    }
+
+    /// The install is a macOS bundle install ([`LayoutScheme::MACOS`], M8-D1): the first
+    /// [`Updater::install`] puts the live bundle in `apps_dir`, the canonical apps folder (the
+    /// user's `~/Applications`, created private when missing), after checking that it is on the
+    /// install's volume and the user can write it ([`Error::UnsupportedLocation`]). The updater's
+    /// layout must be that of an install root under that scheme.
+    pub fn bundle_layout(mut self, apps_dir: PathBuf) -> Self {
+        self.bundle = Some(BundleSetup { apps_dir });
+        self
     }
 
     /// An async transport (polled on the caller's task); wins over every other transport.
@@ -379,6 +401,7 @@ impl UpdaterBuilder {
                 workers: workers.max(1),
                 budget: self.budget,
                 policy: self.policy,
+                bundle: self.bundle,
             }),
         })
     }
@@ -717,6 +740,7 @@ struct Inner {
     workers: usize,
     budget: u64,
     policy: FetchPolicy,
+    bundle: Option<BundleSetup>,
 }
 
 /// The loaded state of either scope.
@@ -1646,10 +1670,59 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
 
 /// The per-user layout of an install root made by [`Layout::user`]: the versions and state
 /// directories of one root under a scheme this build knows ([`UserLayout::from_dirs`]).
-fn install_root_of(state_dir: &Path, versions_dir: &Path) -> Result<UserLayout, Error> {
-    UserLayout::from_dirs(state_dir, versions_dir).ok_or(Error::Config(
+fn install_root_of(
+    state_dir: &Path,
+    versions_dir: &Path,
+    scheme: Option<LayoutScheme>,
+) -> Result<UserLayout, Error> {
+    match scheme {
+        Some(scheme) => UserLayout::from_dirs_as(state_dir, versions_dir, scheme),
+        None => UserLayout::from_dirs(state_dir, versions_dir),
+    }
+    .ok_or(Error::Config(
         "install needs the per-user layout of an install root",
     ))
+}
+
+/// The scheme a bundle install runs under.
+fn scheme_of(inner: &Inner) -> Option<LayoutScheme> {
+    inner.bundle.as_ref().map(|_| LayoutScheme::MACOS)
+}
+
+/// Before anything is written (M8-D4): the apps folder (or the nearest folder that exists above
+/// it) is not read-only, is on the volume the install's versions will be on (the nearest existing
+/// folder above `versions_dir`) and the user can create entries in it.
+fn check_bundle_place(fs: &dyn Fs, setup: &BundleSetup, versions_dir: &Path) -> Result<(), Error> {
+    fn nearest(fs: &dyn Fs, path: &Path) -> Result<lunepack_core::PlaceFacts, Error> {
+        let mut at = path.to_path_buf();
+        loop {
+            match fs.place(&at) {
+                Ok(facts) => return Ok(facts),
+                Err(e) if e.kind == lunepack_core::FsErrorKind::NotFound => {
+                    if !at.pop() {
+                        return Err(Error::from(e));
+                    }
+                }
+                Err(e) => return Err(Error::from(e)),
+            }
+        }
+    }
+    let refuse = |reason| Error::UnsupportedLocation { reason };
+    let apps = nearest(fs, &setup.apps_dir)?;
+    let versions = nearest(fs, versions_dir)?;
+    if apps.fs_type == lunepack_core::layout::TRANSLOCATION_FS_TYPE {
+        return Err(refuse(LocationReason::Translocated));
+    }
+    if apps.read_only {
+        return Err(refuse(LocationReason::ReadOnly));
+    }
+    if apps.device != versions.device {
+        return Err(refuse(LocationReason::OtherVolume));
+    }
+    if !apps.writable {
+        return Err(refuse(LocationReason::NotWritable));
+    }
+    Ok(())
 }
 
 /// M7-D16 rule 3, first thing under the lock of a first install: `state_dir` holds no record of
@@ -1776,9 +1849,13 @@ fn tree_config(
     fs: &dyn Fs,
     app_id: &AppId,
     tree: &Path,
+    scheme: LayoutScheme,
 ) -> Result<lunepack_core::UpdateConfig, Error> {
-    let config = crate::installation::read_config(fs, &tree.join(UPDATE_CONFIG_FILE))?
-        .ok_or(Error::NoUpdateConfig)?;
+    let config = crate::installation::read_config(
+        fs,
+        &crate::installation::scheme_config_path(tree, scheme),
+    )?
+    .ok_or(Error::NoUpdateConfig)?;
     if &config.app_id != app_id {
         return Err(Error::UpdateConfig(UpdateConfigError::RootMismatch(
             "app_id",
@@ -1797,7 +1874,7 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
     else {
         return Err(Error::MachineScope);
     };
-    let root = install_root_of(state_dir, versions_dir)?;
+    let root = install_root_of(state_dir, versions_dir, scheme_of(&inner))?;
     let bootstrap = current_tree.clone().ok_or(Error::Config(
         "install needs the bootstrap tree as the current tree",
     ))?;
@@ -1807,15 +1884,40 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
     // write to the install (the lock is the first); only an earlier uninstall's tombstones beside
     // the root are removed in between (F18).
     let boot_root = root.clone();
-    let (target, boot_version) = on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
-        let config = tree_config(&*inner.fs, &inner.app_id, &bootstrap)?;
-        let request = integration_request(&inner.app_id, boot_root.root(), &config);
-        inner.integration.check(Scope::User, &request)?;
-        clear_tombstones(inner, &boot_root);
-        adoptable(inner, &boot_root)?;
-        Ok((config.target, config.version))
-    })
-    .await?;
+    let (target, boot_version, bundle) =
+        on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
+            let config = tree_config(&*inner.fs, &inner.app_id, &bootstrap, boot_root.scheme())?;
+            // macOS (M8-D1, D4): the place is judged before anything is written, then the live
+            // bundle's name is chosen (the apps folder is made private when it is missing).
+            let bundle = match &inner.bundle {
+                Some(setup) => {
+                    let Layout::User { versions_dir, .. } = &inner.layout else {
+                        return Err(Error::MachineScope);
+                    };
+                    check_bundle_place(&*inner.fs, setup, versions_dir)?;
+                    Some(
+                        lunepack_core::resolve_bundle_target(
+                            &*inner.fs,
+                            &setup.apps_dir,
+                            &config.install.name,
+                            &inner.app_id,
+                        )
+                        .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))?,
+                    )
+                }
+                None => None,
+            };
+            let request = integration_request(
+                &inner.app_id,
+                bundle.as_deref().unwrap_or_else(|| boot_root.root()),
+                &config,
+            );
+            inner.integration.check(Scope::User, &request)?;
+            clear_tombstones(inner, &boot_root);
+            adoptable(inner, &boot_root)?;
+            Ok((config.target, config.version, bundle))
+        })
+        .await?;
 
     // The record: created when missing, resumed when it has no current version.
     {
@@ -1838,6 +1940,22 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
                 let loaded = store.load(&*inner.fs, &*inner.hasher)?;
                 match &loaded.record {
                     Some(record) if record.current.is_some() => {
+                        // macOS (M8-D16): the bundle was removed by the user, so the record
+                        // names a current version no tree holds. That is a fresh install that
+                        // keeps the floors: the record is reset to them (new install id) and
+                        // the install goes on as from a cut-off run.
+                        if inner.bundle.is_some()
+                            && matches!(
+                                state_root.reconcile(&*inner.fs, record),
+                                Err(LayoutError::Orphaned)
+                            )
+                        {
+                            let mut install_id = [0u8; lunepack_core::policy::INSTALL_ID_BYTES];
+                            inner.rng.fill(&mut install_id)?;
+                            let reset = lunepack_core::reset_orphaned(record, install_id)?;
+                            store.commit(&*inner.fs, &loaded, &reset, &*inner.hasher)?;
+                            return Ok(());
+                        }
                         Err(already_installed(&*inner.fs, &state_root, record))
                     }
                     Some(_) => Ok(()),
@@ -1921,17 +2039,27 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
                 .filter(|_| staged_here)
                 .ok_or(Error::NothingStaged)?;
             let tree = versions_dir.join(version.to_string());
-            let config = tree_config(&*inner.fs, &inner.app_id, &tree)?;
+            let config = tree_config(&*inner.fs, &inner.app_id, &tree, root.scheme())?;
             if !crate::installation::same_version(&config.version, &version) {
                 return Err(Error::UpdateConfig(UpdateConfigError::Invalid {
                     field: "version",
                     rule: "is not the version of its directory",
                 }));
             }
-            let request = integration_request(&inner.app_id, root.root(), &config);
+            let request = integration_request(
+                &inner.app_id,
+                bundle.as_deref().unwrap_or_else(|| root.root()),
+                &config,
+            );
             inner.integration.check(Scope::User, &request)?;
             let next =
                 lunepack_core::install_first(&record, version.clone(), issued, record.install_id)?;
+            // macOS: `R/bundle` names the live bundle before the record does (M8-D1); the
+            // reconcile after the commit places the staged tree in it and writes its identity.
+            if let Some(bundle) = &bundle {
+                lunepack_core::set_bundle_pointer(&*inner.fs, &root, bundle)
+                    .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))?;
+            }
             // The integration goes in before the commit (F11, Q42): once the record names a
             // current version a rerun is `AlreadyInstalled`, so nothing that can fail may be left
             // for after it. Its entries point through `R/current`, which the reconcile below makes
@@ -2172,6 +2300,7 @@ fn rerun_installed(inner: &Inner, root: &UserLayout, record: &InstallState) -> E
         &*inner.fs,
         &inner.app_id,
         &root.version_dir(&current.version),
+        root.scheme(),
     )
     .and_then(|config| {
         let request = integration_request(&inner.app_id, root.root(), &config);
@@ -2201,7 +2330,7 @@ async fn install_from_payload(
         return Err(Error::MachineScope);
     };
     let (state_dir, versions_dir) = (state_dir.clone(), versions_dir.clone());
-    let install_root = install_root_of(&state_dir, &versions_dir)?;
+    let install_root = install_root_of(&state_dir, &versions_dir, scheme_of(&inner))?;
     if root.app_id() != &inner.app_id {
         return Err(Error::Verify(lunepack_core::Error::AppIdMismatch));
     }
@@ -2439,7 +2568,7 @@ async fn install_from_payload(
                     return Err(already_installed(&*inner.fs, &install_root, &record));
                 }
                 let tree = staged.tree;
-                let config = tree_config(&*inner.fs, &inner.app_id, &tree)?;
+                let config = tree_config(&*inner.fs, &inner.app_id, &tree, install_root.scheme())?;
                 let request = integration_request(&inner.app_id, install_root.root(), &config);
                 inner.integration.check(Scope::User, &request)?;
                 let next = lunepack_core::install_first(
