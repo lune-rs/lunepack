@@ -120,6 +120,7 @@ fn report(inst: &Installation, result: Result<bool, Kind>) -> (Kind, Event) {
                 tree_version,
                 kind: kind.name(),
                 exit_code: kind.code(),
+                reason: kind.reason(),
             },
         ),
     }

@@ -16,15 +16,17 @@ use std::time::Duration;
 
 use common::{INSTALL_ID, TARGET, World, app_id, channel, sha, version};
 use lunepack::{
-    Error, Installation, Platform, StartupAction, UpdateConfigError, follow_move, startup_for,
+    DownloadOptions, Error, Installation, Platform, StartupAction, UpdateConfigError, block_on,
+    follow_move, startup_for,
 };
 use lunepack_core::state::{InstallState, Scope, StagedRef, UserScope};
 use lunepack_core::{
-    Fs, InstallMeta, IntegrationRequest, LayoutScheme, LocationReason, RelPath, UpdateConfig,
-    UserLayout, set_bundle_pointer, write_bundle_identity,
+    CodecId, Fs, InstallMeta, IntegrationRequest, LayoutScheme, LocationReason, RelPath,
+    UpdateConfig, UserLayout, set_bundle_pointer, write_bundle_identity,
 };
 use lunepack_testkit::{
-    FakeHasher, FakeIntegration, FakeProcess, FakeRng, FakeVerifier, IntegrationOp, MemFs, MemPlace,
+    FakeCodec, FakeHasher, FakeIntegration, FakeProcess, FakeRng, FakeVerifier, IntegrationOp,
+    MemFs, MemPlace, PackBuilder,
 };
 
 const V100: &str = "1.0.0";
@@ -128,17 +130,23 @@ struct Mac {
     fs: MemFs,
     process: FakeProcess,
     integration: FakeIntegration,
+    /// Each platform gets its own random seed, so two installs draw different install ids.
+    seed: std::cell::Cell<u8>,
 }
 
 impl Mac {
     fn new() -> Mac {
         let world = World::new();
         let fs = world.fs.clone();
+        // The user's home exists; the Library and the apps folders do not until something makes
+        // them.
+        fs.create_dir_all(Path::new("/Users/u")).expect("home");
         Mac {
             world,
             fs,
             process: FakeProcess::new("/unused"),
             integration: FakeIntegration::new(),
+            seed: std::cell::Cell::new(9),
         }
     }
 
@@ -166,13 +174,14 @@ impl Mac {
     }
 
     fn platform(&self, token: Option<OsString>) -> Platform {
+        self.seed.set(self.seed.get().wrapping_add(1));
         Platform::native()
             .with_fs(Arc::new(self.fs.clone()))
             .with_hasher(Arc::new(FakeHasher))
             .with_verifier(Arc::new(FakeVerifier))
             .with_process(Arc::new(self.process.clone()))
             .with_integration(Arc::new(self.integration.clone()))
-            .with_rng(Arc::new(FakeRng::new(9)))
+            .with_rng(Arc::new(FakeRng::new(u64::from(self.seed.get()))))
             .with_health_token(token)
             .with_data_home(self.data_home())
             .with_home(self.home())
@@ -600,6 +609,209 @@ fn an_install_whose_bundle_is_gone_is_not_installed_for_the_app() {
         .expect("installation");
     let got = startup_for(&inst, Vec::new());
     assert!(matches!(got, Err(Error::NotInstalled)), "{:?}", got.err());
+}
+
+// ---- the first install ---------------------------------------------------------------------------
+
+/// Publishes release `v` (feed `seq`) as a bundle: the entry, a file and the config in the pack.
+fn publish(mac: &Mac, seq: u64, v: &str) {
+    let mut pack = PackBuilder::new();
+    for (path, bytes) in [
+        ("Contents/MacOS/hello", format!("app {v}").into_bytes()),
+        ("Contents/Resources/share.txt", b"shared".repeat(20)),
+        (
+            "Contents/Resources/lunepack-update.json",
+            config(&mac.world, v).to_bytes().expect("bytes"),
+        ),
+    ] {
+        pack.file(&FakeHasher, path, &bytes, CodecId::Lzma2);
+    }
+    mac.world.publish_pack(seq, v, &pack);
+}
+
+/// A bootstrap bundle of `v` outside the install.
+fn bootstrap(mac: &Mac, v: &str) -> Installation {
+    let tree = PathBuf::from("/media/boot").join(format!("{v}/Hello.app"));
+    write_bundle(&mac.fs, &tree, &config(&mac.world, v));
+    mac.open(&tree, None).expect("bootstrap")
+}
+
+fn install(mac: &Mac, boot: &Installation) -> Result<lunepack::InstalledVersion, Error> {
+    let updater = boot
+        .updater_builder()?
+        .transport(Arc::clone(&mac.world.transport))
+        .codec(Arc::new(FakeCodec::new()))
+        .clock(Arc::clone(&mac.world.clock) as Arc<dyn lunepack_core::Clock>)
+        .workers(2)
+        .build()?;
+    block_on(updater.install(DownloadOptions::default()))
+}
+
+#[test]
+fn install_puts_the_live_bundle_in_the_apps_folder_and_follows_the_order() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    publish(&mac, 1, V100);
+    let boot = bootstrap(&mac, V100);
+    let got = install(&mac, &boot).expect("install");
+    assert_eq!(got.version(), &version(V100));
+
+    // The apps folder was made private, the bundle holds the release, the pointer and the
+    // identity name it, and the staged tree is gone from `versions` (placed, not copied).
+    assert!(mac.fs.is_private_dir(&mac.apps()));
+    assert_eq!(
+        config_version(&mac.fs, &mac.bundle()).as_deref(),
+        Some(V100)
+    );
+    assert_eq!(mac.pointer(), mac.bundle().to_str().expect("utf-8"));
+    assert!(
+        mac.fs
+            .symlink_metadata(&mac.layout().version_dir(&version(V100)))
+            .expect("lstat")
+            .is_none()
+    );
+    assert!(
+        lunepack_core::read_bundle_identity(&mac.fs, &mac.layout())
+            .expect("identity")
+            .is_some()
+    );
+    let rec = mac.record();
+    assert_eq!(rec.current.expect("current").version, version(V100));
+    // The desktop integration is rooted at the bundle, before the record names the version.
+    let applied = mac
+        .integration
+        .calls()
+        .into_iter()
+        .rfind(|c| c.op == IntegrationOp::Apply)
+        .expect("apply");
+    assert_eq!(applied.install_root, mac.bundle());
+
+    // The installed bundle finds itself and its first start gets the install events.
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    assert!(inst.is_installed());
+    let start = startup_for(&inst, Vec::new()).expect("startup");
+    assert_eq!(start.events.len(), 2);
+    // A second install is the answer for a live install.
+    let again = install(&mac, &boot);
+    assert!(matches!(again, Err(Error::AlreadyInstalled)), "{again:?}");
+    common::workers_stopped();
+}
+
+#[test]
+fn a_name_taken_in_the_apps_folder_falls_back_to_the_name_with_the_app_id() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    publish(&mac, 1, V100);
+    // Somebody else's Hello.app is there already.
+    write_bundle(&mac.fs, &mac.bundle(), &config(&mac.world, "9.9.9"));
+    let boot = bootstrap(&mac, V100);
+    install(&mac, &boot).expect("install");
+    let taken = mac
+        .apps()
+        .join(format!("Hello ({}).app", app_id().as_str()));
+    assert_eq!(config_version(&mac.fs, &taken).as_deref(), Some(V100));
+    assert_eq!(
+        config_version(&mac.fs, &mac.bundle()).as_deref(),
+        Some("9.9.9")
+    );
+    assert_eq!(mac.pointer(), taken.to_str().expect("utf-8"));
+    common::workers_stopped();
+}
+
+#[test]
+fn an_apps_folder_on_another_volume_or_that_cannot_be_written_writes_nothing() {
+    let _serial = common::serial();
+    for (what, reason, edit) in [
+        (
+            "another volume",
+            LocationReason::OtherVolume,
+            Box::new(|place: &mut MemPlace| place.device = 5) as Box<dyn Fn(&mut MemPlace)>,
+        ),
+        (
+            "read only",
+            LocationReason::ReadOnly,
+            Box::new(|place: &mut MemPlace| place.read_only = true),
+        ),
+        (
+            "not writable",
+            LocationReason::NotWritable,
+            Box::new(|place: &mut MemPlace| place.writable = false),
+        ),
+    ] {
+        let mac = Mac::new();
+        publish(&mac, 1, V100);
+        let boot = bootstrap(&mac, V100);
+        // `~` and the data home exist; the apps folder and the install root do not yet.
+        mac.fs.create_dir_all(&mac.data_home()).expect("data home");
+        let mut place = MemPlace::default();
+        edit(&mut place);
+        let home_place = MemPlace::default();
+        mac.fs.set_place(&mac.home(), place);
+        mac.fs.set_place(&mac.data_home(), home_place);
+        let got = install(&mac, &boot);
+        assert!(
+            matches!(&got, Err(Error::UnsupportedLocation { reason: r }) if *r == reason),
+            "{what}: {got:?}"
+        );
+        assert!(
+            mac.fs
+                .symlink_metadata(&mac.apps())
+                .expect("lstat")
+                .is_none(),
+            "{what}: the apps folder was made"
+        );
+        assert!(
+            mac.fs
+                .symlink_metadata(mac.layout().root())
+                .expect("lstat")
+                .is_none(),
+            "{what}: the install root was made"
+        );
+        common::workers_stopped();
+    }
+}
+
+#[test]
+fn an_install_whose_bundle_was_trashed_installs_again_and_keeps_the_floors() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    publish(&mac, 1, V100);
+    let boot = bootstrap(&mac, V100);
+    install(&mac, &boot).expect("install");
+    let before = mac.record();
+    // The user drags the app to the Trash: the pointer dangles and no tree holds 1.0.0.
+    mac.fs
+        .remove_dir_all_nofollow(&mac.bundle())
+        .expect("trash");
+
+    publish(&mac, 2, V110);
+    let boot = bootstrap(&mac, V110);
+    let got = install(&mac, &boot).expect("reinstall");
+    assert_eq!(got.version(), &version(V110));
+    let rec = mac.record();
+    assert_eq!(
+        rec.current.as_ref().expect("current").version,
+        version(V110)
+    );
+    assert_ne!(rec.install_id, before.install_id, "a new install id");
+    assert!(rec.previous.is_none() && rec.pending.is_none() && rec.bad.is_empty());
+    // Floors never go down: the old ones carry over and the new feed (seq 2) raised its own.
+    assert_eq!(rec.floors.root, before.floors.root);
+    assert_eq!(rec.floors.keyset_version, before.floors.keyset_version);
+    for (channel, seq) in &before.floors.feed_seq {
+        assert!(
+            rec.floors
+                .feed_seq
+                .get(channel)
+                .is_some_and(|now| now >= seq),
+            "the feed seq floor went down"
+        );
+    }
+    assert_eq!(
+        config_version(&mac.fs, &mac.bundle()).as_deref(),
+        Some(V110)
+    );
+    common::workers_stopped();
 }
 
 // ---- the real disk -------------------------------------------------------------------------------

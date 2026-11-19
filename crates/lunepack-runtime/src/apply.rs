@@ -39,6 +39,7 @@ use lunepack::{
     LockGuard, Phase, Sha256Digest, SpawnSpec, UserLayout, Version, WaitOutcome,
 };
 use lunepack_core::state::{InstallState, Scope, UserScope};
+use lunepack_core::{LayoutError, Projection, RelPath};
 
 use lunepack_core::ui::{ChoiceValue, Outcome, PromptKind, StepItem};
 
@@ -115,6 +116,39 @@ fn stale_bins(outgoing: Option<&Installation>, incoming: &Installation) -> Vec<S
     }
 }
 
+/// Whether the install keeps its live tree in a bundle outside its root (macOS, M8-D1).
+fn is_bundle(layout: &UserLayout) -> bool {
+    layout.scheme().projection == Projection::Bundle
+}
+
+/// The live bundle `B` of a bundle install, `None` for the other layouts.
+fn live_bundle(ad: &Adapters, layout: &UserLayout) -> Option<std::path::PathBuf> {
+    if is_bundle(layout) {
+        layout.bundle_path(&*ad.fs).ok().flatten()
+    } else {
+        None
+    }
+}
+
+/// The entry that starts `version` once it is current (M8-D1): under the bundle layout the live
+/// bundle's, because the version's staging tree is moved into the bundle by the reconcile that
+/// follows the commit; elsewhere the version's own tree's.
+fn live_entry(
+    ad: &Adapters,
+    layout: &UserLayout,
+    version: &Installation,
+    tree_entry: std::path::PathBuf,
+    entry: &RelPath,
+) -> std::path::PathBuf {
+    match live_bundle(ad, layout) {
+        Some(bundle) => entry.components().fold(bundle, |dir, part| dir.join(part)),
+        None => {
+            let _ = version;
+            tree_entry
+        }
+    }
+}
+
 /// Refreshes the desktop integration from `to`'s metadata (best effort: a failure is a warning,
 /// because the entries point through `current` and the next apply or install refreshes them).
 fn refresh_integration(
@@ -126,7 +160,8 @@ fn refresh_integration(
 ) {
     let request = IntegrationRequest {
         app_id: to.app_id().clone(),
-        install_root: layout.root().to_path_buf(),
+        // Under the bundle layout the integration is rooted at the live bundle (M8-D12).
+        install_root: live_bundle(ad, layout).unwrap_or_else(|| layout.root().to_path_buf()),
         version: to.tree_version().clone(),
         meta: to.meta().clone(),
         previous: from.map(|f| f.meta().clone()),
@@ -145,10 +180,24 @@ fn refresh_integration(
     }
 }
 
-fn reconcile(ad: &Adapters, layout: &UserLayout, record: &InstallState, events: &Events) {
-    if layout.reconcile(&*ad.fs, record).is_err() {
+/// Projects `record` onto the disk (`current`, or the bundle swap). A failure is a warning, and
+/// is returned so the bundle layout, where the new version cannot start without it, can stop.
+fn reconcile(
+    ad: &Adapters,
+    layout: &UserLayout,
+    record: &InstallState,
+    events: &Events,
+) -> Result<(), LayoutError> {
+    let result = layout.reconcile(&*ad.fs, record);
+    if result.is_err() {
         events.emit(&Event::warning(Warning::ReconcileFailed, None));
     }
+    result
+}
+
+/// The kind of a failed reconcile (a refused place is exit 28, anything else a failed disk).
+fn layout_kind(e: LayoutError) -> Kind {
+    Kind::of(&lunepack_core::Error::Layout(e).into())
 }
 
 /// Whether `record` still has `v` pending under this run's token.
@@ -231,6 +280,16 @@ fn commit_apply(
         .map_err(|e| refused(Kind::of(&e)))?;
     // The outgoing version's config only names command links to retire.
     let outgoing = inst.version_installation(&current.version).ok();
+    // macOS (M8-D4): the bundle's place is judged before anything is committed, so a refused
+    // place is exit 28 with the install as it was.
+    if is_bundle(layout) {
+        let bundle = layout
+            .bundle_path(&*ad.fs)
+            .map_err(|e| refused(layout_kind(e)))?
+            .ok_or_else(|| refused(Kind::NotInstalled))?;
+        lunepack_core::check_place(&*ad.fs, layout, &bundle)
+            .map_err(|e| refused(layout_kind(e)))?;
+    }
 
     let mut token = [0u8; 32];
     ad.rng.fill(&mut token).map_err(|e| refused(kind_of(e)))?;
@@ -239,7 +298,14 @@ fn commit_apply(
     let committed = store
         .commit(&*ad.fs, &loaded, &next, &*ad.hasher)
         .map_err(|e| refused(kind_of(e)))?;
-    reconcile(ad, layout, &committed, events);
+    // Under the bundle layout the new version starts from the bundle, so a reconcile that did not
+    // put it there stops the apply: the record names it, and the next start or apply finishes
+    // the swap (never undone). The app that exited is started again by the caller.
+    if let Err(e) = reconcile(ad, layout, &committed, events)
+        && is_bundle(layout)
+    {
+        return Err(refused(layout_kind(e)));
+    }
     refresh_integration(ad, layout, outgoing.as_ref(), &new, events);
     drop(guard);
     events.emit(&Event::phase(Phase::Apply, Some(v)));
@@ -395,7 +461,14 @@ fn roll_back(
     let committed = store
         .commit(&*ad.fs, &loaded, &next, &*ad.hasher)
         .map_err(kind_of)?;
-    reconcile(ad, layout, &committed, events);
+    if let Err(e) = reconcile(ad, layout, &committed, events)
+        && is_bundle(layout)
+    {
+        // The rollback is committed but the bundle still holds the failed version: nothing is
+        // relaunched from it, and the next start or apply finishes the swap.
+        drop(guard);
+        return Err(layout_kind(e));
+    }
     refresh_integration(ad, layout, Some(&applied.new), &previous, events);
     drop(guard);
     Ok(RolledBack::Done(Box::new(previous)))
@@ -537,6 +610,7 @@ fn report(inst: &Installation, args: &ApplyArgs, end: &End, events: &Events) -> 
             tree_version,
             kind: kind.name(),
             exit_code: kind.code(),
+            reason: kind.reason(),
         });
     } else {
         events.emit(&Event::Result {
@@ -577,7 +651,13 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
     // Launch, never through a shell: the new tree's entry from its own config.
     events.emit(&Event::phase(Phase::Launch, Some(v)));
     let spec = SpawnSpec {
-        program: applied.new.entry_path(),
+        program: live_entry(
+            ad,
+            &layout,
+            &applied.new,
+            applied.new.entry_path(),
+            &applied.new.meta().entry,
+        ),
         args: args.restart.clone(),
         env_set: vec![(OsString::from(HEALTH_TOKEN_VAR), hex(&applied.token))],
         env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
@@ -616,7 +696,13 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
                     reason: Some(reason),
                 });
                 let relaunch = SpawnSpec {
-                    program: previous.entry_path(),
+                    program: live_entry(
+                        ad,
+                        &layout,
+                        &previous,
+                        previous.entry_path(),
+                        &previous.meta().entry,
+                    ),
                     args: args.restart.clone(),
                     env_set: Vec::new(),
                     env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
@@ -761,5 +847,339 @@ mod tests {
             &exited,
             &applying
         ));
+    }
+
+    // ---- the bundle layout (macOS, M8) ---------------------------------------------------------
+
+    use std::io::Write as _;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use lunepack::{Fs, Installation, Platform};
+    use lunepack_core::state::UserScope;
+    use lunepack_core::{LayoutScheme, UserLayout, set_bundle_pointer, write_bundle_identity};
+    use lunepack_testkit::{
+        FakeCodec, FakeHasher, FakeIntegration, FakeProcess, FakeRng, FakeVerifier, MemFs,
+        MemPlace, abs_path, sample_update_config,
+    };
+
+    use super::{commit_apply, live_entry, roll_back};
+    use crate::events::Events;
+    use crate::modes::{Adapters, Kind, Place};
+
+    struct Mac {
+        fs: MemFs,
+        process: FakeProcess,
+        integration: FakeIntegration,
+        ad: Adapters,
+    }
+
+    fn home() -> PathBuf {
+        abs_path("/Users/u")
+    }
+
+    fn data_home() -> PathBuf {
+        home().join("Library/Application Support")
+    }
+
+    fn bundle() -> PathBuf {
+        home().join("Applications/Hello.app")
+    }
+
+    fn app_layout() -> UserLayout {
+        UserLayout::from_root(
+            data_home().join(sample_update_config().app_id.as_str()),
+            LayoutScheme::MACOS,
+        )
+    }
+
+    fn mac_config(v: &str) -> lunepack::UpdateConfig {
+        let mut c = sample_update_config();
+        c.version = Version::parse(v).expect("version");
+        c.target = Target::MacosAarch64;
+        c.install.entry = lunepack::RelPath::parse("Contents/MacOS/hello").expect("entry");
+        c.install.autostart = false;
+        c
+    }
+
+    fn put(fs: &MemFs, path: PathBuf, bytes: &[u8]) {
+        fs.create_dir_all(path.parent().expect("parent"))
+            .expect("dirs");
+        let mut f = fs.create_new(&path).expect("create");
+        f.write_all(bytes).expect("write");
+        f.sync().expect("sync");
+    }
+
+    fn put_bundle(fs: &MemFs, tree: &std::path::Path, v: &str) {
+        put(
+            fs,
+            tree.join("Contents/Resources/lunepack-update.json"),
+            &mac_config(v).to_bytes().expect("bytes"),
+        );
+        put(fs, tree.join("Contents/MacOS/hello"), v.as_bytes());
+    }
+
+    fn version_in(fs: &MemFs, tree: &std::path::Path) -> Option<String> {
+        let bytes = fs
+            .read_capped(
+                &tree.join("Contents/Resources/lunepack-update.json"),
+                1 << 16,
+            )
+            .ok()?;
+        Some(
+            lunepack::UpdateConfig::parse(&bytes)
+                .ok()?
+                .version
+                .to_string(),
+        )
+    }
+
+    /// 1.0.0 live in the bundle, 1.1.0 staged in `versions`.
+    fn mac() -> Mac {
+        let fs = MemFs::new();
+        let process = FakeProcess::new("/unused");
+        let integration = FakeIntegration::new();
+        let layout = app_layout();
+        for dir in [
+            layout.versions_dir(),
+            layout.state_dir(),
+            home().join("Applications"),
+        ] {
+            fs.create_dir_all(&dir).expect("dirs");
+        }
+        put_bundle(&fs, &bundle(), "1.0.0");
+        put_bundle(&fs, &layout.version_dir(&v("1.1.0")), "1.1.0");
+        set_bundle_pointer(&fs, &layout, &bundle()).expect("pointer");
+        write_bundle_identity(&fs, &layout, &bundle()).expect("identity");
+        let app = sample_update_config().app_id;
+        let record = InstallState::new(
+            1,
+            app.clone(),
+            Scope::User,
+            INSTALL_ID,
+            Target::MacosAarch64,
+        )
+        .install(v("1.0.0"), 10, Target::MacosAarch64, INSTALL_ID)
+        .set_staged(Some((
+            lunepack_core::state::StagedRef::new(
+                v("1.1.0"),
+                Target::MacosAarch64,
+                Sha256Digest::from_bytes([1; 32]),
+            ),
+            20,
+        )));
+        let store = UserScope {
+            dir: layout.state_dir(),
+            app_id: app,
+        };
+        let loaded = store.load(&fs, &FakeHasher).expect("load");
+        store
+            .commit(&fs, &loaded, &record, &FakeHasher)
+            .expect("commit");
+        let fs_arc: Arc<MemFs> = Arc::new(fs.clone());
+        let platform = Platform::native()
+            .with_fs(Arc::clone(&fs_arc) as Arc<dyn Fs>)
+            .with_hasher(Arc::new(FakeHasher))
+            .with_verifier(Arc::new(FakeVerifier))
+            .with_process(Arc::new(process.clone()))
+            .with_integration(Arc::new(integration.clone()))
+            .with_rng(Arc::new(FakeRng::new(4)))
+            .with_health_token(None)
+            .with_data_home(data_home())
+            .with_home(home())
+            .with_layout_scheme(LayoutScheme::MACOS);
+        let ad = Adapters {
+            fs: fs_arc,
+            hasher: Arc::new(FakeHasher),
+            verifier: Arc::new(FakeVerifier),
+            codec: Arc::new(FakeCodec::new()),
+            process: Arc::new(process.clone()),
+            integration: Arc::new(integration.clone()),
+            rng: Arc::new(FakeRng::new(4)),
+            platform,
+        };
+        Mac {
+            fs,
+            process,
+            integration,
+            ad,
+        }
+    }
+
+    impl Mac {
+        fn open(&self) -> Installation {
+            Installation::from_exe_with(
+                &bundle().join("Contents/MacOS/hello"),
+                self.ad.platform.clone(),
+            )
+            .expect("installation")
+        }
+    }
+
+    #[test]
+    fn a_bundle_apply_commits_swaps_and_launches_from_the_live_bundle() {
+        let mac = mac();
+        let inst = mac.open();
+        let layout = inst.layout().cloned().expect("layout");
+        let events = Events::new(None, None);
+        let applied = commit_apply(&mac.ad, &inst, &layout, &v("1.1.0"), &events)
+            .map_err(|r| r.kind)
+            .expect("apply");
+        // The record names 1.1.0; the bundle holds it and 1.0.0 is parked.
+        assert_eq!(version_in(&mac.fs, &bundle()).as_deref(), Some("1.1.0"));
+        assert_eq!(
+            version_in(&mac.fs, &layout.version_dir(&v("1.0.0"))).as_deref(),
+            Some("1.0.0")
+        );
+        assert!(
+            mac.fs
+                .symlink_metadata(&layout.version_dir(&v("1.1.0")))
+                .expect("lstat")
+                .is_none()
+        );
+        // The entry that starts it is the bundle's, not the staging tree's (which is gone).
+        let entry = live_entry(
+            &mac.ad,
+            &layout,
+            &applied.new,
+            applied.new.entry_path(),
+            &applied.new.meta().entry,
+        );
+        assert_eq!(entry, bundle().join("Contents/MacOS/hello"));
+        assert!(applied.new.entry_path().starts_with(layout.versions_dir()));
+        // The desktop integration is rooted at the bundle.
+        let call = mac.integration.calls().pop().expect("integration call");
+        assert_eq!(call.install_root, bundle());
+        assert!(mac.process.spawns().is_empty());
+    }
+
+    #[test]
+    fn a_bundle_apply_in_a_place_lunepack_does_not_update_commits_nothing() {
+        for (what, expected, edit) in [
+            (
+                "another volume",
+                Place::OtherVolume,
+                Box::new(|m: &mut MemPlace| m.device = 9) as Box<dyn Fn(&mut MemPlace)>,
+            ),
+            (
+                "not writable",
+                Place::NotWritable,
+                Box::new(|m: &mut MemPlace| m.writable = false),
+            ),
+            (
+                "not owned",
+                Place::NotOwned,
+                Box::new(|m: &mut MemPlace| m.owned_by_caller = false),
+            ),
+        ] {
+            let mac = mac();
+            let inst = mac.open();
+            let layout = inst.layout().cloned().expect("layout");
+            let before = mac_record(&mac, &layout);
+            let mut facts = MemPlace::default();
+            edit(&mut facts);
+            // The Applications folder (and so the bundle in it, for `not owned`) is the place.
+            mac.fs.set_place(&home().join("Applications"), facts);
+            let events = Events::new(None, None);
+            let got = commit_apply(&mac.ad, &inst, &layout, &v("1.1.0"), &events);
+            assert_eq!(
+                got.err().map(|r| r.kind),
+                Some(Kind::UnsupportedLocation(expected)),
+                "{what}"
+            );
+            assert_eq!(mac_record(&mac, &layout), before, "{what}: committed");
+            assert_eq!(
+                version_in(&mac.fs, &bundle()).as_deref(),
+                Some("1.0.0"),
+                "{what}"
+            );
+            assert_eq!(
+                version_in(&mac.fs, &layout.version_dir(&v("1.1.0"))).as_deref(),
+                Some("1.1.0"),
+                "{what}: moved"
+            );
+        }
+    }
+
+    fn mac_record(mac: &Mac, layout: &UserLayout) -> InstallState {
+        UserScope {
+            dir: layout.state_dir(),
+            app_id: sample_update_config().app_id,
+        }
+        .load(&mac.fs, &FakeHasher)
+        .expect("load")
+        .record
+        .expect("record")
+    }
+
+    #[test]
+    fn a_bundle_rollback_puts_the_previous_version_back_in_the_bundle() {
+        let mac = mac();
+        let inst = mac.open();
+        let layout = inst.layout().cloned().expect("layout");
+        let events = Events::new(None, None);
+        let applied = commit_apply(&mac.ad, &inst, &layout, &v("1.1.0"), &events)
+            .map_err(|r| r.kind)
+            .expect("apply");
+        let done = roll_back(&mac.ad, &inst, &layout, &applied, None, &events).expect("rollback");
+        let super::RolledBack::Done(previous) = done else {
+            panic!("the rollback was not done");
+        };
+        assert_eq!(previous.tree_version(), &v("1.0.0"));
+        assert_eq!(version_in(&mac.fs, &bundle()).as_deref(), Some("1.0.0"));
+        assert_eq!(
+            version_in(&mac.fs, &layout.version_dir(&v("1.1.0"))).as_deref(),
+            Some("1.1.0"),
+            "the failed version is parked"
+        );
+        // Its entry, once the swap is done, is the bundle's.
+        let entry = live_entry(
+            &mac.ad,
+            &layout,
+            &previous,
+            previous.entry_path(),
+            &previous.meta().entry,
+        );
+        assert_eq!(entry, bundle().join("Contents/MacOS/hello"));
+        let rec = mac_record(&mac, &layout);
+        assert_eq!(rec.current.expect("current").version, v("1.0.0"));
+        assert!(rec.bad.contains(&v("1.1.0")));
+    }
+
+    /// GC under the bundle layout touches `R/versions` only: the live bundle, the slots and the
+    /// pointer stay, an unreferenced version tree goes, and one a process still runs from stays
+    /// (an old instance that the swap moved into `versions/<O>`, probe 7 of the plan).
+    #[test]
+    fn gc_collects_unreferenced_trees_in_versions_and_keeps_one_in_use() {
+        for in_use in [true, false] {
+            let mac = mac();
+            let inst = mac.open();
+            let layout = inst.layout().cloned().expect("layout");
+            let old = layout.version_dir(&v("0.8.0"));
+            put_bundle(&mac.fs, &old, "0.8.0");
+            // A slot holding a tree and the pointer, which GC must never touch.
+            put_bundle(&mac.fs, &layout.swap_slot(), "0.7.0");
+            mac.process.script_in_use(in_use);
+            let events = Events::new(None, None);
+            let report = crate::gc::gc(&mac.ad, &inst, None, &events);
+            let still = version_in(&mac.fs, &old).is_some();
+            assert_eq!(still, in_use, "in use = {in_use}");
+            assert_eq!(report.removed.is_empty(), in_use);
+            assert_eq!(report.kept.contains(&v("0.8.0")), in_use);
+            assert_eq!(version_in(&mac.fs, &bundle()).as_deref(), Some("1.0.0"));
+            assert!(
+                version_in(&mac.fs, &layout.swap_slot()).is_some(),
+                "the slot"
+            );
+            assert!(
+                version_in(&mac.fs, &layout.version_dir(&v("1.1.0"))).is_some(),
+                "the staged tree is kept"
+            );
+            assert!(layout.bundle_path(&mac.fs).expect("pointer").is_some());
+            // Every tree it asked about is a direct child of `versions`.
+            for (tree, _) in mac.process.in_use_calls() {
+                assert_eq!(tree.parent(), Some(layout.versions_dir().as_path()));
+            }
+        }
     }
 }

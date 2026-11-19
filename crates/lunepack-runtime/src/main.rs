@@ -162,7 +162,7 @@ fn uninstall_mode(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn uninstall_mode(
     ad: &modes::Adapters,
     inst: &lunepack::Installation,
@@ -170,6 +170,19 @@ fn uninstall_mode(
     silent: bool,
 ) -> Kind {
     uninstall_flow(ad, inst, data_home, silent)
+}
+
+/// macOS: the uninstall of a bundle install (the bundle `B`, the install root `R`, the
+/// LaunchAgent) is its own step (M8-D5, M8-D15); until it lands the mode refuses and removes
+/// nothing, rather than remove `R` and leave the app behind.
+#[cfg(target_os = "macos")]
+fn uninstall_mode(
+    _ad: &modes::Adapters,
+    _inst: &lunepack::Installation,
+    _data_home: &std::path::Path,
+    _silent: bool,
+) -> Kind {
+    headless_fail(uninstall::COMMAND, Kind::Unsupported)
 }
 
 /// The uninstall of `inst` with its UI and its outcome (M5-D10, M6): the confirm prompt, the
@@ -244,12 +257,14 @@ fn hand_off_phase_2(_ad: &modes::Adapters, _args: &modes::HandOffArgs) -> Kind {
 }
 
 /// Whether process `pid` started at `start` runs; a process that cannot be read counts as running.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn alive(pid: u32, start: u64) -> bool {
     #[cfg(target_os = "linux")]
     let found = lunepack_os_linux::LinuxProcess::new().process_id(pid);
     #[cfg(windows)]
     let found = lunepack_os_windows::WindowsProcess::new().process_id(pid);
+    #[cfg(target_os = "macos")]
+    let found = lunepack_os_macos::MacProcess::new().process_id(pid);
     match found {
         Ok(Some(id)) => id.start_ticks == start,
         Ok(None) => false,
@@ -289,7 +304,7 @@ fn conclude(events: Events, last: &Event) {
 
 /// The interactive modes whose end may need a native notice.
 #[derive(Clone, Copy)]
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 enum Operation {
     Install,
     Uninstall,
@@ -304,7 +319,7 @@ const SETUP_TITLE: &str = "Setup";
 
 /// The fixed text of a native notice: the app's validated display name, what happened and the
 /// closed result code (D36). Never a path, a value or an error's own text.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn notice_text(name: &str, operation: Operation, kind: Kind) -> String {
     let (done, failed) = match operation {
         Operation::Install => ("was installed.", "could not be installed"),
@@ -320,7 +335,7 @@ fn notice_text(name: &str, operation: Operation, kind: Kind) -> String {
 }
 
 /// Whether a native notice reports a normal end (the information icon) rather than a failure.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn notice_is_info(operation: Operation, kind: Kind) -> bool {
     matches!(
         (operation, kind),
@@ -347,8 +362,27 @@ fn notice(quiet: bool, seen: bool, name: &str, operation: Operation, kind: Kind)
     let _ = lunepack_os_windows::message_box(name, &notice_text(name, operation, kind), level);
 }
 
+/// macOS (M8-D11): the same rule as Windows: one native alert, through `osascript` with the fixed
+/// script and the text as arguments only, after the outcome is committed; never under `--silent`,
+/// `--no-ui` or `LUNEPACK_NO_UI`, never for a cancellation the user chose, and not when the UI
+/// itself showed the outcome. The alert is bounded and its failure (no window server, no
+/// `osascript`) changes nothing.
+#[cfg(target_os = "macos")]
+fn notice(quiet: bool, seen: bool, name: &str, operation: Operation, kind: Kind) {
+    let env = |var: &str| std::env::var_os(var);
+    if seen || kind == Kind::Cancelled || !ui_host::ui_wanted(quiet, &env) {
+        return;
+    }
+    let level = if notice_is_info(operation, kind) {
+        lunepack_os_macos::NoticeKind::Info
+    } else {
+        lunepack_os_macos::NoticeKind::Error
+    };
+    let _ = lunepack_os_macos::notice(name, &notice_text(name, operation, kind), level);
+}
+
 /// Other platforms print their outcome on the terminal; no native notice.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn notice(_quiet: bool, _seen: bool, _name: &str, _operation: Operation, _kind: Kind) {}
 
 /// A path as the UI shows it: Windows' `\\?\X:\` prefix of a canonical path is dropped.
@@ -372,6 +406,7 @@ fn headless_fail(command: &'static str, kind: Kind) -> Kind {
             tree_version: None,
             kind: kind.name(),
             exit_code: kind.code(),
+            reason: kind.reason(),
         },
     );
     kind
@@ -394,7 +429,15 @@ fn data_home() -> Result<PathBuf, Kind> {
     Ok(std::fs::canonicalize(&dir).unwrap_or(dir))
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+/// `$HOME/Library/Application Support`, canonical (M8-D1): the facade's own rule.
+#[cfg(target_os = "macos")]
+fn data_home() -> Result<PathBuf, Kind> {
+    lunepack::Platform::native()
+        .data_home_dir()
+        .map_err(|e| Kind::of(&e))
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn data_home() -> Result<PathBuf, Kind> {
     Err(Kind::Unsupported)
 }
@@ -419,7 +462,16 @@ fn initial_parent() -> cli::WaitTarget {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn initial_parent() -> cli::WaitTarget {
+    use lunepack::Process as _;
+    match lunepack_os_macos::MacProcess::new().parent() {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) | Err(_) => Err(Kind::Process),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn initial_parent() -> cli::WaitTarget {
     Err(Kind::Unsupported)
 }
@@ -448,7 +500,18 @@ fn wait_target(wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarge
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn wait_target(wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarget {
+    let Some(pid) = wait_pid else {
+        return parent;
+    };
+    match lunepack_os_macos::MacProcess::new().process_id(pid) {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) | Err(_) => Err(Kind::Process),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn wait_target(_wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarget {
     parent
 }
@@ -516,6 +579,7 @@ fn fail(command: &'static str, kind: Kind) -> Kind {
         tree_version: None,
         kind: kind.name(),
         exit_code: kind.code(),
+        reason: kind.reason(),
     });
     events.finish(SINK_DRAIN);
     kind
@@ -637,7 +701,7 @@ fn setup_mode(_args: &[std::ffi::OsString]) -> Option<Kind> {
 }
 
 /// Runs `body` on the native adapters.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn run(body: impl FnOnce(&modes::Adapters) -> Kind) -> Kind {
     use std::sync::Arc;
 
@@ -692,8 +756,20 @@ fn native_adapters() -> (
     )
 }
 
-/// Processes and the desktop integration have no adapter here yet (M8).
-#[cfg(not(any(target_os = "linux", windows)))]
+/// The process and desktop-integration adapters of this OS (per-user scope, M8).
+#[cfg(target_os = "macos")]
+fn native_adapters() -> (
+    std::sync::Arc<dyn lunepack::Process>,
+    std::sync::Arc<dyn lunepack::OsIntegration>,
+) {
+    (
+        std::sync::Arc::new(lunepack_os_macos::MacProcess::new()),
+        std::sync::Arc::new(lunepack_os_macos::MacIntegration::from_process_env()),
+    )
+}
+
+/// Processes and the desktop integration have no adapter on this OS.
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn run(_body: impl FnOnce(&modes::Adapters) -> Kind) -> Kind {
     fail("runtime", Kind::Unsupported)
 }

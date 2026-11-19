@@ -18,6 +18,58 @@ use lunepack::{
 /// The line a usage error prints on stderr. It names no argument value.
 pub const USAGE_LINE: &str = "lunepack-runtime: usage error";
 
+/// Why a place is not one lunepack updates (macOS, M8-D4): the closed set of `reason` of the
+/// `unsupported_location` outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Place {
+    /// Translocated by Gatekeeper.
+    Translocated,
+    /// On a read-only volume (a mounted disk image).
+    ReadOnly,
+    /// The bundle's folder and the install's versions are on different volumes.
+    OtherVolume,
+    /// The bundle is not owned by the user.
+    NotOwned,
+    /// The user cannot write the bundle's folder.
+    NotWritable,
+}
+
+impl Place {
+    /// Every reason, in the order the docs list them.
+    #[allow(dead_code)]
+    pub const ALL: [Place; 5] = [
+        Place::Translocated,
+        Place::ReadOnly,
+        Place::OtherVolume,
+        Place::NotOwned,
+        Place::NotWritable,
+    ];
+
+    /// The `reason` text.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Place::Translocated => "translocated",
+            Place::ReadOnly => "read_only",
+            Place::OtherVolume => "other_volume",
+            Place::NotOwned => "not_owned",
+            Place::NotWritable => "not_writable",
+        }
+    }
+
+    /// The reason the core reports, `None` for one this build does not know.
+    pub fn of(reason: lunepack_core::LocationReason) -> Option<Place> {
+        use lunepack_core::LocationReason as R;
+        Some(match reason {
+            R::Translocated => Place::Translocated,
+            R::ReadOnly => Place::ReadOnly,
+            R::OtherVolume => Place::OtherVolume,
+            R::NotOwned => Place::NotOwned,
+            R::NotWritable => Place::NotWritable,
+            _ => return None,
+        })
+    }
+}
+
 /// The outcome classes of the runtime, each with a stable exit code and a stable `kind` name
 /// (C4: one per error class of the facade's error enum, plus the runtime's own outcomes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,6 +132,9 @@ pub enum Kind {
     /// The channel offers no release for this install yet: none at all, or none whose rollout
     /// admits it (`install`; retryable, nothing was installed).
     NoRelease,
+    /// The running app or the install's bundle is somewhere lunepack does not update (macOS,
+    /// M8-D4); the output names the reason, a closed code.
+    UnsupportedLocation(Place),
     /// Anything else (a worker panic, a facade error this build does not know).
     Internal,
 }
@@ -87,7 +142,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind, in code order (for the golden of step 12).
     #[allow(dead_code)]
-    pub const ALL: [Kind; 28] = [
+    pub const ALL: [Kind; 29] = [
         Kind::Ok,
         Kind::Usage,
         Kind::NotInstalled,
@@ -115,6 +170,8 @@ impl Kind {
         Kind::InUse,
         Kind::InstallMismatch,
         Kind::NoRelease,
+        // One representative: the five reasons share the code and the name (`Place::ALL`).
+        Kind::UnsupportedLocation(Place::Translocated),
         Kind::Internal,
     ];
 
@@ -148,6 +205,7 @@ impl Kind {
             Kind::InUse => 25,
             Kind::InstallMismatch => 26,
             Kind::NoRelease => 27,
+            Kind::UnsupportedLocation(_) => 28,
             Kind::Internal => 70,
         }
     }
@@ -182,7 +240,16 @@ impl Kind {
             Kind::InUse => "in_use",
             Kind::InstallMismatch => "install_mismatch",
             Kind::NoRelease => "no_release",
+            Kind::UnsupportedLocation(_) => "unsupported_location",
             Kind::Internal => "internal",
+        }
+    }
+
+    /// The `reason` member of the error object, for the kinds that have one.
+    pub const fn reason(self) -> Option<&'static str> {
+        match self {
+            Kind::UnsupportedLocation(place) => Some(place.name()),
+            _ => None,
         }
     }
 
@@ -216,6 +283,9 @@ impl Kind {
             E::Integration(_) => Kind::Integration,
             E::RollbackUnavailable => Kind::RollbackUnavailable,
             E::NoRelease => Kind::NoRelease,
+            E::UnsupportedLocation { reason } => {
+                Place::of(*reason).map_or(Kind::Internal, Kind::UnsupportedLocation)
+            }
             // WorkerPanicked, and any variant a later facade adds (the enum is non-exhaustive).
             _ => Kind::Internal,
         }
@@ -819,6 +889,12 @@ mod tests {
         assert_eq!(Kind::InstallMismatch.code(), 26);
         assert_eq!(Kind::NoRelease.code(), 27);
         assert_eq!(Kind::of(&lunepack::Error::NoRelease), Kind::NoRelease);
+        for place in Place::ALL {
+            let kind = Kind::UnsupportedLocation(place);
+            assert_eq!((kind.code(), kind.name()), (28, "unsupported_location"));
+            assert_eq!(kind.reason(), Some(place.name()));
+        }
+        assert_eq!(Kind::Usage.reason(), None);
     }
 
     /// The rows `| <code> | `<kind>` | ... |` of the exit-code table in `docs/RUNTIME.md`.
@@ -861,15 +937,47 @@ mod tests {
     fn every_kind_has_a_golden_error_object() {
         let golden = include_str!("../tests/golden/objects.jsonl");
         for kind in Kind::ALL.iter().filter(|k| **k != Kind::Ok) {
+            // The object ends there, or goes on with its `reason` (kinds that have one).
+            let want = format!("\"kind\":\"{}\",\"exit_code\":{}", kind.name(), kind.code());
+            assert!(
+                golden.lines().any(|l| l.ends_with(&format!("{want}}}"))
+                    || l.contains(&format!("{want},\"reason\":"))),
+                "no golden error object for kind {}",
+                kind.name()
+            );
+        }
+    }
+
+    /// Every reason of exit 28 is a closed code of its own, and every core reason maps to one.
+    #[test]
+    fn every_location_reason_has_a_closed_code_and_a_golden_object() {
+        use lunepack_core::LocationReason as R;
+        let golden = include_str!("../tests/golden/objects.jsonl");
+        for (core, place) in [
+            (R::Translocated, Place::Translocated),
+            (R::ReadOnly, Place::ReadOnly),
+            (R::OtherVolume, Place::OtherVolume),
+            (R::NotOwned, Place::NotOwned),
+            (R::NotWritable, Place::NotWritable),
+        ] {
+            assert_eq!(Place::of(core), Some(place));
+            assert_eq!(
+                core.as_str(),
+                place.name(),
+                "the core's code and ours agree"
+            );
             let want = format!(
-                "\"kind\":\"{}\",\"exit_code\":{}}}",
-                kind.name(),
-                kind.code()
+                "\"kind\":\"unsupported_location\",\"exit_code\":28,\"reason\":\"{}\"}}",
+                place.name()
             );
             assert!(
                 golden.lines().any(|l| l.ends_with(&want)),
-                "no golden error object for kind {}",
-                kind.name()
+                "{}",
+                place.name()
+            );
+            assert_eq!(
+                Kind::of(&lunepack::Error::UnsupportedLocation { reason: core }),
+                Kind::UnsupportedLocation(place)
             );
         }
     }

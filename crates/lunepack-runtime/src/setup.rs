@@ -468,6 +468,7 @@ pub fn failed(kind: Kind, version: Option<Version>) -> Event {
         tree_version: version,
         kind: kind.name(),
         exit_code: kind.code(),
+        reason: kind.reason(),
     }
 }
 

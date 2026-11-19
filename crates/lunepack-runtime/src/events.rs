@@ -154,6 +154,8 @@ pub enum Event {
         kind: &'static str,
         /// The exit code.
         exit_code: u8,
+        /// Why, for the kinds that carry a closed reason (`unsupported_location`).
+        reason: Option<&'static str>,
     },
 }
 
@@ -324,6 +326,7 @@ fn to_json(event: &Event, time_ms: Option<u64>) -> String {
             tree_version,
             kind,
             exit_code,
+            reason,
         } => {
             head(&mut out, "error");
             out.push_str(",\"command\":");
@@ -333,6 +336,10 @@ fn to_json(event: &Event, time_ms: Option<u64>) -> String {
             out.push_str(",\"kind\":");
             json_str(&mut out, kind);
             let _ = write!(out, ",\"exit_code\":{exit_code}");
+            if let Some(reason) = reason {
+                out.push_str(",\"reason\":");
+                json_str(&mut out, reason);
+            }
         }
     }
     if let Some(t) = time_ms {
