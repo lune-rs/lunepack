@@ -6,22 +6,29 @@
 //! manifest written by the core's real writer, every frame stored (the real decoder reads it). The
 //! release tree holds the update config, a shell-script entry that notes when it runs, and the
 //! built `lunepack-runtime` beside it. A bootstrap copy of the same tree sits outside the install,
-//! and its runtime runs `install` with `HOME` set to an empty temporary home. Linux only: the
+//! and its runtime runs `install` with `HOME` set to an empty temporary home. Linux and macOS: the
 //! data home these cases redirect through `HOME` is, on Windows, the shell's known folder, which
 //! a test cannot redirect, and the entry is a shell script; the Windows `install` and `uninstall`
-//! flows are covered by step 11's own tests and the Windows E2E (step 13).
+//! flows are covered by step 11's own tests and the Windows E2E (step 13). On macOS the tree is a
+//! bundle (paths from `tests/common`), the install places the live bundle `B` in
+//! `~/Applications` with `R/bundle` and its identity, and writes no integration (the test config
+//! has `autostart: false`); the cases of the Linux desktop entry and command link are skipped
+//! there, and the uninstall cases that `uninstall_macos.rs` already runs are `ignore`d with the
+//! case that covers them.
 //!
 //! The cases run in parallel on purpose: `uninstall`'s in-use scan must not count another case's
 //! process caught while it exits as using the tree (F9).
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
+
+mod common;
 
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use lunepack::{InstallMeta, RelPath, Target, TrustedRoot, UpdateConfig, Version};
+use lunepack::{InstallMeta, RelPath, TrustedRoot, UpdateConfig, Version};
 use lunepack_core::state::{InstallState, UserScope};
 use lunepack_core::{
     AppId, Channel, CodecId, EncodedFrame, Encoder, PayloadKind, ReleaseLayout, Signer, U53,
@@ -31,18 +38,14 @@ use lunepack_crypto::{Ed25519Signer, Ed25519Verifier, Sha256Hasher, generate_key
 use lunepack_fs::StdFs;
 use lunepack_testkit::{ChainFixture, FakeCodec, SUITE_APP_ID, SUITE_CHANNEL};
 
-const RUNTIME: &str = env!("CARGO_BIN_EXE_lunepack-runtime");
+use common::{APP_PATH, CONFIG_PATH, README_PATH, RUNTIME, RUNTIME_PATH, SCHEME, TARGET};
+
 /// Where the entry script notes that it ran (it must never run in these cases).
 const OUT_VAR: &str = "LUNEPACK_INSTALL_TEST_OUT";
 const V100: &str = "1.0.0";
 const BIN: &str = "lp-install-test";
 const DAY: u64 = 86_400;
 const RUN_LIMIT: Duration = Duration::from_secs(120);
-
-#[cfg(target_arch = "aarch64")]
-const TARGET: Target = Target::LinuxAarch64;
-#[cfg(not(target_arch = "aarch64"))]
-const TARGET: Target = Target::LinuxX86_64;
 
 /// Exit codes of the runtime's table (`modes.rs`).
 const EXIT_OK: i32 = 0;
@@ -86,17 +89,13 @@ impl Encoder for StoreOnly {
 fn tree_files() -> Vec<(String, Vec<u8>, bool)> {
     let script = format!("#!/bin/sh\n: > \"${OUT_VAR}/app-ran\"\n");
     vec![
-        ("bin/app".to_owned(), script.into_bytes(), true),
+        (APP_PATH.to_owned(), script.into_bytes(), true),
         (
-            "bin/lunepack-runtime".to_owned(),
+            RUNTIME_PATH.to_owned(),
             std::fs::read(RUNTIME).expect("runtime"),
             true,
         ),
-        (
-            "share/readme.txt".to_owned(),
-            b"read me\n".repeat(20),
-            false,
-        ),
+        (README_PATH.to_owned(), b"read me\n".repeat(20), false),
     ]
 }
 
@@ -107,6 +106,32 @@ fn write_file(path: &Path, bytes: &[u8], exec: bool) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
 }
 
+/// macOS: every case holds the gate for as long as it runs, an uninstall case alone. An
+/// uninstall's in-use scan fails closed on a process of the user it cannot read, and a process
+/// another case starts or ends at that moment can be unreadable for an instant (the same scan
+/// on Linux reads `/proc`, where that window is closed, F9), so uninstalls run with no other
+/// case running.
+#[cfg(target_os = "macos")]
+static GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(target_os = "macos")]
+type Gate = Box<dyn std::any::Any>;
+#[cfg(not(target_os = "macos"))]
+type Gate = ();
+
+#[cfg(target_os = "macos")]
+fn gate(alone: bool) -> Gate {
+    use std::sync::PoisonError;
+    if alone {
+        Box::new(GATE.write().unwrap_or_else(PoisonError::into_inner))
+    } else {
+        Box::new(GATE.read().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn gate(_alone: bool) -> Gate {}
+
 /// One case's world: a release on a `file:` feed, a bootstrap tree, an empty home.
 struct Lab {
     _tmp: tempfile::TempDir,
@@ -116,31 +141,35 @@ struct Lab {
     root: PathBuf,
     out: PathBuf,
     boot: PathBuf,
+    /// Dropped last, after the directory is removed.
+    _gate: Gate,
 }
 
 impl Lab {
     /// Publishes 1.0.0 and writes its bootstrap tree.
     fn new() -> Lab {
-        let tmp = tempfile::Builder::new()
-            .prefix("install-")
-            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-            .expect("tmp");
-        let base = std::fs::canonicalize(tmp.path()).expect("canonical");
-        let home = base.join("home");
-        let out = base.join("out");
-        for d in [&home, &out] {
-            std::fs::create_dir_all(d).expect("dirs");
-        }
-        let data = home.join(".local/share");
-        let root = data.join(SUITE_APP_ID);
+        Lab::with_gate(false)
+    }
+
+    /// [`Lab::new`] for a case that runs `uninstall`: on macOS no other case runs meanwhile.
+    fn alone() -> Lab {
+        Lab::with_gate(true)
+    }
+
+    fn with_gate(alone: bool) -> Lab {
+        let gate = gate(alone);
+        let h = common::Home::new("install-", SUITE_APP_ID, None, false);
+        let out = h.base.join("out");
+        std::fs::create_dir_all(&out).expect("out");
         let lab = Lab {
-            _tmp: tmp,
-            boot: base.join("boot").join(V100),
-            base,
-            home,
-            data,
-            root,
+            _tmp: h.tmp,
+            boot: h.base.join("boot").join(V100),
+            base: h.base,
+            home: h.home,
+            data: h.data,
+            root: h.root,
             out,
+            _gate: gate,
         };
         lab.publish();
         lab
@@ -187,7 +216,7 @@ impl Lab {
         let release = self.release_dir();
         let feed = format!("file://{}/", release.display());
         let meta = InstallMeta {
-            entry: RelPath::parse("bin/app").expect("entry"),
+            entry: RelPath::parse(APP_PATH).expect("entry"),
             name: "Install test".to_owned(),
             comment: None,
             icon: None,
@@ -213,7 +242,7 @@ impl Lab {
         .expect("config bytes");
 
         let mut files = tree_files();
-        files.push(("lunepack-update.json".to_owned(), config, false));
+        files.push((CONFIG_PATH.to_owned(), config, false));
         let mut layout = ReleaseLayout::new(app_id(), V100, TARGET).expect("layout");
         for (path, bytes, exec) in &files {
             let packed =
@@ -246,15 +275,37 @@ impl Lab {
     }
 
     fn boot_runtime(&self) -> PathBuf {
-        self.boot.join("bin/lunepack-runtime")
+        self.boot.join(RUNTIME_PATH)
     }
 
+    fn layout(&self) -> lunepack_core::UserLayout {
+        lunepack_core::UserLayout::from_root(self.root.clone(), SCHEME)
+    }
+
+    /// The installed tree of 1.0.0: `R/versions/1.0.0`, on macOS the live bundle `B`.
     fn tree(&self) -> PathBuf {
-        self.root.join("versions").join(V100)
+        common::tree_of(&self.layout(), V100)
     }
 
     fn installed_runtime(&self) -> PathBuf {
-        self.tree().join("bin/lunepack-runtime")
+        self.tree().join(RUNTIME_PATH)
+    }
+
+    /// The apps folder of the macOS install.
+    fn apps(&self) -> PathBuf {
+        self.home.join("Applications")
+    }
+
+    /// Where the macOS install puts the live bundle: `~/Applications/<install.name>.app`.
+    fn bundle(&self) -> PathBuf {
+        self.apps().join("Install test.app")
+    }
+
+    /// The LaunchAgent the macOS install would write for `autostart` (this config has none).
+    fn launch_agent(&self) -> PathBuf {
+        self.home
+            .join("Library/LaunchAgents")
+            .join(format!("{SUITE_APP_ID}.lunepack.plist"))
     }
 
     fn desktop_entry(&self) -> PathBuf {
@@ -278,6 +329,7 @@ impl Lab {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        common::quiet_ui(&mut cmd);
         cmd
     }
 
@@ -397,6 +449,19 @@ fn listing(dir: &Path) -> Vec<String> {
     out
 }
 
+/// The names directly in `dir`, sorted.
+#[cfg(target_os = "macos")]
+fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|it| {
+            it.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 // ---- install --------------------------------------------------------------------------------
 
 #[test]
@@ -413,19 +478,23 @@ fn install_into_an_empty_home_installs_and_integrates_without_launching() {
 
     let record = lab.record().expect("record");
     assert_eq!(record.current.expect("current").version.to_string(), V100);
-    assert_eq!(
-        std::fs::read_link(lab.root.join("current")).expect("current"),
-        Path::new("versions/1.0.0")
-    );
+    // The live version is where the layout puts it: `R/current` (Linux), or `B` with the pointer
+    // naming it and no `R/current` (macOS).
+    common::assert_live(&lab.layout(), V100);
     for (path, bytes, _) in tree_files() {
         assert_eq!(std::fs::read(lab.tree().join(&path)).expect("file"), bytes);
     }
-    let entry = std::fs::read_to_string(lab.desktop_entry()).expect("desktop entry");
-    assert!(entry.contains(&format!("X-Lunepack-App-Id={SUITE_APP_ID}")));
-    assert_eq!(
-        std::fs::read_link(lab.bin_link()).expect("bin link"),
-        lab.root.join("current/bin/app")
-    );
+    #[cfg(target_os = "linux")]
+    {
+        let entry = std::fs::read_to_string(lab.desktop_entry()).expect("desktop entry");
+        assert!(entry.contains(&format!("X-Lunepack-App-Id={SUITE_APP_ID}")));
+        assert_eq!(
+            std::fs::read_link(lab.bin_link()).expect("bin link"),
+            lab.root.join("current/bin/app")
+        );
+    }
+    #[cfg(target_os = "macos")]
+    lab.assert_bundle_placed();
     assert!(!lab.app_ran(), "install launched the app");
 
     // A second run from the bootstrap finds the install done and changes nothing.
@@ -477,12 +546,16 @@ fn a_rerun_after_a_kill_mid_install_resumes() {
         "the run finished before it was killed"
     );
     assert!(!exists(&lab.root.join("current")));
+    // Nothing is live yet: the live bundle is not placed.
+    assert!(!exists(&lab.bundle()), "the bundle was placed");
 
     let run = lab.install();
     assert_eq!(run.code, EXIT_OK, "rerun: {run:?}");
     let record = lab.record().expect("record");
     assert_eq!(record.install_id, cut.install_id, "the record was resumed");
     assert_eq!(record.current.expect("current").version.to_string(), V100);
+    common::assert_live(&lab.layout(), V100);
+    #[cfg(target_os = "linux")]
     assert!(exists(&lab.bin_link()) && exists(&lab.desktop_entry()));
     assert!(!lab.app_ran());
 }
@@ -500,6 +573,7 @@ fn a_pre_existing_foreign_root_is_not_adopted() {
     run.assert_no_path(&lab);
     assert_eq!(listing(&lab.root), before, "R was written");
     assert!(!exists(&lab.desktop_entry()) && !exists(&lab.bin_link()));
+    assert!(!exists(&lab.bundle()), "a bundle was placed");
 }
 
 #[test]
@@ -520,6 +594,10 @@ fn a_root_holding_only_a_cut_off_runs_lock_is_adopted() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS writes no command link: nothing there can clash"
+)]
 fn a_conflicting_command_link_stops_install_with_nothing_written() {
     let lab = Lab::new();
     let foreign = lab.bin_link();
@@ -556,8 +634,12 @@ fn install_and_uninstall_take_no_arguments() {
 // ---- uninstall ------------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "covered by uninstall_macos::the_bundle_the_root_and_our_launch_agent_go_and_foreign_items_stay"
+)]
 fn uninstall_removes_what_it_wrote_and_keeps_a_foreign_desktop_file() {
-    let lab = Lab::new();
+    let lab = Lab::alone();
     lab.installed();
     let applications = lab.data.join("applications");
     let foreign = applications.join("org.example.other.desktop");
@@ -581,8 +663,12 @@ fn uninstall_removes_what_it_wrote_and_keeps_a_foreign_desktop_file() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "covered by uninstall_macos::a_foreign_launch_agent_at_our_name_is_kept_and_reported"
+)]
 fn uninstall_keeps_a_foreign_file_at_its_entry_name_and_reports_it() {
-    let lab = Lab::new();
+    let lab = Lab::alone();
     lab.installed();
     let foreign = b"[Desktop Entry]\nName=Not lunepack's\n";
     std::fs::remove_file(lab.desktop_entry()).expect("remove");
@@ -606,50 +692,58 @@ fn uninstall_keeps_a_foreign_file_at_its_entry_name_and_reports_it() {
 
 #[test]
 fn uninstall_from_a_copy_of_the_tree_outside_r_is_refused() {
-    let lab = Lab::new();
+    let lab = Lab::alone();
     lab.installed();
     let before = listing(&lab.root);
     // A bare copy of the tree: not installed.
     let bare = lab.base.join("copy").join(V100);
     std::fs::create_dir_all(lab.base.join("copy")).expect("dirs");
-    // A copy of the whole install root elsewhere: installed, but not where this home derives.
-    let other = lab.base.join("other-root");
-    for (from, to) in [
-        (lab.tree(), bare.clone()),
-        (lab.root.clone(), other.clone()),
-    ] {
+    let cp = |from: &Path, to: &Path| {
         let status = Command::new("cp")
             .arg("-a")
-            .arg(&from)
-            .arg(&to)
+            .arg(from)
+            .arg(to)
             .status()
             .expect("cp");
         assert!(status.success());
-    }
-    let cases = [
-        (bare.join("bin/lunepack-runtime"), EXIT_NOT_INSTALLED),
-        (
+    };
+    cp(&lab.tree(), &bare);
+    #[allow(unused_mut)]
+    let mut cases = vec![(bare.join(RUNTIME_PATH), EXIT_NOT_INSTALLED)];
+    // A copy of the whole install root elsewhere: installed, but not where this home derives. (On
+    // macOS the version trees are not in `R`; a tree the pointer does not name is
+    // `uninstall_macos::a_tree_the_pointer_does_not_name_is_26_with_nothing_removed`.)
+    #[cfg(target_os = "linux")]
+    let other = lab.base.join("other-root");
+    #[cfg(target_os = "linux")]
+    {
+        cp(&lab.root, &other);
+        cases.push((
             other
                 .join("versions")
                 .join(V100)
                 .join("bin/lunepack-runtime"),
             EXIT_INSTALL_MISMATCH,
-        ),
-    ];
+        ));
+    }
     for (runtime, code) in cases {
         let run = lab.run(&runtime, "uninstall");
         assert_eq!(run.code, code, "{run:?}");
         run.assert_no_path(&lab);
     }
     assert_eq!(listing(&lab.root), before, "R was changed");
+    #[cfg(target_os = "linux")]
     assert!(exists(&lab.desktop_entry()) && exists(&lab.bin_link()));
-    assert!(exists(&bare.join("bin/app")));
+    #[cfg(target_os = "macos")]
+    assert!(exists(&lab.tree()), "the live bundle is gone");
+    assert!(exists(&bare.join(APP_PATH)));
+    #[cfg(target_os = "linux")]
     assert!(exists(&other.join("state")));
 }
 
 #[test]
 fn uninstall_through_a_symlinked_root_is_refused_and_the_target_is_untouched() {
-    let lab = Lab::new();
+    let lab = Lab::alone();
     lab.installed();
     // R moves elsewhere and a symlink takes its place.
     let target = lab.base.join("moved-root");
@@ -657,13 +751,17 @@ fn uninstall_through_a_symlinked_root_is_refused_and_the_target_is_untouched() {
     symlink(&target, &lab.root).expect("symlink");
     let before = listing(&target);
 
-    for runtime in [
-        lab.installed_runtime(),
+    // The installed runtime, and (Linux: the tree is under R) the one reached through the target.
+    #[allow(unused_mut)]
+    let mut runtimes = vec![lab.installed_runtime()];
+    #[cfg(target_os = "linux")]
+    runtimes.push(
         target
             .join("versions")
             .join(V100)
             .join("bin/lunepack-runtime"),
-    ] {
+    );
+    for runtime in runtimes {
         let run = lab.run(&runtime, "uninstall");
         assert_eq!(run.code, EXIT_INSTALL_MISMATCH, "{run:?}");
     }
@@ -674,12 +772,19 @@ fn uninstall_through_a_symlinked_root_is_refused_and_the_target_is_untouched() {
             .file_type()
             .is_symlink()
     );
+    #[cfg(target_os = "linux")]
     assert!(exists(&lab.desktop_entry()) && exists(&lab.bin_link()));
+    #[cfg(target_os = "macos")]
+    assert!(exists(&lab.tree()), "the live bundle is gone");
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "covered by uninstall_macos::an_instance_running_from_the_bundle_or_a_version_tree_refuses_with_nothing_removed"
+)]
 fn uninstall_while_a_process_runs_from_r_is_refused() {
-    let lab = Lab::new();
+    let lab = Lab::alone();
     lab.installed();
     let sleeper = lab.tree().join("helper-sleep");
     let sleep = ["/bin/sleep", "/usr/bin/sleep"]
@@ -710,16 +815,22 @@ fn uninstall_while_a_process_runs_from_r_is_refused() {
 
 #[test]
 fn a_symlink_inside_a_tree_pointing_outside_r_is_removed_not_followed() {
-    let lab = Lab::new();
+    let lab = Lab::alone();
     lab.installed();
     let outside = lab.base.join("outside");
     write_file(&outside.join("keep.txt"), b"keep me\n", false);
+    // In the tree (macOS: in the live bundle) and in a directory of it.
+    let data_dir = lab
+        .tree()
+        .join(Path::new(README_PATH).parent().expect("dir"));
     symlink(outside.join("keep.txt"), lab.tree().join("file-link")).expect("file link");
-    symlink(&outside, lab.tree().join("share/dir-link")).expect("dir link");
+    symlink(&outside, data_dir.join("dir-link")).expect("dir link");
 
     let run = lab.run(&lab.installed_runtime(), "uninstall");
     assert_eq!(run.code, EXIT_OK, "{run:?}");
     assert!(!exists(&lab.root));
+    #[cfg(target_os = "macos")]
+    assert!(!exists(&lab.bundle()), "the live bundle is left");
     assert_eq!(
         std::fs::read(outside.join("keep.txt")).expect("kept"),
         b"keep me\n"
@@ -756,11 +867,18 @@ impl Lab {
     /// `R` renamed to a tombstone, and part of the tombstone removed (its `state` first; `versions`
     /// half gone, a link pointing outside still inside). Returns the tombstone.
     fn cut_off_uninstall(&self) -> PathBuf {
-        std::fs::remove_file(self.desktop_entry()).expect("desktop entry");
-        std::fs::remove_file(self.bin_link()).expect("bin link");
+        // The integration (Linux) or the live bundle `B` (macOS: removed before `R`, M8-D5).
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::remove_file(self.desktop_entry()).expect("desktop entry");
+            std::fs::remove_file(self.bin_link()).expect("bin link");
+        }
+        #[cfg(target_os = "macos")]
+        std::fs::remove_dir_all(self.bundle()).expect("bundle");
         let tomb = self.tombstone(7);
         std::fs::rename(&self.root, &tomb).expect("rename");
         std::fs::remove_dir_all(tomb.join("state")).expect("state");
+        #[cfg(target_os = "linux")]
         std::fs::remove_dir_all(tomb.join("versions").join(V100).join("share")).expect("share");
         symlink(self.base.join("outside"), tomb.join("versions/link-out")).expect("link");
         tomb
@@ -781,24 +899,30 @@ fn assert_outside_kept(lab: &Lab) {
 fn assert_installed(lab: &Lab) {
     let record = lab.record().expect("record");
     assert_eq!(record.current.expect("current").version.to_string(), V100);
-    assert_eq!(
-        std::fs::read_link(lab.root.join("current")).expect("current"),
-        Path::new("versions/1.0.0")
-    );
+    common::assert_live(&lab.layout(), V100);
+    #[cfg(target_os = "linux")]
     assert!(exists(&lab.bin_link()) && exists(&lab.desktop_entry()));
+    #[cfg(target_os = "macos")]
+    lab.assert_bundle_placed();
 }
 
 #[test]
 fn uninstall_goes_through_a_tombstone_and_leaves_none() {
-    let lab = Lab::new();
+    let lab = Lab::alone();
     lab.installed();
     let run = lab.run(&lab.installed_runtime(), "uninstall");
     assert_eq!(run.code, EXIT_OK, "{run:?}");
     run.assert_no_path(&lab);
     assert!(!exists(&lab.root));
     assert_eq!(lab.tombstones(), Vec::<String>::new());
-    // The data home holds nothing of the app.
+    // The data home holds nothing of the app (macOS: nor does the apps folder).
+    #[cfg(target_os = "linux")]
     assert_eq!(listing(&lab.data), vec!["applications"]);
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(listing(&lab.data), Vec::<String>::new());
+        assert_eq!(listing(&lab.apps()), Vec::<String>::new());
+    }
     // A reinstall works.
     lab.installed();
     assert_installed(&lab);
@@ -806,7 +930,7 @@ fn uninstall_goes_through_a_tombstone_and_leaves_none() {
 
 #[test]
 fn an_uninstall_cut_off_inside_the_tombstone_removal_is_recovered_by_reinstall() {
-    let lab = Lab::new();
+    let lab = Lab::alone();
     lab.installed();
     write_outside(&lab);
     let tomb = lab.cut_off_uninstall();
@@ -843,8 +967,12 @@ fn a_leftover_tombstone_beside_an_empty_root_does_not_stop_install() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "covered by uninstall_macos::tombstones_of_an_earlier_cut_off_run_are_removed_without_following_links"
+)]
 fn uninstall_removes_a_leftover_tombstone_and_nothing_else_beside_r() {
-    let lab = Lab::new();
+    let lab = Lab::alone();
     lab.installed();
     write_outside(&lab);
     // A cut-off uninstall's tombstone of an earlier install of this app.
@@ -878,4 +1006,119 @@ fn uninstall_removes_a_leftover_tombstone_and_nothing_else_beside_r() {
     );
     assert_outside_kept(&lab);
     assert_eq!(listing(&lab.base.join("outside")), vec!["keep.txt"]);
+}
+
+// ---- macOS: the bundle and the install contract ----------------------------------------------
+
+#[cfg(target_os = "macos")]
+impl Lab {
+    /// `B` is placed: it is the one entry of the apps folder, `R/bundle` names it, `R/bundle.id`
+    /// holds its identity, and no LaunchAgent was written (the config has no autostart).
+    fn assert_bundle_placed(&self) {
+        use std::os::unix::fs::MetadataExt;
+        let layout = self.layout();
+        assert_eq!(common::bundle_of(&layout), self.bundle());
+        assert_eq!(entries(&self.apps()), vec!["Install test.app".to_owned()]);
+        let meta = std::fs::symlink_metadata(self.bundle()).expect("B");
+        let id = lunepack_core::read_bundle_identity(&StdFs::new(), &layout).expect("identity");
+        assert_eq!(id, Some((meta.dev(), meta.ino())), "R/bundle.id");
+        assert!(!exists(&self.launch_agent()), "a LaunchAgent was written");
+    }
+}
+
+/// Makes the folder writable again when dropped, so a failing case leaves a directory the
+/// temporary-directory cleanup can remove.
+#[cfg(target_os = "macos")]
+struct Restore(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// The apps folder the user cannot write: the install is refused (28, `not_writable`) before
+/// anything is written under the apps folder or `R/versions`.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_apps_folder_the_user_cannot_write_is_exit_28_with_nothing_written() {
+    let lab = Lab::new();
+    let _restore = Restore(lab.apps());
+    std::fs::set_permissions(lab.apps(), std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0");
+    let run = lab.install();
+    if run.code != 28 && is_root {
+        println!("note: running as root, the folder is writable to it; case not applicable");
+        return;
+    }
+    assert_eq!(run.code, 28, "{run:?}");
+    assert!(
+        run.line().contains("\"kind\":\"unsupported_location\"")
+            && run.line().contains("\"reason\":\"not_writable\""),
+        "{run:?}"
+    );
+    run.assert_no_path(&lab);
+    assert_eq!(listing(&lab.apps()), Vec::<String>::new());
+    assert!(
+        !exists(&lab.root.join("versions")),
+        "something is under R/versions"
+    );
+    assert!(!lab.app_ran());
+}
+
+/// `B` dragged to the Trash leaves a record with no bundle anywhere (M8-D16): an installer rerun
+/// installs anew (0, not 23), keeping the floors and writing a new install id.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_bundle_moved_to_the_trash_is_an_orphaned_install_that_installs_anew() {
+    let lab = Lab::new();
+    lab.installed();
+    let old = lab.record().expect("record");
+    assert!(
+        old.floors.keyset_version >= 1
+            && !old.floors.feed_seq.is_empty()
+            && old.floors.root.is_some(),
+        "the instrument: a first install raises the floors: {:?}",
+        old.floors
+    );
+    let trash = lab.home.join(".Trash");
+    std::fs::create_dir_all(&trash).expect("trash");
+    std::fs::rename(lab.bundle(), trash.join("Install test.app")).expect("to the trash");
+    assert!(!exists(&lab.bundle()));
+
+    let run = lab.install();
+    assert_eq!(run.code, EXIT_OK, "{run:?}");
+    assert!(run.line().contains("\"outcome\":\"installed\""), "{run:?}");
+    let new = lab.record().expect("record");
+    assert_ne!(new.install_id, old.install_id, "the install id is new");
+    assert_eq!(new.floors, old.floors, "the floors are kept");
+    assert_eq!(new.current.expect("current").version.to_string(), V100);
+    assert_installed(&lab);
+    // The trashed copy is left as it was.
+    assert!(exists(&trash.join("Install test.app")));
+    assert!(!lab.app_ran());
+}
+
+/// Over a live install the installer says so (23) and changes nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_install_over_a_live_install_is_23_and_changes_nothing() {
+    let lab = Lab::new();
+    lab.installed();
+    let before = (lab.record(), listing(&lab.root), listing(&lab.apps()));
+    let run = lab.install();
+    assert_eq!(run.code, EXIT_ALREADY_INSTALLED, "{run:?}");
+    assert!(
+        run.line().contains("\"kind\":\"already_installed\""),
+        "{run:?}"
+    );
+    assert_eq!(
+        (lab.record(), listing(&lab.root), listing(&lab.apps())),
+        before
+    );
+    assert_installed(&lab);
 }

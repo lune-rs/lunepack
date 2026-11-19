@@ -21,26 +21,35 @@
 //!   at a prompt before any change), and the launched or relaunched app holds none of the UI's
 //!   pipes.
 //!
-//! The cases run in parallel, each in its own directory. Linux and Windows (M7 step 10). On
-//! Windows the fake UI is this binary hard-linked as `lunepack-ui.exe` with its script in a file
-//! beside it (no shell wrapper), the host cases and the `apply` cases run, and the cases that need
-//! a shell script app, procfs, or a data home a test can redirect (`install`, `uninstall`: the
-//! data home on Windows is the shell's known folder) are listed in `LINUX_ONLY` with their reason;
-//! the Windows E2E (step 13) covers them against a real install.
+//! The cases run in parallel, each in its own directory. Linux, Windows (M7 step 10) and macOS
+//! (M8 step 6f). On Windows the fake UI is this binary hard-linked as `lunepack-ui.exe` with its
+//! script in a file beside it (no shell wrapper), the host cases and the `apply` cases run, and
+//! the cases that need a shell script app, procfs, or a data home a test can redirect (`install`,
+//! `uninstall`: the data home on Windows is the shell's known folder) are listed in `LINUX_ONLY`
+//! with their reason; the Windows E2E (step 13) covers them against a real install. On macOS
+//! every case runs on the bundle layout (paths from `tests/common`); what procfs shows on Linux
+//! is read from `/dev/fd` (the pipes an app holds) and `ps` (which executable runs), the failure
+//! `install_retry_after_a_failure_installs` provokes is an apps folder the user cannot write, the
+//! uninstall's reveal is not chosen (`/usr/bin/open` is absolute: it would open a Finder window
+//! on the developer's screen), and one more case runs the update window from the helper app
+//! nested in the bundle alone (M8-D6).
 // The Linux-only cases stay compiled on Windows (their helpers are shared), so some are unused.
 #![cfg_attr(windows, allow(dead_code, unused_imports))]
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod common;
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[allow(dead_code)]
 #[path = "../src/events.rs"]
 mod events;
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[allow(dead_code, unused_imports)]
 #[path = "../src/ui_host.rs"]
 mod ui_host;
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -51,12 +60,12 @@ fn main() {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn main() {
-    println!("lunepack-runtime ui_host tests: Linux and Windows only, skipped");
+    println!("lunepack-runtime ui_host tests: Linux, macOS and Windows only, skipped");
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod native {
     use std::io::{Read, Write};
     #[cfg(unix)]
@@ -67,53 +76,39 @@ mod native {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use lunepack::{
-        HEALTH_TOKEN_VAR, InstallMeta, Phase, Process, ProcessId, Progress, RelPath, Target,
-        TrustedRoot, UpdateConfig, Version,
+        HEALTH_TOKEN_VAR, InstallMeta, Phase, Process, ProcessId, Progress, RelPath, TrustedRoot,
+        UpdateConfig, Version,
     };
     use lunepack_core::state::{InstallState, Scope, StagedRef, UserScope};
     use lunepack_core::ui::{
         self, ChoiceValue, Details, EngineMsg, Flow, Outcome, PromptKind, UiMsg,
     };
     use lunepack_core::{
-        AppId, Channel, CodecId, EncodedFrame, Encoder, Hasher, LayoutScheme, PayloadKind,
-        ReleaseLayout, Signer, U53, UserLayout, pack_file,
+        AppId, Channel, CodecId, EncodedFrame, Encoder, Hasher, PayloadKind, ReleaseLayout, Signer,
+        U53, UserLayout, pack_file,
     };
     use lunepack_crypto::{Ed25519Signer, Ed25519Verifier, Sha256Hasher, generate_key_file};
     use lunepack_fs::StdFs;
     #[cfg(target_os = "linux")]
     use lunepack_os_linux::LinuxProcess as NativeProcess;
+    #[cfg(target_os = "macos")]
+    use lunepack_os_macos::MacProcess as NativeProcess;
     #[cfg(windows)]
     use lunepack_os_windows::WindowsProcess as NativeProcess;
     use lunepack_testkit::{ChainFixture, FakeCodec, SUITE_APP_ID, SUITE_CHANNEL};
 
+    use crate::common::{
+        self, APP_PATH, CONFIG_PATH, ENTRY, ENTRY_DIR, RUNTIME, RUNTIME_FILE, RUNTIME_PATH, SCHEME,
+        TARGET, exe,
+    };
     use crate::events::{Event, Events, Sink, SinkFailed, to_json_line};
     use crate::ui_host::{self, Bounds, Start, UiHost, UiStop};
 
     pub const HELPER_ARG: &str = "helper-app";
     /// A helper mode of this binary: `sleep-for <seconds>`, a process to wait for.
     pub const SLEEP_ARG: &str = "sleep-for";
-    /// The layout scheme of this OS (what the runtime's platform picks).
-    #[cfg(windows)]
-    const SCHEME: LayoutScheme = LayoutScheme::WINDOWS;
-    #[cfg(not(windows))]
-    const SCHEME: LayoutScheme = LayoutScheme::XDG;
-    #[cfg(windows)]
-    const RUNTIME_FILE: &str = "lunepack-runtime.exe";
-    #[cfg(not(windows))]
-    const RUNTIME_FILE: &str = "lunepack-runtime";
-
-    /// An entry path as this OS names an executable (`bin/app` is `bin/app.exe` on Windows).
-    fn exe(entry: &str) -> String {
-        if cfg!(windows) {
-            format!("{entry}.exe")
-        } else {
-            entry.to_owned()
-        }
-    }
-
     const FAKE_VAR: &str = "LUNEPACK_FAKE_UI";
     const OUT_VAR: &str = "LUNEPACK_FAKE_UI_OUT";
-    const RUNTIME: &str = env!("CARGO_BIN_EXE_lunepack-runtime");
     const V100: &str = "1.0.0";
     const V110: &str = "1.1.0";
     const BIN: &str = "lp-ui-test";
@@ -126,15 +121,6 @@ mod native {
     /// long an install or an apply takes on a shared runner is not what they check.
     const SLACK: Duration = Duration::from_secs(15);
 
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    const TARGET: Target = Target::LinuxAarch64;
-    #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
-    const TARGET: Target = Target::LinuxX86_64;
-    #[cfg(all(windows, target_arch = "aarch64"))]
-    const TARGET: Target = Target::WindowsAarch64;
-    #[cfg(all(windows, not(target_arch = "aarch64")))]
-    const TARGET: Target = Target::WindowsX86_64;
-
     /// The cases (by name prefix) that need a Linux-only mechanism, each with why; they are
     /// skipped on Windows.
     #[cfg(windows)]
@@ -146,6 +132,22 @@ mod native {
         (
             "uninstall_",
             "the data home is the shell's known folder; the uninstall hand-off is step 11",
+        ),
+    ];
+
+    /// The cases macOS skips, each with why. A run whose UI was lost before it showed the outcome
+    /// ends with the runtime's native alert (`/usr/bin/osascript` by absolute path, M8-D11, up to
+    /// 120 s): the runtime cannot be told to keep the UI and skip the alert, so such a case would
+    /// open a dialog on the developer's screen and wait for it.
+    #[cfg(target_os = "macos")]
+    const MACOS_SKIPPED: &[(&str, &str)] = &[
+        (
+            "install_ui_killed_mid_install_still_installs",
+            "the lost UI never shows the outcome, so the runtime shows its native alert",
+        ),
+        (
+            "install_ui_stops_reading_mid_install_still_installs",
+            "the lost UI never shows the outcome, so the runtime shows its native alert",
         ),
     ];
 
@@ -168,6 +170,7 @@ mod native {
     ///   for the same prompt); past the list, the headless answer;
     /// - `delay=MS`: wait this long before answering a prompt (pings are answered meanwhile);
     /// - `fix=PATH`: remove PATH before answering `retry`;
+    /// - `unlock=PATH`: make the folder PATH writable again (mode 755) before answering `retry`;
     /// - `expect=PATH`: at each prompt, note whether a process runs with PATH as its executable.
     #[derive(Default)]
     struct Script {
@@ -183,6 +186,7 @@ mod native {
         answers: Vec<String>,
         delay: Duration,
         fix: Option<PathBuf>,
+        unlock: Option<PathBuf>,
         expect: Option<PathBuf>,
     }
 
@@ -212,6 +216,7 @@ mod native {
                 "delay" => s.delay = Duration::from_millis(value.parse().expect("ms")),
                 "answers" => s.answers = value.split('+').map(str::to_owned).collect(),
                 "fix" => s.fix = Some(PathBuf::from(value)),
+                "unlock" => s.unlock = Some(PathBuf::from(value)),
                 "expect" => s.expect = Some(PathBuf::from(value)),
                 other => {
                     if let Some(t) = other.strip_prefix("stop@") {
@@ -247,6 +252,18 @@ mod native {
             .unwrap_or_default()
     }
 
+    /// macOS has no procfs: whether descriptor `fd` is a pipe, as `fifo:<fd>` (an identity per
+    /// end, not per pipe, so the check is "holds no pipe at all", see
+    /// `assert_app_holds_no_ui_pipe`), read through `/dev/fd`.
+    #[cfg(target_os = "macos")]
+    fn fd_target(fd: u32) -> String {
+        use std::os::unix::fs::FileTypeExt;
+        match std::fs::metadata(format!("/dev/fd/{fd}")) {
+            Ok(m) if m.file_type().is_fifo() => format!("fifo:{fd}"),
+            _ => String::new(),
+        }
+    }
+
     /// Windows has no descriptor table to read (the pipe checks are Linux only).
     #[cfg(windows)]
     fn fd_target(_fd: u32) -> String {
@@ -268,6 +285,21 @@ mod native {
                 out.push(target.display().to_string());
             }
         }
+        out.join(" ")
+    }
+
+    /// The pipes among this process's descriptors, `fifo:<fd>` each, space separated (macOS).
+    #[cfg(target_os = "macos")]
+    fn all_fds() -> String {
+        use std::os::unix::fs::FileTypeExt;
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir("/dev/fd").expect("fds").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if std::fs::metadata(entry.path()).is_ok_and(|m| m.file_type().is_fifo()) {
+                out.push(format!("fifo:{name}"));
+            }
+        }
+        out.sort();
         out.join(" ")
     }
 
@@ -411,6 +443,7 @@ mod native {
                     let id = *id;
                     let delay = s.delay;
                     let fix = s.fix.clone();
+                    let unlock = s.unlock.clone();
                     let send = send.clone();
                     // From another thread, so pings are answered while the "user" reads.
                     std::thread::spawn(move || {
@@ -421,6 +454,17 @@ mod native {
                             {
                                 let _ = std::fs::remove_file(fix);
                             }
+                            #[cfg(unix)]
+                            if value == ChoiceValue::Retry
+                                && let Some(dir) = &unlock
+                            {
+                                let _ = std::fs::set_permissions(
+                                    dir,
+                                    std::fs::Permissions::from_mode(0o755),
+                                );
+                            }
+                            #[cfg(not(unix))]
+                            let _ = &unlock;
                             send(&UiMsg::Choice { id, value });
                             std::thread::sleep(Duration::from_millis(1100));
                         }
@@ -457,6 +501,20 @@ mod native {
                 .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
                 && std::fs::read_link(e.path().join("exe")).is_ok_and(|t| t == exe)
         })
+    }
+
+    /// Whether a process runs with `exe` as its executable (macOS: `ps` lists each one's path).
+    #[cfg(target_os = "macos")]
+    fn runs(exe: &Path) -> bool {
+        let Ok(out) = Command::new("/bin/ps")
+            .args(["-ax", "-o", "comm="])
+            .output()
+        else {
+            return false;
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| Path::new(l.trim_end()) == exe)
     }
 
     fn outcome_name(o: &Outcome) -> String {
@@ -619,6 +677,11 @@ mod native {
             "apply_no_ui_and_policy_start_no_ui",
             apply_no_ui_and_policy_start_no_ui,
         ),
+        #[cfg(target_os = "macos")]
+        (
+            "apply_shows_the_ui_from_the_helper_app_nested_in_the_bundle",
+            apply_shows_the_ui_from_the_helper_app_nested_in_the_bundle,
+        ),
     ];
 
     pub fn run_all(args: &[String]) {
@@ -626,31 +689,46 @@ mod native {
         let (_wrapper_dir, base) = scratch("uiwrapper-");
         write_wrapper(&base);
         let failed = Mutex::new(Vec::new());
+        let run_case = |name: &'static str, test: Case| {
+            let started = Instant::now();
+            match std::panic::catch_unwind(test) {
+                Ok(()) => println!("test {name} ... ok ({} ms)", started.elapsed().as_millis()),
+                Err(_) => {
+                    println!("test {name} ... FAILED");
+                    failed.lock().expect("failed").push(name);
+                }
+            }
+        };
+        // macOS: an uninstall's in-use scan fails closed on a process of the user it cannot read,
+        // and a process another case starts or ends at that moment can be unreadable for an
+        // instant, so the uninstall cases run alone, after the others.
+        let mut alone: Vec<(&'static str, Case)> = Vec::new();
         std::thread::scope(|scope| {
             for (name, test) in TESTS {
                 if filter.is_some_and(|f| !name.contains(f.as_str())) {
                     continue;
                 }
-                let failed = &failed;
                 #[cfg(windows)]
                 if let Some((_, why)) = LINUX_ONLY.iter().find(|(p, _)| name.starts_with(p)) {
                     println!("test {name} ... skipped on Windows ({why})");
                     continue;
                 }
-                scope.spawn(move || {
-                    let started = Instant::now();
-                    match std::panic::catch_unwind(test) {
-                        Ok(()) => {
-                            println!("test {name} ... ok ({} ms)", started.elapsed().as_millis())
-                        }
-                        Err(_) => {
-                            println!("test {name} ... FAILED");
-                            failed.lock().expect("failed").push(*name);
-                        }
-                    }
-                });
+                #[cfg(target_os = "macos")]
+                if let Some((_, why)) = MACOS_SKIPPED.iter().find(|(n, _)| n == name) {
+                    println!("test {name} ... skipped on macOS ({why})");
+                    continue;
+                }
+                if cfg!(target_os = "macos") && name.starts_with("uninstall_") {
+                    alone.push((name, *test));
+                    continue;
+                }
+                let run_case = &run_case;
+                scope.spawn(move || run_case(name, *test));
             }
         });
+        for (name, test) in alone {
+            run_case(name, test);
+        }
         let failed = failed.into_inner().expect("failed");
         if !failed.is_empty() {
             println!("failed: {failed:?}");
@@ -659,21 +737,7 @@ mod native {
     }
 
     fn scratch(prefix: &str) -> (tempfile::TempDir, PathBuf) {
-        let tmp = tempfile::Builder::new()
-            .prefix(prefix)
-            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-            .expect("tmp");
-        let base = plain(std::fs::canonicalize(tmp.path()).expect("canonical"));
-        (tmp, base)
-    }
-
-    /// `path` without Windows' `\\?\` prefix (a canonical path there).
-    fn plain(path: PathBuf) -> PathBuf {
-        let text = path.to_string_lossy().into_owned();
-        match text.strip_prefix(r"\\?\") {
-            Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
-            _ => path,
-        }
+        common::scratch(prefix)
     }
 
     fn write_exec(path: &Path, text: &str) {
@@ -685,7 +749,10 @@ mod native {
 
     /// The one wrapper script every `lunepack-ui` is a hard link of, written before any case
     /// runs: an executable written while another thread forks can fail to start (`ETXTBSY`,
-    /// the fork holds it open for writing until it execs), so no case writes one.
+    /// the fork holds it open for writing until it execs), so no case writes one. It starts no
+    /// process before the `exec` (`read` and `${0%/*}` are shell built-ins): on a macOS loaded by
+    /// the cases running beside it, a `dirname` or `cat` started by the script failed now and
+    /// then, and the fake UI then started with no script and no notes directory.
     static WRAPPER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
     fn write_wrapper(dir: &Path) {
@@ -708,8 +775,9 @@ mod native {
         write_exec(
             &path,
             &format!(
-                "#!/bin/sh\nd=$(dirname \"$0\")\n{FAKE_VAR}=$(cat \"$d/fake-ui.spec\") \
-                 {OUT_VAR}=$(cat \"$d/fake-ui.out\") exec '{}' \"$@\"\n",
+                "#!/bin/sh\nd=${{0%/*}}\nIFS= read -r spec < \"$d/fake-ui.spec\"\n\
+                 IFS= read -r out < \"$d/fake-ui.out\"\n\
+                 {FAKE_VAR}=$spec {OUT_VAR}=$out exec '{}' \"$@\"\n",
                 me.display()
             ),
         );
@@ -721,6 +789,8 @@ mod native {
         std::fs::create_dir_all(dir).expect("dir");
         std::fs::write(dir.join("fake-ui.spec"), spec).expect("spec");
         std::fs::write(dir.join("fake-ui.out"), out.as_os_str().as_encoded_bytes()).expect("out");
+        // A shell script: no process runs with it as its image (the wrapper `exec`s this test
+        // binary), so hard links are as harmless on macOS as elsewhere.
         let wrapper = WRAPPER.get().expect("wrapper");
         let link = dir.join(ui_host::UI_FILE);
         if std::fs::hard_link(wrapper, &link).is_err() {
@@ -757,6 +827,22 @@ mod native {
         assert!(!app_fds_hold(app_fds, &pipes), "the app holds a UI pipe");
     }
 
+    /// macOS: a pipe has one inode per end, so the UI's own two ends say nothing about the
+    /// runtime's ends of the same pipes. The app is started with no stdio, so it must hold no pipe
+    /// at all; the instrument is that the UI noted two pipes (its stdin and stdout) and that the
+    /// listing finds a pipe this process holds.
+    #[cfg(target_os = "macos")]
+    fn assert_app_holds_no_ui_pipe(out: &Path, app_fds: &str) {
+        let pipes = ui_pipes(out);
+        assert_eq!(pipes.len(), 2, "the UI noted its pipes: {}", notes(out));
+        assert!(pipes.iter().all(|p| p.starts_with("fifo:")), "{pipes:?}");
+        let (reader, _writer) = std::io::pipe().expect("a pipe");
+        assert!(all_fds().contains("fifo:"), "the listing misses a pipe");
+        drop(reader);
+        assert!(app_fds.trim().is_empty(), "the app holds a pipe: {app_fds}");
+    }
+
+    #[cfg(target_os = "linux")]
     fn app_fds_hold(fds: &str, pipes: &[String]) -> bool {
         fds.split(' ').any(|t| pipes.iter().any(|p| p == t))
     }
@@ -1190,20 +1276,16 @@ mod native {
 
     impl InstallLab {
         fn new() -> InstallLab {
-            let (tmp, base) = scratch("uiinstall-");
-            let home = base.join("home");
-            let out = base.join("out");
-            for d in [&home, &out] {
-                std::fs::create_dir_all(d).expect("dirs");
-            }
-            let data = home.join(".local/share");
+            let h = common::Home::new("uiinstall-", SUITE_APP_ID, None, false);
+            let out = h.base.join("out");
+            std::fs::create_dir_all(&out).expect("out");
             let lab = InstallLab {
-                _tmp: tmp,
-                boot: base.join("boot").join(V100),
-                root: data.join(SUITE_APP_ID),
-                base,
-                home,
-                data,
+                _tmp: h.tmp,
+                boot: h.base.join("boot").join(V100),
+                root: h.root,
+                base: h.base,
+                home: h.home,
+                data: h.data,
                 out,
             };
             lab.publish();
@@ -1221,16 +1303,22 @@ mod native {
         /// The app: notes that it ran, its fds and whether it had a token.
         fn tree_files(&self) -> Vec<(String, Vec<u8>, bool)> {
             let out = self.out.display();
+            // Linux lists every descriptor's target; macOS (no procfs) the pipes among them.
+            let fds = if cfg!(target_os = "macos") {
+                "fds=''\nfor f in /dev/fd/*; do if [ -p \"$f\" ]; then fds=\"$fds fifo:${f#/dev/fd/}\"; fi; done\n"
+            } else {
+                "fds=''\nfor f in /proc/$$/fd/*; do fds=\"$fds $(readlink \"$f\")\"; done\n"
+            };
             let script = format!(
-                "#!/bin/sh\nfds=''\nfor f in /proc/$$/fd/*; do fds=\"$fds $(readlink \"$f\")\"; done\n\
+                "#!/bin/sh\n{fds}\
                  echo \"app-fds$fds\" >> '{out}/notes'\n\
                  echo \"app token=${{{HEALTH_TOKEN_VAR}:+yes}}\" >> '{out}/notes'\n\
                  echo app-ran >> '{out}/notes'\n"
             );
             vec![
-                ("bin/app".to_owned(), script.into_bytes(), true),
+                (APP_PATH.to_owned(), script.into_bytes(), true),
                 (
-                    "bin/lunepack-runtime".to_owned(),
+                    RUNTIME_PATH.to_owned(),
                     std::fs::read(RUNTIME).expect("runtime"),
                     true,
                 ),
@@ -1273,7 +1361,7 @@ mod native {
             let release = self.base.join("release");
             let feed = format!("file://{}/", release.display());
             let meta = InstallMeta {
-                entry: RelPath::parse("bin/app").expect("entry"),
+                entry: RelPath::parse(APP_PATH).expect("entry"),
                 name: "UI install test".to_owned(),
                 comment: None,
                 icon: None,
@@ -1299,7 +1387,7 @@ mod native {
             .expect("config bytes");
 
             let mut files = self.tree_files();
-            files.push(("lunepack-update.json".to_owned(), config, false));
+            files.push((CONFIG_PATH.to_owned(), config, false));
             let mut layout = ReleaseLayout::new(app_id(), V100, TARGET).expect("layout");
             for (path, bytes, exec) in &files {
                 let packed = pack_file(bytes, &StoreOnly, &FakeCodec::new(), &Sha256Hasher)
@@ -1308,7 +1396,7 @@ mod native {
                     .add_file(RelPath::parse(path).expect("path"), *exec, &packed)
                     .expect("add file");
                 // Linked, not written: see `WRAPPER`.
-                if path == "bin/lunepack-runtime" {
+                if path == RUNTIME_PATH {
                     place(Path::new(RUNTIME), &self.boot.join(path));
                 } else {
                     write_file(&self.boot.join(path), bytes, *exec);
@@ -1334,8 +1422,25 @@ mod native {
             }
         }
 
+        fn layout(&self) -> UserLayout {
+            UserLayout::from_root(self.root.clone(), SCHEME)
+        }
+
+        /// The directory of the installed entry and runtime (macOS: in the live bundle).
         fn installed_bin(&self) -> PathBuf {
-            self.root.join("versions").join(V100).join("bin")
+            common::tree_of(&self.layout(), V100).join(ENTRY_DIR)
+        }
+
+        /// The live bundle the macOS install places (`~/Applications/<install.name>.app`).
+        fn bundle(&self) -> PathBuf {
+            self.home.join("Applications/UI install test.app")
+        }
+
+        /// The LaunchAgent plist the macOS install would write for `autostart` (none here).
+        fn launch_agent(&self) -> PathBuf {
+            self.home
+                .join("Library/LaunchAgents")
+                .join(format!("{SUITE_APP_ID}.lunepack.plist"))
         }
 
         fn desktop_entry(&self) -> PathBuf {
@@ -1379,7 +1484,7 @@ mod native {
         fn install(&self, args: &[&str]) -> Run {
             let mut all = vec!["install"];
             all.extend_from_slice(args);
-            self.run(&self.boot.join("bin/lunepack-runtime"), &all)
+            self.run(&self.boot.join(RUNTIME_PATH), &all)
         }
 
         fn record(&self) -> Option<InstallState> {
@@ -1557,12 +1662,22 @@ mod native {
         assert_eq!(run.line(), installed_line());
         let record = lab.record().expect("record");
         assert_eq!(record.current.expect("current").version.to_string(), V100);
-        assert!(lab.desktop_entry().exists());
+        if cfg!(target_os = "macos") {
+            // The live bundle is placed, the pointer names it, no desktop entry exists.
+            common::assert_live(&lab.layout(), V100);
+            assert_eq!(common::bundle_of(&lab.layout()), lab.bundle());
+        } else {
+            assert!(lab.desktop_entry().exists());
+        }
     }
 
     fn install_well_behaved_proceeds_and_launches_without_ui_pipes() {
         let lab = InstallLab::new();
-        place_ui(&lab.boot.join("bin"), "answers=proceed+launch", &lab.out);
+        place_ui(
+            &lab.boot.join(ENTRY_DIR),
+            "answers=proceed+launch",
+            &lab.out,
+        );
         let run = lab.install(&[]);
         assert_installed(&lab, &run);
         assert!(!run.stderr.contains("ui_stopped"), "{run:?}");
@@ -1595,28 +1710,56 @@ mod native {
         assert_app_holds_no_ui_pipe(&lab.out, fds);
     }
 
+    /// Restores a folder the case made read-only when dropped (so a failing case leaves a
+    /// directory the temporary-directory cleanup can remove).
+    #[cfg(target_os = "macos")]
+    struct Restore(PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
     fn install_retry_after_a_failure_installs() {
         let lab = InstallLab::new();
-        write_file(&lab.bin_link(), b"someone else's tool\n", true);
-        place_ui(
-            &lab.boot.join("bin"),
-            &format!(
-                "answers=proceed+retry+finish,fix={}",
-                lab.bin_link().display()
-            ),
-            &lab.out,
-        );
+        // The first try fails: Linux, a command link that is not ours (24, the UI's fix removes
+        // it); macOS (no command link), an apps folder the user cannot write (28, the UI's fix
+        // makes it writable again).
+        #[cfg(target_os = "macos")]
+        let (spec, failed, _restore) = {
+            let apps = lab.home.join("Applications");
+            std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+            (
+                format!("answers=proceed+retry+finish,unlock={}", apps.display()),
+                "ui got outcome Failed 28",
+                Restore(apps),
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (spec, failed) = {
+            write_file(&lab.bin_link(), b"someone else's tool\n", true);
+            (
+                format!(
+                    "answers=proceed+retry+finish,fix={}",
+                    lab.bin_link().display()
+                ),
+                "ui got outcome Failed 24",
+            )
+        };
+        place_ui(&lab.boot.join(ENTRY_DIR), &spec, &lab.out);
         let run = lab.install(&[]);
         assert_installed(&lab, &run);
         let notes = lab.notes();
-        assert!(notes.contains("ui got outcome Failed 24"), "{notes}");
+        assert!(notes.contains(failed), "{notes}");
         assert!(notes.contains("ui got outcome Installed"), "{notes}");
         assert!(!notes.contains("app-ran"), "finish without launch launched");
     }
 
     fn install_ui_killed_at_welcome_cancels_and_changes_nothing() {
         let lab = InstallLab::new();
-        place_ui(&lab.boot.join("bin"), "die@prompt:Welcome", &lab.out);
+        place_ui(&lab.boot.join(ENTRY_DIR), "die@prompt:Welcome", &lab.out);
         let run = lab.install(&[]);
         assert_eq!(run.code, 5, "{run:?}");
         assert_eq!(run.line(), cancelled_line("install"));
@@ -1624,12 +1767,13 @@ mod native {
         assert!(!lab.root.exists(), "R was created");
         assert!(!lab.desktop_entry().exists());
         assert!(!lab.bin_link().exists());
+        assert!(!lab.bundle().exists(), "a bundle was placed");
     }
 
     fn install_ui_killed_mid_install_still_installs() {
         let lab = InstallLab::new();
         place_ui(
-            &lab.boot.join("bin"),
+            &lab.boot.join(ENTRY_DIR),
             "answers=proceed+launch,die@progress",
             &lab.out,
         );
@@ -1645,7 +1789,7 @@ mod native {
     fn install_ui_stops_reading_mid_install_still_installs() {
         let lab = InstallLab::new();
         place_ui(
-            &lab.boot.join("bin"),
+            &lab.boot.join(ENTRY_DIR),
             "answers=proceed+launch,stop@progress",
             &lab.out,
         );
@@ -1665,15 +1809,23 @@ mod native {
 
     fn install_silent_and_no_display_start_no_ui() {
         let lab = InstallLab::new();
-        place_ui(&lab.boot.join("bin"), "answers=proceed+launch", &lab.out);
+        place_ui(
+            &lab.boot.join(ENTRY_DIR),
+            "answers=proceed+launch",
+            &lab.out,
+        );
         let run = lab.install(&["--silent"]);
         assert_installed(&lab, &run);
         // The same install again, without a display and with the policy variable: refused as
         // installed, and still no UI.
-        let runtime = lab.boot.join("bin/lunepack-runtime");
-        let mut no_display = lab.command(&runtime, &["install"]);
-        no_display.env_remove("DISPLAY");
-        assert_eq!(lab.run_cmd(no_display).code, 23);
+        let runtime = lab.boot.join(RUNTIME_PATH);
+        // No display (Linux only: macOS has no such policy, it would start the UI and, refusing,
+        // end with its native alert).
+        if cfg!(not(target_os = "macos")) {
+            let mut no_display = lab.command(&runtime, &["install"]);
+            no_display.env_remove("DISPLAY");
+            assert_eq!(lab.run_cmd(no_display).code, 23);
+        }
         let mut policy = lab.command(&runtime, &["install"]);
         policy.env("LUNEPACK_NO_UI", "1");
         assert_eq!(lab.run_cmd(policy).code, 23);
@@ -1686,22 +1838,33 @@ mod native {
     fn uninstall_with_a_live_ui_from_the_tree_reveals_and_succeeds() {
         let lab = InstallLab::new();
         assert_installed(&lab, &lab.install(&["--silent"]));
-        // A desktop file that is not lunepack's at the entry's name: kept and listed.
-        std::fs::remove_file(lab.desktop_entry()).expect("remove");
+        // Something that is not lunepack's at the integration's name: kept and listed. Linux: a
+        // desktop file; macOS: a LaunchAgent plist of another label.
+        #[cfg(not(target_os = "macos"))]
+        {
+            std::fs::remove_file(lab.desktop_entry()).expect("remove");
+            write_file(
+                &lab.desktop_entry(),
+                b"[Desktop Entry]\nName=Other\n",
+                false,
+            );
+        }
+        #[cfg(target_os = "macos")]
         write_file(
-            &lab.desktop_entry(),
-            b"[Desktop Entry]\nName=Other\n",
+            &lab.launch_agent(),
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
+              <key>Label</key>\n<string>com.example.someone-else</string>\n</dict>\n</plist>\n",
             false,
         );
-        place_ui(
-            &lab.installed_bin(),
-            "answers=proceed+reveal0+close",
-            &lab.out,
-        );
-        let run = lab.run(
-            &lab.installed_bin().join("lunepack-runtime"),
-            &["uninstall"],
-        );
+        // The UI asks to reveal the first leftover, except on macOS: the opener there is
+        // `/usr/bin/open` by absolute path, so it cannot be faked and would open a Finder window.
+        let answers = if cfg!(target_os = "macos") {
+            "answers=proceed+close"
+        } else {
+            "answers=proceed+reveal0+close"
+        };
+        place_ui(&lab.installed_bin(), answers, &lab.out);
+        let run = lab.run(&lab.installed_bin().join(RUNTIME_FILE), &["uninstall"]);
         assert_eq!(run.code, 0, "{run:?}");
         assert!(
             run.line()
@@ -1710,16 +1873,21 @@ mod native {
         );
         assert!(!run.stderr.contains("ui_stopped"), "{run:?}");
         assert!(!lab.root.exists(), "R is still there");
+        #[cfg(target_os = "macos")]
+        assert!(!lab.bundle().exists(), "the live bundle is still there");
         let notes = lab.notes();
         assert!(notes.contains("ui got outcome Uninstalled 1"), "{notes}");
-        let applications = lab.data.join("applications");
-        assert!(
-            wait_until(Duration::from_secs(5), || lab
-                .notes()
-                .contains(&format!("open {}\n", applications.display()))),
-            "{}",
-            lab.notes()
-        );
+        #[cfg(not(target_os = "macos"))]
+        {
+            let applications = lab.data.join("applications");
+            assert!(
+                wait_until(Duration::from_secs(5), || lab
+                    .notes()
+                    .contains(&format!("open {}\n", applications.display()))),
+                "{}",
+                lab.notes()
+            );
+        }
         assert!(lab.notes().contains("ui got close"));
         // Nothing printed names a path.
         let base = lab.base.display().to_string();
@@ -1731,15 +1899,16 @@ mod native {
         assert_installed(&lab, &lab.install(&["--silent"]));
         let before = lab.record();
         place_ui(&lab.installed_bin(), "die@prompt:Confirm", &lab.out);
-        let run = lab.run(
-            &lab.installed_bin().join("lunepack-runtime"),
-            &["uninstall"],
-        );
+        let run = lab.run(&lab.installed_bin().join(RUNTIME_FILE), &["uninstall"]);
         assert_eq!(run.code, 5, "{run:?}");
         assert_eq!(run.line(), cancelled_line("uninstall"));
         assert_eq!(lab.record(), before);
-        assert!(lab.desktop_entry().exists());
-        assert!(lab.bin_link().exists());
+        if cfg!(target_os = "macos") {
+            assert!(lab.bundle().exists(), "the live bundle is gone");
+        } else {
+            assert!(lab.desktop_entry().exists());
+            assert!(lab.bin_link().exists());
+        }
     }
 
     // ---- runtime cases: apply -------------------------------------------------------------------
@@ -1748,7 +1917,9 @@ mod native {
         Version::parse(text).expect("version")
     }
 
-    /// Places `from` at `to`: a hard link when possible, else a copy.
+    /// Places `from` at `to`: a hard link when possible, else a copy. Only for what no version
+    /// tree holds: the bootstrap tree (outside `R`, never scanned for what runs from it). A
+    /// tree the in-use scan looks at gets copies on macOS (`common::place`).
     fn place(from: &Path, to: &Path) {
         std::fs::create_dir_all(to.parent().expect("parent")).expect("dirs");
         if std::fs::hard_link(from, to).is_err() {
@@ -1764,36 +1935,58 @@ mod native {
         out: PathBuf,
     }
 
+    /// Where the fake UI of an `apply` case is placed.
+    #[derive(Clone, Copy, PartialEq)]
+    enum UiAt {
+        /// Beside the runtime, in the entry's directory.
+        Beside,
+        /// macOS: only in the helper app nested in the bundle (M8-D6).
+        #[cfg(target_os = "macos")]
+        Helper,
+    }
+
     impl ApplyLab {
         /// 1.0.0 (marker `linger`: it runs five seconds) installed, 1.1.0 (marker `marker`)
         /// staged, the fake UI with `spec` beside 1.0.0's runtime.
         fn new(marker: &str, spec: &str) -> ApplyLab {
-            let (tmp, base) = scratch("uiapply-");
-            let home = base.join("home");
-            let data = home.join(".local/share");
-            let root = data.join(app_id().as_str());
-            let out = base.join("out");
-            for d in [&home, &data, &root, &out] {
-                std::fs::create_dir_all(d).expect("dirs");
-            }
+            ApplyLab::with_ui(marker, spec, UiAt::Beside)
+        }
+
+        fn with_ui(marker: &str, spec: &str, at: UiAt) -> ApplyLab {
+            let h = common::Home::new("uiapply-", app_id().as_str(), None, true);
+            let out = h.base.join("out");
+            std::fs::create_dir_all(&out).expect("out");
             let lab = ApplyLab {
-                _tmp: tmp,
-                home,
-                data,
-                root,
+                _tmp: h.tmp,
+                home: h.home,
+                data: h.data,
+                root: h.root,
                 out,
             };
             lab.tree(V100, "linger");
             lab.tree(V110, marker);
-            // Linux: the app's executable, which a process must be running from; Windows (no
-            // procfs): the note the relaunched 1.0.0 writes when it starts.
+            // Linux and macOS: the app's executable, which a process must be running from (macOS:
+            // in the live bundle); Windows (no procfs): the note the relaunched 1.0.0 writes when
+            // it starts.
             let expect = if cfg!(windows) {
                 "1.0.0 start token=no".to_owned()
             } else {
-                lab.tree_dir(V100).join("bin/app").display().to_string()
+                let tree = if cfg!(target_os = "macos") {
+                    lab.bundle_default()
+                } else {
+                    lab.tree_dir(V100)
+                };
+                common::join_rel(&tree, ENTRY).display().to_string()
             };
             let spec = spec.replace("@expect@", &expect);
-            place_ui(&lab.tree_dir(V100).join("bin"), &spec, &lab.out);
+            let ui_dir = match at {
+                UiAt::Beside => lab.tree_dir(V100).join(ENTRY_DIR),
+                #[cfg(target_os = "macos")]
+                UiAt::Helper => lab
+                    .tree_dir(V100)
+                    .join("Contents/Helpers/lunepack-update.app/Contents/MacOS"),
+            };
+            place_ui(&ui_dir, &spec, &lab.out);
             let fs = StdFs::new();
             let store = UserScope {
                 dir: lab.layout().state_dir(),
@@ -1809,6 +2002,9 @@ mod native {
             store
                 .commit(&fs, &loaded, &next, &Sha256Hasher)
                 .expect("commit");
+            // macOS: 1.0.0's tree is the live bundle (its pointer and identity by the core's
+            // writers); elsewhere the runtime projects the record at its first start.
+            common::project(&lab.layout(), &lab.bundle_default(), V100);
             lab
         }
 
@@ -1820,6 +2016,11 @@ mod native {
             self.layout().versions_dir().join(v)
         }
 
+        /// Where the live bundle goes (macOS).
+        fn bundle_default(&self) -> PathBuf {
+            self.home.join("Applications/UI apply test.app")
+        }
+
         fn tree(&self, v: &str, marker: &str) {
             let dir = self.tree_dir(v);
             let mut cfg = lunepack_testkit::sample_update_config();
@@ -1827,7 +2028,7 @@ mod native {
             cfg.target = TARGET;
             cfg.health_timeout_secs = 10;
             cfg.install = InstallMeta {
-                entry: RelPath::parse(&exe("bin/app")).expect("entry"),
+                entry: RelPath::parse(&exe(ENTRY)).expect("entry"),
                 name: format!("UI apply test {v}"),
                 comment: None,
                 icon: None,
@@ -1839,22 +2040,17 @@ mod native {
                 url_schemes: Vec::new(),
                 autostart: false,
             };
-            write_file(
-                &dir.join("lunepack-update.json"),
-                &cfg.to_bytes().expect("config bytes"),
-                false,
-            );
-            place(
-                &std::env::current_exe().expect("exe"),
-                &dir.join(exe("bin/app")),
-            );
-            place(Path::new(RUNTIME), &dir.join("bin").join(RUNTIME_FILE));
+            common::write_config(&dir, &cfg.to_bytes().expect("config bytes"));
+            common::place_app(&dir, &exe(ENTRY));
             std::fs::write(dir.join("marker"), marker).expect("marker");
         }
 
         fn command(&self, extra: &[&str]) -> Command {
             let target = wait_target();
-            let mut cmd = Command::new(self.tree_dir(V100).join("bin").join(RUNTIME_FILE));
+            let runtime = common::tree_of(&self.layout(), V100)
+                .join(ENTRY_DIR)
+                .join(RUNTIME_FILE);
+            let mut cmd = Command::new(runtime);
             cmd.args([
                 "apply",
                 "--wait-pid",
@@ -2018,13 +2214,32 @@ mod native {
         assert!(lab.log().contains("\"reason\":\"hung\""), "{}", lab.log());
     }
 
+    /// macOS (M8-D6): with the fake UI only in the helper app nested in the bundle,
+    /// `Contents/Helpers/lunepack-update.app/Contents/MacOS/lunepack-ui`, and none beside the
+    /// runtime, the apply shows the update window and confirms.
+    #[cfg(target_os = "macos")]
+    fn apply_shows_the_ui_from_the_helper_app_nested_in_the_bundle() {
+        let lab = ApplyLab::with_ui("confirm", "", UiAt::Helper);
+        let beside = lab.bundle_default().join(ENTRY_DIR).join(ui_host::UI_FILE);
+        assert!(!beside.exists(), "a UI stands beside the runtime");
+        let run = lab.run(lab.command(&[]));
+        assert_eq!(run.code, 0, "{run:?}");
+        assert_eq!(lab.current(), version(V110));
+        let notes = lab.notes();
+        assert!(notes.contains("ui got hello Update"), "{notes}");
+        assert!(notes.contains("ui got outcome Updated"), "{notes}");
+        assert!(notes.contains("ui got close"), "{notes}");
+        assert!(notes.contains("1.1.0 confirm true"), "{notes}");
+        assert!(!lab.log().contains("ui_stopped"), "{}", lab.log());
+    }
+
     fn apply_no_ui_and_policy_start_no_ui() {
         let lab = ApplyLab::new("confirm", "");
         let run = lab.run(lab.command(&["--no-ui"]));
         assert_eq!(run.code, 0, "{run:?}");
         assert!(!lab.notes().contains("ui start"), "{}", lab.notes());
-        // Windows has no display to be missing: only the policy variable.
-        let policies: &[(&str, Option<&str>)] = if cfg!(windows) {
+        // Windows and macOS have no display to be missing: only the policy variable.
+        let policies: &[(&str, Option<&str>)] = if cfg!(windows) || cfg!(target_os = "macos") {
             &[("LUNEPACK_NO_UI", Some("1"))]
         } else {
             &[("LUNEPACK_NO_UI", Some("1")), ("DISPLAY", None)]

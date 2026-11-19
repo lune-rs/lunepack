@@ -187,27 +187,35 @@ pub fn plain(path: PathBuf) -> PathBuf {
     }
 }
 
+/// A new temporary directory named `prefix…` and its canonical path (macOS: `/var` is
+/// `/private/var`; Windows: no `\\?\`).
+///
+/// It is under the target directory (the binaries can be hard-linked from there), except on
+/// macOS: a Docker Desktop bind mount of the working tree makes its VM process, which runs as the
+/// user, hold a descriptor on every file the container has looked at under the tree, and the
+/// in-use scan (GC, uninstall) rightly counts that process as using a tree of ours. The system's
+/// temporary directory is not shared.
+pub fn scratch(prefix: &str) -> (tempfile::TempDir, PathBuf) {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(target_os = "macos")]
+    let tmp = builder.tempdir().expect("tmp");
+    #[cfg(not(target_os = "macos"))]
+    let tmp = builder
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tmp");
+    let base = plain(std::fs::canonicalize(tmp.path()).expect("canonical"));
+    (tmp, base)
+}
+
 impl Home {
     /// A new home under a temporary directory named `prefix…`. `app_id` names `R` in the data
     /// home; `windows_root` (when given) names it `home/Programs/<name>` on Windows instead.
     /// `create_root` makes `R` itself (Linux and Windows `apply` start from an existing one; the
     /// runtime's `install` makes its own). On macOS `home/Applications` exists, as a user's does.
-    ///
-    /// The directory is under the target directory (the binaries can be hard-linked from there),
-    /// except on macOS: a Docker Desktop bind mount of the working tree makes its VM process,
-    /// which runs as the user, hold a descriptor on every file the container has looked at under
-    /// the tree, and the in-use scan (GC, uninstall) rightly counts that process as using a tree
-    /// of ours. The system's temporary directory is not shared.
+    /// The directory is [`scratch`]'s.
     pub fn new(prefix: &str, app_id: &str, windows_root: Option<&str>, create_root: bool) -> Home {
-        let mut builder = tempfile::Builder::new();
-        builder.prefix(prefix);
-        #[cfg(target_os = "macos")]
-        let tmp = builder.tempdir().expect("tmp");
-        #[cfg(not(target_os = "macos"))]
-        let tmp = builder
-            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-            .expect("tmp");
-        let base = plain(std::fs::canonicalize(tmp.path()).expect("canonical"));
+        let (tmp, base) = scratch(prefix);
         let home = base.join("home");
         let data = join_rel(
             &home,
