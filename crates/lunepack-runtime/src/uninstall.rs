@@ -29,6 +29,11 @@
 //! parent is the data home and that holds a record of the marker's app id; its name is never
 //! checked) and then runs the uninstall above unchanged.
 //!
+//! macOS (M8-D5, M8-D15): a bundle install is the live bundle `B` outside `R`, `R` and the
+//! LaunchAgent. `B` is this runtime's own tree and must be exactly what `R/bundle` names; `B` and
+//! then `R` each leave their path in one rename to a tombstone beside them and are removed, and the
+//! LaunchAgent goes last, when its `Label` is ours ([`uninstall_bundle`]).
+//!
 //! With a UI (M6), the confirm prompt comes before anything else: `cancel` there, or the UI lost
 //! there, ends the mode with `cancelled` and nothing changed (M6-D5). The UI process, started from
 //! the tree being removed, is the one process besides this one the in-use scan excludes (by pid
@@ -40,7 +45,7 @@ use std::path::Path;
 use lunepack::{
     FileKind, Installation, IntegrationItem, IntegrationRequest, Phase, ProcessId, Version,
 };
-use lunepack_core::layout::TOMBSTONE_RANDOM_BYTES;
+use lunepack_core::layout::{Projection, TOMBSTONE_RANDOM_BYTES, UserLayout};
 use lunepack_core::state::{Scope, UserScope};
 use lunepack_core::ui::{ChoiceValue, Outcome, PromptKind, StepItem};
 
@@ -155,7 +160,23 @@ fn leftover_paths(inst: &Installation, kept: &[Kept]) -> Vec<String> {
         .collect()
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS: the LaunchAgent kept (a foreign file at its name), under the canonical `HOME`.
+#[cfg(target_os = "macos")]
+fn leftover_paths(inst: &Installation, kept: &[Kept]) -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok()) else {
+        return Vec::new();
+    };
+    kept.iter()
+        .filter(|(item, _)| *item == IntegrationItem::Autostart)
+        .map(|_| {
+            home.join("Library/LaunchAgents")
+                .join(format!("{}.lunepack.plist", inst.app_id().as_str()))
+        })
+        .filter_map(|p| p.to_str().map(str::to_owned))
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn leftover_paths(_inst: &Installation, _kept: &[Kept]) -> Vec<String> {
     Vec::new()
 }
@@ -182,7 +203,19 @@ fn reveal(ad: &Adapters, path: &Path) {
     let _ = ad.process.spawn_detached(&spec);
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS: `/usr/bin/open <dir>` (Finder), started detached without a shell. Best effort.
+#[cfg(target_os = "macos")]
+fn reveal(ad: &Adapters, path: &Path) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let mut spec = lunepack::SpawnSpec::new(std::path::PathBuf::from("/usr/bin/open"));
+    spec.args = vec![dir.as_os_str().to_owned()];
+    spec.env_remove = vec![std::ffi::OsString::from(lunepack::HEALTH_TOKEN_VAR)];
+    let _ = ad.process.spawn_detached(&spec);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn reveal(_ad: &Adapters, _path: &Path) {}
 
 /// Removes everything; the integration items kept. `ui` is the UI process this run started, which
@@ -195,6 +228,9 @@ fn uninstall(
     ui: Option<ProcessId>,
 ) -> Result<Vec<Kept>, Kind> {
     let layout = inst.layout().ok_or(Kind::NotInstalled)?;
+    if layout.scheme().projection == Projection::Bundle {
+        return uninstall_bundle(ad, inst, layout, data_home, events, ui);
+    }
     let root = layout.root();
     // M5-D10, M7-D16: the root this runtime stands in must be one this environment's data home
     // holds under the layout's scheme (`<data home>/<app id>` under XDG).
@@ -301,6 +337,153 @@ fn uninstall(
     }
     let _ = ad.fs.sync_dir(data_home);
     Ok(kept)
+}
+
+/// The uninstall of a macOS bundle install (M8-D5, M8-D15): the live bundle `B` (outside `R`),
+/// the install root `R` and the LaunchAgent. The running tree's place was judged when `inst` was
+/// found (M8-D4: translocated or read-only is exit 28 before this). Then, before anything is
+/// removed:
+///
+/// - `B` is this runtime's own tree (canonical) and exactly what `R/bundle` names, a real
+///   directory whose canonical path is itself; a moved bundle not yet followed, or an old
+///   instance in `R/versions`, is `install_mismatch` (26);
+/// - `R` passes the same rules as on Linux ([`lunepack_core::root_valid_for_uninstall`],
+///   `<data home>/<app id>`, real and canonical) and holds, under its lock, a record of this app id;
+/// - `B`'s place passes [`lunepack_core::check_place`] (exit 28 otherwise);
+/// - no process other than this one and its UI runs from `B` or from `R` (its version trees
+///   included): `in_use` (25).
+///
+/// Once `B` and `R` are known to be the install's, this app id's tombstones in their parents (the
+/// apps folder and the data home) are removed (M5-D10's rule). Under the lock, `B` leaves its path
+/// in one rename to a tombstone in its own folder and is removed, then `R` the same way in the data
+/// home: a cut-off run leaves each whole or gone, and `R` without `B` is an orphaned install
+/// (M8-D16) that an installer rerun installs anew. Last, the LaunchAgent goes when its `Label` is
+/// ours; a foreign one is kept and reported. This runtime and its UI may run from `B`: their files
+/// are unlinked, and the run ends with its final object.
+fn uninstall_bundle(
+    ad: &Adapters,
+    inst: &Installation,
+    layout: &UserLayout,
+    data_home: &Path,
+    events: &Events,
+    ui: Option<ProcessId>,
+) -> Result<Vec<Kept>, Kind> {
+    let fs = &*ad.fs;
+    let root = layout.root();
+    let bundle = inst.tree_root();
+    let app_id = inst.app_id();
+    let valid = || {
+        lunepack_core::root_valid_for_uninstall(fs, data_home, root, app_id, layout.scheme())
+            && real_canonical_dir(ad, root)
+            && is_live_bundle(ad, inst, layout)
+    };
+    if !valid() {
+        return Err(Kind::InstallMismatch);
+    }
+    let apps = bundle.parent().ok_or(Kind::InstallMismatch)?;
+    // Best effort: a tombstone is never `B` or `R`, so one that stays changes nothing here.
+    let _ = lunepack_core::remove_tombstones(fs, data_home, app_id);
+    let _ = lunepack_core::remove_tombstones(fs, apps, app_id);
+
+    let guard = lock_retry(ad, &layout.state_dir(), LOCK_WAIT).map_err(|e| Kind::of(&e))?;
+    let store = UserScope {
+        dir: layout.state_dir(),
+        app_id: app_id.clone(),
+    };
+    let loaded = store
+        .load(fs, &*ad.hasher)
+        .map_err(|e| Kind::of(&e.into()))?;
+    let record = loaded.record.ok_or(Kind::NotInstalled)?;
+    if &record.app_id != app_id {
+        return Err(Kind::InstallMismatch);
+    }
+    // Checked again under the lock, right before anything is removed.
+    if !valid() {
+        return Err(Kind::InstallMismatch);
+    }
+    lunepack_core::check_place(fs, layout, bundle)
+        .map_err(|e| Kind::of(&lunepack_core::Error::Layout(e).into()))?;
+
+    let me: ProcessId = ad.process.current().map_err(|e| Kind::of(&e.into()))?;
+    let mut exclude = vec![me];
+    exclude.extend(ui);
+    for tree in [bundle, root] {
+        match ad.process.tree_in_use(tree, &exclude) {
+            Ok(false) => {}
+            Ok(true) => return Err(Kind::InUse),
+            Err(e) => return Err(Kind::of(&e.into())),
+        }
+    }
+    events.emit(&Event::phase(Phase::Uninstall, Some(inst.tree_version())));
+
+    // `B`, then `R`, each out of its path in one rename. A failed rename returns with what is
+    // left whole; once `B` is gone, `R` follows even if `B`'s tombstone could not be emptied
+    // (its error is returned at the end), so the install is never left half gone.
+    let mut first = remove_whole(ad, bundle, apps, app_id)?;
+    let removed = remove_whole(ad, root, data_home, app_id);
+    drop(guard);
+    if let Some(kind) = removed? {
+        first.get_or_insert(kind);
+    }
+
+    // The LaunchAgent, only when its `Label` is ours (M8-D12); its request names `B`.
+    let request = IntegrationRequest {
+        app_id: app_id.clone(),
+        install_root: bundle.to_path_buf(),
+        version: inst.tree_version().clone(),
+        meta: inst.meta().clone(),
+        previous: None,
+        stale_bins: Vec::new(),
+    };
+    let report = ad
+        .integration
+        .remove(Scope::User, &request)
+        .map_err(|e| Kind::of(&e.into()))?;
+    if let Some(kind) = first {
+        return Err(kind);
+    }
+    let kept: Vec<Kept> = report.kept.into_iter().map(|item| (item, None)).collect();
+    if !kept.is_empty() {
+        events.emit(&Event::warning(Warning::IntegrationKept, None));
+    }
+    Ok(kept)
+}
+
+/// Whether `inst`'s tree is the live bundle: not a moved bundle, exactly `R/bundle`'s target, and
+/// a real directory whose canonical path is itself.
+fn is_live_bundle(ad: &Adapters, inst: &Installation, layout: &UserLayout) -> bool {
+    let bundle = inst.tree_root();
+    !inst.moved()
+        && matches!(layout.bundle_path(&*ad.fs), Ok(Some(b)) if b == bundle)
+        && real_canonical_dir(ad, bundle)
+}
+
+/// Moves `dir` out of its path in one rename, to a fresh tombstone of `app_id` in `parent` (its
+/// own folder, so the same filesystem), then removes the tombstone without following a symlink.
+/// `Err` when `dir` is still there; `Ok(Some(kind))` when it is gone but its tombstone could not
+/// be removed whole (the next uninstall removes it).
+fn remove_whole(
+    ad: &Adapters,
+    dir: &Path,
+    parent: &Path,
+    app_id: &lunepack::AppId,
+) -> Result<Option<Kind>, Kind> {
+    let mut random = [0u8; TOMBSTONE_RANDOM_BYTES];
+    ad.rng.fill(&mut random).map_err(|e| Kind::of(&e.into()))?;
+    let tombstone = parent.join(lunepack_core::tombstone_name(app_id, &random));
+    ad.fs
+        .rename(dir, &tombstone)
+        .map_err(|e| Kind::of(&e.into()))?;
+    let _ = ad.fs.sync_dir(parent);
+    let removed = ad.fs.remove_dir_all_nofollow(&tombstone);
+    let _ = ad.fs.sync_dir(parent);
+    // A failure is one only while the tombstone is still there.
+    Ok(match removed {
+        Err(e) if !matches!(ad.fs.symlink_metadata(&tombstone), Ok(None)) => {
+            Some(Kind::of(&e.into()))
+        }
+        _ => None,
+    })
 }
 
 /// Text equality of two versions.

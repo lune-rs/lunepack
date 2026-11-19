@@ -162,7 +162,9 @@ fn uninstall_mode(
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+/// Linux, and macOS (the bundle `B`, the install root `R` and the LaunchAgent, M8-D5, M8-D15):
+/// the uninstall runs in this process, from the installed tree.
+#[cfg(not(windows))]
 fn uninstall_mode(
     ad: &modes::Adapters,
     inst: &lunepack::Installation,
@@ -170,19 +172,6 @@ fn uninstall_mode(
     silent: bool,
 ) -> Kind {
     uninstall_flow(ad, inst, data_home, silent)
-}
-
-/// macOS: the uninstall of a bundle install (the bundle `B`, the install root `R`, the
-/// LaunchAgent) is its own step (M8-D5, M8-D15); until it lands the mode refuses and removes
-/// nothing, rather than remove `R` and leave the app behind.
-#[cfg(target_os = "macos")]
-fn uninstall_mode(
-    _ad: &modes::Adapters,
-    _inst: &lunepack::Installation,
-    _data_home: &std::path::Path,
-    _silent: bool,
-) -> Kind {
-    headless_fail(uninstall::COMMAND, Kind::Unsupported)
 }
 
 /// The uninstall of `inst` with its UI and its outcome (M5-D10, M6): the confirm prompt, the
