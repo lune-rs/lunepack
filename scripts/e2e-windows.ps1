@@ -52,13 +52,23 @@ if (-not ('Lpe2eProc' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'ci
 
 # ---- small helpers ---------------------------------------------------------------------------------
 
-function Row([string]$id, [scriptblock]$body) {
+# Runs one row. A failure is reported with the row's own line (not a helper's), then -Undo removes
+# what the failed row left (an install it would have removed itself), so one failure does not
+# cascade into the rows after it.
+function Row([string]$id, [scriptblock]$body, [scriptblock]$Undo = $null) {
     try {
         & $body
         Write-Output "ok   row $id"
     } catch {
         $failures.Add("row $id")
-        Write-Output "FAIL row ${id}: $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))"
+        $line = $_.InvocationInfo.ScriptLineNumber
+        foreach ($frame in @("$($_.ScriptStackTrace)" -split "`r?`n")) {
+            if ($frame -notmatch '^at (Require|Same|SameV),' -and $frame -match 'line (\d+)$') { $line = $Matches[1]; break }
+        }
+        Write-Output "FAIL row ${id}: $($_.Exception.Message) (script line $line)"
+        if ($Undo) {
+            try { & $Undo } catch { Write-Output "     undo of row ${id} failed: $($_.Exception.Message)" }
+        }
     }
 }
 
@@ -413,6 +423,21 @@ function Assert-NoDeclarations($app) {
     Require ($null -eq (Run-Value $app.Id)) 'the Run value is gone'
 }
 
+# How many entries Windows' installed-programs inventory (`Get-Package -ProviderName Programs`)
+# has under exactly this display name. The Programs provider ships only with Windows PowerShell
+# 5.1 (PowerShell 7, which CI runs this script in, has no such provider), so the query runs in
+# powershell.exe; the command goes encoded, so the name's space and non-ASCII letter pass intact.
+function Programs-Count([string]$name) {
+    $quoted = $name -replace "'", "''"
+    $command = "`$ProgressPreference = 'SilentlyContinue'; @(Get-Package -ProviderName Programs -Name '$quoted' -ErrorAction SilentlyContinue).Count"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    $out = @(& powershell.exe -NoProfile -NonInteractive -EncodedCommand $encoded)
+    if ($LASTEXITCODE -ne 0) { throw "powershell.exe (Get-Package) exited $LASTEXITCODE" }
+    $last = "$($out | Select-Object -Last 1)".Trim()
+    if ($last -notmatch '^\d+$') { throw 'powershell.exe (Get-Package) printed no count' }
+    return [int]$last
+}
+
 # What a first install of $version leaves in $app.Root, in the registry and in the Start menu.
 function Assert-Installed($app, [string]$version) {
     $root = $app.Root
@@ -433,8 +458,7 @@ function Assert-Installed($app, [string]$version) {
     Same 'InstallLocation' $u.InstallLocation $root
     SameV 'DisplayVersion' $u.DisplayVersion $version
     Same 'QuietUninstallString' $u.QuietUninstallString "`"$(Stub-Path $app)`" --lunepack-uninstall /S"
-    $pkg = Get-Package -ProviderName Programs -Name $app.Name -ErrorAction SilentlyContinue
-    Require ($null -ne $pkg) 'Get-Package lists the app'
+    SameV 'Get-Package -ProviderName Programs entries of the app' (Programs-Count $app.Name) 1
     $lnk = Join-Path $startMenu "$($app.Name).lnk"
     Require (Test-Path -LiteralPath $lnk) 'the Start-menu shortcut exists'
     $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
@@ -469,33 +493,51 @@ function Remove-Tree([string]$path) {
     }
 }
 
-function Cleanup {
-    # Uninstall through the entry's own command first, then sweep what is ours by name.
-    foreach ($app in $apps) {
-        $key = Join-Path $uninstallKeyRoot $app.Id
-        if (Test-Path $key) {
-            $quiet = (Get-ItemProperty $key).QuietUninstallString
-            if ($quiet -match '^"([^"]+)"\s*(.*)$' -and (Test-Path -LiteralPath $Matches[1])) {
-                Stop-Under (Split-Path $Matches[1] -Parent)
-                try { Start-Process -FilePath $Matches[1] -ArgumentList $Matches[2] -Wait -WindowStyle Hidden } catch { }
-                for ($i = 0; $i -lt 30 -and (Test-Path $key); $i++) { Start-Sleep -Seconds 1 }
-            }
+# Removes one app's install, if there is one: through its Uninstall entry's own command first, then
+# what is left of it by name (its folders, shortcuts, Uninstall key and declarations). A no-op when
+# the app is not installed.
+function Reset-App($app) {
+    $key = Join-Path $uninstallKeyRoot $app.Id
+    if (Test-Path $key) {
+        $quiet = (Get-ItemProperty $key).QuietUninstallString
+        if ($quiet -match '^"([^"]+)"\s*(.*)$' -and (Test-Path -LiteralPath $Matches[1])) {
+            $program = $Matches[1]
+            $rest = $Matches[2]
+            Stop-Under (Split-Path $program -Parent)
+            try { Start-Process -FilePath $program -ArgumentList $rest -Wait -WindowStyle Hidden } catch { }
+            for ($i = 0; $i -lt 30 -and (Test-Path $key); $i++) { Start-Sleep -Seconds 1 }
         }
     }
+    $names = @($app.BaseName, $app.Name, "$($app.BaseName) ($($app.Id))", "$($app.Name) ($($app.Id))")
+    foreach ($n in ($names | Select-Object -Unique)) {
+        $d = Join-Path $programs $n
+        if (Test-Path -LiteralPath (Long $d)) {
+            Stop-Under $d
+            Remove-Tree $d
+        }
+    }
+    foreach ($n in (@($app.BaseName, $app.Name) | Select-Object -Unique)) {
+        Remove-Item -LiteralPath (Join-Path $startMenu "$n.lnk") -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue
+    if ($app.Declare) {
+        # The declarations of M7-D3, when the uninstall did not remove them (all names are unique to this run).
+        foreach ($k in "$($app.Id).$($app.Ext)", ".$($app.Ext)", $app.Ext) {
+            Remove-Item -LiteralPath (Join-Path $classesKey $k) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-ItemProperty -LiteralPath $runKey -Name $app.Id -ErrorAction SilentlyContinue
+    }
+}
+
+function Cleanup {
+    # Each app through its entry's own command first, then a sweep of what is ours by name.
+    foreach ($app in $apps) { Reset-App $app }
     foreach ($d in @(Get-ChildItem $programs -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "Lunepack E2E*$hex*" })) {
         Stop-Under $d.FullName
         Remove-Tree $d.FullName
     }
     foreach ($f in @(Get-ChildItem $startMenu -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "Lunepack E2E*$hex*" })) {
         Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
-    }
-    foreach ($app in $apps) { Remove-Item -Path (Join-Path $uninstallKeyRoot $app.Id) -Recurse -Force -ErrorAction SilentlyContinue }
-    foreach ($app in @($apps | Where-Object { $_.Declare })) {
-        # The declarations of M7-D3, when the uninstall did not remove them (all names are unique to this run).
-        foreach ($k in "$($app.Id).$($app.Ext)", ".$($app.Ext)", $app.Ext) {
-            Remove-Item -LiteralPath (Join-Path $classesKey $k) -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        Remove-ItemProperty -LiteralPath $runKey -Name $app.Id -ErrorAction SilentlyContinue
     }
     foreach ($d in Get-ChildItem $tempRoot -Directory -ErrorAction SilentlyContinue) {
         # Only what this run created: uninstall copies and UI dirs that were not there at the start.
@@ -832,7 +874,7 @@ try {
             $copies = @(New-TempDirs 'lunepack-uninstall-')
             Require ($copies.Count -le 1) 'at most the uninstaller copy remains in temp (M7-D5)'
             $state.FirstCopies = $copies
-        }
+        } -Undo { Reset-App $A }
 
         Row '2 (interactive Setup with the stand-in UI; a UI that dies; the stale copy goes)' {
             $A.Name = $A.BaseName
@@ -859,7 +901,7 @@ try {
             $A.Root = Join-Path $programs $A.BaseName
             Assert-Installed $A '1.0.0'
             Invoke-Uninstall $A
-        }
+        } -Undo { Remove-Item Env:LUNEPACK_E2E_UI_MODE -ErrorAction SilentlyContinue; Reset-App $A }
 
         Row '12 (taken folder, M7-D17)' {
             $taken = Join-Path $programs $A.BaseName
@@ -887,7 +929,7 @@ try {
             Require (-not (Test-Path -LiteralPath $alt)) 'no second folder was made'
             $A.Root = $taken
             Invoke-Uninstall $A
-        }
+        } -Undo { Reset-App $A }
 
         # ---- app B: the stub replaced while a console stub instance runs ------------------------------------------------
         Row '3 (a running console stub is replaced; its aside copy goes with the next GC)' {
@@ -913,7 +955,7 @@ try {
             Wait-Until { @(Get-ChildItem -LiteralPath $B.Root -Force -File | Where-Object { $_.Name -like '.*.old-*' }).Count -eq 0 } 60 'the aside copy to be collected'
             SameV 'stub ProductVersion after the second update' (Get-Item -LiteralPath (Stub-Path $B)).VersionInfo.ProductVersion '1.2.0'
             Invoke-Uninstall $B
-        }
+        } -Undo { Reset-App $B }
 
         # ---- app D: console stub stdio, exit code and console events ---------------------------------------------------------
         Row '6 (console stub: stdio and exit code pass through)' {
@@ -925,7 +967,7 @@ try {
             SameV 'exit code' $r.Code 7
             $r = Run-Console (Stub-Path $D) '--exit 0' ''
             SameV 'exit code 0' $r.Code 0
-        }
+        } -Undo { Reset-App $D }
 
         Row 'console events (Ctrl+C and Ctrl+Break reach the app, not the stub)' {
             $ctlCopy = Join-Path $work 'ctl-control.exe'
@@ -935,7 +977,7 @@ try {
             Require ($LASTEXITCODE -eq 0) 'the console-event checks pass'
             Stop-Under $D.Root
             Invoke-Uninstall $D
-        }
+        } -Undo { Reset-App $D }
 
         # ---- app C: a long path ---------------------------------------------------------------------------------------------------
         Row '7 (an entry path over 260 characters installs, launches and uninstalls)' {
@@ -957,11 +999,13 @@ try {
                 Write-Output "     note: the launch needs LongPathsEnabled (value '$longPaths'); install and uninstall are checked, exit code $($r.Code)"
             }
             Invoke-Uninstall $C
-        }
+        } -Undo { Reset-App $C }
 
         # The certificate is trusted machine-wide, so only a CI runner (a throwaway machine) runs this.
         if ($env:CI -eq 'true') {
             Row 'signed Setup.exe' {
+                # The signed copy installs app A with /S: no install of A may be left from a row before.
+                Require (-not (Test-Path -LiteralPath $key)) 'app A is not installed before the signed-setup row'
                 $out = & (Join-Path $PSScriptRoot 'ci\windows-sign-test.ps1') -Setup $setup
                 $out | ForEach-Object { Write-Output "     $_" }
                 Require ($LASTEXITCODE -eq 0) 'the signed-setup checks pass'
