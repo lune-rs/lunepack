@@ -541,10 +541,13 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         setup::Detect::None => return None,
         setup::Detect::Malformed => {
             conclude(stderr_events(), &setup::failed(Kind::Verify, None));
-            // The arguments are not validated here: a usage error is its own exit, so only
-            // `--silent` or `/S` matters for the notice.
-            let quiet = modes::parse_setup(args).unwrap_or(false);
-            notice(quiet, false, SETUP_TITLE, Operation::Setup, Kind::Verify);
+            notice(
+                unparsed_setup_quiet(args),
+                false,
+                SETUP_TITLE,
+                Operation::Setup,
+                Kind::Verify,
+            );
             return Some(Kind::Verify);
         }
         setup::Detect::Setup(found) => found,
@@ -611,6 +614,15 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         notice(silent, seen, prepared.name(), Operation::Install, kind);
         kind
     }))
+}
+
+/// Whether a setup run that ends before its arguments were validated (a malformed setup file) is
+/// quiet for the notice: anything but an empty command line. Arguments that do not parse mean a
+/// command-line caller, as with a valid file (whose usage error shows no notice), so no modal box
+/// may block it; a double-click passes none and still gets the notice (F14).
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn unparsed_setup_quiet(args: &[std::ffi::OsString]) -> bool {
+    modes::parse_setup(args).unwrap_or(true)
 }
 
 /// Setup files are Linux and Windows only in this release (M8 takes macOS's).
@@ -708,6 +720,26 @@ mod tests {
             notice_text("My App", Operation::Uninstall, Kind::InUse),
             "My App could not be uninstalled (code 25)."
         );
+    }
+
+    /// A malformed setup file is checked before its arguments: only an empty command line (a
+    /// double-click) may get the modal notice; anything else is a command-line caller (F14).
+    #[test]
+    fn a_setup_with_unparsed_arguments_shows_a_notice_only_for_an_empty_command_line() {
+        let os = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(!unparsed_setup_quiet(&os(&[])));
+        assert!(unparsed_setup_quiet(&os(&["--silent"])));
+        for args in [
+            &["--no-such-option"][..],
+            &["/quiet"],
+            &["/VERYSILENT"],
+            &["/qn"],
+            &["install"],
+            &["--silent", "--silent"],
+            &["--no-ui"],
+        ] {
+            assert!(unparsed_setup_quiet(&os(args)), "{args:?}");
+        }
     }
 
     /// A setup rerun over the installed app (exit 23) is a normal end, not a failed install.
