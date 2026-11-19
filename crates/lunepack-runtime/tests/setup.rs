@@ -1015,6 +1015,29 @@ mod cases {
         run.assert_no_path(&lab);
     }
 
+    /// F14: a malformed setup file run with arguments it does not accept, as a script passing
+    /// another installer's flag would, exits 7 at once with `LUNEPACK_NO_UI` unset: no modal
+    /// notice waits for a click (it would hang this run until `RUN_LIMIT`).
+    #[cfg(windows)]
+    fn a_malformed_setup_with_unknown_arguments_exits_without_a_notice() {
+        let lab = Lab::new(Twist::default());
+        let mut bad = lab.bytes();
+        let at = bad.len() - 20;
+        bad[at] ^= 0xff;
+        lab.write_setup(&bad);
+        for args in [&["--no-such-option"][..], &["/quiet"], &["/S", "/S"]] {
+            let start = Instant::now();
+            let run = lab.run(args, Some("proceed"));
+            assert_eq!(run.code, EXIT_VERIFY, "{args:?}: {run:?}");
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "{args:?}: the run waited"
+            );
+            assert!(lab.noted("ui-dir").is_empty(), "a UI was started");
+        }
+        lab.assert_nothing_installed();
+    }
+
     /// M7-D5: the installed runtime's `uninstall /S` hands off to its temp copy and exits 0; the
     /// copy removes the install, the stub, the Start-menu shortcut and the uninstall entry. `/S`
     /// is `--silent`: the UI beside the runtime (this binary) never starts.
@@ -1341,6 +1364,11 @@ mod cases {
             (
                 "slash_s_installs_silently_with_no_ui",
                 slash_s_installs_silently_with_no_ui,
+            ),
+            #[cfg(windows)]
+            (
+                "a_malformed_setup_with_unknown_arguments_exits_without_a_notice",
+                a_malformed_setup_with_unknown_arguments_exits_without_a_notice,
             ),
             #[cfg(windows)]
             (
