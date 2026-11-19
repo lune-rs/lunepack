@@ -293,7 +293,8 @@ fn conclude(events: Events, last: &Event) {
 enum Operation {
     Install,
     Uninstall,
-    /// A setup run that ended before it knew the app (no name to show): its title is fixed.
+    /// A setup run that ended before it verified the app's name (a refused payload): its title
+    /// is fixed. A setup refused after that (its root) is an `Install` notice with the name.
     Setup,
 }
 
@@ -580,9 +581,13 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
             &alive,
         ) {
             Ok(prepared) => prepared,
-            Err(kind) => {
-                let kind = headless_fail(setup::COMMAND, kind);
-                notice(silent, false, SETUP_TITLE, Operation::Setup, kind);
+            Err(refused) => {
+                let kind = headless_fail(setup::COMMAND, refused.kind);
+                // A refused root comes after the payload was verified: the notice names the app.
+                match refused.name.as_deref() {
+                    Some(name) => notice(silent, false, name, Operation::Install, kind),
+                    None => notice(silent, false, SETUP_TITLE, Operation::Setup, kind),
+                }
                 return kind;
             }
         };
