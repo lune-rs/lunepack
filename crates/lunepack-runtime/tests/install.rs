@@ -117,7 +117,7 @@ static GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
 #[cfg(target_os = "macos")]
 type Gate = Box<dyn std::any::Any>;
 #[cfg(not(target_os = "macos"))]
-type Gate = ();
+struct Gate;
 
 #[cfg(target_os = "macos")]
 fn gate(alone: bool) -> Gate {
@@ -130,7 +130,9 @@ fn gate(alone: bool) -> Gate {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn gate(_alone: bool) -> Gate {}
+fn gate(_alone: bool) -> Gate {
+    Gate
+}
 
 /// One case's world: a release on a `file:` feed, a bootstrap tree, an empty home.
 struct Lab {
@@ -302,6 +304,7 @@ impl Lab {
     }
 
     /// The LaunchAgent the macOS install would write for `autostart` (this config has none).
+    #[cfg(target_os = "macos")]
     fn launch_agent(&self) -> PathBuf {
         self.home
             .join("Library/LaunchAgents")

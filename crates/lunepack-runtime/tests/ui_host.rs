@@ -1437,6 +1437,7 @@ mod native {
         }
 
         /// The LaunchAgent plist the macOS install would write for `autostart` (none here).
+        #[cfg(target_os = "macos")]
         fn launch_agent(&self) -> PathBuf {
             self.home
                 .join("Library/LaunchAgents")
