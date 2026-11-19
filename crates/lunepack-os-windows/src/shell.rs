@@ -17,7 +17,9 @@ pub enum MessageKind {
 }
 
 /// The user's per-user program files folder (`FOLDERID_UserProgramFiles`, by default
-/// `%LOCALAPPDATA%\Programs`), the parent of a per-user install root (M7-D2).
+/// `%LOCALAPPDATA%\Programs`), the parent of a per-user install root (M7-D2). The folder may not
+/// exist yet (a fresh profile): the path is returned unverified and an install creates it with the
+/// root.
 pub fn user_program_files() -> io::Result<PathBuf> {
     imp::known_folder(imp::Folder::UserProgramFiles)
 }
@@ -70,7 +72,7 @@ mod imp {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{
         FOLDERID_Programs, FOLDERID_UserProgramFiles, GetCurrentProcessExplicitAppUserModelID,
-        KF_FLAG_DEFAULT, SHGetKnownFolderPath, SetCurrentProcessExplicitAppUserModelID,
+        KF_FLAG_DONT_VERIFY, SHGetKnownFolderPath, SetCurrentProcessExplicitAppUserModelID,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AllowSetForegroundWindow, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
@@ -108,13 +110,20 @@ mod imp {
             Folder::Programs => &FOLDERID_Programs,
         };
         let mut raw: *mut u16 = std::ptr::null_mut();
-        // SAFETY: `id` is a valid `GUID` reference for the call; the flags are the default (no
-        // creation) and the token is null (the current user); `raw` is a valid out pointer. On
-        // success the system hands over a NUL-terminated string that this function frees with
-        // `CoTaskMemFree` after copying it; on failure `raw` may still need freeing, which is also
-        // done (a null pointer is accepted by `CoTaskMemFree`).
+        // SAFETY: `id` is a valid `GUID` reference for the call; the flags are
+        // `KF_FLAG_DONT_VERIFY` (the path is returned whether or not the folder exists, as on a
+        // fresh profile where `%LOCALAPPDATA%\Programs` is not created yet; nothing is created) and
+        // the token is null (the current user); `raw` is a valid out pointer. On success the system
+        // hands over a NUL-terminated string that this function frees with `CoTaskMemFree` after
+        // copying it; on failure `raw` may still need freeing, which is also done (a null pointer
+        // is accepted by `CoTaskMemFree`).
         let code = unsafe {
-            SHGetKnownFolderPath(id, KF_FLAG_DEFAULT as u32, std::ptr::null_mut(), &mut raw)
+            SHGetKnownFolderPath(
+                id,
+                KF_FLAG_DONT_VERIFY as u32,
+                std::ptr::null_mut(),
+                &mut raw,
+            )
         };
         let result = if code >= 0 && !raw.is_null() {
             // SAFETY: `raw` is non-null and NUL-terminated (the call succeeded), so scanning for
@@ -294,11 +303,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn the_known_folders_are_absolute_existing_directories() {
+    fn the_known_folders_are_absolute_and_the_programs_folder_exists() {
         for folder in [user_program_files(), start_menu_programs()] {
             let path = folder.expect("known folder");
             assert!(path.is_absolute(), "{path:?}");
         }
+        // `FOLDERID_UserProgramFiles` is returned unverified: a fresh profile has no such folder yet.
         assert!(start_menu_programs().expect("programs").is_dir());
     }
 }
