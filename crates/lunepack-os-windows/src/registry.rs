@@ -7,25 +7,30 @@ use std::os::windows::ffi::OsStrExt as _;
 
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, KEY_WRITE, REG_DWORD,
-    REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW,
-    RegDeleteValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE,
+    KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW,
+    RegDeleteKeyW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW, RegQueryInfoKeyW,
+    RegQueryValueExW, RegSetValueExW,
 };
 
 /// The most bytes of one value that are read; a longer value reads as [`Value::Other`].
 const MAX_VALUE_BYTES: u32 = 64 * 1024;
 
-/// A registry root (M10 adds the local machine).
+/// A registry root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Hive {
     /// `HKEY_CURRENT_USER`.
     CurrentUser,
+    /// `HKEY_LOCAL_MACHINE`: read only here (what another program registered per machine); per-user
+    /// installs never write it (M10's per-machine scope will).
+    LocalMachine,
 }
 
 impl Hive {
     fn handle(self) -> HKEY {
         match self {
             Hive::CurrentUser => HKEY_CURRENT_USER,
+            Hive::LocalMachine => HKEY_LOCAL_MACHINE,
         }
     }
 }
