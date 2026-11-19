@@ -1085,7 +1085,8 @@ fn a_dragged_bundle_is_adopted_by_its_first_check_which_then_finds_the_update() 
 fn a_failed_adoption_leaves_the_bundle_alone_and_records_no_current_version() {
     let _serial = common::serial();
     type Setup = Box<dyn Fn(&Mac)>;
-    let cases: Vec<(&str, Setup, Box<dyn Fn(&Error) -> bool>)> = vec![
+    type Want = Box<dyn Fn(&Error) -> bool>;
+    let cases: Vec<(&str, Setup, Want)> = vec![
         (
             "transport failure",
             Box::new(|mac: &Mac| {
@@ -1122,7 +1123,7 @@ fn a_failed_adoption_leaves_the_bundle_alone_and_records_no_current_version() {
         let inst = mac.open(&mac.bundle(), None).expect("installation");
         assert!(inst.adoptable(), "{what}");
         let got = check_with(&mac, &inst, CheckOptions::default());
-        assert!(got.as_ref().is_err_and(|e| want(e)), "{what}: {got:?}");
+        assert!(got.as_ref().is_err_and(&want), "{what}: {got:?}");
         assert_eq!(
             dump(&mac.fs, &mac.bundle()),
             before,
