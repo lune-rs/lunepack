@@ -137,6 +137,49 @@ pub fn install_first(
     Ok(out)
 }
 
+/// A fresh install of `version` (its manifest issued at `issued`) over an orphaned record (M8-D16:
+/// the bundle was removed by the user, so the record names a current version no tree holds; the
+/// caller proves that, under the lock, from reconcile's [`crate::LayoutError::Orphaned`]). Only
+/// the anti-rollback floors (root parts, key-set version, feed seq) carry over, so a replayed
+/// feed or an older root stays refused; `previous`, `pending`, `staged` (with `staged_issued`),
+/// `bad` and `health` are cleared, `current` is `version`, the install id is `install_id`, and the
+/// lifecycle events are exactly `installed` and `first_run` for `version`. The app id, scope and
+/// target are the record's, and unknown members and `critical` are kept as every writer keeps
+/// them (FORMAT.md 12.8).
+///
+/// A record with no current version is [`LifecycleError::NotInstalled`]: it is not orphaned, and
+/// takes [`install_first`].
+pub fn reinstall_orphaned(
+    s: &InstallState,
+    version: Version,
+    issued: u64,
+    install_id: [u8; INSTALL_ID_BYTES],
+) -> Result<InstallState, LifecycleError> {
+    user_only(s)?;
+    if s.current.is_none() {
+        return Err(LifecycleError::NotInstalled);
+    }
+    let mut out = s.next();
+    out.current = Some(CurrentRef {
+        version: version.clone(),
+        issued,
+    });
+    out.previous = None;
+    out.pending = None;
+    out.staged = None;
+    out.staged_issued = None;
+    out.bad = Vec::new();
+    out.health = None;
+    out.install_id = install_id;
+    out.lifecycle = lifecycle_of(vec![
+        LifecycleEvent::Installed {
+            version: version.clone(),
+        },
+        LifecycleEvent::FirstRun { version },
+    ]);
+    Ok(out)
+}
+
 /// Applies the staged `version` (C4): the old current becomes `previous`, `version` becomes
 /// current with the staged manifest's `issued` (so the floor time of FORMAT.md 11.3 is the
 /// running release's), and it is pending its health check with `token_sha256` recorded for its

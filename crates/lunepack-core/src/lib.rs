@@ -58,7 +58,8 @@ pub use frame::{
     CheckedFrame, FrameDesc, StreamDesc, check_file_frame, decode_verified, decoder_memory,
 };
 pub use fs::{
-    DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, ReadAt,
+    DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, PlaceFacts,
+    ReadAt,
 };
 pub use ident::{AppId, Channel};
 pub use integration::{
@@ -66,14 +67,16 @@ pub use integration::{
 };
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use layout::{
-    Discovery, LayoutScheme, NameRule, Projection, RootChoice, RootNaming, UserLayout, discover,
-    ensure_no_foreign_record, is_tombstone_of, reconcile_current, remove_tombstones, resolve_root,
-    root_valid_for_uninstall, tombstone_name, tree_candidates, version_config_path,
-    windows_name_ok,
+    BundleDiscovery, BundleProbe, Discovery, LayoutScheme, LocationReason, NameRule, Projection,
+    RootChoice, RootNaming, UserLayout, check_place, discover, discover_bundle,
+    ensure_no_foreign_record, is_tombstone_of, macos_name_ok, read_bundle_identity,
+    reconcile_bundle, reconcile_current, remove_tombstones, resolve_bundle_target, resolve_root,
+    root_valid_for_uninstall, set_bundle_pointer, tombstone_name, tree_candidates,
+    version_config_path, windows_name_ok, write_bundle_identity,
 };
 pub use lifecycle::{
     AttemptOutcome, ConfirmOutcome, TokenCheck, apply, confirm, count_attempt, deliver_events,
-    gc_keep, install_first, rollback,
+    gc_keep, install_first, reinstall_orphaned, rollback,
 };
 pub use limits::Limits;
 pub use manifest::{

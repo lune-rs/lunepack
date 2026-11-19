@@ -42,6 +42,9 @@ pub enum FsErrorKind {
     Locked,
     /// The (simulated) process crashed; nothing more can be done through this handle.
     Crashed,
+    /// The adapter, the OS or the volume does not support the operation (for
+    /// [`Fs::exchange`]: `ENOTSUP` from a volume with no atomic swap, M8-D3).
+    Unsupported,
     /// Anything else; the cause is in [`FsError::source`].
     Other,
 }
@@ -58,6 +61,7 @@ impl FsErrorKind {
             FsErrorKind::NotASymlink => "not a symlink",
             FsErrorKind::Locked => "locked",
             FsErrorKind::Crashed => "crashed",
+            FsErrorKind::Unsupported => "not supported",
             FsErrorKind::Other => "I/O failed",
         }
     }
@@ -199,6 +203,24 @@ pub struct DirEntryInfo {
     pub kind: FileKind,
 }
 
+/// Where an entry stands, as [`Fs::place`] reports it (M8-D4, M8-D17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceFacts {
+    /// The device (volume) the entry is on (`st_dev`).
+    pub device: u64,
+    /// The entry's inode number (`st_ino`).
+    pub inode: u64,
+    /// The volume is mounted read-only (`MNT_RDONLY` / `ST_RDONLY`).
+    pub read_only: bool,
+    /// The volume's file system type name (`statfs`'s `f_fstypename` on macOS; at most 15
+    /// bytes), such as `apfs`, `hfs` or `nullfs`; empty where the OS has none.
+    pub fs_type: String,
+    /// The entry is owned by the calling user (`st_uid` equals the effective user id).
+    pub owned_by_caller: bool,
+    /// The calling user may create and remove entries in it (`access(W_OK)` on a directory).
+    pub writable: bool,
+}
+
 /// Positional reads of one open file; `Send + Sync` so decoder threads can share one handle.
 pub trait ReadAt: Send + Sync {
     /// The file's length now.
@@ -299,4 +321,30 @@ pub trait Fs: Send + Sync {
     /// Takes the exclusive advisory lock on the file at `path`, creating it when the adapter needs
     /// one. `Ok(None)` means another holder has it; the lock is released when the guard drops.
     fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError>;
+
+    /// Atomically exchanges the entries at `a` and `b` (macOS `renamex_np(RENAME_SWAP)`, M8-D3):
+    /// afterwards the name `a` holds what `b` held and `b` what `a` held. Neither is followed when
+    /// it is a symlink. Both must exist ([`FsErrorKind::NotFound`]); a volume or OS with no atomic
+    /// swap is [`FsErrorKind::Unsupported`] and nothing is changed. Volatile until
+    /// [`Fs::sync_dir`] of both parents. The default is [`FsErrorKind::Unsupported`].
+    fn exchange(&self, a: &Path, b: &Path) -> Result<(), FsError> {
+        let _ = b;
+        Err(FsError::new(FsErrorKind::Unsupported, a, None).during("exchange"))
+    }
+
+    /// Where the entry at `path` stands ([`PlaceFacts`]): its device, inode and owner from
+    /// `lstat`, its volume's read-only flag and type, and whether the caller may write it. A
+    /// final symlink is not followed: a symlink at `path` is [`FsErrorKind::IsSymlink`], a missing
+    /// path [`FsErrorKind::NotFound`]. The default is [`FsErrorKind::Unsupported`].
+    fn place(&self, path: &Path) -> Result<PlaceFacts, FsError> {
+        Err(FsError::new(FsErrorKind::Unsupported, path, None).during("place"))
+    }
+
+    /// Creates the one directory `path`, readable, writable and searchable by its owner only
+    /// (mode `0700` on Unix), whose parent must exist; an existing entry at `path` is
+    /// [`FsErrorKind::AlreadyExists`] and is never changed. Volatile until [`Fs::sync_dir`] of the
+    /// parent. The default is [`FsErrorKind::Unsupported`].
+    fn create_dir_private(&self, path: &Path) -> Result<(), FsError> {
+        Err(FsError::new(FsErrorKind::Unsupported, path, None).during("mkdir"))
+    }
 }

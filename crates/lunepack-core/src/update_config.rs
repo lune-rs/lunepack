@@ -27,7 +27,7 @@ use crate::version::Version;
 /// The config's file name, at the version tree's root on Linux and Windows (FORMAT.md 13.1). Fixed
 /// for format 1, so any version's runtime finds another version's config at the same place.
 pub const UPDATE_CONFIG_FILE: &str = "lunepack-update.json";
-/// The config's path inside a macOS bundle tree (assumed until M8).
+/// The config's path inside a macOS bundle tree (M8-D1; [`crate::LayoutScheme::MACOS`]).
 pub const UPDATE_CONFIG_PATH_MACOS: &str = "Contents/Resources/lunepack-update.json";
 /// The runtime's file name on Linux and macOS targets, in the directory of `install.entry` (C4).
 pub const RUNTIME_FILE: &str = "lunepack-runtime";
