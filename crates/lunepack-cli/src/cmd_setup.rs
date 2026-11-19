@@ -10,7 +10,9 @@
 //! clock), the pack against the manifest; the runtime and the update config come from the pack
 //! through their signed frames (FORMAT.md 13.6), and the trailer carries the root the config names.
 //! The written file is then parsed back and verified as the runtime parses it. The output is a
-//! function of the release directory only (no time, no name), so two runs give the same bytes.
+//! function of the release directory only (no time, no name; a Windows setup file also depends on its
+//! output file name, which the stamped runtime carries as `OriginalFilename`), so two runs with the
+//! same inputs give the same bytes.
 //!
 //! A Windows setup file (M7-D1, M7-D11) is built the same way, with the runtime copy prepared first:
 //! its Authenticode certificate table (when the pack's runtime carries one) is stripped, it is

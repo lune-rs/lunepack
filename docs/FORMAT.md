@@ -1215,7 +1215,8 @@ Each payload part starts at an offset that is a multiple of 8 (zero bytes fill t
 the release directory's file byte for byte. The trailer also starts at a multiple of 8 (zero bytes
 follow the last part), so the file's length is a multiple of 8: Authenticode pads to 8 before a
 certificate table, and a signed file then keeps the trailer as the last bytes before the table. The writer is `lunepack setup` and its output is a
-function of the release directory alone; it is named `<app_id>-<ver>-<target>-setup`, with `.exe` appended
+function of the release directory (and, for a Windows file, of its output file name, which the stamped
+runtime carries); it is named `<app_id>-<ver>-<target>-setup`, with `.exe` appended
 for a `windows-*` target. Linux and Windows targets have setup files in this revision.
 
 On Windows the runtime part is the release's `lunepack-runtime.exe`, taken from the pack through its signed
