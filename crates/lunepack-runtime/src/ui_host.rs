@@ -216,6 +216,9 @@ struct Shared {
     child_id: ProcessId,
     spawned: Instant,
     done: AtomicBool,
+    /// The UI is this process's parent (`--ui-stdio`, [`UiHost::over_parent`]): it is never
+    /// stopped or waited for, only no longer written to.
+    peer: bool,
 }
 
 fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -544,6 +547,61 @@ impl UiHost {
             });
             return host;
         };
+        host.connect(bounds, hello, child, input, output, false);
+        host
+    }
+
+    /// The UI of an installer app (macOS, M8-D7): the UI is this process's parent, which started
+    /// it with `--ui-stdio`, and the frames go over this process's own standard output (`output`)
+    /// and input (`input`), as they would over a child's. Everything the UI sends is checked as a
+    /// child's is (C10). The parent is never signalled and never waited for: a UI that stalls,
+    /// hangs, breaks the protocol, exits or closes its end is no longer written to, and the run
+    /// goes on headless under the M6-D5 rules. `parent` names it (pid and start time), so its exit
+    /// is seen even while its end of the channel stays open. `LUNEPACK_NO_UI` does not apply: no
+    /// UI is started here.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn over_parent(
+        bounds: Bounds,
+        process: Arc<dyn Process>,
+        parent: ProcessId,
+        input: Box<dyn Read + Send>,
+        output: Box<dyn Write + Send>,
+        flow: Flow,
+        app: AppCard,
+        details: Details,
+    ) -> UiHost {
+        let mut host = UiHost::headless(flow);
+        let hello = EngineMsg::Hello {
+            build_id: ui::build_id(),
+            flow,
+            app,
+            details,
+        };
+        if hello.encode().is_err() {
+            return host;
+        }
+        let peer = Box::new(Parent {
+            process,
+            id: parent,
+            gone: false,
+        });
+        host.connect(bounds, hello, peer, output, input, true);
+        host
+    }
+
+    /// Starts the threads of a conversation with `child` over `input` (the UI's standard input)
+    /// and `output` (its standard output), and sends `hello`.
+    fn connect(
+        &mut self,
+        bounds: Bounds,
+        hello: EngineMsg,
+        child: Box<dyn Child>,
+        input: Box<dyn Write + Send>,
+        output: Box<dyn Read + Send>,
+        peer: bool,
+    ) {
+        let flow = self.flow;
         let (tx, rx) = mpsc::sync_channel::<EngineMsg>(WRITE_QUEUE);
         let (choice_tx, choice_rx) = mpsc::sync_channel(4);
         let shared = Arc::new(Shared {
@@ -566,6 +624,7 @@ impl UiHost {
             child: Mutex::new(child),
             spawned: Instant::now(),
             done: AtomicBool::new(false),
+            peer,
         });
         let threads = [
             spawn_named("lunepack-ui-writer", {
@@ -585,9 +644,8 @@ impl UiHost {
             shared.stop(UiStop::SpawnFailed, None);
         }
         shared.send(hello);
-        host.shared = Some(shared);
-        host.choices = Some(choice_rx);
-        host
+        self.shared = Some(shared);
+        self.choices = Some(choice_rx);
     }
 
     /// The sink that shows the run's events in the UI, when there is a UI.
@@ -778,18 +836,69 @@ impl UiHost {
             }
             // The writer writes what it holds, then ends, which closes the UI's input.
             guard(&shared.tx).take();
-            // A UI that ended by itself on a failure or a signal did not end normally, whatever
-            // the engine was doing when it did; the stop is then logged (a clean exit is not).
-            match shared.exit_status(shared.bounds.close_wait) {
-                Some(code) if code != Some(0) => shared.stop_exited(code),
-                Some(_) => {}
-                None => {
-                    let _ = guard(&shared.child).terminate(KILL_GRACE);
+            if shared.peer {
+                // The parent outlives this process: only the frames still queued are written,
+                // within the close bound.
+                let until = Instant::now() + shared.bounds.close_wait;
+                while shared.queued.load(Ordering::Acquire) > 0
+                    && !shared.stopped()
+                    && Instant::now() < until
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            } else {
+                // A UI that ended by itself on a failure or a signal did not end normally,
+                // whatever the engine was doing when it did; the stop is then logged (a clean
+                // exit is not).
+                match shared.exit_status(shared.bounds.close_wait) {
+                    Some(code) if code != Some(0) => shared.stop_exited(code),
+                    Some(_) => {}
+                    None => {
+                        let _ = guard(&shared.child).terminate(KILL_GRACE);
+                    }
                 }
             }
             shared.done.store(true, Ordering::Release);
         }
         self.report(events);
+    }
+}
+
+/// The parent that is the UI (`--ui-stdio`), in the place of a child. It is never signalled:
+/// [`Child::terminate`] does nothing, so a stop only ends the conversation. It counts as ended
+/// once no process runs with its pid and start time.
+struct Parent {
+    process: Arc<dyn Process>,
+    id: ProcessId,
+    gone: bool,
+}
+
+impl Child for Parent {
+    fn id(&self) -> ProcessId {
+        self.id
+    }
+
+    fn try_wait(&mut self) -> Result<Option<ExitKind>, lunepack_core::Error> {
+        if !self.gone {
+            // A look, not a wait; a process that cannot be read is taken to run.
+            self.gone = matches!(
+                self.process.wait_exit(&self.id, Duration::ZERO),
+                Ok(lunepack::WaitOutcome::Exited)
+            );
+        }
+        Ok(self.gone.then_some(ExitKind::Unknown))
+    }
+
+    fn terminate(&mut self, _grace: Duration) -> Result<(), lunepack_core::Error> {
+        Ok(())
+    }
+
+    fn take_stdin(&mut self) -> Option<Box<dyn Write + Send>> {
+        None
+    }
+
+    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+        None
     }
 }
 
@@ -1194,5 +1303,148 @@ mod tests {
         for code in [Some(0), Some(10), Some(11), Some(13), Some(1), None] {
             assert_eq!(UiStop::of_exit_code(code), UiStop::Exited);
         }
+    }
+
+    // ---- the UI as the parent (`--ui-stdio`, M8 step 8) ----
+
+    const PARENT: ProcessId = ProcessId {
+        pid: 4242,
+        start_ticks: 7,
+    };
+
+    /// A host over a parent UI: the fake's pipes stand in for this process's standard streams.
+    /// Returns the host and the parent's ends (what it reads, where it writes).
+    fn parent_host(process: &FakeProcess, bounds: Bounds) -> (UiHost, FakeChildPipes) {
+        let mut pipes = process
+            .spawn_child(&SpawnSpec {
+                program: PathBuf::from("/fake/pipes"),
+                args: Vec::new(),
+                env_set: Vec::new(),
+                env_remove: Vec::new(),
+                stdio: ChildStdio::Piped,
+            })
+            .expect("pipes");
+        let (output, input) = (
+            pipes.take_stdin().expect("stdin"),
+            pipes.take_stdout().expect("stdout"),
+        );
+        let ends = process.take_child_pipes(pipes.id()).expect("ends");
+        process.mark_running(PARENT);
+        let host = UiHost::over_parent(
+            bounds,
+            Arc::new(process.clone()),
+            PARENT,
+            input,
+            output,
+            Flow::Install,
+            card("App", "1.0.0", None),
+            Details {
+                location: None,
+                size_bytes: None,
+            },
+        );
+        (host, ends)
+    }
+
+    /// The parent UI: hello, pongs, `proceed` at the welcome; after `answer_welcome` frames it
+    /// stops reading when `stop_reading`.
+    fn parent_ui(ends: FakeChildPipes, stop_reading: bool) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let FakeChildPipes {
+                stdin: mut from_engine,
+                stdout: mut to_engine,
+            } = ends;
+            while let Ok(msg) = ui::read_frame::<_, EngineMsg>(&mut from_engine) {
+                let reply = match msg {
+                    EngineMsg::Hello { build_id, .. } => UiMsg::Hello { build_id },
+                    EngineMsg::Ping { n } => UiMsg::Pong { n },
+                    EngineMsg::Prompt { id, .. } => UiMsg::Choice {
+                        id,
+                        value: ChoiceValue::Proceed,
+                    },
+                    _ => continue,
+                };
+                let hello = matches!(reply, UiMsg::Hello { .. });
+                if ui::write_frame(&mut to_engine, &reply).is_err() {
+                    return;
+                }
+                if hello && stop_reading {
+                    // Holds both ends open and reads nothing more.
+                    std::thread::sleep(Duration::from_secs(3));
+                    return;
+                }
+            }
+        })
+    }
+
+    fn wait_stopped(host: &UiHost) -> Stopped {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(stopped) = host.stopped() {
+                return stopped;
+            }
+            assert!(Instant::now() < until, "the host never stopped the UI");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_parent_ui_answers_over_the_own_streams_and_its_exit_is_never_a_signal() {
+        let process = FakeProcess::new("/fake/lunepack-runtime");
+        let bounds = Bounds {
+            watch_tick: Duration::from_millis(20),
+            ..Bounds::default()
+        };
+        let (host, ends) = parent_host(&process, bounds);
+        let ui = parent_ui(ends, false);
+        let events = Events::new(None, None);
+        assert_eq!(
+            host.prompt(PromptKind::Welcome, &events, &mut |_| {}),
+            ChoiceValue::Proceed
+        );
+        // The parent is gone (its end of the channel may stay open, as a crashed parent's
+        // inherited descriptor would): the host stops talking and answers as when a UI is lost.
+        process.mark_exited(PARENT);
+        assert_eq!(wait_stopped(&host).reason, UiStop::Exited);
+        assert_eq!(
+            host.prompt(PromptKind::Done, &events, &mut |_| {}),
+            ChoiceValue::Finish { launch: false }
+        );
+        let start = Instant::now();
+        host.close(&events);
+        assert!(start.elapsed() < Duration::from_secs(2), "close waited");
+        ui.join().expect("ui");
+        assert!(process.terminated().is_empty(), "a process was signalled");
+    }
+
+    #[test]
+    fn a_parent_ui_that_stops_reading_is_dropped_and_never_signalled() {
+        let process = FakeProcess::new("/fake/lunepack-runtime");
+        process.set_pipe_capacity(256);
+        let bounds = Bounds {
+            stall: Duration::from_millis(100),
+            ping_every: Duration::from_millis(10),
+            pong_wait: Duration::from_millis(300),
+            close_wait: Duration::from_millis(300),
+            watch_tick: Duration::from_millis(20),
+            ..Bounds::default()
+        };
+        let (host, ends) = parent_host(&process, bounds);
+        let ui = parent_ui(ends, true);
+        let events = Events::new(None, None);
+        // Before any change: the lost answer is cancel (M6-D5).
+        assert_eq!(
+            host.prompt(PromptKind::Welcome, &events, &mut |_| {}),
+            ChoiceValue::Cancel
+        );
+        assert!(matches!(
+            wait_stopped(&host).reason,
+            UiStop::Stalled | UiStop::Hung
+        ));
+        let start = Instant::now();
+        host.close(&events);
+        assert!(start.elapsed() < Duration::from_secs(2), "close waited");
+        assert!(process.terminated().is_empty(), "a process was signalled");
+        ui.join().expect("ui");
     }
 }
