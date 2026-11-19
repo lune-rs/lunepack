@@ -10,12 +10,14 @@ mod cmd_pack;
 mod cmd_setup;
 mod cmd_verify;
 mod config;
+mod dmg;
 mod pipeline;
 mod place;
 mod plist;
 mod release_dir;
 mod stamp;
 mod state;
+mod zip;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
