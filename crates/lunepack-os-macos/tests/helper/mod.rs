@@ -6,6 +6,8 @@
 //! - `detach-then <exit|sleep> <mode> <arg>...`: starts this binary with `<mode> <arg>...` through
 //!   `MacProcess::spawn_detached`, then exits 0 (`exit`) or sleeps for 600 s (`sleep`).
 //! - `cat`: copies its standard input to its standard output until end of file.
+//! - `env-sleep <file> <secs> <name>...`: as `env`, then sleeps (an app started in the
+//!   background, M8-D13, that stays up to be identified).
 //!
 //! Every file is created atomically (`<file>.tmp`, then a rename).
 
@@ -28,6 +30,7 @@ const MODES: &[&str] = &[
     "pid-sleep",
     "detach-then",
     "cat",
+    "env-sleep",
 ];
 
 /// Runs the helper mode named by `args[0]` and never returns; `false` when `args` names no mode.
@@ -74,6 +77,17 @@ pub fn run(args: &[String]) -> bool {
                 text.push_str(&format!("{name} {}\n", if null { "null" } else { "other" }));
             }
             create(Path::new(&rest[0]), &text);
+        }
+        "env-sleep" => {
+            let text: String = rest[2..]
+                .iter()
+                .map(|name| match std::env::var_os(name) {
+                    Some(v) => format!("{name}={}\n", v.to_string_lossy()),
+                    None => format!("{name} unset\n"),
+                })
+                .collect();
+            create(Path::new(&rest[0]), &text);
+            sleep(&rest[1]);
         }
         "hold" => {
             let _file = std::fs::File::open(&rest[0]).expect("open the held file");

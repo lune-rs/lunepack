@@ -333,7 +333,9 @@ enum Watch {
 
 /// Watches the record (without the lock) and the child until the record changes, the child
 /// fails, or `timeout` runs out. An exit with status 0 is not a failure: a launcher may have
-/// handed off to another process of the same version, which may still confirm.
+/// handed off to another process of the same version, which may still confirm. Nor is an exit
+/// whose status is unknown (a background launch, M8-D13): the deadline decides, so an app started
+/// that way that crashes before it confirms is rolled back at the deadline, not at once.
 fn supervise(
     ad: &Adapters,
     store: &UserScope,
@@ -358,7 +360,7 @@ fn supervise(
             Ok(Some(ExitKind::Failure(_) | ExitKind::Signal(_))) => {
                 return Watch::Failed(Reason::Crashed);
             }
-            Ok(Some(ExitKind::Success) | None) | Err(_) => {}
+            Ok(Some(ExitKind::Success | ExitKind::Unknown) | None) | Err(_) => {}
         }
         let now = Instant::now();
         if now >= deadline {
@@ -495,7 +497,7 @@ fn relaunch_current(
     layout: &UserLayout,
     applying: &Version,
     unmoved: Option<bool>,
-    restart: &[OsString],
+    args: &ApplyArgs,
     events: &Events,
 ) {
     let unmoved = unmoved.or_else(|| {
@@ -515,13 +517,27 @@ fn relaunch_current(
     };
     let relaunch = SpawnSpec {
         program: entry,
-        args: restart.to_vec(),
+        args: args.restart.clone(),
         env_set: Vec::new(),
         env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
         stdio: ChildStdio::Null,
     };
-    if ad.process.spawn_detached(&relaunch).is_err() {
+    if start_unsupervised(ad, &relaunch, args.background).is_err() {
         events.emit(&Event::warning(Warning::RelaunchFailed, Some(version)));
+    }
+}
+
+/// Starts a version nobody supervises (a relaunch, the start after a rollback): detached, or with
+/// `--background` through the background start (M8-D13), whose handle is dropped at once. Dropping
+/// it never ends the app: it only stops watching it.
+fn start_unsupervised(ad: &Adapters, spec: &SpawnSpec, background: bool) -> Result<(), ()> {
+    if background {
+        ad.process
+            .spawn_app_background(spec)
+            .map(drop)
+            .map_err(drop)
+    } else {
+        ad.process.spawn_detached(spec).map_err(drop)
     }
 }
 
@@ -643,7 +659,7 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
             // The app has exited for this apply; nothing was committed, so it starts again as
             // the version it was, unless the record moved on (F10, F17, F19, F21). The failure
             // stays the exit kind.
-            relaunch_current(ad, inst, &layout, v, unmoved, &args.restart, events);
+            relaunch_current(ad, inst, &layout, v, unmoved, args, events);
             return End::Failed(kind);
         }
     };
@@ -663,7 +679,13 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
         env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
         stdio: ChildStdio::Null,
     };
-    let mut child = ad.process.spawn_child(&spec).ok();
+    // `--background` (M8-D13): started without coming to the front; its exit status is then not
+    // observable, and supervision leaves that case to the deadline.
+    let mut child = if args.background {
+        ad.process.spawn_app_background(&spec).ok()
+    } else {
+        ad.process.spawn_child(&spec).ok()
+    };
     drop(spec);
 
     let timeout_secs = applied
@@ -708,7 +730,7 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
                     env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
                     stdio: ChildStdio::Null,
                 };
-                if ad.process.spawn_detached(&relaunch).is_err() {
+                if start_unsupervised(ad, &relaunch, args.background).is_err() {
                     events.emit(&Event::warning(
                         Warning::RelaunchFailed,
                         Some(previous.tree_version()),
@@ -1181,5 +1203,149 @@ mod tests {
                 assert_eq!(tree.parent(), Some(layout.versions_dir().as_path()));
             }
         }
+    }
+
+    // ---- the background start (M8-D13) ---------------------------------------------------------
+
+    use std::ffi::OsString;
+    use std::time::{Duration, Instant};
+
+    use lunepack::HEALTH_TOKEN_VAR;
+    use lunepack_core::{ExitKind, Process, ProcessId};
+    use lunepack_testkit::ChildScript;
+
+    use super::{Decided, Watch, apply_inner, decide, store_of, supervise};
+    use crate::events::Reason;
+    use crate::modes::ApplyArgs;
+
+    /// The apply of `version` with `--background` or not; the wait target has exited already.
+    fn apply_args(version: &str, background: bool) -> ApplyArgs {
+        ApplyArgs {
+            wait: ProcessId {
+                pid: 999,
+                start_ticks: 9,
+            },
+            version: v(version),
+            restart: vec![OsString::from("--after")],
+            no_ui: true,
+            background,
+        }
+    }
+
+    /// Which start each spawn of the fake was: `bg`, `child` or `detached`.
+    fn starts(mac: &Mac) -> Vec<&'static str> {
+        mac.process
+            .spawns()
+            .iter()
+            .map(|s| match (s.detached, s.background) {
+                (true, _) => "detached",
+                (false, true) => "bg",
+                (false, false) => "child",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_new_version_and_the_rollback_start_use_the_background_start_when_asked() {
+        for (background, want) in [(true, ["bg", "bg"]), (false, ["child", "detached"])] {
+            let mac = mac();
+            let inst = mac.open();
+            // The new version crashes at once: rolled back, the previous version started again.
+            mac.process
+                .script_child(ChildScript::exits(0, ExitKind::Failure(1)));
+            let events = Events::new(None, None);
+            let end = apply_inner(&mac.ad, &inst, &apply_args("1.1.0", background), &events);
+            assert!(
+                matches!(&end, super::End::RolledBack(p) if p == &v("1.0.0")),
+                "background {background}"
+            );
+            assert_eq!(starts(&mac), want, "background {background}");
+            let spawns = mac.process.spawns();
+            // Both from the live bundle; the token only in the new version's environment, and
+            // never as an argument.
+            for s in &spawns {
+                assert_eq!(s.program, bundle().join("Contents/MacOS/hello"));
+                assert_eq!(s.args, vec![OsString::from("--after")]);
+            }
+            assert!(spawns[0].env_set.iter().any(|(k, _)| k == HEALTH_TOKEN_VAR));
+            assert!(spawns[1].env_set.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_relaunch_after_a_refused_apply_uses_the_background_start_when_asked() {
+        for (background, want) in [(true, "bg"), (false, "detached")] {
+            let mac = mac();
+            let inst = mac.open();
+            let events = Events::new(None, None);
+            // 1.2.0 is not staged: nothing is committed and 1.0.0 starts again.
+            let end = apply_inner(&mac.ad, &inst, &apply_args("1.2.0", background), &events);
+            assert!(matches!(end, super::End::Failed(Kind::NothingStaged)));
+            assert_eq!(starts(&mac), [want], "background {background}");
+            let spawn = &mac.process.spawns()[0];
+            assert!(spawn.env_set.is_empty());
+            assert_eq!(spawn.env_remove, vec![OsString::from(HEALTH_TOKEN_VAR)]);
+        }
+    }
+
+    #[test]
+    fn an_unknown_exit_is_left_to_the_deadline_and_to_the_record() {
+        let mac = mac();
+        let inst = mac.open();
+        let layout = inst.layout().cloned().expect("layout");
+        let events = Events::new(None, None);
+        let applied = commit_apply(&mac.ad, &inst, &layout, &v("1.1.0"), &events)
+            .map_err(|r| r.kind)
+            .expect("apply");
+        let store = store_of(&inst, &layout);
+        let spec = lunepack_core::SpawnSpec::new(bundle().join("Contents/MacOS/hello"));
+
+        // Gone before it confirmed, status unknown: not a crash; the deadline decides.
+        mac.process
+            .script_child(ChildScript::exits(0, ExitKind::Unknown));
+        let mut child = mac.process.spawn_app_background(&spec).expect("start");
+        let started = Instant::now();
+        let watch = supervise(
+            &mac.ad,
+            &store,
+            &v("1.1.0"),
+            &applied.token_sha256,
+            child.as_mut(),
+            started + Duration::from_millis(400),
+        );
+        assert!(matches!(watch, Watch::Failed(Reason::Timeout)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "not at once"
+        );
+
+        // Gone after it confirmed: the record decides, a success.
+        let rec = mac_record(&mac, &layout);
+        let (confirmed, _) = lunepack_core::confirm(
+            &rec,
+            &v("1.1.0"),
+            lunepack_core::TokenCheck::Presented(applied.token_sha256),
+        )
+        .expect("confirm");
+        let loaded = store.load(&mac.fs, &FakeHasher).expect("load");
+        store
+            .commit(&mac.fs, &loaded, &confirmed, &FakeHasher)
+            .expect("commit");
+        mac.process
+            .script_child(ChildScript::exits(0, ExitKind::Unknown));
+        let mut child = mac.process.spawn_app_background(&spec).expect("start");
+        let watch = supervise(
+            &mac.ad,
+            &store,
+            &v("1.1.0"),
+            &applied.token_sha256,
+            child.as_mut(),
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert!(matches!(watch, Watch::Changed));
+        assert!(matches!(
+            decide(&mac.ad, &inst, &layout, &v("1.1.0"), &applied.token_sha256),
+            Ok(Decided::Confirmed)
+        ));
     }
 }

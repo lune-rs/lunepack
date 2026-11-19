@@ -527,6 +527,11 @@ const BAD_LINES: &[&[&str]] = &[
     &["confirm", "--expect-schema", "x"],
     &["confirm", "--expect-schema", "1", "--expect-schema", "1"],
     &["confirm", "--wait-pid", "42"],
+    // `--background` (M8-D13): `apply-and-restart` only, once.
+    &["check", "--background"],
+    &["download", "--background"],
+    &["apply-and-restart", "--background", "--background"],
+    &["apply-and-restart", "--background=1"],
     &["apply-and-restart", "--wait-pid"],
     &["apply-and-restart", "--wait-pid", "0"],
     &["apply-and-restart", "--wait-pid", "1"],
@@ -1285,6 +1290,10 @@ fn apply_and_restart_with_nothing_staged_or_another_version_starts_nothing() {
         "apply-and-restart: error: nothing_staged (exit 12)\n"
     );
     assert_eq!(lab.log(), "");
+    // `--background` is part of the grammar on every OS (M8-D13): the same answer.
+    let run = lab.cmd(&["apply-and-restart", "--background", "--json"]);
+    assert_eq!(run.code, 12, "{run:?}");
+    assert_eq!(run.line(), golden(GOLDEN_NOTHING_STAGED));
 
     let lab = Lab::staged();
     let run = lab.cmd(&["apply-and-restart", "--json", "--expect-version", "1.2.0"]);

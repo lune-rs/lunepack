@@ -77,6 +77,13 @@ pub struct ApplyOptions {
     pub restart_args: Vec<OsString>,
     /// Whether the applier shows its update window.
     pub ui: UiChoice,
+    /// Start the new version (and, after a rollback, the previous one) without bringing it to the
+    /// front (`apply --background`, M8-D13). macOS only: elsewhere the option is passed on and
+    /// changes nothing. With it, a version that crashes before it confirms its health is rolled
+    /// back at the health deadline rather than at once (macOS gives an app's exit status only to
+    /// its parent, and an app started this way is not the applier's child), and an app that
+    /// activates itself in code still comes to the front.
+    pub background: bool,
 }
 
 impl fmt::Debug for ApplyOptions {
@@ -87,6 +94,7 @@ impl fmt::Debug for ApplyOptions {
             .field("wait_for", &self.wait_for)
             .field("restart_args", &self.restart_args.len())
             .field("ui", &self.ui)
+            .field("background", &self.background)
             .finish()
     }
 }
@@ -448,8 +456,9 @@ pub fn apply_and_restart(options: ApplyOptions) -> Result<ApplyScheduled, Error>
 
 /// Starts `inst`'s own runtime, detached, to apply the staged version once the waited-for process
 /// (by default this one) has exited:
-/// `lunepack-runtime apply --wait-pid <pid> --wait-start <ticks> --version <v> [--no-ui] --
-/// <restart args>` (`--no-ui` for [`UiChoice::Never`]), with no health token in its environment.
+/// `lunepack-runtime apply --wait-pid <pid> --wait-start <ticks> --version <v> [--no-ui]
+/// [--background] -- <restart args>` (`--no-ui` for [`UiChoice::Never`], `--background` for
+/// [`ApplyOptions::background`]), with no health token in its environment.
 /// The caller exits next.
 ///
 /// The staged version is read again (C9): none, one that is not usable (FORMAT.md 12.7), a tree
@@ -485,6 +494,9 @@ pub fn apply_and_restart_for(
     .collect();
     if options.ui == UiChoice::Never {
         args.push(OsString::from("--no-ui"));
+    }
+    if options.background {
+        args.push(OsString::from("--background"));
     }
     args.push(OsString::from("--"));
     args.extend(options.restart_args);

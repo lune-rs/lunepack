@@ -226,7 +226,7 @@ fn exit_code(kind: ExitKind) -> Option<i32> {
     match kind {
         ExitKind::Success => Some(0),
         ExitKind::Failure(code) => Some(code),
-        ExitKind::Signal(_) => None,
+        ExitKind::Signal(_) | ExitKind::Unknown => None,
     }
 }
 

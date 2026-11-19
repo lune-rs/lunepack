@@ -903,6 +903,7 @@ fn a_staged_version_starts_the_own_runtime_detached_with_exactly_this_argv() {
             wait_for: None,
             restart_args: vec!["--flag".into(), "two words".into()],
             ui: UiChoice::Auto,
+            background: false,
         },
     )
     .expect("scheduled");
@@ -966,6 +967,31 @@ fn a_staged_version_starts_the_own_runtime_detached_with_exactly_this_argv() {
         &args[7..],
         &["--no-ui", "--", "--no-ui"].map(OsString::from)
     );
+    // In the background (M8-D13): `--background` before the separator, and only when asked; the
+    // spawn of the applier itself is detached as always.
+    apply_and_restart_for(
+        &inst,
+        ApplyOptions {
+            restart_args: vec!["--background".into()],
+            ui: UiChoice::Never,
+            background: true,
+            ..ApplyOptions::default()
+        },
+    )
+    .expect("scheduled");
+    let spawn = &lab.process.spawns()[3];
+    assert!(spawn.detached && !spawn.background);
+    assert_eq!(
+        &spawn.args[7..],
+        &["--no-ui", "--background", "--", "--background"].map(OsString::from)
+    );
+    for (i, spawn) in lab.process.spawns()[..3].iter().enumerate() {
+        let before = spawn.args.iter().take_while(|a| *a != "--");
+        assert!(
+            !before.into_iter().any(|a| a == "--background"),
+            "spawn {i} carries --background"
+        );
+    }
 }
 
 #[test]

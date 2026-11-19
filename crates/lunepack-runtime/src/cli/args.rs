@@ -3,8 +3,10 @@
 //!
 //! Global options: `--json` (a flag) and `--expect-schema <N>`. `check` and `download` take
 //! `--channel <name>`; `download` and `apply-and-restart` take `--expect-version <version>`;
-//! `apply-and-restart` takes `--wait-pid <pid>` (a pid above 1) and the flag `--no-ui` (the
-//! applier shows no update window); `startup` and `apply-and-restart` take `-- <args>`.
+//! `apply-and-restart` takes `--wait-pid <pid>` (a pid above 1), the flag `--no-ui` (the
+//! applier shows no update window) and the flag `--background` (the new version starts without
+//! coming to the front; macOS only, accepted and without effect elsewhere, M8-D13); `startup` and
+//! `apply-and-restart` take `-- <args>`.
 //! Each option is allowed once, and anything else (an unknown name, a repeat, a value that does not
 //! parse, a missing value, `=` forms, a stray word) is a [`UsageError`] that names nothing of
 //! the arguments. Nothing happens before the whole line has been parsed.
@@ -73,6 +75,9 @@ pub struct Parsed {
     pub wait_pid: Option<u32>,
     /// `--no-ui`: the applier `apply-and-restart` starts shows no update window (D41).
     pub no_ui: bool,
+    /// `--background`: the applier starts the new version without bringing it to the front
+    /// (M8-D13; macOS only).
+    pub background: bool,
     /// The arguments after `--`: the app's own arguments (`startup`, which a rolled-back start
     /// passes on), or the arguments the new version is started with (`apply-and-restart`).
     pub passed_args: Vec<OsString>,
@@ -92,6 +97,7 @@ impl std::fmt::Debug for Parsed {
             )
             .field("wait_pid", &self.wait_pid)
             .field("no_ui", &self.no_ui)
+            .field("background", &self.background)
             .field("passed_args", &self.passed_args.len())
             .finish()
     }
@@ -114,6 +120,7 @@ pub fn parse(command: Command, rest: &[OsString]) -> Result<Parsed, UsageError> 
         expect_version: None,
         wait_pid: None,
         no_ui: false,
+        background: false,
         passed_args: Vec::new(),
     };
     let mut i = 0;
@@ -139,6 +146,14 @@ pub fn parse(command: Command, rest: &[OsString]) -> Result<Parsed, UsageError> 
                 return Err(UsageError);
             }
             parsed.no_ui = true;
+            i += 1;
+            continue;
+        }
+        if name == "--background" {
+            if parsed.background || command != Command::ApplyAndRestart {
+                return Err(UsageError);
+            }
+            parsed.background = true;
             i += 1;
             continue;
         }
@@ -252,7 +267,18 @@ mod tests {
         )
         .expect("parse");
         assert!(p.no_ui);
+        assert!(!p.background);
         assert_eq!(p.passed_args, os(&["--no-ui"]));
+        // `--background` (M8-D13), alone or with `--no-ui`; after `--` it is the app's.
+        let p = parse(
+            Command::ApplyAndRestart,
+            &os(&["--background", "--no-ui", "--", "--background"]),
+        )
+        .expect("parse");
+        assert!(p.background && p.no_ui);
+        assert_eq!(p.passed_args, os(&["--background"]));
+        let p = parse(Command::ApplyAndRestart, &os(&["--", "--background"])).expect("parse");
+        assert!(!p.background);
     }
 
     #[test]
@@ -311,6 +337,13 @@ mod tests {
             (Command::ApplyAndRestart, &["--no-ui", "--no-ui"]),
             (Command::ApplyAndRestart, &["--no-ui=1"]),
             (Command::ApplyAndRestart, &["--no-ui", "1"]),
+            (Command::ApplyAndRestart, &["--background", "--background"]),
+            (Command::ApplyAndRestart, &["--background=1"]),
+            (Command::ApplyAndRestart, &["--background", "1"]),
+            (Command::Check, &["--background"]),
+            (Command::Download, &["--background"]),
+            (Command::Startup, &["--background"]),
+            (Command::Confirm, &["--background"]),
             (Command::Check, &["--no-ui"]),
             (Command::Download, &["--no-ui"]),
             (Command::Startup, &["--no-ui"]),
