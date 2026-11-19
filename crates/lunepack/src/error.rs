@@ -4,8 +4,8 @@
 //! file names and origins, and the facade adds fixed text.
 
 use lunepack_core::{
-    FsError, IntegrationError, LayoutError, LifecycleError, ProcessError, ProcessErrorKind,
-    RangeError, RelPath, StateError, TransportError, UpdateConfigError,
+    FsError, IntegrationError, LayoutError, LifecycleError, LocationReason, ProcessError,
+    ProcessErrorKind, RangeError, RelPath, StateError, TransportError, UpdateConfigError,
 };
 
 /// Every way an [`Updater`](crate::Updater) operation fails.
@@ -111,6 +111,16 @@ pub enum Error {
     /// There is no previous version to roll back to.
     #[error("no previous version to roll back to")]
     RollbackUnavailable,
+    /// The running tree or the install's bundle is somewhere lunepack does not update (macOS,
+    /// M8-D4): translocated by Gatekeeper, on a read-only volume (a mounted disk image), on
+    /// another volume than the install's versions, not owned by the user, or in a folder the user
+    /// cannot write. The reason is one of a closed set; the fix is the same for all of them: move
+    /// the app to the user's Applications folder and open it from there.
+    #[error("unsupported location: {reason}")]
+    UnsupportedLocation {
+        /// Why the place is refused.
+        reason: LocationReason,
+    },
 }
 
 /// Sorts a core error into the variant an app can act on: a disk failure is [`Error::Fs`] (so
@@ -127,6 +137,15 @@ impl From<lunepack_core::Error> for Error {
             lunepack_core::Error::Integration(e) => Error::from(e),
             lunepack_core::Error::Lifecycle(e) => Error::from(e),
             lunepack_core::Error::Layout(LayoutError::Fs(e)) => Error::Fs(e),
+            // M8-D4: the place is not one lunepack updates.
+            lunepack_core::Error::Layout(LayoutError::Location(reason)) => {
+                Error::UnsupportedLocation { reason }
+            }
+            // M8-D16: the bundle the record names is gone and no tree holds its version; for the
+            // app that runs, this install does not exist.
+            lunepack_core::Error::Layout(LayoutError::Orphaned) => Error::NotInstalled,
+            // M8-D1: both names a first install may use in the Applications folder are taken.
+            lunepack_core::Error::Layout(LayoutError::BundleNameTaken) => Error::ForeignInstallRoot,
             // M7-D15: the display name cannot be the install folder's name (exit `config`).
             lunepack_core::Error::Layout(LayoutError::NameNotAllowed(_)) => {
                 Error::UpdateConfig(UpdateConfigError::Invalid {
