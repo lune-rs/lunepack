@@ -426,6 +426,10 @@ mod cases {
             let keys_part = place(&ks_bytes);
             let manifest_part = place(&manifest);
             let pack_part = place(&pack);
+            // As `lunepack setup` writes it: the trailer starts 8-aligned (F5).
+            while !(bytes.len() as u64).is_multiple_of(PART_ALIGN) {
+                bytes.push(0);
+            }
             let trailer = SetupTrailer {
                 root,
                 version: Version::parse(V100).expect("version"),
@@ -925,8 +929,9 @@ mod cases {
         let lab = Lab::new(Twist::default());
         let good = lab.bytes();
         let t = lab.trailer();
-        // A payload byte short, the trailer kept: its parts no longer fit.
-        let mut cut = good[..good.len() - TRAILER_SIZE as usize - 1].to_vec();
+        // A payload byte short (the pack's last, and the alignment padding after it), the trailer
+        // kept: its parts no longer fit.
+        let mut cut = good[..(t.pack.offset + t.pack.length - 1) as usize].to_vec();
         cut.extend_from_slice(&good[good.len() - TRAILER_SIZE as usize..]);
         lab.write_setup(&cut);
         let run = lab.run(&[], None);
