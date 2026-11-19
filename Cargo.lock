@@ -2123,6 +2123,7 @@ dependencies = [
  "lunepack-fs",
  "lunepack-http",
  "lunepack-os-linux",
+ "lunepack-os-macos",
  "lunepack-os-windows",
  "lunepack-testkit",
  "serde",
