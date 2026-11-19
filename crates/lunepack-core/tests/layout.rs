@@ -2028,6 +2028,188 @@ mod bundle {
         assert_eq!(discover_real(&fs, &moved, "1.0.0").unwrap(), moved_from);
     }
 
+    // ---- a bundle replaced at the live bundle's own path (M8-D16 amended, Revision 4) ---------
+
+    /// A live install of 1.0.0 whose bundle the user replaced at its own path by `version` (a new
+    /// directory, so a new inode): Finder's Replace, or Trash and drag back.
+    fn replaced_by(version: &str) -> (MemFs, UserLayout) {
+        let (fs, l) = installed(Some("1.0.0"), &[]);
+        store(&fs, &l, &record("1.0.0"));
+        let old = fs.place(&bundle()).unwrap().inode;
+        fs.remove_dir_all_nofollow(&bundle()).unwrap();
+        put_tree(&fs, &bundle(), version);
+        assert_ne!(fs.place(&bundle()).unwrap().inode, old, "a new directory");
+        (fs, l)
+    }
+
+    #[test]
+    fn a_newer_bundle_dragged_over_the_live_one_is_adoptable() {
+        let (fs, l) = replaced_by("1.2.0");
+        assert!(lunepack_core::bundle_replaced(
+            &fs,
+            &l,
+            &record("1.0.0"),
+            &bundle()
+        ));
+        let ops = fs.op_count();
+        assert_eq!(discover_real(&fs, &bundle(), "1.2.0").unwrap(), adoptable());
+        assert_eq!(fs.op_count(), ops, "discovery wrote nothing");
+        // The state reconcile cannot heal (which made the app's start fail before).
+        assert!(matches!(
+            reconcile_bundle(&fs, &l, &record("1.0.0")),
+            Err(LayoutError::BundleMissing)
+        ));
+    }
+
+    #[test]
+    fn a_replaced_bundle_whose_identity_was_already_written_is_still_adoptable() {
+        // An adoption cut after its first write (the identity of the new bundle).
+        let (fs, l) = replaced_by("1.2.0");
+        write_bundle_identity(&fs, &l, &bundle()).unwrap();
+        let facts = fs.place(&bundle()).unwrap();
+        assert_eq!(
+            read_bundle_identity(&fs, &l).unwrap(),
+            Some((facts.device, facts.inode))
+        );
+        assert_eq!(discover_real(&fs, &bundle(), "1.2.0").unwrap(), adoptable());
+    }
+
+    #[test]
+    fn a_same_version_copy_dragged_back_to_the_live_path_is_installed() {
+        let (fs, l) = replaced_by("1.0.0");
+        assert!(!lunepack_core::bundle_replaced(
+            &fs,
+            &l,
+            &record("1.0.0"),
+            &bundle()
+        ));
+        assert_eq!(
+            discover_real(&fs, &bundle(), "1.0.0").unwrap(),
+            installed_as("1.0.0")
+        );
+        // The reconcile that follows records the new directory.
+        reconcile_bundle(&fs, &l, &record("1.0.0")).unwrap();
+        let facts = fs.place(&bundle()).unwrap();
+        assert_eq!(
+            read_bundle_identity(&fs, &l).unwrap(),
+            Some((facts.device, facts.inode))
+        );
+        assert_eq!(version_at(&fs, &bundle()).as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn a_bundle_mid_update_is_installed_not_replaced() {
+        // The record names 2.0.0; the bundle still holds 1.0.0 and 2.0.0 waits in the version
+        // tree, the swap slot or the out slot (an update cut after its record commit).
+        for slot in ["versions", "swap", "out"] {
+            let (fs, l) = installed(Some("1.0.0"), &[]);
+            store(&fs, &l, &record("2.0.0"));
+            let at = match slot {
+                "versions" => l.version_dir(&v("2.0.0")),
+                "swap" => l.swap_slot(),
+                _ => l.out_slot(),
+            };
+            put_tree(&fs, &at, "2.0.0");
+            assert!(
+                !lunepack_core::bundle_replaced(&fs, &l, &record("2.0.0"), &bundle()),
+                "{slot}"
+            );
+            assert_eq!(
+                discover_real(&fs, &bundle(), "1.0.0").unwrap(),
+                installed_as("1.0.0"),
+                "{slot}"
+            );
+            reconcile_bundle(&fs, &l, &record("2.0.0")).unwrap_or_else(|e| panic!("{slot}: {e:?}"));
+            assert_eq!(
+                version_at(&fs, &bundle()).as_deref(),
+                Some("2.0.0"),
+                "{slot}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_replaced_bundle_outside_an_apps_folder_is_not_installed() {
+        // The install followed its bundle to the Desktop earlier; there it is replaced.
+        let (fs, l) = installed(Some("1.0.0"), &[]);
+        store(&fs, &l, &record("1.0.0"));
+        let desk = home().join("Desktop").join("Hello.app");
+        fs.create_dir_all(desk.parent().unwrap()).unwrap();
+        fs.rename(&bundle(), &desk).unwrap();
+        set_bundle_pointer(&fs, &l, &desk).unwrap();
+        write_bundle_identity(&fs, &l, &desk).unwrap();
+        assert_eq!(
+            discover_real(&fs, &desk, "1.0.0").unwrap(),
+            installed_as("1.0.0")
+        );
+        fs.remove_dir_all_nofollow(&desk).unwrap();
+        put_tree(&fs, &desk, "1.2.0");
+        assert_eq!(
+            discover_real(&fs, &desk, "1.2.0").unwrap(),
+            BundleDiscovery::NotInstalled
+        );
+    }
+
+    #[test]
+    fn a_replaced_bundle_with_an_unreadable_record_stays_installed() {
+        // Unreadable: the record's file cut short.
+        let (fs, l) = replaced_by("1.2.0");
+        for entry in fs.list_dir(&l.state_dir()).unwrap() {
+            if entry.name.to_string_lossy().ends_with(".rec") {
+                fs.truncate(&l.state_dir().join(&entry.name), 5).unwrap();
+            }
+        }
+        assert_eq!(
+            discover_real(&fs, &bundle(), "1.2.0").unwrap(),
+            installed_as("1.2.0")
+        );
+        // Another app's record, written by the core's writer.
+        let (fs, l) = installed(Some("1.0.0"), &[]);
+        let other = AppId::parse("com.other.app").unwrap();
+        let mut foreign = record("1.0.0");
+        foreign.app_id = other.clone();
+        let loaded =
+            lunepack_core::state::load::<InstallState>(&fs, &l.state_dir(), &other, &FakeHasher)
+                .unwrap();
+        lunepack_core::state::commit(&fs, &l.state_dir(), &loaded, &foreign, &FakeHasher).unwrap();
+        fs.remove_dir_all_nofollow(&bundle()).unwrap();
+        put_tree(&fs, &bundle(), "1.2.0");
+        assert_eq!(
+            discover_real(&fs, &bundle(), "1.2.0").unwrap(),
+            installed_as("1.2.0")
+        );
+    }
+
+    #[test]
+    fn bundle_replaced_is_false_for_what_it_cannot_judge() {
+        let rec = record("1.0.0");
+        // The bundle's config cannot be read.
+        let (fs, l) = replaced_by("1.2.0");
+        fs.remove_file(&config_file(&bundle())).unwrap();
+        assert!(!lunepack_core::bundle_replaced(&fs, &l, &rec, &bundle()));
+        // A slot holds another app's tree.
+        let (fs, l) = replaced_by("1.2.0");
+        let mut foreign = mac_config("0.5.0");
+        foreign.app_id = AppId::parse("com.other.app").unwrap();
+        put_tree_of(&fs, &l.swap_slot(), &foreign);
+        assert!(!lunepack_core::bundle_replaced(&fs, &l, &rec, &bundle()));
+        // The pointer names another path than the tree asked about.
+        let (fs, l) = replaced_by("1.2.0");
+        let elsewhere = abs_path("/Applications/Hello.app");
+        put_tree(&fs, &elsewhere, "1.2.0");
+        assert!(!lunepack_core::bundle_replaced(&fs, &l, &rec, &elsewhere));
+        // The bundle is another app's.
+        let (fs, l) = replaced_by("1.2.0");
+        fs.remove_dir_all_nofollow(&bundle()).unwrap();
+        put_tree_of(&fs, &bundle(), &foreign);
+        assert!(!lunepack_core::bundle_replaced(&fs, &l, &rec, &bundle()));
+        // And nothing was written by any of it.
+        let (fs, l) = replaced_by("1.2.0");
+        let ops = fs.op_count();
+        assert!(lunepack_core::bundle_replaced(&fs, &l, &rec, &bundle()));
+        assert_eq!(fs.op_count(), ops);
+    }
+
     #[test]
     fn a_bundle_in_the_trash_is_not_installed() {
         let (fs, l) = installed(Some("1.0.0"), &[]);

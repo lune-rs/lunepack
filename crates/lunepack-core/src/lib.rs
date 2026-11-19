@@ -68,11 +68,11 @@ pub use integration::{
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use layout::{
     BundleDiscovery, BundleProbe, Discovery, LayoutScheme, LocationReason, NameRule, Projection,
-    RootChoice, RootNaming, UserLayout, bundle_orphaned, check_place, discover, discover_bundle,
-    ensure_no_foreign_record, is_tombstone_of, macos_name_ok, read_bundle_identity,
-    reconcile_bundle, reconcile_current, remove_tombstones, resolve_bundle_target, resolve_root,
-    root_valid_for_uninstall, set_bundle_pointer, tombstone_name, tree_candidates,
-    version_config_path, windows_name_ok, write_bundle_identity,
+    RootChoice, RootNaming, UserLayout, bundle_orphaned, bundle_replaced, check_place, discover,
+    discover_bundle, ensure_no_foreign_record, is_tombstone_of, macos_name_ok,
+    read_bundle_identity, reconcile_bundle, reconcile_current, remove_tombstones,
+    resolve_bundle_target, resolve_root, root_valid_for_uninstall, set_bundle_pointer,
+    tombstone_name, tree_candidates, version_config_path, windows_name_ok, write_bundle_identity,
 };
 pub use lifecycle::{
     AttemptOutcome, ConfirmOutcome, TokenCheck, apply, confirm, count_attempt, deliver_events,
