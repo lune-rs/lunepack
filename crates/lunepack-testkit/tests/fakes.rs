@@ -1095,6 +1095,55 @@ fn the_loopback_server_logs_requests() {
 }
 
 #[test]
+fn the_loopback_server_stalls_after_n_bytes_without_closing() {
+    let server = LoopbackServer::fixture().unwrap();
+    server
+        .origin()
+        .set_faults(vec![TransportFault::StallAfter(100)]);
+    let mut stream = TcpStream::connect(server.addr()).unwrap();
+    write!(stream, "GET /{LARGE} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut quiet = 0;
+    // Read until the connection has been quiet for five timeouts in a row.
+    while quiet < 5 {
+        match stream.read(&mut buf) {
+            Ok(0) => panic!(
+                "the stalled connection was closed after {} bytes",
+                got.len()
+            ),
+            Ok(n) => {
+                got.extend_from_slice(&buf[..n]);
+                quiet = 0;
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                quiet += 1;
+            }
+            Err(e) => panic!("read: {e}"),
+        }
+    }
+    let at = got
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a head")
+        + 4;
+    assert_eq!(&got[at..], &TransportFixture::bytes(LARGE).unwrap()[..100]);
+    // The client going away ends the stall; dropping the server is still prompt.
+    drop(stream);
+    let started = Instant::now();
+    drop(server);
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
 fn dropping_the_loopback_server_stops_it_within_a_second() {
     let server = LoopbackServer::fixture().unwrap();
     let addr = server.addr();
