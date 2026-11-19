@@ -84,6 +84,9 @@ name = "Hello file"
 
 [windows]                    # optional: inputs of the Windows stamp, not part of any signed document
 icon = "assets/hello.ico"    # an .ico file, relative to this file
+
+[macos]                      # optional: inputs of the macOS update window's helper app, not signed
+icon = "assets/hello.icns"   # an .icns file, relative to this file; read only with --ui on a macos-* target
 ```
 
 ## The publisher state file (M3-R2-D1)
@@ -274,6 +277,9 @@ in the release directory.
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
     [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--config <CONFIG>]
+
+lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runtime <RUNTIME>
+    [--ui <UI>] --assemble <DIR> [--config <CONFIG>]
 ```
 
 - `--version`: SemVer 2.0.0, used verbatim as the directory name. A directory of equal precedence with
@@ -286,12 +292,17 @@ lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-di
 - `--app-id`: when given, it must equal the config's.
 - `--runtime`: the static runtime to place beside the entry. Required when the config has `[update]`,
   refused without it (see "Self-updating apps").
-- `--ui`: the `lunepack-ui` binary to place beside the runtime. Needs `--runtime` and `[update]`, and
-  is refused without them. Without it no UI is placed. A file over 64 MiB is refused.
+- `--ui`: the `lunepack-ui` binary to place beside the runtime (for a `macos-*` target, inside the update
+  window's helper app, see "macOS targets"). Needs `--runtime` and `[update]`, and is refused without
+  them. Without it no UI is placed. A file over 64 MiB is refused.
 - `--stub`: the Windows launcher stub, stamped and placed beside the entry as `lunepack-stub.exe`.
   Required for a `windows-*` target when the config has `[update]`; refused for any other target and
   without `[update]`. The console stub is needed when `install.terminal` is set, the GUI stub
   otherwise. A file over 32 MiB is refused.
+- `--assemble <dir>`: for a `macos-*` target with `[update]` (below): write the tree `pack` would hash to
+  the new directory `<dir>` and stop, so it can be code-signed and then packed. It takes no
+  `--release-dir` and no `--sign` (giving either is a usage error), reads no key and writes nothing to a
+  release.
 
 Pre-checks run before any encoding: `keys.json` verifies; every `--sign` key is in the key set and
 inside its window; the signers reach the threshold; the manifest and pack do not exist yet; the target
@@ -322,15 +333,16 @@ With `[update]` (and then `[install]`, which is required; `[install]` without `[
 
 - `--runtime <path>` is required. The file must match the target: for `linux-*`, a 64-bit ELF of the
   target's machine (x86-64 or aarch64) with no `PT_INTERP`, meaning statically linked (a static-pie
-  executable passes); for `windows-*` a PE and for `macos-*` a Mach-O of the target's architecture
-  (a header check only, until those runtimes exist). Anything else is refused.
+  executable passes); for `windows-*` a PE (hardened, see below) and for `macos-*` a Mach-O of the
+  target's architecture (`macos-universal`: a fat file with both slices; a header check only).
+  Anything else is refused.
 - After the input is copied and before code signing and hashing, `pack` copies the runtime to
   `<directory of install.entry>/lunepack-runtime` (`lunepack-runtime.exe` for `windows-*`), marked
   executable, and, with `--ui`, the UI to `<directory of install.entry>/lunepack-ui` (`lunepack-ui.exe`
   for `windows-*`), also marked executable. A `linux-*` UI may be dynamically linked (glibc); the
   runtime may not. The UI's bytes are checked against the target's format and machine, like the
   runtime's. Then it writes the update configuration at the tree's root, `lunepack-update.json`
-  (`Contents/Resources/lunepack-update.json` for `macos-*`, assumed until M8). The configuration holds
+  (`Contents/Resources/lunepack-update.json` for `macos-*`, FORMAT.md 13.1). The configuration holds
   the app id and root from `lunepack.toml`, the `--version` and `--target` of this pack, the feed, the
   channel, the health timeout and the install metadata. It holds no timestamp. Stdout gets one
   `update:` line.
@@ -361,6 +373,14 @@ Building the runtime: `scripts/build-runtime.sh <linux-x86_64|linux-aarch64>` ru
 build (the target must be installed with `rustup target add`; `--print-command` shows the command and
 runs nothing). `pack` does not build the runtime itself in M5; D19's build-from-source waits for a
 published crate (M13).
+
+`scripts/build-runtime.sh <macos-aarch64|macos-x86_64|macos-universal>` builds on a macOS host only (the
+Apple linker, `lipo` and `otool`). `macos-universal` builds both slices and joins them with
+`lipo -create`. The build sets `MACOSX_DEPLOYMENT_TARGET=10.15`, which binds the x86_64 slice only: the
+aarch64 slice keeps Rust's own minimum, macOS 11.0, the first release for Apple silicon (M8-D14). The
+binary is stripped and checked: the architectures are exactly the target's, `otool -L` lists
+`/usr/lib` and `/System/Library` libraries only, and the x86_64 slice's minimum is 10.15; the script
+prints both slices' minimums.
 
 ### Windows targets (M7)
 
@@ -401,6 +421,51 @@ name) and appends the payload and the trailer, with nothing after it (FORMAT.md 
 `<app_id>-<VERSION>-<TARGET>-setup.exe` by default. Sign it with Authenticode after it is built (M9); the
 runtime finds the trailer in a signed file (FORMAT.md 14.3), and a byte added after the signature makes it
 refuse to run.
+
+### macOS targets (M8)
+
+A `macos-*` pack with `[update]` packs an app bundle (`<Name>.app`'s contents) and adds files inside it,
+each written before hashing so the signed manifest covers them (FORMAT.md 13, 17):
+
+- The input must hold `Contents/Info.plist` as a regular file, and `install.entry` must be
+  `Contents/MacOS/<file>` (an executable regular file). The error names `Contents/Info.plist` or
+  `[install] entry`, never the value.
+- The runtime is placed beside the entry, `Contents/MacOS/lunepack-runtime` (marked executable), and the
+  update configuration at `Contents/Resources/lunepack-update.json`.
+- With `--ui`, the update window is a helper app (M8-D6): the UI binary at
+  `Contents/Helpers/lunepack-update.app/Contents/MacOS/lunepack-ui` (executable) with a generated
+  `Contents/Info.plist` (`CFBundleExecutable` `lunepack-ui`; `CFBundleIdentifier` the app id with `_` written
+  as `-`, then `.lunepack-update`; `CFBundleName` the `install.name`, XML-escaped; `CFBundlePackageType`
+  `APPL`; `LSMinimumSystemVersion` `10.15`; `NSHighResolutionCapable`). The plist is a function of the app
+  id, the name and whether there is an icon, so equal inputs give equal bytes. Nothing but the runtime sits
+  in `Contents/MacOS` beside the entry. Without `--ui` no helper app is placed.
+- `[macos] icon` is an `.icns` file (checked: the `icns` magic and a header length equal to the file's, at
+  most 4 MiB) copied to the helper's `Contents/Resources/lunepack-update.icns`, which the plist names as
+  `CFBundleIconFile`. It is read only with `--ui` on a `macos-*` target; elsewhere it is ignored. A bad file
+  is refused naming `[macos] icon`, never its content.
+- Reserved, each an error before anything is written: `Contents/Helpers/lunepack-update.app` and
+  everything under it, `Contents/Resources/lunepack-setup.payload` (the installer app's payload file), the
+  names `lunepack-update.json` (at any depth), and `lunepack-runtime` and `lunepack-ui` in
+  `Contents/MacOS`. Comparison ignores ASCII case.
+- Symlinks are packed as links (a framework's `Versions/Current` → `A` works) and must satisfy FORMAT
+  10.2: a link's target may not pass through another link, so write a framework's top-level link as
+  `Foo` → `Versions/A/Foo`, not `Versions/Current/Foo`. Exec bits come from the Unix mode.
+- The installed bundle's name is `install.name` when it can be a file name: 1 to 200 UTF-8 bytes, no `/`,
+  `:` or control character, no leading `.` (FORMAT.md 13.4). Otherwise it is the app id. `pack` still
+  packs, and warns on stderr, naming the rule and never the name.
+
+**Signed bundles (M8-D8).** `pack` never modifies a bundle that holds `Contents/_CodeSignature`, since any
+change would break its seal. Such a bundle is packed as it is when every file `pack` would place is
+already in it byte for byte (content and exec bit): the runtime and, with `--ui`, the helper's
+executable, `Info.plist` and icon must be the files given to `--runtime`, `--ui` and `[macos] icon`, and
+the config the one this version and target would get. The helper app's own signature may sit inside the
+helper app. Otherwise `pack` fails before it writes anything, naming the first path that is missing or
+different, and says to use `--assemble`. The flow: `pack --assemble <dir> ...` writes the assembled
+bundle, with the same `--input`, `--version`, `--target`, `--runtime`, `--ui` and config as the pack; sign
+that tree (inner code first); pack it with the same options, passing the signed copies of the runtime and
+UI from the assembled tree as `--runtime` and `--ui` (signing rewrites a Mach-O file). `--assemble`
+refuses a `<dir>` that exists, an input that is already signed, a target that is not `macos-*` and a
+config without `[update]`; a failure removes the `<dir>` it created.
 
 ### `lunepack feed add`
 

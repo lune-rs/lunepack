@@ -12,6 +12,7 @@ mod cmd_verify;
 mod config;
 mod pipeline;
 mod place;
+mod plist;
 mod release_dir;
 mod stamp;
 mod state;

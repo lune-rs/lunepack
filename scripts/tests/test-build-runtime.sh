@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tests for scripts/build-runtime.sh. Nothing here runs the real cargo: a valid target is given with
 # --print-command, or the build runs in a scratch copy of the script with stub cargo, readelf,
-# uname and musl-gcc on a PATH that holds nothing else but cp, wc and mkdir.
+# lipo, otool, uname and musl-gcc on a PATH that holds nothing else but cp, wc, mkdir, sort, tr
+# and awk.
 # shellcheck disable=SC2016,SC2034 # SC2016: stub bodies are scripts; SC2034: RC is read by lib.sh
 set -euo pipefail
 
@@ -26,7 +27,7 @@ run_cmd bash "$SCRIPT" linux-x86_64 linux-aarch64
 t_check "two targets are a usage error" rc_is 2
 
 run_cmd bash "$SCRIPT" windows-x86_64
-t_check "a non-Linux target is refused" rc_is 2
+t_check "a Windows target is refused" rc_is 2
 t_check "the refusal says so" out_has "unknown target"
 
 run_cmd bash "$SCRIPT" x86_64-unknown-linux-musl
@@ -47,8 +48,26 @@ run_cmd bash "$SCRIPT" --print-command linux-aarch64
 t_check "aarch64 prints its command" rc_is 0
 t_check "with its musl triple" out_has "--target aarch64-unknown-linux-musl"
 
+run_cmd bash "$SCRIPT" --print-command macos-aarch64
+t_check "macos-aarch64 prints its command" rc_is 0
+t_check "with the Apple triple" out_has "--target aarch64-apple-darwin"
+t_check "with the deployment target" out_has "MACOSX_DEPLOYMENT_TARGET=10.15 cargo build --locked --release -p lunepack-runtime"
+
+run_cmd bash "$SCRIPT" --print-command macos-x86_64
+t_check "macos-x86_64 prints its command" rc_is 0
+t_check "with its Apple triple" out_has "--target x86_64-apple-darwin"
+
+run_cmd bash "$SCRIPT" --print-command macos-universal
+t_check "macos-universal prints both builds" rc_is 0
+t_check "the aarch64 build" out_has "--target aarch64-apple-darwin"
+t_check "the x86_64 build" out_has "--target x86_64-apple-darwin"
+t_check "and the lipo join" out_has "lipo -create -output target/universal-apple-darwin/release/lunepack-runtime"
+
 run_cmd bash "$SCRIPT" --help
 t_check "--help exits 0" rc_is 0
+t_check "the usage lists the macOS targets" out_has "macos-universal"
+t_check "the usage says the deployment target binds x86_64 only" out_has "binds the x86_64 slice only"
+t_check "and that aarch64 keeps its own minimum" out_has "aarch64 slice keeps Rust's 11.0 minimum"
 
 # --- the build path, against stubs --------------------------------------------------------
 BASH_BIN=$(command -v bash)
@@ -56,16 +75,19 @@ repo=$T_TMP/repo
 stubs=$T_TMP/stubs
 mkdir -p "$repo/scripts" "$stubs"
 cp "$SCRIPT" "$repo/scripts/build-runtime.sh"
-for tool in cp wc mkdir; do
+for tool in cp wc mkdir sort tr awk; do
   ln -s "$(command -v "$tool")" "$stubs/$tool"
 done
 stub() { # name, body (a /bin/sh script)
   printf '#!/bin/sh\n%s\n' "$2" >"$stubs/$1"
   chmod +x "$stubs/$1"
 }
-stub uname 'echo "${STUB_UNAME:-x86_64}"'
+stub uname 'case "$1" in
+  -s) echo "${STUB_OS:-Linux}" ;;
+  *) echo "${STUB_UNAME:-x86_64}" ;;
+esac'
 stub musl-gcc 'exit 0'
-stub cargo 'echo "$@" >"$STUB_LOG"
+stub cargo 'echo "MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-unset} $@" >>"$STUB_LOG"
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --target ]; then t=$2; fi
   shift
@@ -89,6 +111,7 @@ esac
 
 # sbuild [VAR=value]... -- args: runs the scratch copy with only the stubs on PATH.
 sbuild() {
+  rm -f "$T_TMP/cargo.args"
   local envs=()
   while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
     envs+=("$1")
@@ -171,5 +194,109 @@ t_check "an arm64 host builds aarch64 with musl-gcc" rc_is 0
 rm -f "$stubs/readelf"
 sbuild -- linux-x86_64
 t_check "a missing readelf is refused before the build" rc_nonzero
+
+# --- macOS targets, against stubs --------------------------------------------------------
+stub lipo 'case "$1" in
+  -archs)
+    echo "${STUB_ARCHS:-arm64}"
+    [ -z "${STUB_NOT_MACHO:-}" ]
+    ;;
+  -create)
+    shift
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -output ]; then o=$2; fi
+      shift
+    done
+    printf "fat" >"$o"
+    ;;
+esac'
+stub otool 'case "$1" in
+  -L)
+    echo "$2:"
+    printf "%s\n" "${STUB_LIBS-$(printf "\t")/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)}"
+    ;;
+  -arch)
+    case "$2" in
+      x86_64) m=${STUB_MINOS_X86:-10.15} ;;
+      *) m=${STUB_MINOS_ARM:-11.0} ;;
+    esac
+    echo "Load command 9"
+    echo "      cmd LC_BUILD_VERSION"
+    echo "  cmdsize 32"
+    echo "    minos $m"
+    ;;
+esac'
+tab=$(printf '\t')
+
+rm -rf "$repo/target"
+sbuild STUB_OS=Darwin STUB_ARCHS=arm64 -- macos-aarch64
+t_check "a macos-aarch64 build succeeds" rc_is 0
+t_check "it reports a Mach-O of system libraries" out_has "macho: yes (arm64; system libraries only)"
+t_check "it reports the minimum macOS" out_has "minos: arm64=11.0"
+t_check "it prints the size" out_has "size: 10 bytes"
+t_check "cargo built for the Apple triple" grep -q -- "--target aarch64-apple-darwin" "$T_TMP/cargo.args"
+t_check "with the deployment target set" grep -q -- "^MACOSX_DEPLOYMENT_TARGET=10.15 build --locked --release -p lunepack-runtime" "$T_TMP/cargo.args"
+t_check "and the strip config" grep -q -- "--config profile.release.strip=true" "$T_TMP/cargo.args"
+
+rm -rf "$repo/target"
+sbuild STUB_OS=Darwin STUB_ARCHS=x86_64 -- macos-x86_64
+t_check "a macos-x86_64 build succeeds" rc_is 0
+t_check "its minimum is the deployment target" out_has "minos: x86_64=10.15"
+
+sbuild STUB_OS=Darwin STUB_ARCHS=x86_64 STUB_MINOS_X86=10.12 -- macos-x86_64
+t_check "an x86_64 slice with a lower minimum is refused" rc_nonzero
+t_check "the refusal names the minimum" out_has "needs macOS 10.12"
+
+sbuild STUB_OS=Darwin STUB_ARCHS=x86_64 STUB_MINOS_X86=11.0 -- macos-x86_64
+t_check "an x86_64 slice with a higher minimum is refused" rc_nonzero
+
+rm -rf "$repo/target"
+sbuild STUB_OS=Darwin 'STUB_ARCHS=x86_64 arm64' -- macos-universal
+t_check "a macos-universal build succeeds" rc_is 0
+t_check "it reports both slices" out_has "macho: yes (x86_64 arm64; system libraries only)"
+t_check "with both minimums" out_has "minos: x86_64=10.15 arm64=11.0"
+t_check "both Apple triples were built" test "$(grep -c -- "--target" "$T_TMP/cargo.args")" -eq 2
+t_check "the aarch64 build ran" grep -q -- "--target aarch64-apple-darwin" "$T_TMP/cargo.args"
+t_check "the x86_64 build ran" grep -q -- "--target x86_64-apple-darwin" "$T_TMP/cargo.args"
+t_check "every build had the deployment target" test "$(grep -c -- "^MACOSX_DEPLOYMENT_TARGET=10.15 " "$T_TMP/cargo.args")" -eq 2
+t_check "lipo wrote the universal binary" test -f "$repo/target/universal-apple-darwin/release/lunepack-runtime"
+t_check "the check names it" out_has "universal-apple-darwin/release/lunepack-runtime"
+
+sbuild STUB_OS=Darwin STUB_ARCHS=arm64 -- macos-universal
+t_check "a universal binary with one slice is refused" rc_nonzero
+t_check "the refusal names both lists" out_has "holds the architectures [arm64], not [arm64 x86_64]"
+
+sbuild STUB_OS=Darwin STUB_ARCHS=x86_64 -- macos-aarch64
+t_check "a binary of the wrong architecture is refused" rc_nonzero
+t_check "the refusal names the architecture" out_has "not [arm64]"
+
+sbuild STUB_OS=Darwin "STUB_LIBS=${tab}/opt/homebrew/lib/libfoo.dylib (compatibility version 1.0.0)" -- macos-aarch64
+t_check "a non-system library is refused" rc_nonzero
+t_check "the refusal names it" out_has "links /opt/homebrew/lib/libfoo.dylib"
+
+sbuild STUB_OS=Darwin STUB_LIBS= -- macos-aarch64
+t_check "an otool that lists no library is refused" rc_nonzero
+t_check "the refusal says so" out_has "listed no libraries"
+
+sbuild STUB_OS=Darwin STUB_NOT_MACHO=1 -- macos-aarch64
+t_check "a file lipo rejects is refused" rc_nonzero
+
+sbuild -- macos-aarch64
+t_check "a macOS target on another host is refused" rc_nonzero
+t_check "the refusal names the host" out_has "macOS host only"
+t_check "and cargo did not run" test ! -e "$T_TMP/cargo.args"
+
+rm -f "$stubs/lipo"
+sbuild STUB_OS=Darwin -- macos-aarch64
+t_check "a missing lipo is refused before the build" rc_nonzero
+t_check "the refusal names lipo" out_has "lipo is not on PATH"
+t_check "and cargo did not run before it" test ! -e "$T_TMP/cargo.args"
+
+rm -rf "$repo/target"
+stub lipo 'echo arm64'
+sbuild STUB_OS=Darwin -- macos-aarch64 --out "$T_TMP/macos-runtime"
+t_check "--out works for a macOS build" rc_is 0
+t_check "--out copied the binary" test -f "$T_TMP/macos-runtime"
+
 
 t_finish

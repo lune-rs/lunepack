@@ -16,17 +16,20 @@ use clap::Args;
 use lunepack_codec_lzma::LzmaCodec;
 use lunepack_core::digest::U53;
 use lunepack_core::error::UpdateConfigError;
+use lunepack_core::update_config::MACOS_ENTRY_DIR;
 use lunepack_core::{
-    AppId, ArtifactRef, Channel, ClockReading, CodeSign, Hasher, InstallMeta, PayloadKind, RelPath,
-    ReleaseDoc, ReleaseLayout, RollbackFloor, Signer, Target, UpdateConfig, VerifiedEntry,
-    VerifiedKeySet, Version, check_pe_stub, check_runtime_image, check_ui_image, decode_verified,
-    next_feed, sign_envelope, verify_feed, verify_manifest, windows_name_ok,
+    AppId, ArtifactRef, Channel, ClockReading, CodeSign, Hasher, InstallMeta, NameRule,
+    PayloadKind, RelPath, ReleaseDoc, ReleaseLayout, RollbackFloor, Signer, Target, UpdateConfig,
+    VerifiedEntry, VerifiedKeySet, Version, check_pe_stub, check_runtime_image, check_ui_image,
+    decode_verified, macos_name_ok, next_feed, sign_envelope, verify_feed, verify_manifest,
+    windows_name_ok,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
 use crate::config::{Config, resolve_signer, writer_clock};
 use crate::pipeline::{self, Settings, UpdatePlan};
 use crate::place;
+use crate::plist;
 use crate::release_dir;
 use crate::stamp;
 
@@ -55,12 +58,20 @@ pub struct PackArgs {
     /// The target id, such as `windows-x86_64` or `linux-aarch64`.
     #[arg(long)]
     target: String,
-    /// The release directory (with `keys.json`).
-    #[arg(long = "release-dir")]
-    release_dir: PathBuf,
+    /// The release directory (with `keys.json`); required unless `--assemble` is given.
+    #[arg(
+        long = "release-dir",
+        required_unless_present = "assemble",
+        conflicts_with = "assemble"
+    )]
+    release_dir: Option<PathBuf>,
     /// A release signer: a name from the config, `file:<path>` or `env:<VAR>`; repeat to reach
-    /// the key set's threshold.
-    #[arg(long = "sign", required = true)]
+    /// the key set's threshold. Required unless `--assemble` is given.
+    #[arg(
+        long = "sign",
+        required_unless_present = "assemble",
+        conflicts_with = "assemble"
+    )]
     sign: Vec<String>,
     /// The app id; when given, it must equal the config's.
     #[arg(long = "app-id")]
@@ -85,6 +96,11 @@ pub struct PackArgs {
     /// refused for any other target. The console stub for a terminal app, the GUI stub otherwise.
     #[arg(long)]
     stub: Option<PathBuf>,
+    /// For a `macos-*` target with `[update]` (M8-D8): write the tree `pack` would hash to this
+    /// new directory and stop, so it can be code-signed and then packed. Takes no release
+    /// directory and no signer, and writes nothing to a release.
+    #[arg(long)]
+    assemble: Option<PathBuf>,
 }
 
 fn say(line: &str) -> Result<()> {
@@ -251,6 +267,10 @@ struct Prepared {
     ui: Option<Vec<u8>>,
     /// The stamped Windows stub (M7-D14); `Some` exactly for a `windows-*` target.
     stub: Option<Vec<u8>>,
+    /// The helper app's `Info.plist` (M8-D6); `Some` for a `macos-*` target with `--ui`.
+    helper_plist: Option<Vec<u8>>,
+    /// The helper app's checked `.icns` bytes, when `[macos] icon` is set and a helper is built.
+    helper_icon: Option<Vec<u8>>,
     config: Vec<u8>,
 }
 
@@ -311,6 +331,41 @@ fn check_windows_install(install: &InstallMeta, version: &Version) -> Result<()>
     }
     stamp::version_numbers(version)?;
     Ok(())
+}
+
+/// M8-D6 for a `macos-*` target: the entry is `Contents/MacOS/<file>`, so the runtime lands in
+/// `Contents/MacOS` and the bundle's `Info.plist` is where `Contents/Info.plist` expects it. When
+/// `install.name` is not a usable bundle name, the installed bundle is named after the app id
+/// (M8-D1) and `pack` says so on stderr, naming the rule and never the name.
+fn check_macos_install(install: &InstallMeta) -> Result<()> {
+    let parts: Vec<&str> = install.entry.components().collect();
+    if parts.len() != 3 || parts[..2].join("/") != MACOS_ENTRY_DIR {
+        bail!("[install] entry: a macos-* target's entry must be {MACOS_ENTRY_DIR}/<file>");
+    }
+    if let Err(rule) = macos_name_ok(&install.name) {
+        let why = match rule {
+            NameRule::Empty => "empty",
+            NameRule::TooLong => "longer than 200 bytes",
+            NameRule::ForbiddenChar => "holds `/`, `:` or a control character",
+            NameRule::Edge => "starts with a dot",
+            _ => "not accepted",
+        };
+        eprintln!(
+            "warning: [install] name is not usable as a macOS bundle name ({why}); \
+             the installed bundle will be named after the app id"
+        );
+    }
+    Ok(())
+}
+
+/// The helper app's `.icns` from `[macos] icon`, read and checked (M8-D6). Errors name the option,
+/// never the file's content.
+fn macos_icon_file(path: &Path) -> Result<Vec<u8>> {
+    let bytes = release_dir::read_capped(path, plist::MAX_ICNS_BYTES)
+        .map_err(|_| anyhow!("[macos] icon: cannot be read as a file of at most 4 MiB"))?
+        .ok_or_else(|| anyhow!("[macos] icon: the file does not exist"))?;
+    plist::check_icns(&bytes).map_err(|e| anyhow!("[macos] icon: {e}"))?;
+    Ok(bytes)
 }
 
 /// The icon bytes a Windows stub or setup file is stamped with (M7-D14): `[windows] icon` when
@@ -415,6 +470,9 @@ fn prepare_update(
         }
         check_windows_install(&settings.install, version)?;
     }
+    if target.is_macos() {
+        check_macos_install(&settings.install)?;
+    }
     let root = config.trusted_root(&Sha256Hasher, &Ed25519Verifier)?;
     let document = UpdateConfig::new(
         &root,
@@ -444,12 +502,28 @@ fn prepare_update(
         .stub
         .map(|path| prepare_stub(config, &document.install, path, inputs, version, target))
         .transpose()?;
+    // The helper app's files exist only with a UI, and `[macos] icon` is read only then.
+    let (helper_plist, helper_icon) = if target.is_macos() && ui.is_some() {
+        let icon = config
+            .macos_icon
+            .as_deref()
+            .map(macos_icon_file)
+            .transpose()?;
+        let plist =
+            plist::helper_info_plist(&config.app_id, &document.install.name, icon.is_some())
+                .context("the helper app's Info.plist cannot be written")?;
+        (Some(plist), icon)
+    } else {
+        (None, None)
+    };
     Ok(Some(Prepared {
         install: document.install.clone(),
         config: document.to_bytes().map_err(config_error)?,
         runtime: bytes,
         ui,
         stub,
+        helper_plist,
+        helper_icon,
     }))
 }
 
@@ -474,6 +548,14 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         );
     }
 
+    if args.assemble.is_some() {
+        if !target.is_macos() {
+            bail!("--assemble is only for macos-* targets");
+        }
+        if config.update.is_none() {
+            bail!("--assemble needs [update] and [install] in the config");
+        }
+    }
     let prepared = prepare_update(
         &config,
         &UpdateInputs {
@@ -486,6 +568,30 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         &version,
         target,
     )?;
+    let update_plan = prepared.as_ref().map(|p| UpdatePlan {
+        target,
+        install: &p.install,
+        runtime: &p.runtime,
+        ui: p.ui.as_deref(),
+        stub: p.stub.as_deref(),
+        config: &p.config,
+        helper_plist: p.helper_plist.as_deref(),
+        helper_icon: p.helper_icon.as_deref(),
+    });
+    if let Some(dest) = &args.assemble {
+        // M8-D8: write the tree to sign, and stop. Nothing is signed, read from or written to a
+        // release. `[update]` was checked above, so there is a plan.
+        let Some(plan) = &update_plan else {
+            bail!("internal error: --assemble without an update plan");
+        };
+        pipeline::assemble_bundle(&args.input, dest, plan)?;
+        say("assemble: wrote the bundle; code-sign it, then pack it with the same options")?;
+        say(&format!("assembled: {}", dest.display()))?;
+        return Ok(());
+    }
+    let (Some(release_dir_arg), true) = (&args.release_dir, !args.sign.is_empty()) else {
+        bail!("internal error: pack needs a release directory and a signer");
+    };
 
     let clock = writer_clock()?;
     let now = clock.now_unix_secs();
@@ -493,11 +599,11 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
     // at `now` below.
     let skip = ClockReading::read(clock.as_ref(), Some(u64::MAX));
     let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
-    let opened = release_dir::open(&args.release_dir, &config, &hasher, &verifier, &skip)?;
+    let opened = release_dir::open(release_dir_arg, &config, &hasher, &verifier, &skip)?;
     let Some(keys) = opened.keys else {
         bail!(
             "{} has no keys.json; run `lunepack keys set` first",
-            args.release_dir.display()
+            release_dir_arg.display()
         );
     };
     let signers = args
@@ -507,7 +613,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         .collect::<Result<Vec<_>>>()?;
     check_signers(&signers, &keys, now)?;
 
-    let version_dir = args.release_dir.join(&args.version);
+    let version_dir = release_dir_arg.join(&args.version);
     let pack_path = version_dir.join(format!("{}.pack", target.as_str()));
     let manifest_path = version_dir.join(format!("{}.manifest.json", target.as_str()));
     for path in [&manifest_path, &pack_path] {
@@ -515,7 +621,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
             bail!("{} already exists", path.display());
         }
     }
-    check_precedence(&args.release_dir, &version, &args.version)?;
+    check_precedence(release_dir_arg, &version, &args.version)?;
     let layout = ReleaseLayout::new(config.app_id.clone(), &args.version, target)?;
 
     let workers = match args.jobs {
@@ -529,14 +635,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         encoder: &LzmaCodec,
         codec: &LzmaCodec,
         hasher: &hasher,
-        update: prepared.as_ref().map(|p| UpdatePlan {
-            target,
-            install: &p.install,
-            runtime: &p.runtime,
-            ui: p.ui.as_deref(),
-            stub: p.stub.as_deref(),
-            config: &p.config,
-        }),
+        update: update_plan,
     };
     // Removed on drop: on success and on every error path.
     let work = tempfile::Builder::new()

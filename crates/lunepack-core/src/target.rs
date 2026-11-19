@@ -81,6 +81,14 @@ impl Target {
     pub const fn is_windows(self) -> bool {
         matches!(self, Target::WindowsX86_64 | Target::WindowsAarch64)
     }
+
+    /// Whether this is a `macos-*` target (a bundle tree, M8).
+    pub const fn is_macos(self) -> bool {
+        matches!(
+            self,
+            Target::MacosX86_64 | Target::MacosAarch64 | Target::MacosUniversal
+        )
+    }
 }
 
 impl FromStr for Target {

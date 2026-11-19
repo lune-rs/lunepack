@@ -9,7 +9,9 @@ use std::path::Path;
 
 use lunepack_core::error::JsonError;
 use lunepack_core::update_config::{
-    DENIED_URL_SCHEMES, MAX_UPDATE_CONFIG_BYTES, RUNTIME_FILE, RUNTIME_FILE_WINDOWS,
+    DENIED_URL_SCHEMES, MACOS_CODE_SIGNATURE_DIR, MACOS_ENTRY_DIR, MACOS_HELPER_APP,
+    MACOS_HELPER_ICON, MACOS_HELPER_INFO_PLIST, MACOS_HELPER_UI, MACOS_INFO_PLIST,
+    MACOS_INSTALLER_PAYLOAD, MAX_UPDATE_CONFIG_BYTES, RUNTIME_FILE, RUNTIME_FILE_WINDOWS, UI_FILE,
     UPDATE_CONFIG_PATH_MACOS, config_path, runtime_file,
 };
 use lunepack_core::{
@@ -84,6 +86,25 @@ fn the_location_is_fixed() {
     assert_eq!(runtime_file(Target::LinuxAarch64), RUNTIME_FILE);
     assert_eq!(runtime_file(Target::WindowsX86_64), RUNTIME_FILE_WINDOWS);
     assert_eq!(runtime_file(Target::MacosX86_64), "lunepack-runtime");
+}
+
+#[test]
+fn the_macos_bundle_paths_agree_with_each_other() {
+    assert_eq!(
+        MACOS_HELPER_UI,
+        format!("{MACOS_HELPER_APP}/Contents/MacOS/{UI_FILE}")
+    );
+    assert_eq!(
+        MACOS_HELPER_INFO_PLIST,
+        format!("{MACOS_HELPER_APP}/Contents/Info.plist")
+    );
+    assert!(MACOS_HELPER_ICON.starts_with(&format!("{MACOS_HELPER_APP}/Contents/Resources/")));
+    assert!(MACOS_INFO_PLIST.starts_with("Contents/") && MACOS_ENTRY_DIR.starts_with("Contents/"));
+    assert!(UPDATE_CONFIG_PATH_MACOS.starts_with("Contents/Resources/"));
+    assert!(MACOS_INSTALLER_PAYLOAD.starts_with("Contents/Resources/"));
+    assert_eq!(MACOS_CODE_SIGNATURE_DIR, "Contents/_CodeSignature");
+    assert!(Target::MacosAarch64.is_macos() && Target::MacosUniversal.is_macos());
+    assert!(!Target::LinuxX86_64.is_macos() && !Target::WindowsX86_64.is_macos());
 }
 
 // ---- writer and reader -----------------------------------------------------------------------------
