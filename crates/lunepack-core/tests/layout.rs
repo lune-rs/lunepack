@@ -704,6 +704,70 @@ fn resolve_root_adopts_an_empty_folder_and_skips_a_non_empty_one() {
     assert_eq!(resolve(&fs, NAME).unwrap(), RootChoice::New(fallback()));
 }
 
+/// A first install cut off after it took the lock, before its first record: `root` holds only
+/// the state directory with `files` in it.
+fn cut_off_at(fs: &MemFs, root: &Path, files: &[&str]) {
+    let dir = UserLayout::from_root(root.to_path_buf(), LayoutScheme::WINDOWS).state_dir();
+    fs.create_dir_all(&dir).unwrap();
+    for name in files {
+        put_file(fs, &dir.join(name));
+    }
+}
+
+#[test]
+fn resolve_root_resumes_a_first_install_cut_off_before_its_first_record() {
+    // Only the lock: this app's own folder, resumed rather than left beside a second copy.
+    let fs = MemFs::new();
+    cut_off_at(&fs, &dh().join(NAME), &["lock"]);
+    let before = fs.op_count();
+    assert_eq!(
+        resolve(&fs, NAME).unwrap(),
+        RootChoice::New(dh().join(NAME))
+    );
+    assert_eq!(fs.op_count(), before, "resolution writes nothing");
+    // A torn record file next to the lock is still only what a cut-off run leaves.
+    let fs = MemFs::new();
+    cut_off_at(&fs, &dh().join(NAME), &["lock", "00000000000000000001.rec"]);
+    assert_eq!(
+        resolve(&fs, NAME).unwrap(),
+        RootChoice::New(dh().join(NAME))
+    );
+    // The same at the second name, when the first is another app's.
+    let fs = MemFs::new();
+    install_at(&fs, &dh().join(NAME), &other_app());
+    cut_off_at(&fs, &fallback(), &["lock"]);
+    assert_eq!(resolve(&fs, NAME).unwrap(), RootChoice::New(fallback()));
+}
+
+#[test]
+fn resolve_root_keeps_a_folder_with_anything_foreign_taken() {
+    // A file beside the state directory.
+    let fs = MemFs::new();
+    cut_off_at(&fs, &dh().join(NAME), &["lock"]);
+    put_file(&fs, &dh().join(NAME).join("notes.txt"));
+    assert_eq!(resolve(&fs, NAME).unwrap(), RootChoice::New(fallback()));
+    // A file beside the state directory's own parent (`.lunepack`).
+    let fs = MemFs::new();
+    cut_off_at(&fs, &dh().join(NAME), &["lock"]);
+    put_file(&fs, &dh().join(NAME).join(".lunepack").join("notes.txt"));
+    assert_eq!(resolve(&fs, NAME).unwrap(), RootChoice::New(fallback()));
+    // A foreign file in the state directory.
+    let fs = MemFs::new();
+    cut_off_at(&fs, &dh().join(NAME), &["lock", "notes.txt"]);
+    assert_eq!(resolve(&fs, NAME).unwrap(), RootChoice::New(fallback()));
+    // Another app's whole record beside the lock is an install, not a leftover.
+    let fs = MemFs::new();
+    install_at(&fs, &dh().join(NAME), &other_app());
+    let state = UserLayout::from_root(dh().join(NAME), LayoutScheme::WINDOWS).state_dir();
+    put_file(&fs, &state.join("lock"));
+    assert_eq!(resolve(&fs, NAME).unwrap(), RootChoice::New(fallback()));
+    // Both names hold a leftover that is not ours to resume: refused as before.
+    let fs = MemFs::new();
+    cut_off_at(&fs, &dh().join(NAME), &["lock", "notes.txt"]);
+    cut_off_at(&fs, &fallback(), &["lock", "notes.txt"]);
+    assert!(matches!(resolve(&fs, NAME), Err(LayoutError::FolderTaken)));
+}
+
 #[test]
 fn resolve_root_takes_a_file_or_link_at_the_name_as_taken_and_never_follows_it() {
     let fs = MemFs::new();

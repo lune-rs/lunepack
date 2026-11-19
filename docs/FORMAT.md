@@ -1372,8 +1372,10 @@ name does not start with `.` and that holds `.lunepack\state` (no link or repars
    refused, because the user has copies of the install.
 2. A record that cannot be read or is of another format is skipped, except in the folder named exactly
    `<name>` or `<name> (<app id>)`, where it is a refusal (installing beside it would make a second copy).
-3. No match: `<name>` is used when it does not exist or is an empty real directory (adopted). Otherwise
-   (a file, a link or reparse point, a non-empty directory, another app's install) `<name> (<app id>)` is
+3. No match: `<name>` is used when it does not exist, is an empty real directory (adopted), or holds only what
+   a first install cut off before its first record leaves (`.lunepack\state` with nothing but the lock and
+   record-named files, no whole record: resumed). Otherwise (a file, a link or reparse point, a non-empty
+   directory, another app's install) `<name> (<app id>)` is
    used under the same rule. When both are taken the install is refused (`install_mismatch`) and nothing is
    written; the entry that is in the way is never touched.
 4. Every writer, under `R`'s lock and before its first write, checks that `.lunepack\state` holds no record of
