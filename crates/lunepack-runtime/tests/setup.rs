@@ -1124,11 +1124,13 @@ mod cases {
     /// certificate table follows it to the end of the file.
     #[cfg(windows)]
     fn signed_setup(lab: &Lab) -> Vec<u8> {
-        let good = lab.bytes();
-        let cut = good.len() - TRAILER_SIZE as usize;
-        let mut bytes = good[..cut].to_vec();
-        pad8(&mut bytes);
-        bytes.extend_from_slice(&good[cut..]);
+        let mut bytes = lab.bytes();
+        // The writer ends the file on a multiple of 8, so signtool's padding before the table is
+        // none (F5); nothing is inserted before the trailer here.
+        assert!(
+            bytes.len().is_multiple_of(8),
+            "the setup writer must end the file 8-aligned"
+        );
         let at = bytes.len() as u64;
         set_security(&mut bytes, at, 1024);
         bytes.extend(cert_table(1024));
