@@ -707,10 +707,7 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
     let exe = process.current_exe().ok()?;
     let how = setup::parse_installer(args);
     let ui_stdio = how == Ok(InstallerRun::UiStdio);
-    // F14: only a run a person started may get a notice: no argument (a double-click on the
-    // installer's runtime) or the installer app's own UI (`--ui-stdio`, which a double-click on
-    // the app starts). Anything else is a command-line caller.
-    let quiet = !matches!(how, Ok(InstallerRun::Ui | InstallerRun::UiStdio));
+    let quiet = installer_quiet(how);
     let found = match setup::detect_installer(
         &lunepack_fs::StdFs::new(),
         &exe,
@@ -801,6 +798,18 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         notice(quiet, seen, prepared.name(), Operation::Install, kind);
         kind
     }))
+}
+
+/// Whether a macOS installer run is quiet for the notice (F14): only a run a person started may
+/// get one, which is no argument (a double-click on the installer's runtime) or the installer
+/// app's own UI (`--ui-stdio`, which a double-click on the app starts). `--silent` and a command
+/// line that does not parse are a command-line caller.
+#[cfg(target_os = "macos")]
+fn installer_quiet(how: Result<setup::InstallerRun, modes::UsageError>) -> bool {
+    !matches!(
+        how,
+        Ok(setup::InstallerRun::Ui | setup::InstallerRun::UiStdio)
+    )
 }
 
 /// This process's standard input and output as files of their own (duplicated descriptors, so
@@ -965,6 +974,31 @@ mod tests {
             Operation::Uninstall,
             Kind::AlreadyInstalled
         ));
+    }
+
+    /// macOS (F14): the installer's notice only for a double-click (no argument) or its own UI.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_installer_shows_a_notice_only_for_a_double_click_or_its_own_ui() {
+        let os = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(!installer_quiet(setup::parse_installer(&os(&[]))));
+        assert!(!installer_quiet(setup::parse_installer(&os(&[
+            "--ui-stdio"
+        ]))));
+        for args in [
+            &["--silent"][..],
+            &["--no-such-option"],
+            &["/S"],
+            &["install"],
+            &["--ui-stdio", "--silent"],
+            &["--ui-stdio", "--ui-stdio"],
+            &["--ui-stdio=1"],
+        ] {
+            assert!(
+                installer_quiet(setup::parse_installer(&os(args))),
+                "{args:?}"
+            );
+        }
     }
 
     #[cfg(windows)]
