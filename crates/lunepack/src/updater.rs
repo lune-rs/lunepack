@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lunepack_core::fetch::FetchPolicy;
-use lunepack_core::state::{CurrentRef, Scope};
+use lunepack_core::layout::LOCK_FILE;
+use lunepack_core::state::{CurrentRef, Scope, is_record_name};
 use lunepack_core::state::{
     Floors, InstallCounters, InstallState, Loaded, MachineScope as MachineStore, RootParts,
     StagedRef, UserScope,
@@ -878,9 +879,6 @@ where
     });
     cancellable(cancel, future).await??
 }
-
-/// The updater lock's file name in the lock directory.
-const LOCK_FILE: &str = "lock";
 
 /// Takes the updater lock on a short job: [`Error::Busy`] when it is held.
 async fn take_lock(inner: &Arc<Inner>, cancel: &CancelToken) -> Result<OpLock, Error> {
@@ -1754,12 +1752,6 @@ fn adoptable(inner: &Inner, layout: &UserLayout) -> Result<(), Error> {
     } else {
         Err(Error::ForeignInstallRoot)
     }
-}
-
-/// A record file name of the state store, `<20 digits>.rec` (FORMAT.md 12.4).
-fn is_record_name(name: &str) -> bool {
-    name.strip_suffix(".rec")
-        .is_some_and(|digits| digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The integration request for the first install of `config`'s tree at `root` (no outgoing

@@ -27,7 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::error::LayoutError;
 use crate::fs::{FileKind, Fs, FsError, FsErrorKind};
 use crate::ident::AppId;
-use crate::state::{InstallState, Scope, load_any};
+use crate::state::{InstallState, Scope, is_record_name, load_any};
 use crate::traits::Hasher;
 use crate::update_config::{UPDATE_CONFIG_FILE, UpdateConfig};
 use crate::version::Version;
@@ -612,6 +612,45 @@ fn holds(
     }
 }
 
+/// The updater lock's file name, in the state directory.
+pub const LOCK_FILE: &str = "lock";
+
+/// Whether `dir` is what a first install cut off after taking the lock but before its first record
+/// leaves: a real directory holding nothing but the state directory (each level of
+/// `scheme.state` a real directory holding only the next), and that holding no whole record and
+/// only the lock and record-named files. Read only; a read failure is "no".
+fn is_unfinished_install(
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    dir: &Path,
+    scheme: LayoutScheme,
+) -> bool {
+    let mut at = dir.to_path_buf();
+    for name in scheme.state.split('/') {
+        let Ok(listing) = fs.list_dir(&at) else {
+            return false;
+        };
+        let [only] = listing.as_slice() else {
+            return false;
+        };
+        if only.name.as_os_str() != OsStr::new(name) || only.kind != FileKind::Dir {
+            return false;
+        }
+        at.push(name);
+    }
+    let Ok(listing) = fs.list_dir(&at) else {
+        return false;
+    };
+    let only_ours = listing.iter().all(|e| {
+        e.kind == FileKind::File
+            && e.name
+                .to_str()
+                .is_some_and(|n| n == LOCK_FILE || is_record_name(n))
+    });
+    // A whole record (of any app) or a read that fails is an install, not a leftover.
+    only_ours && matches!(load_any::<InstallState>(fs, &at, hasher), Ok(None))
+}
+
 /// Whether `path` is a real directory (not a symlink or reparse point). A read failure is "no".
 fn is_real_dir(fs: &dyn Fs, path: &Path) -> bool {
     matches!(fs.symlink_metadata(path), Ok(Some(meta)) if meta.kind == FileKind::Dir)
@@ -640,8 +679,10 @@ fn same_folder_name(a: &OsStr, b: &str) -> bool {
 ///    case), where it is [`LayoutError::InstallUnreadable`]. Two matches or more are
 ///    [`LayoutError::InstallAmbiguous`]; one is `Existing`.
 /// 3. No match: `<data home>/<name>`, then `<data home>/<name> (<app id>)` (which must pass
-///    [`windows_name_ok`] as well), is `New` when it does not exist or is an empty real directory
-///    (adopted); anything else there (a file, a link or reparse point, a non-empty directory,
+///    [`windows_name_ok`] as well), is `New` when it does not exist, is an empty real directory
+///    (adopted) or holds only what a first install cut off before its first record leaves (the
+///    state directory with only the lock and record-named files, no whole record: resumed);
+///    anything else there (a file, a link or reparse point, a non-empty directory,
 ///    another app's install) is taken and never touched. Both taken: [`LayoutError::FolderTaken`].
 ///
 /// Errors carry no path or name.
@@ -706,6 +747,14 @@ pub fn resolve_root(
         match meta {
             None => return Ok(RootChoice::New(path)),
             Some(meta) if meta.kind == FileKind::Dir && fs.list_dir(&path)?.is_empty() => {
+                return Ok(RootChoice::New(path));
+            }
+            // This app's own first install, cut off before its first record: resumed here, not
+            // left behind beside a second copy (the writer's under-lock checks still guard it).
+            Some(meta)
+                if meta.kind == FileKind::Dir
+                    && is_unfinished_install(fs, hasher, &path, scheme) =>
+            {
                 return Ok(RootChoice::New(path));
             }
             Some(_) => {}

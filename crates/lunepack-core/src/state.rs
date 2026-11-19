@@ -1043,6 +1043,14 @@ fn name_seq(name: &std::ffi::OsStr) -> Option<u64> {
     digits.parse::<u64>().ok().filter(|&s| s <= MAX_JSON_INT)
 }
 
+/// Whether `name` is shaped like a record file, `<20 digits>.rec` (FORMAT.md 12.4), whatever the
+/// seq: what a state directory may hold besides the lock without being foreign.
+pub fn is_record_name(name: &str) -> bool {
+    name.strip_suffix(NAME_SUFFIX).is_some_and(|digits| {
+        digits.len() == NAME_DIGITS && digits.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
 fn record_name(seq: u64) -> String {
     format!("{seq:0width$}{NAME_SUFFIX}", width = NAME_DIGITS)
 }
