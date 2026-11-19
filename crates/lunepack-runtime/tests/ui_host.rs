@@ -121,6 +121,10 @@ mod native {
     const INSTALL_ID: [u8; 16] = [3; 16];
     /// A bound on any one runtime run.
     const RUN_LIMIT: Duration = Duration::from_secs(90);
+    /// What a bound measured from a run's own events may exceed the channel's bound by, for a
+    /// runner under load. The cases measure the channel's waits, never a run's whole time: how
+    /// long an install or an apply takes on a shared runner is not what they check.
+    const SLACK: Duration = Duration::from_secs(15);
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     const TARGET: Target = Target::LinuxAarch64;
@@ -1398,6 +1402,11 @@ mod native {
         stdout: String,
         stderr: String,
         took: Duration,
+        /// When the run ended, in milliseconds since the Unix epoch (the clock of the log's
+        /// `time_ms`).
+        ended_ms: u64,
+        /// When each stderr line arrived, as `ended_ms` (one per line of `stderr`).
+        stderr_ms: Vec<u64>,
     }
 
     impl std::fmt::Debug for Run {
@@ -1411,13 +1420,46 @@ mod native {
     }
 
     impl Run {
-        fn of(out: Output, took: Duration) -> Run {
+        fn of(out: Finished, took: Duration) -> Run {
             Run {
-                code: out.status.code().unwrap_or(-1),
-                stdout: String::from_utf8(out.stdout).expect("utf-8 stdout"),
-                stderr: String::from_utf8(out.stderr).expect("utf-8 stderr"),
+                code: out.output.status.code().unwrap_or(-1),
+                stdout: String::from_utf8(out.output.stdout).expect("utf-8 stdout"),
+                stderr: String::from_utf8(out.output.stderr).expect("utf-8 stderr"),
                 took,
+                ended_ms: wall_ms(),
+                stderr_ms: out.stderr_ms,
             }
+        }
+
+        /// How long the stderr line holding `needle` came after the line before it. The span of
+        /// a stop that is found by the channel's own bounds, from the last thing the run said
+        /// before it started waiting for the UI: the install work before that, which a loaded
+        /// runner stretches, is not in it.
+        fn gap_before_stderr_line(&self, needle: &str) -> Duration {
+            let at = self
+                .stderr
+                .lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no stderr line with {needle}: {self:?}"));
+            assert!(at > 0, "a line before the one with {needle}: {self:?}");
+            Duration::from_millis(self.stderr_ms[at].saturating_sub(self.stderr_ms[at - 1]))
+        }
+
+        /// How long the run lasted after its final event, `log`'s last result or error line:
+        /// what the run did after it committed its outcome, which is the UI waits only (the
+        /// operation's own work, which a loaded runner stretches, is not in it).
+        fn since_final_event(&self, log: &str) -> Duration {
+            let final_ms = log
+                .lines()
+                .rev()
+                .find(|l| l.contains("\"type\":\"result\"") || l.contains("\"type\":\"error\""))
+                .and_then(|l| l.split_once("\"time_ms\":"))
+                .and_then(|(_, rest)| {
+                    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                    digits.parse::<u64>().ok()
+                })
+                .unwrap_or_else(|| panic!("a final event with a time in the log: {log:?}"));
+            Duration::from_millis(self.ended_ms.saturating_sub(final_ms))
         }
 
         fn line(&self) -> &str {
@@ -1427,9 +1469,25 @@ mod native {
         }
     }
 
+    fn wall_ms() -> u64 {
+        u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_millis(),
+        )
+        .expect("ms")
+    }
+
+    /// What a run left: its output, and when each stderr line arrived.
+    struct Finished {
+        output: Output,
+        stderr_ms: Vec<u64>,
+    }
+
     /// Waits for `child` (at most [`RUN_LIMIT`], then kills it and fails), reading its stdout
     /// and stderr meanwhile so a full pipe never holds it up.
-    fn finish(mut child: Child) -> Output {
+    fn finish(mut child: Child) -> Finished {
         fn drain(stream: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
             std::thread::spawn(move || {
                 let mut all = Vec::new();
@@ -1439,8 +1497,26 @@ mod native {
                 all
             })
         }
+        /// [`drain`], stamping the arrival of every line.
+        fn drain_lines(
+            stream: Option<impl Read + Send + 'static>,
+        ) -> std::thread::JoinHandle<(Vec<u8>, Vec<u64>)> {
+            std::thread::spawn(move || {
+                let mut all = Vec::new();
+                let mut stamps = Vec::new();
+                if let Some(s) = stream {
+                    let mut lines = std::io::BufReader::new(s);
+                    while std::io::BufRead::read_until(&mut lines, b'\n', &mut all)
+                        .is_ok_and(|n| n > 0)
+                    {
+                        stamps.push(wall_ms());
+                    }
+                }
+                (all, stamps)
+            })
+        }
         let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
+        let stderr = drain_lines(child.stderr.take());
         let start = Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait().expect("wait") {
@@ -1453,10 +1529,14 @@ mod native {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        Output {
-            status,
-            stdout: stdout.join().expect("stdout"),
-            stderr: stderr.join().expect("stderr"),
+        let (stderr, stderr_ms) = stderr.join().expect("stderr");
+        Finished {
+            output: Output {
+                status,
+                stdout: stdout.join().expect("stdout"),
+                stderr,
+            },
+            stderr_ms,
         }
     }
 
@@ -1572,8 +1652,13 @@ mod native {
         let run = lab.install(&[]);
         assert_installed(&lab, &run);
         assert!(lab.notes().contains("ui stops at progress"));
-        // Found at the done prompt at the latest: no pong within the hang bound.
-        assert!(run.took < Duration::from_secs(30), "{run:?}");
+        // Found at the done prompt at the latest: no pong within the hang bound. Measured from
+        // the last event before the prompt to the stop's report, not over the whole install.
+        let found = run.gap_before_stderr_line("\"code\":\"ui_stopped\"");
+        assert!(
+            found < Bounds::default().pong_wait + SLACK,
+            "{found:?} {run:?}"
+        );
         assert!(run.stderr.contains("\"code\":\"ui_stopped\""), "{run:?}");
         assert!(!lab.notes().contains("app-ran"));
     }
@@ -1893,8 +1978,12 @@ mod native {
         let run = lab.run(lab.command(&[]));
         assert_eq!(run.code, 0, "{run:?}");
         assert_eq!(lab.current(), version(V110));
-        // The close bound, then the kill.
-        assert!(run.took < Duration::from_secs(20), "{run:?}");
+        // The close bound, then the kill, after the outcome was committed.
+        let after = run.since_final_event(&lab.log());
+        assert!(
+            after < Bounds::default().close_wait + SLACK,
+            "{after:?} {run:?}"
+        );
     }
 
     fn apply_rollback_with_a_hung_ui_relaunches_first_and_ends() {
@@ -1918,8 +2007,14 @@ mod native {
             .find_map(|l| l.strip_prefix("1.0.0 app-fds "))
             .expect("1.0.0 app fds");
         assert_app_holds_no_ui_pipe(&lab.out, fds);
-        // Found hung by the pings, within the bounds: a ping at once, a pong bound of 15 s.
-        assert!(run.took < Duration::from_secs(45), "{run:?}");
+        // Found hung by the pings, within the bounds: a ping at once, a pong bound of 15 s,
+        // then the close bound, all after the outcome was committed.
+        let after = run.since_final_event(&lab.log());
+        let bounds = Bounds::default();
+        assert!(
+            after < bounds.pong_wait + bounds.close_wait + SLACK,
+            "{after:?} {run:?}"
+        );
         assert!(lab.log().contains("\"reason\":\"hung\""), "{}", lab.log());
     }
 
