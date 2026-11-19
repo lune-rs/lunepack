@@ -42,8 +42,11 @@ pub const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Unin
 /// The per-user autostart key, relative to `HKEY_CURRENT_USER`.
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
-/// The per-user classes key, relative to `HKEY_CURRENT_USER`.
+/// The classes key, relative to `HKEY_CURRENT_USER` (written) and to `HKEY_LOCAL_MACHINE` (read).
 const CLASSES_KEY: &str = r"Software\Classes";
+
+/// Under a [`WinScope::with_registry_prefix`] root, the folder standing in for `HKLM` (read only).
+const MACHINE_PREFIX: &str = "Machine";
 
 /// The marker value of a key lunepack made (the uninstall key, a ProgID, a scheme): its data is
 /// the app id.
@@ -58,6 +61,9 @@ pub struct WinScope {
     hive: Hive,
     uninstall: String,
     classes: String,
+    /// The per-machine classes root, read only: what another program registered for all users
+    /// (a scheme or ProgID there is a conflict, not ours to shadow). `None` reads none.
+    machine_classes: Option<(Hive, String)>,
     run: String,
     /// The Start-menu programs folder; `None` asks the shell (`FOLDERID_Programs`).
     programs: Option<PathBuf>,
@@ -73,6 +79,7 @@ impl WinScope {
             hive: Hive::CurrentUser,
             uninstall: UNINSTALL_KEY.to_owned(),
             classes: CLASSES_KEY.to_owned(),
+            machine_classes: Some((Hive::LocalMachine, CLASSES_KEY.to_owned())),
             run: RUN_KEY.to_owned(),
             programs: None,
             notify: true,
@@ -82,7 +89,9 @@ impl WinScope {
     /// The current user's layout moved under `HKCU\<prefix>` (for tests and tools: the uninstall
     /// entries go to `HKCU\<prefix>\Software\Microsoft\Windows\CurrentVersion\Uninstall`, the
     /// classes to `HKCU\<prefix>\Software\Classes`, the `Run` value to `...\Run`), and the shell
-    /// is not told of association changes. `None` when `prefix` is empty, has an empty component,
+    /// is not told of association changes, and a folder `HKCU\<prefix>\Machine\Software\Classes`
+    /// stands in for the per-machine classes the check reads (what another program registered
+    /// for all users). `None` when `prefix` is empty, has an empty component,
     /// a `/` or a control character. The shortcut still goes to the real Start menu unless
     /// [`WinScope::with_start_menu`] moves it.
     pub fn with_registry_prefix(prefix: &str) -> Option<WinScope> {
@@ -93,6 +102,10 @@ impl WinScope {
             hive: Hive::CurrentUser,
             uninstall: format!(r"{prefix}\{UNINSTALL_KEY}"),
             classes: format!(r"{prefix}\{CLASSES_KEY}"),
+            machine_classes: Some((
+                Hive::CurrentUser,
+                format!(r"{prefix}\{MACHINE_PREFIX}\{CLASSES_KEY}"),
+            )),
             run: format!(r"{prefix}\{RUN_KEY}"),
             programs: None,
             notify: false,
@@ -181,6 +194,11 @@ impl Prepared<'_> {
         classes::Ctx {
             hive: self.hive(),
             classes: &self.scope.classes,
+            machine: self
+                .scope
+                .machine_classes
+                .as_ref()
+                .map(|(hive, path)| (*hive, path.as_str())),
             run: &self.scope.run,
             app_id,
             name,
@@ -835,6 +853,17 @@ mod tests {
         fn foreign_class(&self, path: &str, name: &str, value: &str) {
             let key = Key::create(Hive::CurrentUser, &format!(r"{}\{path}", self.classes()))
                 .expect("foreign key");
+            key.set_str(name, value).expect("value");
+        }
+
+        /// A key under the stand-in for `HKLM\Software\Classes` (read only to the code under
+        /// test): `name` = `value`, so a key made by "another program" for all users.
+        fn machine_class(&self, path: &str, name: &str, value: &str) {
+            let key = Key::create(
+                Hive::CurrentUser,
+                &format!(r"{}\Machine\Software\Classes\{path}", self.prefix),
+            )
+            .expect("machine key");
             key.set_str(name, value).expect("value");
         }
 
@@ -1518,6 +1547,61 @@ mod tests {
                     .expect("clear");
             }
         }
+        sb.finish();
+    }
+
+    #[test]
+    fn a_scheme_or_progid_registered_per_machine_by_another_program_is_a_conflict() {
+        let sb = Sandbox::new();
+        let w = sb.integration();
+        let req = declaring_request(&sb);
+
+        let cases: [(&str, IntegrationItem); 2] = [
+            ("test.app.suite", IntegrationItem::FileType),
+            ("suite-app", IntegrationItem::UrlScheme),
+        ];
+        for (where_, item) in cases {
+            sb.machine_class(where_, "Theirs", "yes");
+            for result in [
+                w.check(Scope::User, &req),
+                w.apply(Scope::User, &req).map(|_| ()),
+            ] {
+                match result {
+                    Err(IntegrationError::Conflict(got)) => assert_eq!(got, item, "{where_}"),
+                    other => panic!("{where_}: {other:?}"),
+                }
+            }
+            assert!(sb.values().is_none(), "{where_}: apply wrote something");
+            assert!(!sb.class_exists(where_), "{where_}: a user key was made");
+            // Remove only reads the user's keys: nothing of ours, nothing reported, theirs stays.
+            let report = w.remove(Scope::User, &req).expect("remove");
+            assert!(report.kept.is_empty(), "{where_}: {:?}", report.kept);
+            registry::delete_tree(
+                Hive::CurrentUser,
+                &format!(r"{}\Machine\Software\Classes\{where_}", sb.prefix),
+            )
+            .expect("clear");
+        }
+        // With nothing per machine it applies.
+        w.apply(Scope::User, &req).expect("apply");
+        sb.finish();
+    }
+
+    #[test]
+    fn per_machine_keys_that_shadow_nothing_do_not_conflict() {
+        let sb = Sandbox::new();
+        let w = sb.integration();
+        let req = declaring_request(&sb);
+        // An extension's own key (its handler) is never shadowed: only `OpenWithProgids` is added.
+        sb.machine_class(".suite", "", "other.file");
+        // A per-machine key of this app's own (M10) carries the marker.
+        sb.machine_class("suite-app", MARKER_VALUE, "test.app");
+        w.check(Scope::User, &req).expect("check");
+        w.apply(Scope::User, &req).expect("apply");
+        // A per-machine key that appeared after our own user key was made does not turn an
+        // update into a conflict.
+        sb.machine_class("test.app.suiteb", "Theirs", "yes");
+        w.apply(Scope::User, &req).expect("second apply");
         sb.finish();
     }
 

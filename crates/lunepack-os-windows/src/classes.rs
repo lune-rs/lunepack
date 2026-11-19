@@ -9,6 +9,12 @@
 //!   marker);
 //! - autostart is the `Run` value `<app id>`.
 //!
+//! The merged `HKEY_CLASSES_ROOT` view lets a per-user key shadow a per-machine one, so a ProgID or
+//! scheme key that another program registered per machine (`HKLM\Software\Classes`, read only
+//! here) and that this app would create under `HKCU` is a `Conflict` too, unless it is marked as
+//! this app's. An existing `.<ext>` key needs no such check: only a value in its `OpenWithProgids`
+//! is added, and its default value (the handler) stays visible through the merge.
+//!
 //! A key is lunepack's when it holds `LunepackAppId` = the app id; a `Run` value is lunepack's when
 //! its data is exactly one of the commands lunepack writes. Anything else is a `Conflict` for
 //! `check` and `apply`, and is left (and reported) by `remove`. Errors never show a value.
@@ -45,10 +51,14 @@ pub(crate) struct Decls {
 }
 
 /// Where and as whom the declarations are written.
+#[derive(Clone, Copy)]
 pub(crate) struct Ctx<'a> {
     pub hive: Hive,
     /// The key path of `Software\Classes`.
     pub classes: &'a str,
+    /// The per-machine classes root another program may have registered a scheme or ProgID in,
+    /// read only: its hive and `Software\Classes` path.
+    pub machine: Option<(Hive, &'a str)>,
     /// The key path of `...\CurrentVersion\Run`.
     pub run: &'a str,
     pub app_id: &'a str,
@@ -108,6 +118,24 @@ fn state(ctx: &Ctx<'_>, path: &str) -> Result<State, IntegrationError> {
     )
 }
 
+/// The state of the class key `name` as the user would see it through the merged view: this
+/// user's own key, else (when there is none) the per-machine one. A key of the machine's that
+/// carries this app's marker is not foreign (M10's per-machine scope).
+fn merged_state(ctx: &Ctx<'_>, name: &str) -> Result<State, IntegrationError> {
+    let user = state(ctx, &ctx.class_key(name))?;
+    if user != State::Absent {
+        return Ok(user);
+    }
+    let Some((hive, classes)) = ctx.machine else {
+        return Ok(State::Absent);
+    };
+    let machine = Ctx { hive, ..*ctx };
+    Ok(match state(&machine, &format!(r"{classes}\{name}"))? {
+        State::Foreign => State::Foreign,
+        State::Absent | State::Ours => State::Absent,
+    })
+}
+
 /// Whether the `Run` value is there and not lunepack's.
 fn run_foreign(ctx: &Ctx<'_>) -> Result<bool, IntegrationError> {
     let Some(key) = Key::open(ctx.hive, ctx.run, false).map_err(|_| READ_FAILED)? else {
@@ -124,12 +152,12 @@ fn run_foreign(ctx: &Ctx<'_>) -> Result<bool, IntegrationError> {
 /// nothing.
 pub(crate) fn check(ctx: &Ctx<'_>, decls: &Decls) -> Result<(), IntegrationError> {
     for ft in &decls.file_types {
-        if state(ctx, &ctx.class_key(&ft.progid))? == State::Foreign {
+        if merged_state(ctx, &ft.progid)? == State::Foreign {
             return Err(IntegrationError::Conflict(IntegrationItem::FileType));
         }
     }
     for scheme in &decls.schemes {
-        if state(ctx, &ctx.class_key(scheme))? == State::Foreign {
+        if merged_state(ctx, scheme)? == State::Foreign {
             return Err(IntegrationError::Conflict(IntegrationItem::UrlScheme));
         }
     }
