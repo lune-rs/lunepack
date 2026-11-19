@@ -25,8 +25,12 @@ New-Item -ItemType Directory $dir | Out-Null
 $cert = $null
 $trusted = @()
 $failed = 0
-function Check([string]$what, [bool]$ok) {
-    if ($ok) { Write-Output "ok   $what" } else { Write-Output "FAIL $what"; $script:failed++ }
+function Check([string]$what, [bool]$ok, [string]$detail = '') {
+    if ($ok) { Write-Output "ok   $what" } else { Write-Output "FAIL $what$(if ($detail) { " ($detail)" })"; $script:failed++ }
+}
+# An exit code check prints the code it got beside the one it wanted.
+function CheckExit([string]$what, $got, [int]$want) {
+    Check "$what (exit $want)" ($got -eq $want) "exit $got"
 }
 try {
     $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=lunepack-e2e-$hex" -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1)
@@ -39,6 +43,7 @@ try {
 
     $signed = Join-Path $dir 'Setup-signed.exe'
     Copy-Item $Setup $signed
+    $unsignedLength = (Get-Item -LiteralPath $Setup).Length
     & $signtool.FullName sign /fd sha256 /sha1 $cert.Thumbprint /s My $signed | Out-Null
     Check 'signtool sign' ($LASTEXITCODE -eq 0)
     & $signtool.FullName verify /pa $signed | Out-Null
@@ -49,14 +54,18 @@ try {
     $pe = [BitConverter]::ToInt32($bytes, 0x3C)
     $tableAt = [BitConverter]::ToUInt32($bytes, $pe + 24 + 112 + 32)
     Check 'the signed file has a certificate table at its end' ($tableAt -gt 4096 -and $tableAt -lt $bytes.Length)
+    # FORMAT 14.3 reads the trailer as the 4096 bytes before the table, so the table must start
+    # where the unsigned file ended. The PE format puts the table at a multiple of 8 and pads with
+    # zeros up to it, so an unsigned length that is not a multiple of 8 moves the table away.
+    Check 'the certificate table starts where the unsigned setup ended' ($tableAt -eq $unsignedLength) "unsigned length $unsignedLength (remainder $($unsignedLength % 8) of 8), table at $tableAt"
 
     if (-not $NoInstall) {
         $p = Start-Process -FilePath $signed -ArgumentList '/S' -Wait -PassThru
-        Check 'the signed Setup.exe installs with /S (exit 0)' ($p.ExitCode -eq 0)
+        CheckExit 'the signed Setup.exe installs with /S' $p.ExitCode 0
         # The caller's script removes what installed, by the app's own uninstall entry.
     } else {
         $p = Start-Process -FilePath $signed -ArgumentList '--no-such-option' -Wait -PassThru
-        Check 'a signed Setup.exe is recognised as a setup file (usage error 2, not verify 7)' ($p.ExitCode -eq 2)
+        CheckExit 'a signed Setup.exe is recognised as a setup file (usage error, not verify 7)' $p.ExitCode 2
     }
 
     $flipped = Join-Path $dir 'Setup-flipped.exe'
@@ -66,12 +75,12 @@ try {
     & $signtool.FullName verify /pa $flipped 2>&1 | Out-Null
     Check 'signtool verify fails after one trailer byte is flipped' ($LASTEXITCODE -ne 0)
     $p = Start-Process -FilePath $flipped -ArgumentList '/S' -Wait -PassThru
-    Check 'the setup with a flipped trailer byte exits 7' ($p.ExitCode -eq 7)
+    CheckExit 'the setup with a flipped trailer byte is refused' $p.ExitCode 7
 
     $appended = Join-Path $dir 'Setup-appended.exe'
     [IO.File]::WriteAllBytes($appended, [byte[]]($bytes + [byte]0))
     $p = Start-Process -FilePath $appended -ArgumentList '/S' -Wait -PassThru
-    Check 'the setup with one appended byte exits 7' ($p.ExitCode -eq 7)
+    CheckExit 'the setup with one appended byte is refused' $p.ExitCode 7
 } finally {
     foreach ($t in $trusted) { Remove-Item -Path $t -Force -ErrorAction SilentlyContinue }
     if ($cert) { Remove-Item -Path "Cert:\CurrentUser\My\$($cert.Thumbprint)" -Force -ErrorAction SilentlyContinue }
