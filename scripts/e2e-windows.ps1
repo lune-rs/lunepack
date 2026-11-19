@@ -153,22 +153,45 @@ function Start-Proc([string]$file, [string[]]$arguments = @()) {
     return $p
 }
 
-# Runs a program to its end with its output captured; returns Code, Out and Err (lines).
-function Run-Tool([string]$file, [string[]]$arguments = @(), [int]$seconds = 180) {
+# Runs a program to its end with its output captured; returns Code, Out and Err (lines) and Notices.
+# An interactive install that no window closed ends in the runtime's native outcome notice, a modal
+# message box that blocks until it is closed: while the program runs, every message box it owns
+# (only its own process, never another's) is recorded (Title, Text) and closed, so no run can hang
+# on one. A notice is a failure unless -AllowNotice is given; the caller then asserts what it says.
+function Run-Tool([string]$file, [string[]]$arguments = @(), [int]$seconds = 180, [switch]$AllowNotice) {
     $o = Join-Path $work ('tool-' + [Guid]::NewGuid().ToString('N') + '.out')
     $e = $o + '.err'
     $params = @{ FilePath = $file; PassThru = $true; WindowStyle = 'Hidden'; RedirectStandardOutput = $o; RedirectStandardError = $e }
     if ($arguments.Count -gt 0) { $params.ArgumentList = $arguments }
     $p = Start-Process @params
     $null = $p.Handle
-    if (-not $p.WaitForExit($seconds * 1000)) {
-        try { $p.Kill() } catch { }
-        throw "timed out running $(Split-Path $file -Leaf)"
+    $notices = New-Object System.Collections.ArrayList
+    $closed = @{}
+    $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+    while (-not $p.WaitForExit(200)) {
+        # The open handle keeps the process id from being reused while it is polled.
+        foreach ($n in [Lpe2eWin]::CloseNotices($p.Id)) {
+            if (-not $closed.ContainsKey($n.Handle)) { $closed[$n.Handle] = $true; $null = $notices.Add($n) }
+        }
+        if ([DateTime]::UtcNow -gt $deadline) {
+            try { $p.Kill() } catch { }
+            throw "timed out running $(Split-Path $file -Leaf)"
+        }
     }
     $p.WaitForExit()
-    $result = [pscustomobject]@{ Code = $p.ExitCode; Out = @(Read-Lines $o); Err = (Read-Text $e) }
+    $result = [pscustomobject]@{ Code = $p.ExitCode; Out = @(Read-Lines $o); Err = (Read-Text $e); Notices = @($notices) }
     Remove-Item -LiteralPath $o, $e -Force -ErrorAction SilentlyContinue
+    if ($notices.Count -gt 0 -and -not $AllowNotice) {
+        throw "$(Split-Path $file -Leaf) showed $($notices.Count) unexpected notice(s), the first titled '$($notices[0].Title)': '$($notices[0].Text)'"
+    }
     return $result
+}
+
+# Asserts that a run showed exactly one native outcome notice, with this title and text.
+function Assert-Notice($run, [string]$title, [string]$text) {
+    SameV 'outcome notices shown' @($run.Notices).Count 1
+    Same 'notice title' $run.Notices[0].Title $title
+    Same 'notice text' $run.Notices[0].Text $text
 }
 
 # Runs a console program with its standard input, output and error redirected.
@@ -879,6 +902,7 @@ try {
         Row '2 (interactive Setup with the stand-in UI; a UI that dies; the stale copy goes)' {
             $A.Name = $A.BaseName
             Reset-Ui
+            # The window showed the outcome, so no native notice may follow (Run-Tool fails on one).
             $r = Run-Tool $setup
             SameV 'interactive Setup exit code' $r.Code 0
             Require ((@($r.Out) -join '') -match '"outcome":"installed"') 'the result line says installed'
@@ -892,12 +916,14 @@ try {
             $copies = @(New-TempDirs 'lunepack-uninstall-')
             foreach ($old in @($state.FirstCopies)) { Require ($copies -notcontains $old) 'the stale uninstaller copy of the first cycle was removed' }
             Require ($copies.Count -le 1) 'at most one uninstaller copy remains'
-            # A window that dies during the install changes nothing (C10): same install, a warning.
+            # A window that dies during the install changes nothing (C10): same install, a warning,
+            # and, as no window showed the outcome, the one native notice naming the app (D36).
             Reset-Ui
             $env:LUNEPACK_E2E_UI_MODE = 'die'
-            try { $r = Run-Tool $setup } finally { Remove-Item Env:LUNEPACK_E2E_UI_MODE -ErrorAction SilentlyContinue }
+            try { $r = Run-Tool $setup -AllowNotice } finally { Remove-Item Env:LUNEPACK_E2E_UI_MODE -ErrorAction SilentlyContinue }
             SameV 'Setup exit code with a dying window' $r.Code 0
             Require ($r.Err -match 'ui_stopped') 'the dying window is reported as a warning'
+            Assert-Notice $r $A.Name "$($A.Name) was installed."
             $A.Root = Join-Path $programs $A.BaseName
             Assert-Installed $A '1.0.0'
             Invoke-Uninstall $A
