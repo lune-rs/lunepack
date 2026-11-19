@@ -7,7 +7,7 @@ use std::path::Path;
 use lunepack_core::pe::{SUBSYSTEM_CONSOLE, SUBSYSTEM_GUI};
 use lunepack_core::setup::{
     FOOTER_SIZE, HEAD_SIZE, Located, SetupPart, SetupTrailer, TRAILER_MAGIC, TRAILER_SIZE,
-    has_magic, locate, locate_file, table_candidate,
+    has_magic, locate, locate_file, parse_payload_file, table_candidate,
 };
 use lunepack_core::{Error, FsError, FsErrorKind, ReadAt, Target, Version};
 use lunepack_testkit::exe_headers::{self, PeSpec, pe_image};
@@ -459,4 +459,77 @@ fn truncated_setups_never_panic() {
             "truncated to {n}"
         );
     }
+}
+
+// ---- the macOS installer's payload file (M8-D7) ---------------------------------------------------
+
+/// A payload file as the installer carries it: the parts from offset 0, each 8-aligned, then the
+/// trailer naming them (zero bytes stand in for the key set, the manifest and the pack).
+fn payload_file() -> (Vec<u8>, SetupTrailer) {
+    let (file, mut t) = setup_file(Vec::new());
+    t.target = Target::MacosAarch64;
+    let mut file = file[..file.len() - TRAILER_SIZE as usize].to_vec();
+    file.extend_from_slice(&t.encode().unwrap());
+    (file, t)
+}
+
+fn parse_payload(file: &[u8]) -> Result<SetupTrailer, Error> {
+    parse_payload_file(&Bytes(file.to_vec()), &FakeHasher, &FakeVerifier)
+}
+
+#[test]
+fn a_payload_file_round_trips() {
+    let (file, t) = payload_file();
+    assert_eq!(t.keys.offset, 0);
+    assert!(file.len().is_multiple_of(8));
+    assert_eq!(parse_payload(&file).unwrap(), t);
+}
+
+/// Every truncation is refused (never a panic, never the same trailer).
+#[test]
+fn every_truncation_of_a_payload_file_is_refused() {
+    let (file, _) = payload_file();
+    for n in 0..file.len() {
+        assert!(parse_payload(&file[..n]).is_err(), "truncated to {n}");
+    }
+}
+
+/// A flipped byte in the trailer is refused or parses to another trailer (whose parts then fail
+/// verification); one in a part leaves the trailer and is the verification's to refuse.
+#[test]
+fn a_flipped_byte_in_a_payload_files_trailer_is_refused_or_seen() {
+    let (file, t) = payload_file();
+    let start = file.len() - TRAILER_SIZE as usize;
+    for i in start..file.len() {
+        let mut b = file.clone();
+        b[i] ^= 0x01;
+        if let Ok(other) = parse_payload(&b) {
+            assert_ne!(other, t, "byte {i}");
+        }
+    }
+}
+
+#[test]
+fn a_payload_file_must_be_aligned_start_at_zero_and_end_in_its_trailer() {
+    let (file, t) = payload_file();
+    // A byte after the trailer: not a multiple of 8, and no magic at the end.
+    let mut longer = file.clone();
+    longer.push(0);
+    assert!(parse_payload(&longer).is_err());
+    // Eight bytes after the trailer: aligned, but no magic at the end.
+    let mut longer = file.clone();
+    longer.extend_from_slice(&[0u8; 8]);
+    assert!(parse_payload(&longer).is_err());
+    // Eight bytes in front with the parts moved along: the payload no longer starts at 0.
+    let mut moved = t.clone();
+    for part in [&mut moved.keys, &mut moved.manifest, &mut moved.pack] {
+        part.offset += 8;
+    }
+    let mut shifted = vec![0u8; 8];
+    shifted.extend_from_slice(&file[..file.len() - TRAILER_SIZE as usize]);
+    shifted.extend_from_slice(&moved.encode().unwrap());
+    assert!(parse_payload(&shifted).is_err());
+    // A Linux setup file (a runtime in front of the payload) is not a payload file.
+    let (setup, _) = setup_file(vec![0x7f; 4000]);
+    assert!(parse_payload(&setup).is_err());
 }

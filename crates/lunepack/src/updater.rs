@@ -32,10 +32,10 @@ use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, CancelToken, Channel, ClockReading, Codec,
     FileKind, Fs, Hasher, IntegrationError, IntegrationRequest, Limits, OsIntegration, Phase,
     Progress, ReadAt, RelPath, Request, Rng, RootNaming, Sha256Digest, SourceFor, StageEnv,
-    StageError, StageInput, Target, Transport, TransportError, TrustedRoot, UPDATE_CONFIG_FILE,
-    UpdateConfig, UpdateConfigError, UserLayout, VerifiedEntry, VerifiedManifest, Verifier,
-    Version, advance_root, read_entry, select_candidate, verify_feed, verify_key_set,
-    verify_manifest, verify_payload_manifest,
+    StageError, StageInput, Target, Transport, TransportError, TrustedRoot, UpdateConfig,
+    UpdateConfigError, UserLayout, VerifiedEntry, VerifiedManifest, Verifier, Version,
+    advance_root, read_entry, select_candidate, verify_feed, verify_key_set, verify_manifest,
+    verify_payload_manifest,
 };
 use lunepack_core::{LayoutError, LayoutScheme, LocationReason};
 
@@ -1138,6 +1138,16 @@ impl Updater {
     ///    no feed `seq`, and `current` is linked.
     ///
     /// A failure or cancel leaves no current version and no floor raised; a rerun resumes.
+    ///
+    /// A macOS bundle install ([`UpdaterBuilder::bundle_layout`]) goes as `install` does there:
+    /// before anything is written, the apps folder's place ([`Error::UnsupportedLocation`]:
+    /// `other_volume`, `not_writable`, `read_only`, `translocated`; where the payload itself is
+    /// read from is not judged); a record whose live bundle the user removed (M8-D16) is not
+    /// installed: under the lock it is reset to its floors with a new install id and the install
+    /// goes on; in step 3 the live bundle's name is chosen in the apps folder and the integration's
+    /// preflight runs against it; the commit writes `R/bundle` before the record, and the
+    /// reconcile after it places the staged tree as the bundle. A rerun on a live install applies
+    /// the integration of the live bundle again and is [`Error::AlreadyInstalled`].
     pub fn install_from_payload(
         &self,
         payload: OfflinePayload,
@@ -2557,6 +2567,8 @@ struct VerifiedPayload {
     manifest: Arc<VerifiedManifest>,
     pack: Arc<PayloadWindow>,
     floors: Floors,
+    /// The update config read from the pack.
+    config: lunepack_core::UpdateConfig,
 }
 
 /// Step 2 of [`Updater::install_from_payload`]: reads only.
@@ -2566,6 +2578,8 @@ fn verify_payload(
     root: &TrustedRoot,
     install_root: &Path,
 ) -> Result<VerifiedPayload, Error> {
+    // A bundle install (macOS) has its integration checked against the live bundle once that is
+    // chosen ([`install_from_payload`] step 3); it is not known yet.
     let (hasher, verifier) = (&*inner.hasher, &*inner.verifier);
     let file = &*payload.file;
     // A first install: no floor time (the clock is plausible) and no stored floors (P6).
@@ -2606,8 +2620,9 @@ fn verify_payload(
         length: payload.pack.length,
     });
 
-    // FORMAT.md 13.6: the config before staging, so a foreign root writes nothing.
-    let config_path = RelPath::parse(UPDATE_CONFIG_FILE)
+    // FORMAT.md 13.6: the config before staging, so a foreign root writes nothing. Its place in
+    // the tree is the target's (`Contents/Resources/lunepack-update.json` in a macOS bundle).
+    let config_path = RelPath::parse(lunepack_core::update_config::config_path(payload.target))
         .map_err(|_| Error::Config("the update config's name is not a path"))?;
     let config_bytes = read_entry(
         &manifest,
@@ -2625,8 +2640,10 @@ fn verify_payload(
         manifest.version(),
         manifest.target(),
     )?;
-    let request = integration_request(&inner.app_id, install_root, &config);
-    inner.integration.check(Scope::User, &request)?;
+    if inner.bundle.is_none() {
+        let request = integration_request(&inner.app_id, install_root, &config);
+        inner.integration.check(Scope::User, &request)?;
+    }
 
     Ok(VerifiedPayload {
         manifest: Arc::new(manifest),
@@ -2638,6 +2655,7 @@ fn verify_payload(
             keyset_version: keys.version(),
             feed_seq: std::collections::BTreeMap::new(),
         },
+        config,
     })
 }
 
@@ -2684,11 +2702,28 @@ async fn refuse_installed(
             app_id: inner.app_id.clone(),
         };
         match store.load(&*inner.fs, &*inner.hasher)?.record {
+            // macOS (M8-D16): a record whose current version no tree holds (the bundle went to
+            // the Trash) is installed anew, as `install` does; the record is reset under the lock
+            // in step 3.
+            Some(record) if record.current.is_some() && orphaned_bundle(inner, &root, &record) => {
+                Ok(())
+            }
             Some(record) if record.current.is_some() => Err(rerun_installed(inner, &root, &record)),
             _ => Ok(()),
         }
     })
     .await
+}
+
+/// Whether `record`, which names a current version, is a macOS bundle install the user removed
+/// (M8-D16: [`LayoutError::Orphaned`] from the reconcile, which never moves anything into a
+/// missing bundle): the first install then installs anew, keeping the floors.
+fn orphaned_bundle(inner: &Inner, root: &UserLayout, record: &InstallState) -> bool {
+    inner.bundle.is_some()
+        && matches!(
+            root.reconcile(&*inner.fs, record),
+            Err(LayoutError::Orphaned)
+        )
 }
 
 /// What a Setup rerun on an installed app returns (M7-D8: a setup rerun is an integration apply).
@@ -2708,19 +2743,30 @@ fn rerun_installed(inner: &Inner, root: &UserLayout, record: &InstallState) -> E
     let Some(current) = record.current.as_ref() else {
         return outcome;
     };
-    let repaired = tree_config(
-        &*inner.fs,
-        &inner.app_id,
-        &root.version_dir(&current.version),
-        root.scheme(),
-    )
-    .and_then(|config| {
-        let request = integration_request(&inner.app_id, root.root(), &config);
-        match inner.integration.apply(Scope::User, &request) {
-            Ok(_) | Err(IntegrationError::Conflict(_)) => Ok(()),
-            Err(e) => Err(Error::from(e)),
-        }
-    });
+    // macOS: the live tree is the bundle `R/bundle` names, and the integration points at it.
+    let bundle = match inner.bundle {
+        Some(_) => match root.bundle_path(&*inner.fs) {
+            Ok(Some(bundle)) => Some(bundle),
+            Ok(None) => return outcome,
+            Err(e) => return Error::from(lunepack_core::Error::Layout(e)),
+        },
+        None => None,
+    };
+    let tree = bundle
+        .clone()
+        .unwrap_or_else(|| root.version_dir(&current.version));
+    let repaired =
+        tree_config(&*inner.fs, &inner.app_id, &tree, root.scheme()).and_then(|config| {
+            let request = integration_request(
+                &inner.app_id,
+                bundle.as_deref().unwrap_or_else(|| root.root()),
+                &config,
+            );
+            match inner.integration.apply(Scope::User, &request) {
+                Ok(_) | Err(IntegrationError::Conflict(_)) => Ok(()),
+                Err(e) => Err(Error::from(e)),
+            }
+        });
     match repaired {
         Ok(()) => outcome,
         Err(e) => e,
@@ -2747,10 +2793,16 @@ async fn install_from_payload(
         return Err(Error::Verify(lunepack_core::Error::AppIdMismatch));
     }
     let cancel = options.cancel.clone().unwrap_or_default();
+    // macOS (M8-D4): the apps folder's place is judged before anything is written, the lock
+    // included; the installer's own place (a read-only disk image, a translocated copy) is not.
+    if let Some(setup) = &inner.bundle {
+        check_bundle_place(&*inner.fs, setup, &versions_dir)?;
+    }
     let (sink, mut pump) = progress(Phase::Install, 0);
     let mut callback = options.progress.take();
     with_progress(&mut pump, &mut callback, async {
-        // 1. An installed record is `AlreadyInstalled` before anything else.
+        // 1. An installed record is `AlreadyInstalled` before anything else (an orphaned bundle
+        //    install is not installed, M8-D16).
         {
             let lock = take_lock(&inner, &cancel).await?;
             refuse_installed(&inner, &lock, &cancel, &install_root).await?;
@@ -2767,11 +2819,30 @@ async fn install_from_payload(
         let version = manifest.version().clone();
         let target = manifest.target();
 
-        // 3. The install root, then the record, as `install`.
+        // 3. The install root, then the record, as `install`. macOS (M8-D1): the live bundle's
+        //    name is chosen (the apps folder is made private when missing) and the integration's
+        //    preflight runs against it.
         let boot_root = install_root.clone();
-        on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
+        let boot_config = verified.config.clone();
+        let bundle = on_job(&inner, None, &cancel, "bootstrap", move |inner, _| {
+            let bundle = match &inner.bundle {
+                Some(setup) => {
+                    let bundle = lunepack_core::resolve_bundle_target(
+                        &*inner.fs,
+                        &setup.apps_dir,
+                        &boot_config.install.name,
+                        &inner.app_id,
+                    )
+                    .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))?;
+                    let request = integration_request(&inner.app_id, &bundle, &boot_config);
+                    inner.integration.check(Scope::User, &request)?;
+                    Some(bundle)
+                }
+                None => None,
+            };
             clear_tombstones(inner, &boot_root);
-            adoptable(inner, &boot_root)
+            adoptable(inner, &boot_root)?;
+            Ok(bundle)
         })
         .await?;
         let lock = take_lock(&inner, &cancel).await?;
@@ -2789,6 +2860,17 @@ async fn install_from_payload(
                 };
                 let loaded = store.load(&*inner.fs, &*inner.hasher)?;
                 match &loaded.record {
+                    // M8-D16: reset to its floors (a new install id), then installed as from a
+                    // cut-off run, as `install` does.
+                    Some(record)
+                        if record.current.is_some()
+                            && orphaned_bundle(inner, &state_root, record) =>
+                    {
+                        let mut install_id = [0u8; lunepack_core::policy::INSTALL_ID_BYTES];
+                        inner.rng.fill(&mut install_id)?;
+                        let reset = lunepack_core::reset_orphaned(record, install_id)?;
+                        store.commit(&*inner.fs, &loaded, &reset, &*inner.hasher)?;
+                    }
                     Some(record) if record.current.is_some() => {
                         return Err(already_installed(&*inner.fs, &state_root, record));
                     }
@@ -2930,24 +3012,25 @@ async fn install_from_payload(
         let tree = staged.tree.clone();
         let tree_root = root.clone();
         let tree_version = version.clone();
+        let tree_scheme = install_root.scheme();
         on_job(
             &inner,
             Some(&lock),
             &cancel,
             "payload-root",
             move |inner, _| {
-                let checked =
-                    crate::installation::read_config(&*inner.fs, &tree.join(UPDATE_CONFIG_FILE))
-                        .and_then(|c| c.ok_or(Error::NoUpdateConfig))
-                        .and_then(|config| {
-                            check_payload_config(
-                                &inner.app_id,
-                                &config,
-                                &tree_root,
-                                &tree_version,
-                                target,
-                            )
-                        });
+                let at = crate::installation::scheme_config_path(&tree, tree_scheme);
+                let checked = crate::installation::read_config(&*inner.fs, &at)
+                    .and_then(|c| c.ok_or(Error::NoUpdateConfig))
+                    .and_then(|config| {
+                        check_payload_config(
+                            &inner.app_id,
+                            &config,
+                            &tree_root,
+                            &tree_version,
+                            target,
+                        )
+                    });
                 if let Err(e) = checked {
                     inner.fs.remove_dir_all_nofollow(&tree)?;
                     return Err(e);
@@ -2981,7 +3064,11 @@ async fn install_from_payload(
                 }
                 let tree = staged.tree;
                 let config = tree_config(&*inner.fs, &inner.app_id, &tree, install_root.scheme())?;
-                let request = integration_request(&inner.app_id, install_root.root(), &config);
+                let request = integration_request(
+                    &inner.app_id,
+                    bundle.as_deref().unwrap_or_else(|| install_root.root()),
+                    &config,
+                );
                 inner.integration.check(Scope::User, &request)?;
                 let next = lunepack_core::install_first(
                     &record.raise_floors(&floors),
@@ -2989,6 +3076,12 @@ async fn install_from_payload(
                     issued,
                     record.install_id,
                 )?;
+                // macOS: `R/bundle` names the live bundle before the record does (M8-D1); the
+                // reconcile after the commit places the staged tree in it and writes its identity.
+                if let Some(bundle) = &bundle {
+                    lunepack_core::set_bundle_pointer(&*inner.fs, &install_root, bundle)
+                        .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))?;
+                }
                 // As `install` (F11, Q42): the integration before the commit.
                 inner.integration.apply(Scope::User, &request)?;
                 let committed = store.commit(&*inner.fs, &loaded, &next, &*inner.hasher)?;

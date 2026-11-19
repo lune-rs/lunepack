@@ -282,8 +282,17 @@ fn stderr_events() -> Events {
 
 /// Ends a headless mode: `last` to the sinks, then as the one line on stdout.
 fn conclude(events: Events, last: &Event) {
+    conclude_to(events, last, true);
+}
+
+/// [`conclude`], with the line on stdout only when `stdout` (a standard output that carries a
+/// UI's frames, `--ui-stdio`, gets nothing else).
+fn conclude_to(events: Events, last: &Event, stdout: bool) {
     events.emit(last);
     events.finish(SINK_DRAIN);
+    if !stdout {
+        return;
+    }
     let mut line = events::to_json_line(last);
     line.push('\n');
     let mut out = std::io::stdout().lock();
@@ -303,7 +312,7 @@ enum Operation {
 }
 
 /// The title of a native notice for a setup run that failed before the app's name was verified.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 const SETUP_TITLE: &str = "Setup";
 
 /// The fixed text of a native notice: the app's validated display name, what happened and the
@@ -683,8 +692,136 @@ fn unparsed_setup_quiet(args: &[std::ffi::OsString]) -> bool {
     modes::parse_setup(args).unwrap_or(true)
 }
 
-/// Setup files are Linux and Windows only in this release (M8 takes macOS's).
-#[cfg(not(any(target_os = "linux", windows)))]
+/// The macOS installer (M8-D7, [`setup`]): `None` when this runtime is not the installer app's
+/// (the ordinary runtime), else the run's exit kind. A payload file that is malformed is
+/// `verify`; a command line other than nothing, `--silent` or `--ui-stdio` is a usage error.
+///
+/// With `--ui-stdio` the standard output carries the UI's frames and nothing else: the result
+/// goes to the standard error stream only (where the events go too).
+#[cfg(target_os = "macos")]
+fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
+    use lunepack::Process as _;
+    use setup::InstallerRun;
+
+    let process = lunepack_os_macos::MacProcess::new();
+    let exe = process.current_exe().ok()?;
+    let how = setup::parse_installer(args);
+    let ui_stdio = how == Ok(InstallerRun::UiStdio);
+    // F14: only a run a person started may get a notice: no argument (a double-click on the
+    // installer's runtime) or the installer app's own UI (`--ui-stdio`, which a double-click on
+    // the app starts). Anything else is a command-line caller.
+    let quiet = !matches!(how, Ok(InstallerRun::Ui | InstallerRun::UiStdio));
+    let found = match setup::detect_installer(
+        &lunepack_fs::StdFs::new(),
+        &exe,
+        &lunepack_crypto::Sha256Hasher,
+        &lunepack_crypto::Ed25519Verifier,
+    ) {
+        setup::Detect::None => return None,
+        setup::Detect::Malformed => {
+            conclude_to(
+                stderr_events(),
+                &setup::failed(Kind::Verify, None),
+                !ui_stdio,
+            );
+            notice(quiet, false, SETUP_TITLE, Operation::Setup, Kind::Verify);
+            return Some(Kind::Verify);
+        }
+        setup::Detect::Setup(found) => found,
+    };
+    let Ok(how) = how else {
+        eprintln!("{USAGE_LINE}");
+        return Some(Kind::Usage);
+    };
+    Some(run(|ad| {
+        let fail = |kind: Kind, name: Option<&str>| {
+            conclude_to(stderr_events(), &setup::failed(kind, None), !ui_stdio);
+            // A refused root comes after the payload was verified: the notice names the app.
+            match name {
+                Some(name) => notice(quiet, false, name, Operation::Install, kind),
+                None => notice(quiet, false, SETUP_TITLE, Operation::Setup, kind),
+            }
+            kind
+        };
+        let data_home = match data_home() {
+            Ok(dir) => dir,
+            Err(kind) => return fail(kind, None),
+        };
+        // M8-D2: the live bundle goes in `~/Applications`; the data home is
+        // `<canonical HOME>/Library/Application Support` (M8-D1).
+        let Some(apps_dir) = data_home
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|home| home.join("Applications"))
+        else {
+            return fail(Kind::Fs, None);
+        };
+        // No UI is read out of the pack: the installer app carries it beside this runtime.
+        let prepared = match setup::prepare(ad, found, &data_home, None, false, None, &alive) {
+            Ok(prepared) => prepared.with_apps_dir(apps_dir),
+            Err(refused) => return fail(refused.kind, refused.name.as_deref()),
+        };
+        let (app, details) = setup::welcome(&prepared);
+        let env = |name: &str| std::env::var_os(name);
+        let ui = match how {
+            InstallerRun::Silent => UiHost::headless(Flow::Install),
+            InstallerRun::Ui => UiHost::start(
+                &ui_host::Start {
+                    process: std::sync::Arc::clone(&ad.process),
+                    fs: &*ad.fs,
+                    runtime_exe: &exe,
+                    env: &env,
+                    quiet: false,
+                },
+                Flow::Install,
+                app,
+                details,
+            ),
+            InstallerRun::UiStdio => match (process.parent(), own_streams()) {
+                (Ok(Some(parent)), Some((input, output))) => UiHost::over_parent(
+                    ui_host::Bounds::default(),
+                    std::sync::Arc::clone(&ad.process),
+                    parent,
+                    input,
+                    output,
+                    Flow::Install,
+                    app,
+                    details,
+                ),
+                // The parent is gone already, or the streams cannot be used: headless.
+                _ => UiHost::headless(Flow::Install),
+            },
+        };
+        let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
+        ui.report(&events);
+        let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui);
+        let seen = ui.outcome_acknowledged();
+        ui.close(&events);
+        conclude_to(events, &last, !ui_stdio);
+        notice(quiet, seen, prepared.name(), Operation::Install, kind);
+        kind
+    }))
+}
+
+/// This process's standard input and output as files of their own (duplicated descriptors, so
+/// no lock of the standard library's handles is held while a frame is written), for a UI that is
+/// the parent (`--ui-stdio`).
+#[cfg(target_os = "macos")]
+fn own_streams() -> Option<(
+    Box<dyn std::io::Read + Send>,
+    Box<dyn std::io::Write + Send>,
+)> {
+    use std::os::fd::AsFd as _;
+    let input = std::io::stdin().as_fd().try_clone_to_owned().ok()?;
+    let output = std::io::stdout().as_fd().try_clone_to_owned().ok()?;
+    Some((
+        Box::new(std::fs::File::from(input)),
+        Box::new(std::fs::File::from(output)),
+    ))
+}
+
+/// Setup files are Linux, Windows and macOS only.
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn setup_mode(_args: &[std::ffi::OsString]) -> Option<Kind> {
     None
 }
