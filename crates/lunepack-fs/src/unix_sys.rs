@@ -76,6 +76,9 @@ pub(crate) fn volume(path: &Path) -> Result<(String, bool), FsError> {
     }
     // SAFETY: `statvfs` returned 0, so it initialised the whole struct.
     let st = unsafe { buf.assume_init() };
+    // The flag types differ by target (`c_ulong` on 64-bit Linux, narrower elsewhere): widen both,
+    // which is a no-op where they are already `u64`.
+    #[allow(clippy::unnecessary_cast)]
     let read_only = (st.f_flag as u64) & (libc::ST_RDONLY as u64) != 0;
     Ok((String::new(), read_only))
 }
