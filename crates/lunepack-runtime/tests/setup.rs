@@ -1519,7 +1519,8 @@ mod cases {
     /// starts the installer's runtime with `--ui-stdio` (stderr to `engine-stderr` in the out
     /// directory, its pid to `engine-pid`), says hello, answers every `Ping`, notes the prompts and
     /// answers them (`launch`: finish with a launch; `die`: exits with code 9 on the first frame
-    /// after the welcome was answered, mid-install, without a word), then on `Close` waits for the
+    /// after the welcome was answered, mid-install, without a word; `kill`: is killed (SIGKILL,
+    /// as a crash ends it, with no crash report) at that point instead), then on `Close` waits for the
     /// runtime and notes its exit code (`engine-exit`) and how many bytes its standard output
     /// carried after `Close` (`after-close`). Every frame the runtime writes on its standard
     /// output must be a valid frame; anything else ends this UI with code 12.
@@ -1574,6 +1575,12 @@ mod cases {
                     break;
                 }
                 _ if welcomed && script == "die" => std::process::exit(9),
+                _ if welcomed && script == "kill" => {
+                    let _ = Command::new("/bin/kill")
+                        .args(["-KILL", &std::process::id().to_string()])
+                        .status();
+                    std::process::exit(137);
+                }
                 _ => None,
             };
             if let Some(reply) = reply {
@@ -1654,6 +1661,73 @@ mod cases {
         assert_eq!(run.code, 9, "{run:?}");
         let pid: u32 = lab.noted("engine-pid").trim().parse().expect("pid");
         wait_gone(pid);
+        assert_eq!(lab.noted("ui-prompts"), "Welcome\n");
+        let stderr = lab.noted("engine-stderr");
+        assert!(stderr.contains("\"outcome\":\"installed\""), "{stderr}");
+        lab.assert_installed();
+        assert!(!lab.out.join("app-ran").exists(), "the app was launched");
+    }
+
+    /// The sandbox profile under which `/usr/bin/osascript` cannot start: the native alert of a
+    /// run that lost its UI (M8-D11) is then refused before any window opens, and everything else
+    /// runs as usual.
+    #[cfg(target_os = "macos")]
+    const NO_ALERT_PROFILE: &str =
+        "(version 1)(allow default)(deny process-exec (literal \"/usr/bin/osascript\"))";
+
+    /// F6: the UI parent is killed mid-install with the native notice on (no `LUNEPACK_NO_UI`;
+    /// the alert itself is kept off the screen by a sandbox that refuses to start `osascript`).
+    /// The orphaned runtime finishes the install headless, goes through the notice path and
+    /// exits; it never lingers.
+    #[cfg(target_os = "macos")]
+    fn a_ui_parent_killed_mid_install_with_the_notice_on_leaves_no_runtime() {
+        // The instrument: under the profile `osascript` cannot run, while other programs can.
+        let refused = Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                NO_ALERT_PROFILE,
+                "/usr/bin/osascript",
+                "-e",
+                "return 1",
+            ])
+            .output()
+            .expect("sandbox-exec");
+        assert!(!refused.status.success(), "osascript ran in the sandbox");
+        let allowed = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", NO_ALERT_PROFILE, "/usr/bin/true"])
+            .status()
+            .expect("sandbox-exec");
+        assert!(allowed.success(), "the sandbox refuses everything");
+
+        let lab = Lab::new(Twist::default());
+        let me = std::env::current_exe().expect("test exe");
+        let me = me.to_str().expect("utf-8");
+        let engine = lab.installer_runtime();
+        let engine = engine.to_str().expect("utf-8");
+        // `Some`: `LUNEPACK_NO_UI` is removed, so the runtime's notice path is on.
+        let run = lab.run_program(
+            Path::new("/usr/bin/sandbox-exec"),
+            &[
+                "-p",
+                NO_ALERT_PROFILE,
+                me,
+                "--fake-installer-ui",
+                engine,
+                "kill",
+            ],
+            Some("kill"),
+        );
+        assert_eq!(run.code, -1, "the UI was not killed: {run:?}");
+        let died = Instant::now();
+        let pid: u32 = lab.noted("engine-pid").trim().parse().expect("pid");
+        wait_gone(pid);
+        // The install itself and the refused alert take well under this on a loaded machine; a
+        // runtime that lingers or spins after its parent died does not end at all.
+        assert!(
+            died.elapsed() < Duration::from_secs(60),
+            "the runtime ran {:?} after its UI died",
+            died.elapsed()
+        );
         assert_eq!(lab.noted("ui-prompts"), "Welcome\n");
         let stderr = lab.noted("engine-stderr");
         assert!(stderr.contains("\"outcome\":\"installed\""), "{stderr}");
@@ -2021,6 +2095,11 @@ mod cases {
             (
                 "a_ui_parent_that_dies_mid_install_leaves_the_same_outcome",
                 a_ui_parent_that_dies_mid_install_leaves_the_same_outcome,
+            ),
+            #[cfg(target_os = "macos")]
+            (
+                "a_ui_parent_killed_mid_install_with_the_notice_on_leaves_no_runtime",
+                a_ui_parent_killed_mid_install_with_the_notice_on_leaves_no_runtime,
             ),
             #[cfg(target_os = "macos")]
             (
