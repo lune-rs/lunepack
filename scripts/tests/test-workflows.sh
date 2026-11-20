@@ -206,6 +206,8 @@ e2e_windows_jobs_ok() {
     if ! printf '%s\n' "$block" | grep -q 'runs-on: windows-latest'; then echo "$job does not run on windows-latest"; bad=1; fi
     if ! printf '%s\n' "$block" | grep -q 'scripts/e2e-windows.ps1'; then echo "$job does not run e2e-windows.ps1"; bad=1; fi
   done
+  block=$(job_block "$1" e2e-windows)
+  if ! printf '%s\n' "$block" | grep -q 'run: ./scripts/ci/windows-publisher-test.ps1'; then echo "e2e-windows does not run windows-publisher-test.ps1"; bad=1; fi
   block=$(job_block "$1" e2e-windows-defender)
   if ! printf '%s\n' "$block" | grep -q 'scripts/ci/defender-on.ps1'; then echo "the Defender job does not run defender-on.ps1"; bad=1; fi
   if ! printf '%s\n' "$block" | grep -q 'defender-on.ps1 -Report'; then echo "the Defender job does not report detections"; bad=1; fi
@@ -227,6 +229,11 @@ if [ -f "$ci" ]; then
   RC=0
   e2e_windows_jobs_ok "$T_TMP/e2e-noreport.yml" >"$OUT" 2>&1 || RC=$?
   t_check "seeded Defender job without its report fails" rc_nonzero
+  grep -v 'windows-publisher-test.ps1' "$ci" >"$T_TMP/e2e-nopub.yml" || true
+  RC=0
+  e2e_windows_jobs_ok "$T_TMP/e2e-nopub.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded e2e-windows without the publisher test fails" rc_nonzero
+  t_check "seeded e2e-windows without the publisher test reports why" out_has "windows-publisher-test.ps1"
   RC=0
   e2e_windows_jobs_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
   t_check "a file with no Windows e2e jobs fails" rc_nonzero
@@ -288,6 +295,24 @@ if command -v pwsh >/dev/null 2>&1; then
   RC=0
   env -u CI -u GITHUB_ACTIONS pwsh -NoProfile -File "$repo/scripts/ci/os-trust.ps1" >"$OUT" 2>&1 || RC=$?
   t_check "os-trust.ps1 refuses off CI: exit 3" rc_is 3
+fi
+
+# The throwaway-identity script of the macOS suite (M9 step 9) refuses off CI before it makes a
+# directory or touches a keychain, and refuses a bad usage.
+if [ "$(uname -s)" = Darwin ]; then
+  ident_dir=$T_TMP/ident-never
+  RC=0
+  env -u CI bash "$repo/scripts/ci/macos-selfsigned.sh" create "$ident_dir" >"$OUT" 2>&1 || RC=$?
+  t_check "macos-selfsigned.sh refuses off CI" rc_is 1
+  t_check "macos-selfsigned.sh names why" out_has "off CI"
+  t_check "macos-selfsigned.sh made nothing when it refused" test ! -e "$ident_dir"
+  RC=0
+  CI=true bash "$repo/scripts/ci/macos-selfsigned.sh" frobnicate "$ident_dir" >"$OUT" 2>&1 || RC=$?
+  t_check "macos-selfsigned.sh: an unknown command is a usage error" rc_is 2
+  RC=0
+  CI=true bash "$repo/scripts/ci/macos-selfsigned.sh" delete "$T_TMP/guard-tmp" >"$OUT" 2>&1 || RC=$?
+  t_check "macos-selfsigned.sh delete refuses a directory it did not make" rc_is 1
+  t_check "macos-selfsigned.sh delete left that directory alone" test -d "$T_TMP/guard-tmp"
 fi
 
 t_finish

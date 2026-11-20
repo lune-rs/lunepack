@@ -52,6 +52,38 @@ pub struct Bins {
     pub fake_ui: PathBuf,
 }
 
+/// Who signs a release through the packager's `[codesign.macos]` templates (M9-D2).
+#[derive(Clone, Copy)]
+pub enum Signer {
+    /// `codesign --sign -`: no identity, no key; every Mac can do it.
+    AdHoc,
+    /// The throwaway identity named by `LUNEPACK_E2E_IDENTITY_A` in the keychain at
+    /// `LUNEPACK_E2E_KEYCHAIN` (`--ci` only: `scripts/ci/macos-selfsigned.sh` makes them).
+    IdentityA,
+    /// The second throwaway identity (`LUNEPACK_E2E_IDENTITY_B`): another publisher.
+    IdentityB,
+}
+
+impl Signer {
+    /// The `[codesign.macos]` table. The `{env:}` values are names and paths, not secrets.
+    fn toml(self) -> String {
+        let who = match self {
+            Signer::AdHoc => "\"-\"",
+            Signer::IdentityA => "\"{env:LUNEPACK_E2E_IDENTITY_A}\"",
+            Signer::IdentityB => "\"{env:LUNEPACK_E2E_IDENTITY_B}\"",
+        };
+        let keychain = match self {
+            Signer::AdHoc => "",
+            _ => ", \"--keychain\", \"{env:LUNEPACK_E2E_KEYCHAIN}\"",
+        };
+        format!(
+            "\n[codesign.macos]\n\
+             sign = [\"/usr/bin/codesign\", \"--force\", \"--sign\", {who}{keychain}, \"--timestamp=none\", \"{{path}}\"]\n\
+             verify = [\"/usr/bin/codesign\", \"--verify\", \"--deep\", \"--strict\", \"{{path}}\"]\n"
+        )
+    }
+}
+
 /// What one release holds.
 #[derive(Clone, Copy)]
 pub struct Release {
@@ -146,6 +178,24 @@ pub const ROWS: &[Row] = &[
         name: "the signed flow: assemble, ad-hoc sign, pack; codesign-clean after every change",
         run: row_signed,
         ci_only: false,
+    },
+    Row {
+        id: "13",
+        name: "the packager signs through [codesign.macos] (ad hoc): install, update, verify after the swap",
+        run: row_codesign_templates,
+        ci_only: false,
+    },
+    Row {
+        id: "13b",
+        name: "publisher continuity with an ad-hoc install under enforce: download proceeds, installed_unsigned",
+        run: row_continuity_ad_hoc,
+        ci_only: false,
+    },
+    Row {
+        id: "14",
+        name: "publisher continuity with throwaway identities: same certificate updates, another or an ad-hoc one is refused (exit 29)",
+        run: row_continuity_identities,
+        ci_only: true,
     },
     Row {
         id: "3b",
@@ -321,6 +371,8 @@ pub struct RecordView {
     pub current: Option<String>,
     pub previous: Option<String>,
     pub pending: Option<(String, u64)>,
+    /// The staged version (`download` recorded it; the apply has not run).
+    pub staged: Option<String>,
     pub bad: Vec<String>,
     pub events: usize,
 }
@@ -346,6 +398,8 @@ pub struct World {
     pub origin: FakeOrigin,
     root_key_hex: String,
     extra_vars: Vec<(String, String)>,
+    /// Variables of the `lunepack` command line's environment (the signer templates' `{env:}`).
+    cli_vars: Vec<(String, String)>,
     /// `HOME` as the children see it, when it differs from `home` (a symlink to it).
     home_env: Option<PathBuf>,
 }
@@ -416,6 +470,7 @@ impl World {
             origin,
             root_key_hex: String::new(),
             extra_vars: Vec::new(),
+            cli_vars: Vec::new(),
             home_env: None,
         };
         w.setup_publisher();
@@ -445,6 +500,9 @@ impl World {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (name, value) in &self.cli_vars {
+            cmd.env(name, value);
+        }
         let output = run_limited(cmd, COMMAND_LIMIT, "the lunepack command line");
         assert!(
             output.status.success(),
@@ -499,6 +557,11 @@ impl World {
     }
 
     fn write_config(&self, path: &Path, release: &Release) {
+        self.write_config_with(path, release, "");
+    }
+
+    /// The config of `release` with `extra` (TOML tables, such as `[codesign.macos]`) appended.
+    fn write_config_with(&self, path: &Path, release: &Release, extra: &str) {
         let text = format!(
             "app_id = \"{APP_ID}\"\n\
              \n\
@@ -522,7 +585,8 @@ impl World {
              entry = \"Contents/MacOS/{ENTRY}\"\n\
              name = \"{APP_NAME}\"\n\
              comment = \"The lunepack end-to-end app\"\n\
-             autostart = {autostart}\n",
+             autostart = {autostart}\n\
+             {extra}",
             root = self.root_key_hex,
             feed = self.feed,
             timeout = release.health_timeout_secs,
@@ -587,11 +651,26 @@ impl World {
     /// Packs `release` with the real command line (the stand-in UI as the helper), adds it to the
     /// feed and serves it.
     pub fn publish(&self, release: &Release) {
+        self.publish_with(release, None);
+    }
+
+    /// Packs `release` as an unsigned bundle of real Mach-O code and lets the packager sign it
+    /// through `signer`'s `[codesign.macos]` templates (M9): no `codesign` call of this harness.
+    pub fn publish_codesigned(&self, release: &Release, signer: Signer) {
+        self.publish_with(release, Some(signer));
+    }
+
+    fn publish_with(&self, release: &Release, signer: Option<Signer>) {
         let input = self.bundle_input(release);
+        if signer.is_some() {
+            // Only code `codesign` can seal: no text framework, no script.
+            std::fs::remove_dir_all(input.join("Contents/Frameworks")).expect("no framework");
+            std::fs::remove_dir_all(input.join("Contents/Helpers")).expect("no helper tool");
+        }
         let cfg = self
             .cfg_dir
             .join(format!("release-{}.toml", release.version));
-        self.write_config(&cfg, release);
+        self.write_config_with(&cfg, release, &signer.map(Signer::toml).unwrap_or_default());
         let s = |p: &Path| p.to_string_lossy().into_owned();
         let (input_s, rd, cfg_s) = (s(&input), s(&self.release_dir), s(&cfg));
         let (runtime, ui) = (s(&self.bins.runtime), s(&self.bins.fake_ui));
@@ -748,12 +827,24 @@ impl World {
 
     /// The `.dmg` of the published `version` (`lunepack setup`).
     pub fn build_dmg(&self, version: &str) -> PathBuf {
+        self.build_dmg_from(version, &self.cfg_dir.join("lunepack.toml"))
+    }
+
+    /// The `.dmg` of `version` built with the release's own config (its `[codesign.macos]` signs
+    /// the installer app and the image, M9 step 4).
+    pub fn build_dmg_signed(&self, version: &str) -> PathBuf {
+        self.build_dmg_from(
+            version,
+            &self.cfg_dir.join(format!("release-{version}.toml")),
+        )
+    }
+
+    fn build_dmg_from(&self, version: &str, cfg: &Path) -> PathBuf {
         let out = self.work.join(format!("{APP_ID}-{version}.dmg"));
         let (rd, o) = (
             self.release_dir.to_string_lossy().into_owned(),
             out.to_string_lossy().into_owned(),
         );
-        let cfg = self.cfg_dir.join("lunepack.toml");
         self.cli(&[
             "setup",
             &rd,
@@ -834,6 +925,13 @@ impl World {
     pub fn set_var(&mut self, name: &str, value: &str) {
         self.extra_vars.retain(|(n, _)| n != name);
         self.extra_vars.push((name.to_owned(), value.to_owned()));
+    }
+
+    /// Sets a variable of the `lunepack` command line's environment (a signer template's
+    /// `{env:NAME}`); never a secret: names, paths and identities only.
+    pub fn set_cli_var(&mut self, name: &str, value: &str) {
+        self.cli_vars.retain(|(n, _)| n != name);
+        self.cli_vars.push((name.to_owned(), value.to_owned()));
     }
 
     /// Runs the installer app's runtime of `dmg` with `--silent` from a read-only mount and
@@ -942,6 +1040,7 @@ impl World {
             current: r.current.map(|c| c.version.to_string()),
             previous: r.previous.map(|p| p.version.to_string()),
             pending: r.pending.map(|p| (p.version.to_string(), p.attempts)),
+            staged: r.staged.map(|s| s.version.to_string()),
             bad: r.bad.iter().map(ToString::to_string).collect(),
             events: r.lifecycle.map_or(0, |l| l.events.len()),
         })
@@ -2142,6 +2241,237 @@ fn row_signed(bins: &Bins) -> Vec<String> {
     }
     assert_no_quarantine(&w.bundle());
     report.push("instrument xattr: no com.apple.quarantine under B".to_owned());
+    report
+}
+
+/// `codesign --verify --deep --strict` of a plain file (a disk image) or a bundle.
+fn assert_verifies(what: &str, path: &Path) {
+    if let Err(why) = codesign_verify(path) {
+        panic!("{what} does not verify: {why}");
+    }
+}
+
+/// The instrument check of a verify: a copy of `bundle` whose runtime lost its signature does not
+/// verify, so a pass means something.
+fn assert_verify_can_fail(w: &World, bundle: &Path) {
+    let copy = w
+        .work
+        .join("verify-control")
+        .join(format!("{APP_NAME}.app"));
+    std::fs::create_dir_all(copy.parent().expect("parent")).expect("control dir");
+    let mut cmd = Command::new("/usr/bin/ditto");
+    cmd.arg(bundle)
+        .arg(&copy)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let out = run_limited(cmd, Duration::from_secs(120), "ditto");
+    assert!(out.status.success(), "ditto of the control copy failed");
+    let mut cmd = Command::new("/usr/bin/codesign");
+    cmd.args(["--remove-signature"])
+        .arg(copy.join("Contents/MacOS/lunepack-runtime"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let out = run_limited(cmd, Duration::from_secs(60), "codesign --remove-signature");
+    assert!(out.status.success(), "could not unsign the control copy");
+    assert!(
+        codesign_verify(&copy).is_err(),
+        "the verify passes a bundle whose runtime is unsigned: it cannot tell"
+    );
+    std::fs::remove_dir_all(w.work.join("verify-control")).expect("remove the control copy");
+}
+
+/// Row 13 (M9 step 9): no `codesign` call of the harness: the packager signs 1.0.0 and 1.1.0
+/// through ad-hoc `[codesign.macos]` templates (and the installer app and the `.dmg` through the
+/// same section), the runtime installs and updates, and the live bundle passes `codesign --verify
+/// --deep --strict` after the install and after the swap. The update runs under the default
+/// policy `enforce` (the section is there, M9-D6) on an ad-hoc install: no baseline, so it goes
+/// through (M9-D9).
+fn row_codesign_templates(bins: &Bins) -> Vec<String> {
+    let w = World::new(bins);
+    let mut report = Vec::new();
+    for release in [&V1, &V2] {
+        w.publish_codesigned(release, Signer::AdHoc);
+    }
+    let dmg = w.build_dmg_signed("1.0.0");
+    assert_verifies("the signed .dmg", &dmg);
+    report.push("codesign: the .dmg verifies".to_owned());
+    {
+        let mount = Mounted::attach(&dmg, &w.work.join("mnt-verify"), &["-readonly"]);
+        let installer = mount.at.join(format!("Install {APP_NAME}.app"));
+        assert_verifies("the installer app in the .dmg", &installer);
+        report.push("codesign: the installer app in the .dmg verifies".to_owned());
+    }
+    assert_eq!(w.install_from_dmg(&dmg), 0, "the installer's exit code");
+    w.assert_installed("1.0.0");
+    assert_verifies("the installed bundle", &w.bundle());
+    assert_verify_can_fail(&w, &w.bundle());
+    report.push("codesign: B verifies after the install (the verify can fail)".to_owned());
+    assert_eq!(w.run_app(&w.entry(), &[]), 0, "the entry run directly");
+    w.expect_lines(&first_install_lines(), false);
+
+    w.run_app(&w.entry(), &["--update", "--no-ui"]);
+    w.expect_lines(&confirmed_update_lines("1.0.0", "1.1.0"), false);
+    w.wait_runtime_gone();
+    assert_eq!(w.bundle_version().as_deref(), Some("1.1.0"));
+    assert_verifies("the bundle after the swap", &w.bundle());
+    let r = w.record().expect("a record");
+    assert_eq!(r.current.as_deref(), Some("1.1.0"));
+    assert!(r.bad.is_empty(), "nothing is marked bad");
+    report.push("codesign: B verifies after the swap to 1.1.0".to_owned());
+    assert_no_quarantine(&w.bundle());
+    report
+}
+
+/// Row 13b: the same ad-hoc install, asked through the runtime's command line: `download` runs the
+/// installed tree's policy (`enforce`, the default of a signed pack), the baseline is unsigned, so
+/// the update is staged and the result says `publisher: installed_unsigned` (M9-D9); the update
+/// goes on to apply.
+fn row_continuity_ad_hoc(bins: &Bins) -> Vec<String> {
+    let w = World::new(bins);
+    for release in [&V1, &V2] {
+        w.publish_codesigned(release, Signer::AdHoc);
+    }
+    let dmg = w.build_dmg_signed("1.0.0");
+    assert_eq!(w.install_from_dmg(&dmg), 0, "the installer's exit code");
+    w.assert_installed("1.0.0");
+    let config =
+        std::fs::read_to_string(w.bundle().join("Contents/Resources/lunepack-update.json"))
+            .expect("the installed bundle's update configuration");
+    let parsed = lunepack_core::UpdateConfig::parse(config.as_bytes())
+        .expect("the installed update configuration parses");
+    assert_eq!(
+        parsed.publisher_check,
+        lunepack_core::PublisherPolicy::Enforce,
+        "the signed pack wrote the default policy `enforce`"
+    );
+    let (code, out) = w.runtime(&["download", "--json"]);
+    assert_eq!(code, 0, "download under enforce, installed ad hoc: {out}");
+    let line = last_line(&out);
+    assert!(
+        line.contains("\"version\":\"1.1.0\",\"staged\":true")
+            && line.contains("\"publisher\":\"installed_unsigned\""),
+        "the result names the finding: {line}"
+    );
+    let r = w.record().expect("a record");
+    assert_eq!(r.staged.as_deref(), Some("1.1.0"), "1.1.0 is staged");
+    assert!(r.bad.is_empty(), "nothing is marked bad");
+    // The staged update applies (the app finds it staged).
+    w.run_app(&w.entry(), &["--update", "--no-ui"]);
+    wait_for("the update to 1.1.0", || {
+        w.record()
+            .is_some_and(|r| r.current.as_deref() == Some("1.1.0") && r.pending.is_none())
+    });
+    w.wait_runtime_gone();
+    assert_verifies("the bundle after the swap", &w.bundle());
+    vec![
+        "continuity: download under enforce on an ad-hoc install reports installed_unsigned"
+            .to_owned(),
+    ]
+}
+
+/// The throwaway identities `scripts/ci/macos-selfsigned.sh` made: the keychain and two names.
+/// A missing variable fails the row as INVALID, never as a pass.
+fn identity_vars() -> [(&'static str, String); 3] {
+    [
+        "LUNEPACK_E2E_KEYCHAIN",
+        "LUNEPACK_E2E_IDENTITY_A",
+        "LUNEPACK_E2E_IDENTITY_B",
+    ]
+    .map(|name| {
+        let value = std::env::var(name)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                panic!(
+                    "INVALID: {name} is not set (scripts/e2e-macos.sh --ci makes the identities)"
+                )
+            });
+        (name, value)
+    })
+}
+
+/// Row 14 (`--ci`): two throwaway self-signed identities in a temporary keychain. Every negative
+/// has its positive control in the run: an update signed by the installed certificate must be
+/// staged and applied first, else the row is INVALID (the runner refused the identity, or the
+/// check cannot tell publishers apart) and fails the job. Then a release signed by the other
+/// certificate is refused with exit 29 `different` and marked bad, and an ad-hoc one with
+/// `candidate_unsigned`; `check` never offers either again.
+fn row_continuity_identities(bins: &Bins) -> Vec<String> {
+    let mut w = World::new(bins);
+    for (name, value) in identity_vars() {
+        w.set_cli_var(name, &value);
+    }
+    let mut report = Vec::new();
+    for release in [&V1, &V2] {
+        w.publish_codesigned(release, Signer::IdentityA);
+    }
+    let dmg = w.build_dmg_signed("1.0.0");
+    assert_eq!(w.install_from_dmg(&dmg), 0, "the installer's exit code");
+    w.assert_installed("1.0.0");
+    assert_verifies("B signed by the throwaway identity", &w.bundle());
+
+    // The control: the same certificate updates.
+    let (code, out) = w.runtime(&["download", "--json"]);
+    let line = last_line(&out);
+    assert!(
+        code == 0 && line.contains("\"version\":\"1.1.0\",\"staged\":true"),
+        "INVALID: the control failed (same certificate, exit {code}): {line}"
+    );
+    assert!(
+        !line.contains("publisher"),
+        "INVALID: the control reports a finding where the certificates are the same: {line}"
+    );
+    w.run_app(&w.entry(), &["--update", "--no-ui"]);
+    wait_for("the control update to 1.1.0", || {
+        w.record()
+            .is_some_and(|r| r.current.as_deref() == Some("1.1.0") && r.pending.is_none())
+    });
+    w.wait_runtime_gone();
+    assert_verifies("B after the control update", &w.bundle());
+    report.push("continuity: same certificate: download and apply proceed".to_owned());
+
+    // Another certificate.
+    w.publish_codesigned(&Release::plain("1.2.0"), Signer::IdentityB);
+    let (code, out) = w.runtime(&["download", "--json"]);
+    let line = last_line(&out);
+    assert_eq!(code, 29, "another certificate: {line}");
+    assert!(
+        line.contains("\"kind\":\"publisher_mismatch\"")
+            && line.contains("\"reason\":\"different\""),
+        "another certificate: {line}"
+    );
+    let r = w.record().expect("a record");
+    assert_eq!(r.bad, ["1.2.0"], "the refused version is marked bad");
+    assert_eq!(r.staged, None, "nothing is staged");
+    assert_eq!(w.bundle_version().as_deref(), Some("1.1.0"));
+    let (code, out) = w.runtime(&["download", "--json"]);
+    assert_eq!(code, 0, "a bad version is not offered again: {out}");
+    assert!(
+        last_line(&out).contains("\"version\":null,\"staged\":false"),
+        "nothing new: {out}"
+    );
+    report.push(
+        "continuity: another certificate: exit 29 different, marked bad, not offered again"
+            .to_owned(),
+    );
+
+    // An ad-hoc candidate.
+    w.publish_codesigned(&Release::plain("1.3.0"), Signer::AdHoc);
+    let (code, out) = w.runtime(&["download", "--json"]);
+    let line = last_line(&out);
+    assert_eq!(code, 29, "an ad-hoc candidate: {line}");
+    assert!(
+        line.contains("\"reason\":\"candidate_unsigned\""),
+        "an ad-hoc candidate: {line}"
+    );
+    let r = w.record().expect("a record");
+    assert_eq!(r.bad, ["1.2.0", "1.3.0"], "both refusals are marked bad");
+    assert_eq!(r.staged, None, "nothing is staged");
+    assert_eq!(w.bundle_version().as_deref(), Some("1.1.0"));
+    assert_verifies("B after the refusals", &w.bundle());
+    report.push("continuity: ad-hoc candidate: exit 29 candidate_unsigned, marked bad".to_owned());
     report
 }
 

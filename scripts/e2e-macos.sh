@@ -11,7 +11,12 @@
 # the bundles the rows start through `open`; the trap unregisters them with `lsregister -u`,
 # detaches every image mounted under the root and removes the root. No sudo, no signing identity
 # (ad-hoc only). Every external tool (`hdiutil`, `codesign`, `spctl`, `open`, ...) is bounded.
-# `--ci` adds the rows that launch the installed bundle through LaunchServices (row 12).
+# `--ci` adds the rows that launch the installed bundle through LaunchServices (row 12) and the
+# publisher-continuity rows with two throwaway self-signed identities (row 14, M9 step 9):
+# scripts/ci/macos-selfsigned.sh makes them in a temporary keychain under the root (never in the
+# search list), the trap deletes them, and the publisher adapter's own identity rows
+# (`cargo test -p lunepack-os-macos --test publisher`) run with the same identities and fail on a
+# skip. Without --ci nothing touches a keychain: the packager signs ad hoc only.
 #
 # It builds the release `lunepack-runtime` (scripts/build-runtime.sh), `lunepack`, the Rust example
 # app, the stand-in UI (tests/e2e/fake-ui), then runs the test binary crates/lunepack-runtime/tests/e2e
@@ -82,6 +87,7 @@ real_home=$HOME
 export CARGO_HOME=${CARGO_HOME:-$real_home/.cargo}
 export RUSTUP_HOME=${RUSTUP_HOME:-$real_home/.rustup}
 
+keys=
 root=$(mktemp -d "${TMPDIR:-/tmp}/lunepack-e2e-mac.XXXXXX")
 root=$(cd "$root" && pwd -P)
 case $root in
@@ -124,6 +130,10 @@ cleanup() {
   else
     echo "e2e-macos: lsregister is absent: LaunchServices registrations were not checked"
   fi
+  # The throwaway identities (--ci): the keychain and what was trusted for it, before the root goes.
+  if [ -n "$keys" ] && [ -d "$keys" ]; then
+    "$top/scripts/ci/macos-selfsigned.sh" delete "$keys" || echo "e2e-macos: WARNING: the throwaway identities were not removed" >&2
+  fi
   rm -rf "$root"
   exit "$status"
 }
@@ -146,6 +156,12 @@ if command -v shellcheck >/dev/null 2>&1; then
   shellcheck -s sh "$shell_app"
 fi
 
+# How many crash reports named after what the suite starts the real user's own folder holds.
+real_reports() {
+  find "$real_home/Library/Logs/DiagnosticReports" -maxdepth 2 \
+    \( -name 'lunepack*' -o -name 'e2e_*' -o -name 'e2e-*' \) 2>/dev/null | wc -l | tr -d ' '
+}
+
 # How many entries named after the e2e app the real user's own folders hold.
 real_entries() {
   find "$real_home/Applications" "$real_home/Library/Application Support" -maxdepth 1 \
@@ -155,8 +171,31 @@ real_entries() {
 # The real user's own folders must not gain an entry named after the e2e app (checked at the end).
 real_home=$(cd "$real_home" 2>/dev/null && pwd -P || true)
 before=
+reports_before=
 if [ -n "$real_home" ] && [ "$real_home" != "$HOME" ]; then
   before=$(real_entries)
+  reports_before=$(real_reports)
+fi
+
+if [ "$ci" = 1 ]; then
+  echo "e2e-macos: making the throwaway identities (CI only)"
+  keys=$root/identities
+  made=$("$top/scripts/ci/macos-selfsigned.sh" create "$keys") || die "INVALID: the throwaway identities could not be made"
+  while IFS='=' read -r name value; do
+    case $name in
+      LUNEPACK_E2E_KEYCHAIN | LUNEPACK_E2E_IDENTITY_A | LUNEPACK_E2E_IDENTITY_B) export "$name=$value" ;;
+    esac
+  done <<<"$made"
+  [ -n "${LUNEPACK_E2E_KEYCHAIN:-}" ] && [ -n "${LUNEPACK_E2E_IDENTITY_A:-}" ] && [ -n "${LUNEPACK_E2E_IDENTITY_B:-}" ] ||
+    die "INVALID: the identity script printed no keychain and two identities"
+  echo "e2e-macos: the publisher adapter's identity rows"
+  LUNEPACK_TEST_KEYCHAIN=$LUNEPACK_E2E_KEYCHAIN \
+    LUNEPACK_TEST_IDENTITY_A=$LUNEPACK_E2E_IDENTITY_A \
+    LUNEPACK_TEST_IDENTITY_B=$LUNEPACK_E2E_IDENTITY_B \
+    cargo test --locked -p lunepack-os-macos --test publisher -- --nocapture 2>&1 | tee "$root/publisher-rows.log"
+  if grep -q '^skipped:' "$root/publisher-rows.log"; then
+    die "FAIL: a publisher row was skipped on CI (a skip is not a pass)"
+  fi
 fi
 
 echo "e2e-macos: running the suite"
@@ -174,5 +213,7 @@ LUNEPACK_E2E_ROOT=$root/rows \
 if [ -n "$real_home" ] && [ "$real_home" != "$HOME" ]; then
   after=$(real_entries)
   [ "$after" = "$before" ] || die "FAIL: the real user's folders gained an e2e entry"
+  reports_after=$(real_reports)
+  [ "$reports_after" = "$reports_before" ] || die "FAIL: a helper crashed: $((reports_after - reports_before)) new crash report(s) named after lunepack or the e2e apps"
 fi
 echo "e2e-macos: PASS"

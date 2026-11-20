@@ -70,6 +70,14 @@ pub const FILE_ROWS: &[Row] = &[Row {
     run: row_file_feed,
 }];
 
+/// Row 9: the published releases say `publisher_check = "enforce"` (M9-D6); Linux has no OS code
+/// signature, so the check does not apply and the update goes through as in row 2.
+pub const ENFORCE_ROWS: &[Row] = &[Row {
+    id: 9,
+    name: "publisher_check = enforce: install and update proceed (not applicable on Linux)",
+    run: row_enforce_update,
+}];
+
 const V1: Release = Release::plain("1.0.0");
 const V2: Release = Release::plain("2.0.0");
 const V3: Release = Release {
@@ -104,6 +112,9 @@ pub fn run_table(bins: &Binaries, app: &App) -> Result<Vec<String>, String> {
         let mut lab = Lab::new(bins, app, kind);
         run_rows(&mut lab, rows, &mut log)?;
     }
+    let mut lab = Lab::new(bins, app, FeedKind::Http);
+    lab.set_publisher_check("enforce");
+    run_rows(&mut lab, ENFORCE_ROWS, &mut log)?;
     Ok(log)
 }
 
@@ -510,6 +521,41 @@ fn row_file_feed(lab: &mut Lab) -> Vec<String> {
     let mut lines = row_install(lab);
     lines.extend(row_update_confirmed(lab));
     assert!(lab.requests().is_empty(), "a file feed makes no request");
+    lines
+}
+
+/// Row 9: rows 1 and 2 again with `publisher_check = "enforce"` in every release (M9-D9: the
+/// platform has no check, so the outcome is "not applicable" and the update is staged and applied
+/// as without a policy), then a `download` from the updated tree. The policy really is in the
+/// installed tree's configuration, nothing is marked bad, and the `download` result carries no
+/// `publisher` member.
+fn row_enforce_update(lab: &mut Lab) -> Vec<String> {
+    let mut lines = row_install(lab);
+    let config = std::fs::read_to_string(lab.root.join("versions/1.0.0/lunepack-update.json"))
+        .expect("the installed tree's update configuration");
+    let parsed = lunepack_core::UpdateConfig::parse(config.as_bytes())
+        .expect("the installed update configuration parses");
+    assert_eq!(
+        parsed.publisher_check,
+        lunepack_core::PublisherPolicy::Enforce,
+        "the policy is written into the installed tree's configuration"
+    );
+    lines.extend(row_update_confirmed(lab));
+    lab.publish(&Release::plain("2.1.0"));
+    let runtime = lab.root.join("versions/2.0.0/bin").join(RUNTIME_FILE);
+    let run = lab.run_cmd(&runtime, &["download", "--json"], None);
+    assert_eq!(run.code, 0, "download under enforce exited {}", run.code);
+    let last = run.last_line();
+    assert!(
+        last.contains("\"version\":\"2.1.0\",\"staged\":true"),
+        "download stages 2.1.0: {last}"
+    );
+    assert!(
+        !last.contains("publisher"),
+        "no finding on a platform without a check: {last}"
+    );
+    let record = lab.record().expect("a record");
+    assert!(record.bad.is_empty(), "nothing is marked bad");
     lines
 }
 
