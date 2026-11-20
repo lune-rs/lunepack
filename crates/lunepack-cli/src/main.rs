@@ -9,6 +9,7 @@ mod cmd_keys;
 mod cmd_pack;
 mod cmd_setup;
 mod cmd_verify;
+mod codesign;
 mod config;
 mod dmg;
 mod pipeline;

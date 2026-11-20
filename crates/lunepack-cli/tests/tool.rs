@@ -4,6 +4,8 @@
 //!
 //! Every planted value is made at run time; no case prints an environment or a config.
 
+// The binary uses part of this module; the cases here use the rest.
+#[allow(dead_code)]
 #[path = "../src/tool.rs"]
 mod tool;
 

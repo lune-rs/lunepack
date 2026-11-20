@@ -392,7 +392,7 @@ pub fn build(
 
 /// The stem of the bundle's file name (M8-D1's rule, as the runtime applies it at the first
 /// install): `install.name` when it can be a bundle name, else the app id.
-fn bundle_stem<'a>(name: &'a str, app_id: &'a AppId) -> &'a str {
+pub(crate) fn bundle_stem<'a>(name: &'a str, app_id: &'a AppId) -> &'a str {
     if macos_name_ok(name).is_ok() {
         name
     } else {

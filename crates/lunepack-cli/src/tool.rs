@@ -12,9 +12,6 @@
 //! (at most [`STDERR_TAIL`] bytes) of the tool's standard error with every `{env:}` value of the call
 //! replaced by `<NAME>`. It never shows or logs the expanded argv or any environment variable.
 
-// The sign stage (M9 step 3) is the caller of `run_tool`; until then only `hdiutil` uses this.
-#![allow(dead_code)]
-
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read};
@@ -44,6 +41,7 @@ pub struct Captured {
     /// The first [`OUTPUT_CAP`] bytes of standard error.
     pub stderr: Vec<u8>,
     /// Whether standard output had more than the cap.
+    #[allow(dead_code)] // the runner's tests read it
     pub stdout_truncated: bool,
     /// Whether standard error had more than the cap.
     pub stderr_truncated: bool,
@@ -51,6 +49,7 @@ pub struct Captured {
 
 /// What a tool that succeeded wrote, capped.
 #[derive(Debug)]
+#[allow(dead_code)] // the sign stage keeps only the verdict; the runner's tests read the bytes
 pub struct ToolOutput {
     /// The first [`OUTPUT_CAP`] bytes of standard output.
     pub stdout: Vec<u8>,

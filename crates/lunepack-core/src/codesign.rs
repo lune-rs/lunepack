@@ -181,6 +181,12 @@ impl ArgvTemplate {
         self.role
     }
 
+    /// Whether the template names `{zip}` (the packager writes the zip only for a template that
+    /// does).
+    pub fn uses_zip(&self) -> bool {
+        self.elements.contains(&Element::Zip)
+    }
+
     /// The names of the environment variables the template reads, once each, in name order.
     pub fn env_names(&self) -> Vec<&str> {
         let names: BTreeSet<&str> = self
