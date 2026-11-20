@@ -197,7 +197,6 @@ pub const MAX_CODESIGN_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
 /// One resolved `[codesign.<os>]` section (M9-D2): every template parsed, every default applied.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // read by the sign stage (M9 step 3)
 pub struct CodeSignSection {
     /// `sign`: each unsigned PE (Windows) or loose Mach-O file (macOS).
     pub sign: ArgvTemplate,
@@ -206,6 +205,7 @@ pub struct CodeSignSection {
     /// `sign_outer`: the app bundle (macOS); defaults to `sign_bundle`.
     pub sign_outer: ArgvTemplate,
     /// `sign_installer`: `Setup.exe`, the installer app's items and the `.dmg`; defaults to `sign`.
+    #[allow(dead_code)] // read by `lunepack setup` (M9 step 4)
     pub sign_installer: ArgvTemplate,
     /// `verify`: run on the signed outer object.
     pub verify: Option<ArgvTemplate>,
@@ -523,7 +523,6 @@ impl Config {
 
     /// The `[codesign.<os>]` section that applies to `target`: `windows` for a `windows-*` target,
     /// `macos` for a `macos-*` one, none for Linux (M9-D2). A section for another OS is ignored.
-    #[allow(dead_code)] // read by the sign stage (M9 step 3)
     pub fn codesign_for(&self, target: Target) -> Option<&CodeSignSection> {
         if target.is_windows() {
             self.codesign_windows.as_ref()
@@ -537,7 +536,6 @@ impl Config {
     /// The publisher-continuity policy to write into the config of a tree for `target` (M9-D6): an
     /// explicit `[update] publisher_check` wins; otherwise `enforce` when the target's OS has a
     /// `[codesign.<os>]` section, else `off`.
-    #[allow(dead_code)] // read by the sign stage (M9 step 3)
     pub fn publisher_policy(&self, target: Target) -> PublisherPolicy {
         if let Some(explicit) = self.update.as_ref().and_then(|u| u.publisher_check) {
             return explicit;
