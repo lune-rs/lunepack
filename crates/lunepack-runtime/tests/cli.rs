@@ -169,7 +169,9 @@ impl Lab {
         lab
     }
 
-    /// Publishes 1.0.0 (and writes its bootstrap tree); installs nothing.
+    /// Publishes 1.0.0 (and writes its bootstrap tree); installs nothing (the macOS adoption
+    /// cases).
+    #[cfg(target_os = "macos")]
     fn published() -> Lab {
         Lab::published_with(PublisherPolicy::Off)
     }
