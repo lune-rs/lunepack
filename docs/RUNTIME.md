@@ -431,7 +431,9 @@ of the user runs from `B` or from a tree in `R`, then removes, under the lock, `
 LaunchAgent entry if it is the app's, in that order. A foreign file beside `B`, another app's LaunchAgent and
 another entry of the apps folder are never touched. An entry that is not lunepack's is left and reported
 (`uninstalled_with_leftovers`). The interactive uninstall may offer to open the folder of a leftover
-(`/usr/bin/open`, the same rule as `xdg-open`).
+(`/usr/bin/open`, the same rule as `xdg-open`). A tombstone of `B` that a cut-off uninstall left in the apps
+folder is removed by the next uninstall, install, installer run or adoption (a real directory named exactly
+`.<app id>.removing-<16 hex>`; nothing else there).
 
 **Declarations.** `autostart = true` writes `~/Library/LaunchAgents/<app id>.lunepack.plist` (`Label` the
 same, `ProgramArguments` the entry inside `B`, `RunAtLoad`, `LimitLoadToSessionType` `Aqua`). It is never

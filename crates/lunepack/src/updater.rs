@@ -1925,9 +1925,14 @@ fn already_installed(fs: &dyn Fs, root: &UserLayout, record: &InstallState) -> E
 
 /// Removes the tombstones an uninstall cut off before its end left beside `root` (F18), when
 /// `root` is `<parent>/<app id>` (the derivation of M5-D2; tombstones are named after the app id
-/// only and never sit anywhere else). Best effort: a tombstone is never the install root, so one
-/// that stays changes nothing about the install and the next install or uninstall tries again.
-fn clear_tombstones(inner: &Inner, layout: &UserLayout) {
+/// only and never sit anywhere else), and, on macOS, the ones it left beside the live bundle
+/// `bundle` (M8-D5: `B` is renamed to a tombstone in its own folder, which hides a whole app from
+/// the user). Best effort: a tombstone is never the install root or `B`, so one that stays changes
+/// nothing about the install and the next install or uninstall tries again.
+fn clear_tombstones(inner: &Inner, layout: &UserLayout, bundle: Option<&Path>) {
+    if let Some(folder) = bundle.and_then(Path::parent) {
+        let _ = lunepack_core::remove_tombstones(&*inner.fs, folder, &inner.app_id);
+    }
     let root = layout.root();
     let derived = match layout.scheme().root {
         RootNaming::AppId => root.file_name().is_some_and(|n| n == inner.app_id.as_str()),
@@ -2105,7 +2110,7 @@ async fn check_adopting(
         check_adopt_place(&*inner.fs, &pre_bundle, &pre_root.versions_dir())?;
         let request = integration_request(&inner.app_id, &pre_bundle, &config);
         inner.integration.check(Scope::User, &request)?;
-        clear_tombstones(inner, &pre_root);
+        clear_tombstones(inner, &pre_root, Some(&pre_bundle));
         adoptable(inner, &pre_root)?;
         Ok(config)
     })
@@ -2347,7 +2352,7 @@ async fn install(inner: Arc<Inner>, options: DownloadOptions) -> Result<Installe
                 &config,
             );
             inner.integration.check(Scope::User, &request)?;
-            clear_tombstones(inner, &boot_root);
+            clear_tombstones(inner, &boot_root, bundle.as_deref());
             adoptable(inner, &boot_root)?;
             Ok((config.target, config.version, bundle))
         })
@@ -2852,7 +2857,7 @@ async fn install_from_payload(
                 }
                 None => None,
             };
-            clear_tombstones(inner, &boot_root);
+            clear_tombstones(inner, &boot_root, bundle.as_deref());
             adoptable(inner, &boot_root)?;
             Ok(bundle)
         })

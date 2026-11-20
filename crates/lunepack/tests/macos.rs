@@ -1089,6 +1089,59 @@ fn a_dragged_bundle_is_adopted_by_its_first_check_which_then_finds_the_update() 
     common::workers_stopped();
 }
 
+/// Plants what a cut-off uninstall of `B` leaves in the apps folder (a hidden whole bundle), and
+/// two names that are not tombstones of this app, which must stay.
+fn plant_tombstones(mac: &Mac) -> (PathBuf, [PathBuf; 2]) {
+    let hex = "0123456789abcdef";
+    let id = app_id();
+    let tomb = mac.apps().join(format!(".{}.removing-{hex}", id.as_str()));
+    write_file(&mac.fs, &tomb.join("Contents/Resources/x"), b"x");
+    let other_app = mac.apps().join(format!(".other.removing-{hex}"));
+    write_file(&mac.fs, &other_app.join("x"), b"x");
+    let not_hex = mac.apps().join(format!(".{}.removing-nothex", id.as_str()));
+    write_file(&mac.fs, &not_hex.join("x"), b"x");
+    (tomb, [other_app, not_hex])
+}
+
+fn assert_tombstones_gone(mac: &Mac, tomb: &Path, kept: &[PathBuf; 2]) {
+    assert!(
+        mac.fs.symlink_metadata(tomb).expect("lstat").is_none(),
+        "the cut-off uninstall's tombstone of B was not removed"
+    );
+    for path in kept {
+        assert!(
+            mac.fs.symlink_metadata(path).expect("lstat").is_some(),
+            "{path:?} is not this app's tombstone and must stay"
+        );
+    }
+}
+
+#[test]
+fn an_install_removes_the_tombstone_of_a_cut_off_uninstall_in_the_apps_folder() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    publish(&mac, 1, V100);
+    let boot = bootstrap(&mac, V100);
+    let (tomb, kept) = plant_tombstones(&mac);
+    install(&mac, &boot).expect("install");
+    assert_tombstones_gone(&mac, &tomb, &kept);
+    common::workers_stopped();
+}
+
+#[test]
+fn an_adoption_removes_the_tombstone_of_a_cut_off_uninstall_in_the_apps_folder() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    publish_all(&mac, 1, &[V100]);
+    drag(&mac, &mac.bundle(), V100);
+    let (tomb, kept) = plant_tombstones(&mac);
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    let outcome = check_with(&mac, &inst, CheckOptions::default()).expect("check");
+    assert!(outcome.adopted);
+    assert_tombstones_gone(&mac, &tomb, &kept);
+    common::workers_stopped();
+}
+
 #[test]
 fn a_root_owned_bundle_is_a_machine_install_and_is_not_adopted() {
     let _serial = common::serial();
