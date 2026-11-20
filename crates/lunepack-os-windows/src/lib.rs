@@ -31,6 +31,7 @@ mod shell;
 mod shortcut;
 #[cfg(windows)]
 mod stub_place;
+#[cfg(any(windows, test))]
 mod trust_status;
 
 pub use harden::harden_dll_search;
