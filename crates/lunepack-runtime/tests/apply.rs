@@ -117,6 +117,10 @@ mod native {
             "a_translocated_runtime_is_exit_28_before_anything_else",
             MACOS_ONLY,
         ),
+        (
+            "an_apply_from_a_bundle_the_user_moved_follows_it_and_updates_it_where_it_is",
+            MACOS_ONLY,
+        ),
     ];
     #[cfg(target_os = "linux")]
     const SKIPPED: &[(&str, &str)] = &[
@@ -126,6 +130,10 @@ mod native {
         ),
         (
             "a_translocated_runtime_is_exit_28_before_anything_else",
+            MACOS_ONLY,
+        ),
+        (
+            "an_apply_from_a_bundle_the_user_moved_follows_it_and_updates_it_where_it_is",
             MACOS_ONLY,
         ),
     ];
@@ -227,6 +235,10 @@ mod native {
         (
             "a_translocated_runtime_is_exit_28_before_anything_else",
             a_translocated_runtime_is_exit_28_before_anything_else,
+        ),
+        (
+            "an_apply_from_a_bundle_the_user_moved_follows_it_and_updates_it_where_it_is",
+            an_apply_from_a_bundle_the_user_moved_follows_it_and_updates_it_where_it_is,
         ),
     ];
 
@@ -1577,6 +1589,57 @@ mod native {
     #[cfg(not(unix))]
     fn an_apps_folder_the_user_cannot_write_is_exit_28_and_the_app_comes_back(_: &Lab) {
         unreachable!("skipped: {MACOS_ONLY}");
+    }
+
+    /// macOS (M8-D17): the user moved the app's bundle (a Finder move, the app having been
+    /// started before it) and its `apply` runs from where it is now. The applier follows the move
+    /// under the lock before it commits anything, so the new version is placed in the bundle the
+    /// user kept and not at the path it was moved from.
+    fn an_apply_from_a_bundle_the_user_moved_follows_it_and_updates_it_where_it_is(lab: &Lab) {
+        lab.tree(V100, ENTRY, "exit0", 30);
+        lab.tree(V110, ENTRY, "confirm", 30);
+        lab.install(V110);
+        let old = common::bundle_of(&lab.layout());
+        let moved = lab.home.join("Documents/Hello.app");
+        std::fs::create_dir_all(moved.parent().expect("parent")).expect("dirs");
+        std::fs::rename(&old, &moved).expect("move");
+        let wait = target("0.2");
+        let runtime = moved.join(ENTRY_DIR).join(RUNTIME_FILE);
+        let child = lab
+            .command(&runtime)
+            .args([
+                "apply",
+                "--wait-pid",
+                &wait.pid.to_string(),
+                "--wait-start",
+                &wait.start_ticks.to_string(),
+                "--version",
+                V110,
+                "--",
+                HELPER_ARG,
+            ])
+            .spawn()
+            .expect("runtime");
+        let (code, printed) = finish(child);
+        let output = format!("{}{}", String::from_utf8_lossy(&printed), lab.log());
+        assert_eq!(code, 0, "{output}");
+        // The bundle the user kept holds 1.1.0, the pointer names it, and nothing was put back
+        // at the old path.
+        assert_eq!(common::bundle_of(&lab.layout()), moved);
+        lab.assert_live(V110);
+        assert!(
+            std::fs::symlink_metadata(&old).is_err(),
+            "the new version was placed where the bundle was moved from"
+        );
+        lab.assert_parked(V100);
+        assert!(
+            lab.notes().contains(&format!(
+                "1.1.0 start token=yes exe={}",
+                common::join_rel(&moved, &exe(ENTRY)).display()
+            )),
+            "{}",
+            lab.notes()
+        );
     }
 
     /// macOS: the runtime of a copy of the app under an `AppTranslocation` folder, as Gatekeeper

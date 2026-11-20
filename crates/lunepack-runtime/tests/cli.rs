@@ -871,6 +871,33 @@ fn a_tree_that_is_not_installed_has_nothing_to_check_or_download() {
     assert_eq!(run.line(), golden(9));
 }
 
+// ---- a bundle the user moved (macOS, M8-D17) -----------------------------------------------------
+
+/// `check` and `download` from a bundle the user moved follow it first, under the lock, and then
+/// act on the install where it now is.
+#[cfg(target_os = "macos")]
+#[test]
+fn check_and_download_from_a_moved_bundle_follow_it_first() {
+    for command in ["check", "download"] {
+        let mut lab = Lab::installed();
+        lab.publish(&["1.0.0", "1.1.0"]);
+        let old = common::bundle_of(&lab.layout());
+        let moved = lab.home.join("Documents").join("CLI test.app");
+        std::fs::create_dir_all(moved.parent().expect("parent")).expect("dirs");
+        std::fs::rename(&old, &moved).expect("move");
+        let run = lab.run(&moved.join(RUNTIME_PATH), &[command, "--json"], &[]);
+        assert_eq!(run.code, 0, "{command}: {run:?}");
+        assert_eq!(
+            std::fs::read_link(lab.root.join("bundle")).expect("pointer"),
+            moved,
+            "{command}"
+        );
+        assert!(std::fs::symlink_metadata(&old).is_err(), "{command}");
+        let staged = lab.record().expect("record").staged.is_some();
+        assert_eq!(staged, command == "download", "{command}");
+    }
+}
+
 // ---- adoption of a dragged bundle (macOS, M8-D9 (b)) ---------------------------------------------
 
 /// Copies the directory `from` to `to`: files (with their mode) and directories only.
