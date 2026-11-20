@@ -116,6 +116,8 @@ mod native {
     const INSTALL_ID: [u8; 16] = [3; 16];
     /// A bound on any one runtime run.
     const RUN_LIMIT: Duration = Duration::from_secs(90);
+    /// How long a wait target waits for a note of the fake UI (see `sleep`), within `RUN_LIMIT`.
+    const UNTIL_LIMIT: Duration = Duration::from_secs(60);
     /// What a bound measured from a run's own events may exceed the channel's bound by, for a
     /// runner under load. The cases measure the channel's waits, never a run's whole time: how
     /// long an install or an apply takes on a shared runner is not what they check.
@@ -553,10 +555,19 @@ mod native {
 
     // ---- the app for `apply` ---------------------------------------------------------------
 
-    /// A process that sleeps `<seconds>` (the wait target of a case).
+    /// A process that sleeps `<seconds>` (the wait target of a case); given `<file> <text>` too,
+    /// it then goes on until `file` holds `text`, for at most [`UNTIL_LIMIT`].
     pub fn sleep(rest: &[String]) {
         let secs: f64 = rest.first().and_then(|s| s.parse().ok()).expect("seconds");
         std::thread::sleep(Duration::from_secs_f64(secs));
+        if let [_, file, text] = rest {
+            let until = Instant::now() + UNTIL_LIMIT;
+            while Instant::now() < until
+                && !std::fs::read_to_string(file).is_ok_and(|t| t.contains(text.as_str()))
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     /// The app `apply` starts: notes its start and its fds, then confirms or crashes as its
@@ -2058,7 +2069,14 @@ mod native {
         }
 
         fn command(&self, extra: &[&str]) -> Command {
-            let target = wait_target();
+            self.command_until(extra, None)
+        }
+
+        /// [`ApplyLab::command`] whose wait target (the app that "exits" for the apply) runs on
+        /// until the fake UI noted `note` (bounded): the apply cannot move past its wait before
+        /// the UI got there.
+        fn command_until(&self, extra: &[&str], note: Option<&str>) -> Command {
+            let target = wait_target(note.map(|n| (self.out.join("notes"), n)));
             let runtime = common::tree_of(&self.layout(), V100)
                 .join(ENTRY_DIR)
                 .join(RUNTIME_FILE);
@@ -2132,12 +2150,15 @@ mod native {
         }
     }
 
-    /// A short-lived process to wait for (reaped by a thread), and its id.
-    fn wait_target() -> ProcessId {
-        let mut child = Command::new(std::env::current_exe().expect("exe"))
-            .args([SLEEP_ARG, "0.3"])
-            .spawn()
-            .expect("sleep");
+    /// A short-lived process to wait for (reaped by a thread), and its id; with `until`, it runs
+    /// on until that file holds that text (bounded, see `sleep`).
+    fn wait_target(until: Option<(PathBuf, &str)>) -> ProcessId {
+        let mut cmd = Command::new(std::env::current_exe().expect("exe"));
+        cmd.args([SLEEP_ARG, "0.3"]);
+        if let Some((file, text)) = until {
+            cmd.arg(file).arg(text);
+        }
+        let mut child = cmd.spawn().expect("sleep");
         let id = NativeProcess::new()
             .process_id(child.id())
             .expect("probe")
@@ -2168,12 +2189,22 @@ mod native {
         assert!(!notes.contains(HEALTH_TOKEN_VAR));
     }
 
+    /// The UI dies at the first progress frame: the wait phase's, sent before the apply waits
+    /// for the app. The wait target runs until the UI noted its death, so the apply's commit
+    /// comes after it: a UI started from the live bundle by path (macOS: the fake UI is a shell
+    /// script, which `/bin/sh` opens by that path once started) would otherwise, under load, be
+    /// read after the commit swapped the bundle, from the new version's tree, and never run.
     fn apply_ui_killed_mid_apply_still_confirms() {
         let lab = ApplyLab::new("confirm", "die@progress");
-        let run = lab.run(lab.command(&[]));
+        let run = lab.run(lab.command_until(&[], Some("ui dies at progress")));
         assert_eq!(run.code, 0, "{run:?}");
         assert_eq!(lab.current(), version(V110));
-        assert!(lab.notes().contains("ui dies at progress"));
+        assert!(
+            lab.notes().contains("ui dies at progress"),
+            "notes:\n{}\nlog:\n{}",
+            lab.notes(),
+            lab.log()
+        );
         assert!(
             lab.log().contains("\"code\":\"ui_stopped\""),
             "{}",
