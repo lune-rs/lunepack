@@ -222,7 +222,7 @@ fn path_error_display_is_bounded() {
 
 // ---- trees (FORMAT.md 10.2) ----
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum K {
     F,
     D,
@@ -368,8 +368,7 @@ fn tree_rejects_the_apfs_eszett_escape() {
         matches!(r, Err(TreeError::UnderNonDirectory { .. })),
         "{r:?}"
     );
-    let e = link_err(&[("ss", K::L(".")), ("l", K::L("ẞ/../x"))]);
-    assert!(matches!(e, LinkTargetError::ThroughSymlink(_)), "{e:?}");
+    // The link `ẞ/../x` through `ss` -> `.`: `hops_find_links_by_fold_key`.
 }
 
 #[test]
@@ -480,26 +479,299 @@ fn tree_rejects_bad_symlink_targets() {
     );
 }
 
+// ---- links through links (FORMAT.md 10.2, M8-D20) ----
+
+/// The verdict on Linux and macOS: `Ok`, or the rejected link rule's variant.
+#[track_caller]
+fn link_verdict(entries: &[(&str, K)]) -> Result<(), LinkTargetError> {
+    let mut first = None;
+    for target in [Target::LinuxX86_64, MAC] {
+        let verdict = match tree(entries, target) {
+            Ok(()) => Ok(()),
+            Err(TreeError::LinkTarget { source, .. }) => Err(source),
+            Err(other) => panic!("expected a link verdict, got {other:?}"),
+        };
+        match &first {
+            None => first = Some(verdict),
+            Some(f) => assert_eq!(
+                f.as_ref().map_err(std::mem::discriminant),
+                verdict.as_ref().map_err(std::mem::discriminant),
+                "the verdict differs between targets"
+            ),
+        }
+    }
+    first.unwrap()
+}
+
+/// `link_verdict`, also with the entries reversed: the variant must not depend on entry order.
+#[track_caller]
+fn link_verdict_both_orders(entries: &[(&str, K)]) -> Result<(), LinkTargetError> {
+    let forward = link_verdict(entries);
+    let mut reversed = entries.to_vec();
+    reversed.reverse();
+    let backward = link_verdict(&reversed);
+    assert_eq!(
+        forward.as_ref().map_err(std::mem::discriminant),
+        backward.as_ref().map_err(std::mem::discriminant),
+        "the verdict depends on entry order: {forward:?} / {backward:?}"
+    );
+    forward
+}
+
+#[track_caller]
+fn hop_accepts(entries: &[(&str, K)]) {
+    if let Err(e) = link_verdict_both_orders(entries) {
+        panic!("rejected: {e:?}");
+    }
+}
+
+#[track_caller]
+fn hop_rejects(entries: &[(&str, K)]) -> LinkTargetError {
+    match link_verdict_both_orders(entries) {
+        Err(e) => e,
+        Ok(()) => panic!("accepted"),
+    }
+}
+
+/// The `framework-links` seed tree (crates/lunepack-testkit/src/seeds.rs).
+const FRAMEWORK: &[(&str, K)] = &[
+    ("Versions/A", K::D),
+    ("Versions/A/Foo", K::F),
+    ("Versions/Current", K::L("A")),
+    ("Foo", K::L("Versions/Current/Foo")),
+    ("Resources", K::L("Versions/Current/Resources")),
+    ("Versions/A/Resources", K::D),
+];
+
 #[test]
-fn tree_rejects_targets_through_another_symlink() {
-    // The contract example: `s` -> `.` with `l` -> `s/../x`.
-    let e = link_err(&[("s", K::L(".")), ("l", K::L("s/../x"))]);
-    assert!(matches!(e, LinkTargetError::ThroughSymlink(_)), "{e:?}");
-    // Through a symlink further down, by fold key, and through itself.
-    let e = link_err(&[("d", K::D), ("d/s", K::L("..")), ("l", K::L("d/s/x"))]);
-    assert!(matches!(e, LinkTargetError::ThroughSymlink(_)), "{e:?}");
-    let e = link_err(&[("S", K::L(".")), ("l", K::L("s/x"))]);
-    assert!(matches!(e, LinkTargetError::ThroughSymlink(_)), "{e:?}");
-    let e = link_err(&[("l", K::L("l/x"))]);
-    assert!(matches!(e, LinkTargetError::ThroughSymlink(_)), "{e:?}");
-    let e = link_err(&[("s", K::L("a")), ("l", K::L("s/."))]);
-    assert!(matches!(e, LinkTargetError::ThroughSymlink(_)), "{e:?}");
-    // A symlink as the final component is allowed (chains are checked link by link).
-    tree(
-        &[("s", K::L(".")), ("l", K::L("s")), ("m", K::L("./l"))],
-        Target::LinuxX86_64,
-    )
-    .unwrap();
+fn tree_accepts_the_standard_framework_links() {
+    hop_accepts(FRAMEWORK);
+    // `Versions/A` implied by its children, with no `dir` entry.
+    let implied: Vec<(&str, K)> = FRAMEWORK
+        .iter()
+        .copied()
+        .filter(|(p, _)| *p != "Versions/A")
+        .collect();
+    hop_accepts(&implied);
+    // And inside a bundle, as packed.
+    hop_accepts(&[
+        ("Contents/Frameworks/Foo.framework/Versions/A/Foo", K::F),
+        (
+            "Contents/Frameworks/Foo.framework/Versions/A/Resources/Info.plist",
+            K::F,
+        ),
+        (
+            "Contents/Frameworks/Foo.framework/Versions/Current",
+            K::L("A"),
+        ),
+        (
+            "Contents/Frameworks/Foo.framework/Foo",
+            K::L("Versions/Current/Foo"),
+        ),
+        (
+            "Contents/Frameworks/Foo.framework/Resources",
+            K::L("Versions/Current/Resources"),
+        ),
+    ]);
+}
+
+#[test]
+fn a_hop_then_dotdot_pops_where_the_hop_led() {
+    // `s` leads to `a/b`; `..` then pops to `a`, so `x` resolves to `a/c`.
+    hop_accepts(&[("a/b", K::D), ("s", K::L("a/b")), ("x", K::L("s/../c"))]);
+    // `s` leads to the root; `..` from there leaves the tree.
+    let e = hop_rejects(&[("s", K::L(".")), ("l", K::L("s/../x"))]);
+    assert_eq!(e, LinkTargetError::Escapes);
+}
+
+#[test]
+fn hops_that_end_inside_are_accepted() {
+    // `d/s` leads to the root (a directory); `l` ends at `x`, dangling inside.
+    hop_accepts(&[("d", K::D), ("d/s", K::L("..")), ("l", K::L("d/s/x"))]);
+    // `s` folds to `S`, a hop to the root; `x` dangles inside.
+    hop_accepts(&[("S", K::L(".")), ("l", K::L("s/x"))]);
+    // Final hops: `l` follows 1 link, `m` 2.
+    hop_accepts(&[("s", K::L(".")), ("l", K::L("s")), ("m", K::L("./l"))]);
+}
+
+#[test]
+fn escape_through_a_hop_is_rejected() {
+    // The `link-hop-escapes` seed: `a/s` leads to the root, so `a/s/../y` leaves it.
+    let e = hop_rejects(&[("a", K::D), ("a/s", K::L("..")), ("x", K::L("a/s/../y"))]);
+    assert_eq!(e, LinkTargetError::Escapes);
+}
+
+#[test]
+fn cycles_are_rejected() {
+    for entries in [
+        // `link-cycle`
+        vec![("a", K::L("b/x")), ("b", K::L("a/y"))],
+        // `link-self`
+        vec![("a", K::L("a/x"))],
+        // final position
+        vec![("a", K::L("b")), ("b", K::L("a"))],
+        vec![("l", K::L("l/x"))],
+        vec![("l", K::L("l"))],
+    ] {
+        let e = hop_rejects(&entries);
+        assert!(matches!(e, LinkTargetError::Cycle(_)), "{entries:?}: {e:?}");
+    }
+}
+
+/// `d` dir, `c0` -> `d`, `c1` -> `c0`, ... `c{k}` -> `c{k-1}`: `hops(c{k}) = k`.
+fn chain(k: usize) -> Vec<(String, String)> {
+    (0..=k)
+        .map(|i| {
+            let target = if i == 0 {
+                "d".to_owned()
+            } else {
+                format!("c{}", i - 1)
+            };
+            (format!("c{i}"), target)
+        })
+        .collect()
+}
+
+fn with_chain(k: usize, extra: &[(&'static str, K)]) -> Vec<(&'static str, K)> {
+    let mut entries: Vec<(&'static str, K)> = vec![("d", K::D)];
+    for (p, t) in chain(k) {
+        let p: &'static str = Box::leak(p.into_boxed_str());
+        let t: &'static str = Box::leak(t.into_boxed_str());
+        entries.push((p, K::L(t)));
+    }
+    entries.extend_from_slice(extra);
+    entries
+}
+
+#[test]
+fn hop_chains_are_bounded() {
+    assert_eq!(lunepack_core::path::MAX_LINK_HOPS, 8);
+    hop_accepts(&with_chain(8, &[]));
+    assert_eq!(
+        hop_rejects(&with_chain(9, &[])),
+        LinkTargetError::TooManyHops
+    );
+    // Non-final hops count the same: 1 + hops(c8) = 9, 1 + hops(c7) = 8.
+    assert_eq!(
+        hop_rejects(&with_chain(8, &[("x", K::L("c8/f"))])),
+        LinkTargetError::TooManyHops
+    );
+    hop_accepts(&with_chain(8, &[("x", K::L("c7/f"))]));
+    // Every step onto a link counts: two steps through `c3` (4 each) are 8, three are 12.
+    hop_accepts(&with_chain(3, &[("x", K::L("c3/../c3"))]));
+    assert_eq!(
+        hop_rejects(&with_chain(3, &[("x", K::L("c3/../c3/../c3"))])),
+        LinkTargetError::TooManyHops
+    );
+}
+
+#[test]
+fn a_hop_must_end_on_a_directory() {
+    // Through a file.
+    let e = hop_rejects(&[("w", K::F), ("y", K::L("w")), ("x", K::L("y/z"))]);
+    assert!(matches!(e, LinkTargetError::HopNotDirectory(_)), "{e:?}");
+    // Through a dangling link.
+    let e = hop_rejects(&[("y", K::L("nowhere")), ("x", K::L("y/z"))]);
+    assert!(matches!(e, LinkTargetError::HopNotDirectory(_)), "{e:?}");
+    let e = hop_rejects(&[("s", K::L("a")), ("l", K::L("s/."))]);
+    assert!(matches!(e, LinkTargetError::HopNotDirectory(_)), "{e:?}");
+    // The error names the hop, not the link checked.
+    let e = hop_rejects(&[("w", K::F), ("y", K::L("w")), ("x", K::L("y/z"))]);
+    match e {
+        LinkTargetError::HopNotDirectory(hop) => assert_eq!(hop.as_str(), "y"),
+        other => panic!("{other:?}"),
+    }
+    // A final link to a file or to a dangling name stays accepted.
+    hop_accepts(&[("w", K::F), ("y", K::L("w")), ("x", K::L("y"))]);
+    hop_accepts(&[("y", K::L("nowhere")), ("x", K::L("y"))]);
+    // A hop that ends on an implied directory is a directory.
+    hop_accepts(&[("a/b/f", K::F), ("y", K::L("a/b")), ("x", K::L("y/f"))]);
+}
+
+#[test]
+fn hops_find_links_by_fold_key() {
+    // A case-sensitive lookup would treat `s` as a plain name and accept; on APFS `s` is `S`.
+    let e = hop_rejects(&[("S", K::L(".")), ("x", K::L("s/../y"))]);
+    assert_eq!(e, LinkTargetError::Escapes);
+    // `ẞ` folds to `ss`: a hop to the root, then `..` leaves it.
+    let e = hop_rejects(&[("ss", K::L(".")), ("l", K::L("ẞ/../x"))]);
+    assert_eq!(e, LinkTargetError::Escapes);
+}
+
+#[test]
+fn link_verdicts_do_not_depend_on_entry_order() {
+    // Every case above runs in both orders through `link_verdict_both_orders`; these add trees
+    // where a memoised result is reused from another link before or after it.
+    hop_accepts(&with_chain(8, &[("x", K::L("c7/f")), ("y", K::L("c6/c7"))]));
+    let e = hop_rejects(&[("a", K::L("b/x")), ("b", K::L("a/y")), ("n", K::L("a/z"))]);
+    assert!(matches!(e, LinkTargetError::Cycle(_)), "{e:?}");
+    for entries in [
+        vec![
+            ("d", K::D),
+            ("d/s", K::L("..")),
+            ("m", K::L("d/s/d/s")),
+            ("l", K::L("m/../x")),
+        ],
+        vec![("s", K::L(".")), ("l", K::L("s/../x")), ("m", K::L("s"))],
+    ] {
+        let e = hop_rejects(&entries);
+        assert_eq!(e, LinkTargetError::Escapes, "{entries:?}");
+    }
+    // Each single-bad-link case with the entries shuffled every way gives the same variant.
+    let cases: &[&[(&str, K)]] = &[
+        FRAMEWORK,
+        &[("a", K::D), ("a/s", K::L("..")), ("x", K::L("a/s/../y"))],
+        &[("w", K::F), ("y", K::L("w")), ("x", K::L("y/z"))],
+        &[("y", K::L("nowhere")), ("x", K::L("y/z"))],
+        &[("S", K::L(".")), ("x", K::L("s/../y"))],
+        &[("a/b", K::D), ("s", K::L("a/b")), ("x", K::L("s/../c"))],
+    ];
+    for case in cases {
+        let want = link_verdict(case);
+        let mut perm = case.to_vec();
+        for rotation in 0..perm.len() {
+            perm.rotate_left(1);
+            let got = link_verdict(&perm);
+            assert_eq!(
+                want.as_ref().map_err(std::mem::discriminant),
+                got.as_ref().map_err(std::mem::discriminant),
+                "rotation {rotation} of {case:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_hop_rule_stays_linear() {
+    // `d`, `c0` ... `c7` (head `c7` has 7 hops), then `x` links to `c7/f` (8 hops each), filling
+    // the tree to the manifest cap of 200,000 entries.
+    let mut texts: Vec<(String, String)> = chain(7);
+    let total = 200_000;
+    let xs = total - 1 - texts.len();
+    assert_eq!(xs, 199_991);
+    for i in 0..xs {
+        texts.push((format!("x{i:06}"), "c7/f".to_owned()));
+    }
+    let mut paths: Vec<(RelPath, &str)> = vec![(validate_path("d").unwrap(), "")];
+    for (p, t) in &texts {
+        paths.push((validate_path(p).unwrap(), t.as_str()));
+    }
+    assert_eq!(paths.len(), total);
+    let started = std::time::Instant::now();
+    let result = validate_tree(
+        paths.iter().map(|(p, t)| {
+            let kind = if t.is_empty() {
+                EntryKind::Dir
+            } else {
+                EntryKind::Symlink { target: t }
+            };
+            (p, kind)
+        }),
+        MAC,
+    );
+    let took = started.elapsed();
+    assert_eq!(result, Ok(()));
+    eprintln!("the_hop_rule_stays_linear: {total} entries validated in {took:?}");
 }
 
 #[test]

@@ -447,9 +447,10 @@ each written before hashing so the signed manifest covers them (FORMAT.md 13, 17
   everything under it, `Contents/Resources/lunepack-setup.payload` (the installer app's payload file), the
   names `lunepack-update.json` (at any depth), and `lunepack-runtime` and `lunepack-ui` in
   `Contents/MacOS`. Comparison ignores ASCII case.
-- Symlinks are packed as links (a framework's `Versions/Current` → `A` works) and must satisfy FORMAT
-  10.2: a link's target may not pass through another link, so write a framework's top-level link as
-  `Foo` → `Versions/A/Foo`, not `Versions/Current/Foo`. Exec bits come from the Unix mode.
+- Symlinks are packed as links, unchanged, and must satisfy FORMAT 10.2: a target stays inside the
+  bundle, may pass through other links inside it (a framework's `Versions/Current` → `A` and `Foo` →
+  `Versions/Current/Foo` pack as they are), and follows at most 8 of them. Exec bits come from the
+  Unix mode.
 - The installed bundle's name is `install.name` when it can be a file name: 1 to 200 UTF-8 bytes, no `/`,
   `:` or control character, no leading `.` (FORMAT.md 13.4). Otherwise it is the app id. `pack` still
   packs, and warns on stderr, naming the rule and never the name.

@@ -2187,9 +2187,8 @@ fn mac_app(root: &Path) {
         b"<plist/>",
     );
     std::os::unix::fs::symlink("A", root.join(format!("{fw}/Versions/Current"))).unwrap();
-    // FORMAT 10.2: a link's target never passes through another link, so the usual
-    // `Foo -> Versions/Current/Foo` is written `Foo -> Versions/A/Foo`.
-    std::os::unix::fs::symlink("Versions/A/Foo", root.join(format!("{fw}/Foo"))).unwrap();
+    // The standard framework form: `Foo` passes through the link `Versions/Current` (FORMAT 10.2).
+    std::os::unix::fs::symlink("Versions/Current/Foo", root.join(format!("{fw}/Foo"))).unwrap();
     write(root, "Contents/Helpers/Updater", &text(500));
     set_mode(&root.join("Contents/Helpers/Updater"), 0o755);
 }
@@ -2302,7 +2301,7 @@ fn macos_pack_places_the_runtime_the_config_and_the_helper_app() {
     assert!(!exec_of(&m, "Contents/Info.plist"));
     for (path, want) in [
         (format!("{fw}/Versions/Current"), "A"),
-        (format!("{fw}/Foo"), "Versions/A/Foo"),
+        (format!("{fw}/Foo"), "Versions/Current/Foo"),
     ] {
         assert!(
             m.entries().iter().any(|e| matches!(e,

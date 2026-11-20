@@ -33,6 +33,8 @@ const DETAIL_VAR: &str = "LUNEPACK_E2E_DETAIL";
 const WAIT: Duration = Duration::from_secs(90);
 const COMMAND_LIMIT: Duration = Duration::from_secs(300);
 const POLL: Duration = Duration::from_millis(50);
+/// The framework's top-level link in the bundle input, in the standard form.
+const FRAMEWORK_LINK: &str = "Versions/Current/Foo";
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 
 #[cfg(target_arch = "aarch64")]
@@ -524,7 +526,7 @@ impl World {
     }
 
     /// The bundle input of `release`: an `Info.plist`, the entry (the Rust or the shell app), a
-    /// framework with direct `Versions/` symlinks, an executable helper and a data file.
+    /// framework with the standard `Versions/` symlinks, an executable helper and a data file.
     pub fn bundle_input(&self, release: &Release) -> PathBuf {
         let input = self.work.join(format!("in-{}", release.version));
         let app = if release.shell {
@@ -566,7 +568,8 @@ impl World {
         let fw = input.join("Contents/Frameworks/Foo.framework");
         write_file(&fw.join("Versions/A/Foo"), b"framework binary\n", true);
         symlink("A", fw.join("Versions/Current")).expect("symlink");
-        symlink("Versions/A/Foo", fw.join("Foo")).expect("symlink");
+        // The standard form: through the link `Versions/Current` (FORMAT 10.2, M8-D20).
+        symlink(FRAMEWORK_LINK, fw.join("Foo")).expect("symlink");
         write_file(
             &input.join("Contents/Helpers/tool"),
             b"#!/bin/sh\nexit 0\n",
@@ -1062,6 +1065,19 @@ fn row_install(bins: &Bins) -> Vec<String> {
         w.install_from_dmg(&dmg),
         23,
         "an installer rerun over a live install"
+    );
+    // The framework's top-level link passes through `Versions/Current` (M8-D20) and was placed as
+    // packed: its text unchanged, and reading through it gives `Versions/A/Foo`'s bytes.
+    let fw = w.bundle().join("Contents/Frameworks/Foo.framework");
+    assert_eq!(
+        std::fs::read_link(fw.join("Foo")).expect("read the framework link"),
+        Path::new(FRAMEWORK_LINK),
+        "the framework link's text"
+    );
+    assert_eq!(
+        std::fs::read(fw.join("Foo")).expect("read through the framework link"),
+        std::fs::read(fw.join("Versions/A/Foo")).expect("read the framework binary"),
+        "reading through the framework link"
     );
     let status = w.run_app(&w.entry(), &[]);
     assert_eq!(status, 0, "the entry run directly");

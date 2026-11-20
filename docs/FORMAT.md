@@ -586,12 +586,35 @@ Accepted examples: `bin/app`, `Contents/MacOS/App`, `a b/c.d.e`, `ünïcode/文�
   - is non-empty, at most 1024 bytes, NFC, without `\`, NUL, C0 controls or DEL, and not absolute
     (does not start with `/`);
   - has no empty components;
-  - resolved lexically from the symlink's parent directory (`..` pops one component, `.` is skipped:
-    neither pushed nor popped, any other component is pushed), never leaves the tree (a `..` with nothing to pop is rejected);
-  - never passes through another symlink entry as a non-final component (`s` → `.` together with
-    `l` → `s/../x` is rejected), because lexical and physical resolution differ after a symlink.
-  - Accepted: `Versions/Current` → `A`, `lib/x.so` → `x.so.1`. A target inside the tree that names no
+  - resolves inside the tree. A stack of fold keys starts at the symlink's parent directory and the
+    target's components are taken in order: `.` stays in place; `..` pops one component, and a `..`
+    with nothing to pop leaves the tree (rejected); any other name is pushed, then looked up by fold
+    key. When it names another symlink entry, that entry is a **hop**: its own target is resolved by
+    this same rule, from its own parent, and the stack becomes where it led. So a later `..` pops
+    the place the hop led to, not the hop's own place, as the kernel does. Hops are followed in any
+    position, the last one included;
+  - a hop that is not the last component ends on a directory: the tree root, a `dir` entry or an
+    implied parent directory (a proper prefix, by fold key, of some entry). A hop ending on a `file`
+    entry or on a name with no entry is rejected. The symlink's own end (after its last component
+    and any final hop) may be any entry, an implied directory or a name with no entry (dangling);
+  - follows at most `MAX_LINK_HOPS` = 8 symlink entries: the count of a symlink is the sum, over
+    every symlink entry its resolution steps onto (each step counts), of one plus that entry's own
+    count; a symlink whose target names no symlink counts 0. More is rejected. A hop into a symlink
+    whose own resolution is in progress (a cycle, the symlink itself included) is rejected; a long
+    cycle may be reported as too many hops first. 8 is far below the kernels' limits (32 on macOS,
+    40 on Linux), so an accepted symlink never meets `ELOOP`.
+  - Each symlink's target is resolved at most once per tree (memoised), so the check stays
+    `O(n log n)` in the entry count plus the targets' bytes. Which symlink a rejection names follows
+    the entry order; whether the tree is rejected does not.
+  - Accepted: `Versions/Current` → `A`, `lib/x.so` → `x.so.1`, a framework's `Foo` →
+    `Versions/Current/Foo` and `Resources` → `Versions/Current/Resources` with `Versions/Current` →
+    `A` (one hop, ending on the directory `Versions/A`, listed or implied), `d/s` → `..` with `l` →
+    `d/s/x` (the hop ends on the root; `x` dangles inside). A target inside the tree that names no
     entry (dangling) is allowed.
+  - Rejected: `s` → `.` with `l` → `s/../x` (the hop leads to the root, and `..` then leaves the
+    tree), `S` → `.` with `l` → `s/../x` (the hop is found by fold key), `y` → `w` with `w` a file
+    and `x` → `y/z` (the hop ends on a file), `a` → `b/x` with `b` → `a/y` (a cycle), and a chain of
+    nine symlinks each naming the next.
 
 ### 10.3 Versions
 
