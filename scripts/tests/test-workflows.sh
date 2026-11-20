@@ -231,6 +231,41 @@ if [ -f "$ci" ]; then
   e2e_windows_jobs_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
   t_check "a file with no Windows e2e jobs fails" rc_nonzero
 fi
+# --- the macOS end-to-end job (M8 step 11) -----------------------------------------------------
+# Required (no continue-on-error), time-bounded, on a macOS runner, runs the suite with --ci, and
+# uploads the instrument records whatever the suite did.
+e2e_macos_job_ok() {
+  local block bad=0
+  block=$(job_block "$1" e2e-macos)
+  if [ -z "$block" ]; then echo "no e2e-macos job"; return 1; fi
+  if ! printf '%s\n' "$block" | grep -q 'timeout-minutes:'; then echo "e2e-macos has no timeout-minutes"; bad=1; fi
+  if printf '%s\n' "$block" | grep -q 'continue-on-error'; then echo "e2e-macos must not be continue-on-error"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'runs-on: macos-latest'; then echo "e2e-macos does not run on macos-latest"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'scripts/e2e-macos.sh --ci'; then echo "e2e-macos does not run e2e-macos.sh --ci"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'actions/upload-artifact@'; then echo "e2e-macos does not upload the instrument records"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'if: always()'; then echo "e2e-macos's records are not kept after a failure"; bad=1; fi
+  return "$bad"
+}
+
+if [ -f "$ci" ]; then
+  RC=0
+  e2e_macos_job_ok "$ci" >"$OUT" 2>&1 || RC=$?
+  t_check "ci.yml has the e2e-macos job, required and time-bounded" rc_is 0
+  if [ "$RC" -ne 0 ]; then sed 's/^/    /' "$OUT" >&2; fi
+  sed 's|^  e2e-macos:|  e2e-macos:\n    continue-on-error: true|' "$ci" >"$T_TMP/macos-coe.yml"
+  RC=0
+  e2e_macos_job_ok "$T_TMP/macos-coe.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded continue-on-error on e2e-macos fails" rc_nonzero
+  t_check "seeded continue-on-error on e2e-macos reports why" out_has "continue-on-error"
+  sed 's|scripts/e2e-macos.sh --ci|scripts/e2e-macos.sh|' "$ci" >"$T_TMP/macos-noci.yml"
+  RC=0
+  e2e_macos_job_ok "$T_TMP/macos-noci.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded e2e-macos without --ci fails" rc_nonzero
+  RC=0
+  e2e_macos_job_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "a file with no e2e-macos job fails" rc_nonzero
+fi
+
 t_check "defender-on.ps1 refuses off GitHub Actions" grep -q "GITHUB_ACTIONS -ne 'true'" "$repo/scripts/ci/defender-on.ps1"
 if command -v pwsh >/dev/null 2>&1; then
   RC=0
