@@ -1,0 +1,6 @@
+d Versions/A
+f Versions/A/Foo
+l Versions/Current>A
+l Foo>Versions/Current/Foo
+l Resources>Versions/Current/Resources
+d Versions/A/Resources
