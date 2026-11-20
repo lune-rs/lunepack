@@ -327,7 +327,7 @@ mod tests {
 
     /// A signed system binary verifies and gives a subject; a plain text file is unsigned.
     #[test]
-    fn a_system_binary_is_trusted_and_a_text_file_is_unsigned() {
+    fn a_system_binary_is_trusted_and_a_text_file_is_no_verdict() {
         let notepad = Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot"))
             .join("System32")
             .join("notepad.exe");
@@ -341,7 +341,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let text = dir.join("a.txt");
         fs::write(&text, b"not a PE file").unwrap();
-        assert_eq!(verify_file(&text), FileSig::Unsigned);
+        // Probed on Windows 11: a file of a form Windows cannot sign (a text file) is answered
+        // with `TRUST_E_SUBJECT_FORM_UNKNOWN` as the status itself, not with a no-signature status;
+        // that is not on the allowlist, so it is a local fault, never a verdict about the file.
+        assert_eq!(verify_file(&text), FileSig::Os);
         let _ = fs::remove_dir_all(&dir);
     }
 }
