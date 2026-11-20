@@ -1146,7 +1146,7 @@ fn row_update(bins: &Bins) -> Vec<String> {
     w.expect_lines(&first_install_lines(), false);
 
     // An old instance: 1.0.0 started from `B`, kept running across the swaps.
-    let mut cmd = w.command(&w.entry());
+    let mut cmd = w.command(w.entry());
     cmd.args(["--hold", "300"])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
