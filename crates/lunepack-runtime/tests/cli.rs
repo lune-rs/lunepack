@@ -922,6 +922,34 @@ fn check_adopts_a_bundle_dragged_into_the_applications_folder() {
     assert_eq!(run.line(), golden(0));
 }
 
+/// A freshly adopted bundle has the layout of any install (`R/versions` among it), so an
+/// uninstall right after the adopting check, with no update in between, removes `B` and `R`.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_adopted_bundle_uninstalls_before_any_update() {
+    let lab = Lab::published();
+    let bundle = lab.home.join("Applications").join("CLI test.app");
+    copy_bundle(&lab.boot, &bundle);
+    let run = lab.run(&bundle.join(RUNTIME_PATH), &["check", "--json"], &[]);
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.last_line(), golden(GOLDEN_ADOPTED));
+    assert!(
+        lab.root.join("versions").is_dir(),
+        "R/versions after adoption"
+    );
+    let run = lab.run(&bundle.join(RUNTIME_PATH), &["uninstall", "--silent"], &[]);
+    assert_eq!(run.code, 0, "{run:?}");
+    run.assert_clean(&lab, &[]);
+    assert!(
+        std::fs::symlink_metadata(&bundle).is_err(),
+        "B is gone: {run:?}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&lab.root).is_err(),
+        "R is gone: {run:?}"
+    );
+}
+
 /// The same bundle anywhere but directly in an apps folder is a development run: `not_installed`
 /// before any request (the feed is gone, so a request would have been a transport error) and
 /// nothing written.

@@ -2252,6 +2252,11 @@ async fn check_adopting(
             if record.target != config.target {
                 return Err(Error::NotInstalled);
             }
+            // An install's layout holds `R/versions` (staging makes it on every other path), and
+            // `check_place` and reconcile rely on it; adoption stages nothing, so it is made here,
+            // durable before anything is committed.
+            fs.create_dir_all(&commit_root.versions_dir())?;
+            fs.sync_dir(commit_root.root())?;
             lunepack_core::write_bundle_identity(fs, &commit_root, &commit_bundle)
                 .map_err(layout_err)?;
             let request = integration_request(&inner.app_id, &commit_bundle, &config);

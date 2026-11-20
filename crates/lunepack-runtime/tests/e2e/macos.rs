@@ -61,6 +61,8 @@ pub struct Release {
     pub health_timeout_secs: u64,
     /// Which app the bundle's entry is.
     pub shell: bool,
+    /// `[install] autostart`: the install writes a LaunchAgent (M8-D12).
+    pub autostart: bool,
 }
 
 impl Release {
@@ -70,6 +72,7 @@ impl Release {
             flags: &[],
             health_timeout_secs: 20,
             shell: false,
+            autostart: false,
         }
     }
 }
@@ -81,6 +84,7 @@ const V3_CRASH: Release = Release {
     flags: &["crash-on-start"],
     health_timeout_secs: 20,
     shell: false,
+    autostart: false,
 };
 
 pub type RowFn = fn(&Bins) -> Vec<String>;
@@ -181,7 +185,7 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         id: "11",
-        name: "the .zip: adopted by the check, updated, refused when altered, left alone elsewhere",
+        name: "the .zip: adopted by the check, updated, refused when altered, left alone elsewhere, uninstalled",
         run: row_zip,
         ci_only: false,
     },
@@ -517,10 +521,12 @@ impl World {
              [install]\n\
              entry = \"Contents/MacOS/{ENTRY}\"\n\
              name = \"{APP_NAME}\"\n\
-             comment = \"The lunepack end-to-end app\"\n",
+             comment = \"The lunepack end-to-end app\"\n\
+             autostart = {autostart}\n",
             root = self.root_key_hex,
             feed = self.feed,
             timeout = release.health_timeout_secs,
+            autostart = release.autostart,
         );
         std::fs::write(path, text).expect("write config");
     }
@@ -1226,6 +1232,7 @@ const fn with(base: Release, flags: &'static [&'static str], health: u64) -> Rel
         flags,
         health_timeout_secs: health,
         shell: base.shell,
+        autostart: base.autostart,
     }
 }
 
@@ -1507,9 +1514,13 @@ fn row_zip(bins: &Bins) -> Vec<String> {
     assert_eq!(out.status.code(), Some(3), "a copy on the Desktop");
     assert_eq!(w4.requests().len(), before, "no request was made");
 
-    // 5. The feed unreachable: transport (8) and no current version; reachable: adopted.
+    // 5. The feed unreachable: transport (8) and no current version; reachable: adopted, with
+    //    the LaunchAgent of its `autostart` (M8-D12).
     let w5 = World::new(bins);
-    w5.publish(&V1);
+    w5.publish(&Release {
+        autostart: true,
+        ..V1
+    });
     let zip5 = w5.build_zip("1.0.0");
     std::fs::create_dir_all(&w5.apps).expect("apps");
     w5.extract_zip(&zip5, &w5.apps);
@@ -1525,6 +1536,22 @@ fn row_zip(bins: &Bins) -> Vec<String> {
     let (code, stdout) = w5.runtime(&["check", "--json"]);
     assert_eq!(code, 0, "{stdout}");
     assert!(last_line(&stdout).contains("\"adopted\":true"), "{stdout}");
+    let agent = w5
+        .home
+        .join("Library/LaunchAgents")
+        .join(format!("{APP_ID}.lunepack.plist"));
+    assert!(agent.is_file(), "the adoption wrote the LaunchAgent");
+    assert!(
+        w5.root.join("versions").is_dir(),
+        "R/versions exists, as after any install"
+    );
+
+    // 6. Uninstalled right after the adoption, before any update: B, R and the LaunchAgent go.
+    let (code, _) = w5.runtime(&["uninstall", "--silent"]);
+    assert_eq!(code, 0, "uninstall of a freshly adopted bundle");
+    assert!(!w5.bundle().exists(), "B is gone");
+    assert!(!w5.root.exists(), "R is gone");
+    assert!(!agent.exists(), "the LaunchAgent is gone");
     lines
 }
 

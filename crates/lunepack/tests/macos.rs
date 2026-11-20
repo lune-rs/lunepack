@@ -992,6 +992,14 @@ fn assert_adopted(mac: &Mac, bundle: &Path, v: &str, events: &[LifecycleEvent]) 
         bundle.to_str(),
         "the pointer names the bundle"
     );
+    assert_eq!(
+        mac.fs
+            .symlink_metadata(&layout.versions_dir())
+            .expect("versions")
+            .map(|m| m.kind),
+        Some(FileKind::Dir),
+        "R/versions exists, as after any install"
+    );
     let facts = mac.fs.place(bundle).expect("place");
     assert_eq!(
         read_bundle_identity(&mac.fs, &layout).expect("identity"),
