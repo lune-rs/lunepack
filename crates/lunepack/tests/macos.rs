@@ -1090,6 +1090,27 @@ fn a_dragged_bundle_is_adopted_by_its_first_check_which_then_finds_the_update() 
 }
 
 #[test]
+fn a_root_owned_bundle_is_a_machine_install_and_is_not_adopted() {
+    let _serial = common::serial();
+    let mac = Mac::new();
+    publish_all(&mac, 1, &[V100]);
+    drag(&mac, &mac.bundle(), V100);
+    // M8-D4: owned by root and not by the caller, so the scope is the machine's (D10).
+    mac.fs.set_place(
+        &mac.bundle(),
+        MemPlace {
+            owned_by_caller: false,
+            owned_by_root: true,
+            ..MemPlace::default()
+        },
+    );
+    let inst = mac.open(&mac.bundle(), None).expect("installation");
+    let got = check_with(&mac, &inst, CheckOptions::default());
+    assert!(matches!(got, Err(Error::MachineScope)), "{got:?}");
+    common::workers_stopped();
+}
+
+#[test]
 fn a_failed_adoption_leaves_the_bundle_alone_and_records_no_current_version() {
     let _serial = common::serial();
     type Setup = Box<dyn Fn(&Mac)>;

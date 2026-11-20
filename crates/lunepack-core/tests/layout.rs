@@ -1705,6 +1705,34 @@ mod bundle {
     }
 
     #[test]
+    fn check_place_reads_a_root_owned_bundle_as_a_machine_install() {
+        let (fs, l) = installed(Some("1.0.0"), &["2.0.0"]);
+        // M8-D4: root-owned `B` is a machine install by ownership (D10), not `not_owned`.
+        fs.set_place(
+            &bundle(),
+            place(|p| {
+                p.owned_by_caller = false;
+                p.owned_by_root = true;
+            }),
+        );
+        let got = check_place(&fs, &l, &bundle());
+        assert!(matches!(got, Err(LayoutError::MachineBundle)), "{got:?}");
+        let before = snapshot(&fs, &l);
+        let got = reconcile_bundle(&fs, &l, &record("2.0.0"));
+        assert!(matches!(got, Err(LayoutError::MachineBundle)), "{got:?}");
+        assert_eq!(snapshot(&fs, &l), before);
+        // The caller being root owns it: not a machine refusal.
+        fs.set_place(
+            &bundle(),
+            place(|p| {
+                p.owned_by_caller = true;
+                p.owned_by_root = true;
+            }),
+        );
+        check_place(&fs, &l, &bundle()).unwrap();
+    }
+
+    #[test]
     fn check_place_wants_a_writable_folder_not_an_owned_one() {
         let (fs, l) = installed(Some("1.0.0"), &["2.0.0"]);
         // /Applications: root:admin, group-writable (M8-D4 (a)); the bundle is the caller's.
@@ -2606,6 +2634,7 @@ mod bundle {
                     read_only: false,
                     fs_type: String::new(),
                     owned_by_caller: true,
+                    owned_by_root: false,
                     writable: true,
                 })
             }

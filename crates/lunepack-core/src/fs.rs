@@ -217,6 +217,9 @@ pub struct PlaceFacts {
     pub fs_type: String,
     /// The entry is owned by the calling user (`st_uid` equals the effective user id).
     pub owned_by_caller: bool,
+    /// The entry is owned by the superuser (`st_uid` is 0): a per-machine install by ownership
+    /// (D10, M8-D4).
+    pub owned_by_root: bool,
     /// The calling user may create and remove entries in it (`access(W_OK)` on a directory).
     pub writable: bool,
 }

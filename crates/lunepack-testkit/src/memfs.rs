@@ -59,6 +59,8 @@ pub struct MemPlace {
     pub fs_type: String,
     /// The entry is the caller's.
     pub owned_by_caller: bool,
+    /// The entry is the superuser's.
+    pub owned_by_root: bool,
     /// The caller may create entries in it.
     pub writable: bool,
 }
@@ -70,6 +72,7 @@ impl Default for MemPlace {
             read_only: false,
             fs_type: "apfs".to_owned(),
             owned_by_caller: true,
+            owned_by_root: false,
             writable: true,
         }
     }
@@ -899,6 +902,7 @@ impl Fs for MemFs {
             read_only: place.read_only,
             fs_type: place.fs_type,
             owned_by_caller: place.owned_by_caller,
+            owned_by_root: place.owned_by_root,
             writable: place.writable,
         })
     }

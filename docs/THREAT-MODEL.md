@@ -670,8 +670,8 @@ rather than deletes, and fails toward keeping the app.
   `AppTranslocation` path component) or on a read-only volume, and an install whose `B` is on another
   volume than `R/versions`, is not owned by the user or whose folder the user cannot write, is refused with
   exit 28 and a reason from a closed set before anything is read, written or fetched, so such a copy
-  can neither fail halfway nor be updated from an image. A root-owned `B` is `not_owned`, not a per-machine
-  install; a per-machine install is a later milestone. The facts come from `statfs`, `stat` and
+  can neither fail halfway nor be updated from an image. A root-owned `B` is a machine install by ownership
+  (D10) and is refused `machine_scope`, exit 17; a per-machine install is a later milestone. The facts come from `statfs`, `stat` and
   `faccessat` through `Fs::place`; the translocation test is the mount type and the path component, which are
   what the system uses and have not been exercised on a real translocated app (that needs a notarized one,
   M9): the refusal is correct for the system's translocation and untested against it.

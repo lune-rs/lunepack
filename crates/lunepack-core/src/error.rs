@@ -529,6 +529,10 @@ pub enum LayoutError {
     /// one of a closed set.
     #[error("unsupported location: {0}")]
     Location(crate::layout::LocationReason),
+    /// The bundle is owned by the superuser: a per-machine install by ownership (D10, M8-D4), which
+    /// a per-user caller never updates.
+    #[error("the app bundle is a per-machine install")]
+    MachineBundle,
     /// A filesystem operation failed.
     #[error("{0}")]
     Fs(#[from] FsError),

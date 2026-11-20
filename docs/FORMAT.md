@@ -1551,7 +1551,7 @@ state for any other purpose, and writes nothing while it does:
 
 After the tree is accepted as `B`, a runtime that is about to change the install checks the place once
 (`check_place`): `B`'s folder and `R/versions` are on one device (else `other_volume`); `B` is owned by the
-caller (else `not_owned`; a root-owned `B` is refused, not read as a machine install); the caller can create
+caller (else `not_owned`; a root-owned `B` is a machine install by ownership, D10, and is `machine_scope`, exit 17); the caller can create
 entries in `B`'s folder (else `not_writable`). The folder itself need not be the caller's, so an
 administrator's app in `/Applications` keeps updating (M8-D4).
 

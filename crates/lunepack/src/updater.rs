@@ -1891,7 +1891,12 @@ fn check_adopt_place(fs: &dyn Fs, bundle: &Path, versions_dir: &Path) -> Result<
         return Err(refuse(LocationReason::OtherVolume));
     }
     if !own.owned_by_caller {
-        return Err(refuse(LocationReason::NotOwned));
+        // M8-D4: a root-owned `B` is a machine install (scope by ownership, D10).
+        return Err(if own.owned_by_root {
+            Error::MachineScope
+        } else {
+            refuse(LocationReason::NotOwned)
+        });
     }
     if !folder.writable {
         return Err(refuse(LocationReason::NotWritable));

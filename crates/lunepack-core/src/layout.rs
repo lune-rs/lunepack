@@ -1186,7 +1186,8 @@ pub fn write_bundle_identity(
 /// The location rules of M8-D4 for the live bundle `bundle` of `layout`, read through
 /// [`Fs::place`] and checked in this order: translocated and read-only (`B`'s folder, then `B`
 /// when it exists), [`LocationReason::OtherVolume`] (`B`'s folder and `R/versions` on different
-/// devices), [`LocationReason::NotOwned`] (`B` exists and is not the caller's) and
+/// devices), [`LocationReason::NotOwned`] (`B` exists and is not the caller's; a root-owned `B` is
+/// [`LayoutError::MachineBundle`] instead, M8-D4) and
 /// [`LocationReason::NotWritable`] (the caller may not create entries in `B`'s folder). `B`'s folder
 /// need not be the caller's (M8-D4 (a)). A failure is [`LayoutError::Location`].
 pub fn check_place(fs: &dyn Fs, layout: &UserLayout, bundle: &Path) -> Result<(), LayoutError> {
@@ -1206,8 +1207,13 @@ pub fn check_place(fs: &dyn Fs, layout: &UserLayout, bundle: &Path) -> Result<()
     if versions.device != folder.device {
         return Err(LayoutError::Location(LocationReason::OtherVolume));
     }
-    if own.is_some_and(|facts| !facts.owned_by_caller) {
-        return Err(LayoutError::Location(LocationReason::NotOwned));
+    if let Some(facts) = own.as_ref().filter(|facts| !facts.owned_by_caller) {
+        // M8-D4: a root-owned `B` is a machine install (scope by ownership, D10).
+        return Err(if facts.owned_by_root {
+            LayoutError::MachineBundle
+        } else {
+            LayoutError::Location(LocationReason::NotOwned)
+        });
     }
     if !folder.writable {
         return Err(LayoutError::Location(LocationReason::NotWritable));
