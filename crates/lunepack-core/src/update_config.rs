@@ -126,7 +126,7 @@ pub const DENIED_URL_SCHEMES: [&str; 31] = [
 pub const MS_SCHEME_PREFIX: &str = "ms-";
 
 const KIND: &str = "update-config";
-const TOP_KEYS: [&str; 11] = [
+const TOP_KEYS: [&str; 12] = [
     "app_id",
     "channel",
     "critical",
@@ -135,10 +135,12 @@ const TOP_KEYS: [&str; 11] = [
     "health_timeout_secs",
     "install",
     "kind",
+    "publisher_check",
     "root",
     "target",
     "version",
 ];
+const PUBLISHER_CHECK: &str = "publisher_check";
 const ROOT_KEYS: [&str; 3] = ["keys", "threshold", "version"];
 const INSTALL_KEYS: [&str; 11] = [
     "autostart",
@@ -234,6 +236,43 @@ pub enum FeedKind {
     HttpLoopback,
 }
 
+/// The publisher-continuity policy of an installed tree (M9-D6, M9-D9): what the client does when
+/// an update's OS code-signing publisher is not the installed version's. The **installed** tree's
+/// config decides; a candidate's own value never governs its own check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PublisherPolicy {
+    /// No check runs. A config without the member reads as this (configs from before M9).
+    #[default]
+    Off,
+    /// The check runs and every outcome other than "same publisher" or "not applicable" is
+    /// reported; the update proceeds.
+    Warn,
+    /// The check runs and refuses a different, unsigned or invalid candidate (M9-D9).
+    Enforce,
+}
+
+impl PublisherPolicy {
+    /// The member's text: `off`, `warn` or `enforce`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PublisherPolicy::Off => "off",
+            PublisherPolicy::Warn => "warn",
+            PublisherPolicy::Enforce => "enforce",
+        }
+    }
+
+    /// Parses the exact, lowercase text of [`PublisherPolicy::as_str`]; anything else is `None`.
+    pub fn parse(text: &str) -> Option<PublisherPolicy> {
+        [
+            PublisherPolicy::Off,
+            PublisherPolicy::Warn,
+            PublisherPolicy::Enforce,
+        ]
+        .into_iter()
+        .find(|p| p.as_str() == text)
+    }
+}
+
 /// An update-config document (FORMAT.md 13.2). Build one with [`UpdateConfig::new`]; the fields are
 /// public, and [`UpdateConfig::to_bytes`] checks them all again.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +293,10 @@ pub struct UpdateConfig {
     pub health_timeout_secs: u64,
     /// The install metadata.
     pub install: InstallMeta,
+    /// The top-level `publisher_check` member (M9-D6): absent reads as
+    /// [`PublisherPolicy::Off`], and the writer leaves the member out for `Off` (M9-R1-D1), so the
+    /// bytes of a config with `Off` are its pre-M9 bytes.
+    pub publisher_check: PublisherPolicy,
     /// Unknown top-level members a reader found (13.7); written back unchanged.
     pub extra: BTreeMap<String, Value>,
 }
@@ -280,6 +323,7 @@ impl UpdateConfig {
             channel,
             health_timeout_secs,
             install,
+            publisher_check: PublisherPolicy::Off,
             extra: BTreeMap::new(),
         };
         config.to_bytes()?;
@@ -381,6 +425,13 @@ impl UpdateConfig {
         for (key, value) in defined {
             top.insert(key.to_owned(), value);
         }
+        // Left out when `Off`, like the optional install members (M9-R1-D1).
+        if self.publisher_check != PublisherPolicy::Off {
+            top.insert(
+                PUBLISHER_CHECK.to_owned(),
+                Value::String(self.publisher_check.as_str().to_owned()),
+            );
+        }
         let mut bytes = serde_json::to_vec_pretty(&top)
             .map_err(|_| invalid("document", "does not serialise"))?;
         bytes.push(b'\n');
@@ -443,6 +494,12 @@ impl UpdateConfig {
             return Err(invalid("health_timeout_secs", "is outside 5..=3600"));
         }
         let install = read_install(take(&mut top, "install")?)?;
+        let publisher_check = match top.remove(PUBLISHER_CHECK) {
+            None => PublisherPolicy::Off,
+            Some(Value::String(text)) => PublisherPolicy::parse(&text)
+                .ok_or(invalid(PUBLISHER_CHECK, "is not off, warn or enforce"))?,
+            Some(_) => return Err(UpdateConfigError::WrongType(PUBLISHER_CHECK)),
+        };
 
         Ok(UpdateConfig {
             app_id,
@@ -453,6 +510,7 @@ impl UpdateConfig {
             channel,
             health_timeout_secs,
             install,
+            publisher_check,
             extra: top,
         })
     }
