@@ -99,6 +99,17 @@ mod macos {
             "a_running_instance_is_never_identified_as_the_new_one",
             background_second_instance,
         ),
+        // M8-D19 (a): a process whose executable was deleted.
+        (
+            "deleted_exe_judged_by_cwd_and_files",
+            deleted_exe_judged_by_cwd_and_files,
+        ),
+        (
+            "deleted_exe_holding_a_file_in_the_tree",
+            deleted_exe_holding_a_file_in_the_tree,
+        ),
+        // M8-D19 (b): last, alone, so its churn reaches no other case.
+        ("churn_never_counts", churn_never_counts),
     ];
 
     pub fn run_all(args: &[String]) {
@@ -583,6 +594,133 @@ mod macos {
         } else {
             println!("note: the volume is case sensitive; the case spelling was not tested");
         }
+    }
+
+    /// A copy of the helper at `<scratch>/exe/helper`, started with `args` in `cwd`, then deleted
+    /// once it runs (`ready` exists: deleted any earlier, the copy is killed by the system as it
+    /// pages its code in). Returns the copy's directory and the child.
+    fn start_then_delete_exe(
+        scratch: &Path,
+        cwd: &Path,
+        ready: &Path,
+        args: &[&std::ffi::OsStr],
+    ) -> (PathBuf, Reap) {
+        let exe_dir = scratch.join("exe");
+        std::fs::create_dir(&exe_dir).unwrap();
+        let exe = exe_dir.join("helper");
+        std::fs::copy(helper(), &exe).expect("copy the helper");
+        let child = Reap(
+            Command::new(&exe)
+                .args(args)
+                .current_dir(cwd)
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn the copy"),
+        );
+        let pid = child.0.id();
+        wait_for_file(ready);
+        // The instrument, before the delete: the executable path names the copy.
+        assert_eq!(libproc::exe_path(pid).unwrap(), Some(exe.clone()));
+        std::fs::remove_file(&exe).expect("delete the copy");
+        // And after: the kernel has no path for it any more (ENOENT, M8-D19 (a)).
+        let err = libproc::exe_path(pid).expect_err("a deleted executable has no path");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "{err}");
+        (exe_dir, child)
+    }
+
+    /// M8-D19 (a): a process in `sleep` (`pid-sleep`, which says when it runs) whose executable
+    /// was deleted is judged by its working directory and open files.
+    fn deleted_exe_judged_by_cwd_and_files(scratch: &Path) {
+        let tree = scratch.join("tree");
+        let cwd = scratch.join("cwd");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        let ready = scratch.join("ready");
+        let (exe_dir, _child) = start_then_delete_exe(
+            scratch,
+            &cwd,
+            &ready,
+            &["pid-sleep".as_ref(), ready.as_os_str(), "600".as_ref()],
+        );
+        assert!(
+            !os().tree_in_use(&tree, &[]).unwrap(),
+            "a deleted executable counted for an unrelated tree"
+        );
+        assert!(
+            os().tree_in_use(&cwd, &[]).unwrap(),
+            "its working directory"
+        );
+        assert!(
+            !os().tree_in_use(&exe_dir, &[]).unwrap(),
+            "the deleted executable's old directory"
+        );
+    }
+
+    fn deleted_exe_holding_a_file_in_the_tree(scratch: &Path) {
+        let tree = scratch.join("tree");
+        let cwd = scratch.join("cwd");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        let ready = scratch.join("ready");
+        let held = tree.join("held");
+        std::fs::write(&held, b"x").unwrap();
+        let (_exe_dir, _child) = start_then_delete_exe(
+            scratch,
+            &cwd,
+            &ready,
+            &[
+                "hold".as_ref(),
+                held.as_os_str(),
+                ready.as_os_str(),
+                "600".as_ref(),
+            ],
+        );
+        assert!(
+            os().tree_in_use(&tree, &[]).unwrap(),
+            "an open file in the tree"
+        );
+    }
+
+    /// M8-D19 (b): processes of this user that start and end all through the scans never count
+    /// for a tree nobody uses.
+    fn churn_never_counts(scratch: &Path) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        const SCANS: usize = 2_000;
+        const THREADS: usize = 4;
+        let tree = scratch.join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let stop = AtomicBool::new(false);
+        let started = AtomicU64::new(0);
+        let mut positives = 0;
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let status = Command::new("/usr/bin/true")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status()
+                            .expect("start /usr/bin/true");
+                        assert!(status.success());
+                        started.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            // The churn runs before the first scan.
+            while started.load(Ordering::Relaxed) < THREADS as u64 {
+                std::thread::yield_now();
+            }
+            for _ in 0..SCANS {
+                if os().tree_in_use(&tree, &[]).unwrap() {
+                    positives += 1;
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        let churned = started.load(Ordering::Relaxed);
+        println!("note: {SCANS} scans, {churned} processes started meanwhile, {positives} in use");
+        assert_eq!(positives, 0, "a tree nobody uses was in use");
     }
 
     fn terminate_stubborn(scratch: &Path) {
