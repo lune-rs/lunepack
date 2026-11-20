@@ -201,6 +201,8 @@ pub struct Lab {
     feed_prefix: String,
     /// The feed the packed configs name instead of `feed` (the seed install still uses `feed`).
     release_feed: Option<String>,
+    /// `[update] publisher_check` of the published releases (M9-D2); `None` leaves it out.
+    publisher_check: Option<&'static str>,
     kind: FeedKind,
     _server: Option<LoopbackServer>,
     origin: Option<FakeOrigin>,
@@ -364,6 +366,7 @@ impl Lab {
             feed,
             feed_prefix,
             release_feed: None,
+            publisher_check: None,
             kind,
             _server: server,
             origin,
@@ -476,6 +479,7 @@ impl Lab {
              feed = \"{feed}\"\n\
              channel = \"{CHANNEL}\"\n\
              health_timeout_secs = {timeout}\n\
+             {publisher_check}\
              \n\
              [install]\n\
              entry = \"{entry}\"\n\
@@ -486,6 +490,10 @@ impl Lab {
              terminal = false\n",
             feed = self.release_feed.as_deref().unwrap_or(&self.feed),
             timeout = release.health_timeout_secs,
+            publisher_check = self
+                .publisher_check
+                .map(|p| format!("publisher_check = \"{p}\"\n"))
+                .unwrap_or_default(),
         );
         std::fs::write(path, text).expect("write config");
     }
@@ -710,6 +718,11 @@ impl Lab {
     /// keeps using the loopback feed (so a tree can be installed whose own feed is unreachable).
     pub fn set_release_feed(&mut self, feed: &str) {
         self.release_feed = Some(feed.to_owned());
+    }
+
+    /// The published releases carry `[update] publisher_check = "<policy>"` from now on.
+    pub fn set_publisher_check(&mut self, policy: &'static str) {
+        self.publisher_check = Some(policy);
     }
 
     /// The loopback origin (an `http:` lab).
