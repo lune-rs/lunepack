@@ -842,3 +842,118 @@ fn any_other_value_is_refused_naming_the_member_only() {
         .insert("publisher_check".to_owned(), json!("warn"));
     assert!(config.to_bytes().is_err());
 }
+
+// ---- the publisher policy (M9-D9) --------------------------------------------------------------
+
+mod publisher_policy {
+    use lunepack_core::PublisherOutcome::{
+        CandidateInvalid, CandidateUnsigned, Different, InstalledInvalid, InstalledUnsigned, Os,
+    };
+    use lunepack_core::PublisherPolicy::{Enforce, Off, Warn};
+    use lunepack_core::{Decision, PublisherError, PublisherOutcome, decide};
+
+    /// Every result a check can give.
+    fn results() -> Vec<(&'static str, Result<bool, PublisherError>)> {
+        vec![
+            ("same", Ok(true)),
+            ("different", Ok(false)),
+            ("installed_unsigned", Err(PublisherError::InstalledUnsigned)),
+            ("installed_invalid", Err(PublisherError::InstalledInvalid)),
+            ("candidate_unsigned", Err(PublisherError::CandidateUnsigned)),
+            ("candidate_invalid", Err(PublisherError::CandidateInvalid)),
+            ("not_applicable", Err(PublisherError::NotApplicable)),
+            ("os", Err(PublisherError::Os)),
+        ]
+    }
+
+    fn proceed(found: Option<PublisherOutcome>) -> Decision {
+        Decision::Proceed(found)
+    }
+
+    fn refuse(reason: PublisherOutcome, mark_bad: bool) -> Decision {
+        Decision::Refuse { reason, mark_bad }
+    }
+
+    /// The M9-D9 table, written out pair by pair (policy `off`, `warn`, `enforce`).
+    #[test]
+    fn decide_is_the_m9_d9_table_for_every_pair() {
+        #[rustfmt::skip]
+        let table: [(&str, [Decision; 3]); 8] = [
+            ("same",               [proceed(None), proceed(None), proceed(None)]),
+            ("not_applicable",     [proceed(None), proceed(None), proceed(None)]),
+            ("installed_unsigned", [proceed(None), proceed(Some(InstalledUnsigned)), proceed(Some(InstalledUnsigned))]),
+            ("different",          [proceed(None), proceed(Some(Different)), refuse(Different, true)]),
+            ("candidate_unsigned", [proceed(None), proceed(Some(CandidateUnsigned)), refuse(CandidateUnsigned, true)]),
+            ("candidate_invalid",  [proceed(None), proceed(Some(CandidateInvalid)), refuse(CandidateInvalid, true)]),
+            ("installed_invalid",  [proceed(None), proceed(Some(InstalledInvalid)), refuse(InstalledInvalid, false)]),
+            ("os",                 [proceed(None), proceed(Some(Os)), refuse(Os, false)]),
+        ];
+        let all = results();
+        assert_eq!(table.len(), all.len(), "the table covers every result");
+        for (name, expected) in table {
+            let (_, result) = all.iter().find(|(n, _)| *n == name).expect(name);
+            for (policy, want) in [Off, Warn, Enforce].into_iter().zip(expected) {
+                assert_eq!(decide(policy, *result), want, "{name} under {policy:?}");
+            }
+        }
+    }
+
+    /// The invariants the table is built to keep, stated as properties.
+    #[test]
+    fn only_a_finding_about_the_candidate_marks_it_bad() {
+        for (name, result) in results() {
+            // `off` runs nothing: it never refuses and never reports.
+            assert_eq!(decide(Off, result), proceed(None), "{name}");
+            // `warn` never refuses.
+            assert!(
+                matches!(decide(Warn, result), Decision::Proceed(_)),
+                "{name}"
+            );
+            if let Decision::Refuse { reason, mark_bad } = decide(Enforce, result) {
+                let about_candidate =
+                    matches!(reason, Different | CandidateUnsigned | CandidateInvalid);
+                assert_eq!(mark_bad, about_candidate, "{name}");
+            }
+        }
+        // No baseline is not a refusal under `enforce`; a local fault is, and marks nothing.
+        assert_eq!(
+            decide(Enforce, Err(PublisherError::InstalledUnsigned)),
+            proceed(Some(InstalledUnsigned))
+        );
+        assert_eq!(decide(Enforce, Err(PublisherError::Os)), refuse(Os, false));
+    }
+
+    #[test]
+    fn codes_are_stable_and_errors_show_no_detail() {
+        let codes = [
+            (PublisherError::InstalledUnsigned, "installed_unsigned"),
+            (PublisherError::InstalledInvalid, "installed_invalid"),
+            (PublisherError::CandidateUnsigned, "candidate_unsigned"),
+            (PublisherError::CandidateInvalid, "candidate_invalid"),
+            (PublisherError::NotApplicable, "not_applicable"),
+            (PublisherError::Os, "os"),
+        ];
+        for (error, code) in codes {
+            assert_eq!(error.code(), code);
+            let shown = error.to_string();
+            // Closed text: no path separator, no number, no quoted detail.
+            assert!(
+                !shown
+                    .chars()
+                    .any(|c| matches!(c, '/' | '\\' | '"') || c.is_ascii_digit()),
+                "{shown}"
+            );
+        }
+        let outcomes = [
+            (Different, "different"),
+            (InstalledUnsigned, "installed_unsigned"),
+            (InstalledInvalid, "installed_invalid"),
+            (CandidateUnsigned, "candidate_unsigned"),
+            (CandidateInvalid, "candidate_invalid"),
+            (Os, "os"),
+        ];
+        for (outcome, code) in outcomes {
+            assert_eq!(outcome.code(), code);
+        }
+    }
+}

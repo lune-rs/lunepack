@@ -5,9 +5,11 @@
 //! `Send + Sync`; implementations live in adapter crates, fakes in `lunepack-testkit`.
 
 use std::io::Write;
+use std::path::PathBuf;
 
 use crate::digest::Sha256Digest;
-use crate::error::{Error, Result};
+use crate::error::{Error, PublisherError, Result};
+use crate::path::RelPath;
 
 /// A streaming SHA-256 computation, created by [`Hasher::sha256_start`].
 pub trait HashState: Send {
@@ -236,4 +238,31 @@ pub trait CodeSign: Send + Sync {
         root: &std::path::Path,
         plan: &[crate::codesign::SignItem],
     ) -> Result<(), Error>;
+}
+
+/// One tree whose operating-system code-signing publisher is asked about (M9-D8, M9-D7): its root
+/// directory (on macOS, the bundle) and the entry, the path of the executable inside it that
+/// `install.entry` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedTree {
+    /// The tree's root directory (absolute).
+    pub root: PathBuf,
+    /// The tree's entry, relative to `root`.
+    pub entry: RelPath,
+}
+
+/// The publisher-continuity check (M9, C7): whether two trees were published by the same
+/// operating-system code-signing identity. Object-safe and `Send + Sync`; it reads the two trees
+/// and calls the operating system, never the network.
+///
+/// The answer is `Ok(true)`, `Ok(false)`, or a [`PublisherError`] from a closed set. An adapter
+/// returns a verdict about the candidate or the installed tree only for the operating-system
+/// statuses its documentation lists; every other failure is [`PublisherError::Os`] (M9-R1-D2).
+pub trait PublisherCheck: Send + Sync {
+    /// Whether `candidate` is signed by the publisher of `installed`.
+    fn same_publisher(
+        &self,
+        installed: &SignedTree,
+        candidate: &SignedTree,
+    ) -> std::result::Result<bool, PublisherError>;
 }

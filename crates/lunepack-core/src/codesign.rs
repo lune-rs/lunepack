@@ -13,9 +13,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::Path;
 
+use crate::error::PublisherError;
 use crate::path::RelPath;
 use crate::pe::{PeError, PeHeaders};
 use crate::target::Target;
+use crate::update_config::PublisherPolicy;
 
 // ---- argv templates (M9-D1) ------------------------------------------------------------------------
 
@@ -651,4 +653,97 @@ fn thin_signed(slice: &[u8]) -> bool {
         at = next;
     }
     signed
+}
+
+// ---- the publisher policy (M9-D9) ------------------------------------------------------------------
+
+/// What a publisher check found when it did not simply say "same publisher" (or "not applicable"):
+/// the closed set of reasons a refusal or a warning can carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PublisherOutcome {
+    /// Signed by another publisher than the installed version.
+    Different,
+    /// The installed version is not signed: no baseline.
+    InstalledUnsigned,
+    /// The installed version's signature does not verify.
+    InstalledInvalid,
+    /// The candidate is not signed.
+    CandidateUnsigned,
+    /// The candidate's signature does not verify.
+    CandidateInvalid,
+    /// The operating system could not answer.
+    Os,
+}
+
+impl PublisherOutcome {
+    /// The stable code text: `different`, `installed_unsigned`, `installed_invalid`,
+    /// `candidate_unsigned`, `candidate_invalid` or `os`.
+    pub const fn code(self) -> &'static str {
+        match self {
+            PublisherOutcome::Different => "different",
+            PublisherOutcome::InstalledUnsigned => "installed_unsigned",
+            PublisherOutcome::InstalledInvalid => "installed_invalid",
+            PublisherOutcome::CandidateUnsigned => "candidate_unsigned",
+            PublisherOutcome::CandidateInvalid => "candidate_invalid",
+            PublisherOutcome::Os => "os",
+        }
+    }
+}
+
+/// What the policy makes of a check's result (M9-D9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// The update goes on. `Some` is a finding to report (a `tracing` warning and the `publisher`
+    /// member of the result); `None` is "same publisher", "not applicable" or "no check ran".
+    Proceed(Option<PublisherOutcome>),
+    /// The update is refused for `reason`. `mark_bad` is set only when the finding is about the
+    /// candidate's own bytes or signature: then the version is marked bad in the same state
+    /// commit, so it is never offered again.
+    Refuse {
+        /// Why.
+        reason: PublisherOutcome,
+        /// Whether the candidate version is marked bad.
+        mark_bad: bool,
+    },
+}
+
+/// The policy decision over a check's `result` (M9-D9), total over every pair:
+///
+/// | result | `off` | `warn` | `enforce` |
+/// |---|---|---|---|
+/// | same publisher, not applicable | proceed | proceed | proceed |
+/// | installed unsigned | proceed | proceed, report | proceed, report (no baseline yet) |
+/// | different, candidate unsigned, candidate invalid | proceed | proceed, report | refuse, mark bad |
+/// | installed invalid, os | proceed | proceed, report | refuse, mark nothing (a local fault) |
+pub fn decide(policy: PublisherPolicy, result: Result<bool, PublisherError>) -> Decision {
+    let found = match result {
+        Ok(true) | Err(PublisherError::NotApplicable) => None,
+        Ok(false) => Some(PublisherOutcome::Different),
+        Err(PublisherError::InstalledUnsigned) => Some(PublisherOutcome::InstalledUnsigned),
+        Err(PublisherError::InstalledInvalid) => Some(PublisherOutcome::InstalledInvalid),
+        Err(PublisherError::CandidateUnsigned) => Some(PublisherOutcome::CandidateUnsigned),
+        Err(PublisherError::CandidateInvalid) => Some(PublisherOutcome::CandidateInvalid),
+        // `PublisherError` is non-exhaustive: anything this table does not know is a local fault.
+        Err(_) => Some(PublisherOutcome::Os),
+    };
+    let Some(found) = found else {
+        return Decision::Proceed(None);
+    };
+    match policy {
+        PublisherPolicy::Off => Decision::Proceed(None),
+        PublisherPolicy::Warn => Decision::Proceed(Some(found)),
+        PublisherPolicy::Enforce => match found {
+            PublisherOutcome::InstalledUnsigned => Decision::Proceed(Some(found)),
+            PublisherOutcome::Different
+            | PublisherOutcome::CandidateUnsigned
+            | PublisherOutcome::CandidateInvalid => Decision::Refuse {
+                reason: found,
+                mark_bad: true,
+            },
+            PublisherOutcome::InstalledInvalid | PublisherOutcome::Os => Decision::Refuse {
+                reason: found,
+                mark_bad: false,
+            },
+        },
+    }
 }
