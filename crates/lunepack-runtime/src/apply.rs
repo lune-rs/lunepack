@@ -653,6 +653,24 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
         Err(e) => return End::Failed(kind_of(e)),
     }
 
+    // A bundle the user moved since this app started is followed under the lock before anything
+    // is committed (M8-D17), so the new version is placed in the bundle the user kept and not at
+    // the path it was moved from. A move that cannot be followed is a stray copy: nothing is
+    // applied through the old pointer and the app that exited comes back where it is.
+    let followed = if inst.moved() {
+        match lunepack::follow_move(inst) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Kind::NotInstalled),
+            Err(e) => Err(Kind::of(&e)),
+        }
+    } else {
+        Ok(())
+    };
+    if let Err(kind) = followed {
+        relaunch_current(ad, inst, &layout, v, None, args, events);
+        return End::Failed(kind);
+    }
+
     let applied = match commit_apply(ad, inst, &layout, v, events) {
         Ok(applied) => applied,
         Err(Refused { kind, unmoved }) => {

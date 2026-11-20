@@ -1543,7 +1543,9 @@ state for any other purpose, and writes nothing while it does:
 4. **The pointer is missing or its target is gone** and the tree is not under `$HOME/.Trash`: the install
    follows the move when the tree's device and inode are exactly those in `R/bundle.id` and the record is
    this app's, per user, with the tree's version as its current one. The follow happens under the install
-   lock, which re-checks all of that, and re-points `R/bundle`. A copy, a re-extracted archive, a move to
+   lock, which re-checks all of that, and re-points `R/bundle`. `startup`, `check`, `download`, `apply-and-restart`
+   and `apply` each follow before they use the install, and a move that cannot be followed is `not_installed`
+   (3), so an apply never recreates the bundle at the path it was moved from. A copy, a re-extracted archive, a move to
    another volume or a tree in the Trash has another inode and is not installed.
 5. **Adoptable** (17.5): the tree's canonical parent is exactly `~/Applications` or `/Applications` and `R`
    holds no record, a record without a current version, or an orphaned or replaced one (17.4).

@@ -31,12 +31,33 @@ pub fn run(
     cancel: &CancelToken,
     wait: Option<WaitTarget>,
 ) -> Result<Body, Kind> {
+    // A bundle the user moved is followed under the lock before a mode that reads or changes the
+    // install uses it (M8-D17); a move that cannot be followed is not this install.
+    if matches!(
+        parsed.command,
+        Command::Check | Command::Download | Command::ApplyAndRestart
+    ) {
+        followed(inst)?;
+    }
     match parsed.command {
         Command::Check => check(inst, parsed, output, cancel),
         Command::Download => download(inst, parsed, output, cancel),
         Command::Startup => startup(inst, parsed),
         Command::Confirm => confirm(inst),
         Command::ApplyAndRestart => apply_and_restart(inst, parsed, wait),
+    }
+}
+
+/// Follows `inst`'s bundle to where the user moved it ([`lunepack::follow_move`]); a copy that is
+/// not the install's after all is `not_installed`.
+fn followed(inst: &Installation) -> Result<(), Kind> {
+    if !inst.moved() {
+        return Ok(());
+    }
+    match lunepack::follow_move(inst) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Kind::NotInstalled),
+        Err(e) => Err(Kind::of(&e)),
     }
 }
 
