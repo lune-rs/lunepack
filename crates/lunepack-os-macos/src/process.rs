@@ -19,7 +19,9 @@
 //!   directory and its open vnode files, through libproc, and compares them with the tree's own
 //!   path as the kernel names it (M5-D9; the premise that a tree moved by a swap is reported under
 //!   its new path is a test of this crate). Gap: files only mapped into a process (a library it
-//!   loaded from the tree) are not read.
+//!   loaded from the tree) are not read. A process whose executable was deleted is judged by its
+//!   working directory and open files, and a read that fails is re-read a bounded number of times
+//!   (M8-D19, on `scan`).
 //! - A background start (`spawn_app_background`, M8-D13) asks LaunchServices to start the app
 //!   without activating it: `/usr/bin/open -g -n -W <bundle> --args <args>`, run as our own child
 //!   (no shell), the spec's environment changes applied to `open`'s own environment, which `open`
@@ -439,67 +441,174 @@ impl Process for MacProcess {
     }
 }
 
+/// How many more times the in-use scan reads a process of this user that it could not read
+/// (M8-D19 (b)).
+const REREADS: u32 = 3;
+/// The pause before each such re-read: at most `REREADS * REREAD_PAUSE` (30 ms) of waiting per
+/// troubled process.
+const REREAD_PAUSE: Duration = Duration::from_millis(10);
+
 /// Whether any process of this user other than those in `exclude` has its executable, working
-/// directory or an open file under `tree`. A process of this user that cannot be read counts as in
-/// use, unless it has ended meanwhile (M5-D9); any other error answers `true` (fail closed).
+/// directory or an open file under `tree` (M5-D9, amended on macOS by M8-D19).
+///
+/// A process of this user that cannot be read counts as in use (fail closed), with two exceptions:
+///
+/// - a protected daemon: the kernel refuses its working directory or open files (`EPERM`) while
+///   its executable is readable, and it is judged by what is readable ([`verdict`]); and
+/// - a deleted executable (M8-D19 (a)): `proc_pidpath` fails with `ENOENT`, so it cannot lie in
+///   the tree, and the process is judged by its working directory and open files; it counts as in
+///   use when its working directory is refused too, since then nothing about it can be told.
+///
+/// Any other failed read (the listing's identity, the executable, the working directory, the open
+/// files) is re-read up to [`REREADS`] times, [`REREAD_PAUSE`] apart, each time reading the
+/// identity first (M8-D19 (b)): a process that is gone, a zombie, or whose pid now names a process
+/// with another start time has ended meanwhile and is not in use; another user's process now is
+/// skipped; one still unreadable after the last re-read is in use. Any error listing the pids
+/// answers an error.
 fn scan(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool> {
     let my_uid = effective_uid();
     for pid in libproc::list_pids()? {
+        if listed_uses_tree(pid, tree, my_uid, exclude) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The in-use answer for one listed pid, with the bounded re-reads of [`scan`].
+fn listed_uses_tree(pid: u32, tree: &Path, my_uid: u32, exclude: &[ProcessId]) -> bool {
+    // The start time first read for this pid: a later read naming another is another process.
+    let mut start: Option<u64> = None;
+    for attempt in 0..=REREADS {
+        if attempt > 0 {
+            std::thread::sleep(REREAD_PAUSE);
+        }
         let info = match libproc::bsd_info(pid) {
             Ok(Some(info)) => info,
-            Ok(None) => continue,
+            // Gone: ended meanwhile.
+            Ok(None) => return false,
             // Another user's process: the kernel refuses its details to everyone but that user
             // and root, and it is not ours to scan (`PROC_PIDTBSDINFO` is a same-user call).
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => continue,
-            // Anything else: whose process this is cannot be told: fail closed.
-            Err(_) => return Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return false,
+            // Whose process this is cannot be told yet: read it again.
+            Err(_) => continue,
         };
+        match start {
+            None => start = Some(info.start_micros),
+            // The pid was reused: the process that was listed has ended.
+            Some(listed) if listed != info.start_micros => return false,
+            Some(_) => {}
+        }
         if info.uid != my_uid || info.zombie {
-            continue;
+            return false;
         }
         let id = ProcessId {
             pid,
             start_ticks: info.start_micros,
         };
         if exclude.contains(&id) {
-            continue;
+            return false;
         }
-        match process_uses_tree(pid, tree) {
-            Ok(true) => return Ok(true),
-            Ok(false) => {}
-            // Unreadable: fine only if the process ended (or the pid was reused) meanwhile.
-            Err(_) => {
-                if !has_exited(&id).unwrap_or(false) {
-                    return Ok(true);
-                }
-            }
+        match verdict(
+            exe_source(pid, tree),
+            dir_source(libproc::cwd_path(pid), tree),
+            files_source(libproc::fd_paths(pid), tree),
+        ) {
+            Verdict::InUse => return true,
+            Verdict::NotInUse => return false,
+            Verdict::Reread => {}
         }
     }
-    Ok(false)
+    // Still unreadable after the last re-read: fail closed.
+    true
 }
 
-/// Reads the three sources of process `pid` in turn. The executable path must be readable. The
-/// working directory and the open files may be refused by the kernel (`EPERM`) for a process of
-/// this user that the system protects by design (Apple's own daemons, such as `progressd`: their
-/// descriptor list is denied to every ordinary process): such a process is judged by what is
-/// readable of it, its executable path and, when the kernel gives it, its working directory. That
-/// is the macOS counterpart of Linux's non-dumpable process (M5-D9) and a recorded gap: a
-/// protected process that runs outside the tree but holds a file inside it is not seen.
-fn process_uses_tree(pid: u32, tree: &Path) -> io::Result<bool> {
-    if libproc::exe_path(pid)?.is_some_and(|p| p.starts_with(tree)) {
-        return Ok(true);
+/// What one source of a process said about the tree (M8-D19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// The source names a path under the tree.
+    Under,
+    /// The source was read and names nothing under the tree (or the process is gone).
+    Elsewhere,
+    /// The kernel refused the read (`EPERM`): a process the system protects by design.
+    Refused,
+    /// The executable only: its file was deleted (`ENOENT` from `proc_pidpath`).
+    Deleted,
+    /// Any other failed read.
+    Failed,
+}
+
+/// The in-use decision for one process of this user from its three sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    InUse,
+    NotInUse,
+    /// A source could not be read: read the process again.
+    Reread,
+}
+
+/// The decision of M5-D9 as amended on macOS by M8-D19, over what each source of one process gave:
+///
+/// - a source under the tree: in use;
+/// - an executable that could not be read (refused counts as failed): read again;
+/// - an executable read and elsewhere: judged by the working directory, then the open files. A
+///   working directory refused by the kernel ends the judgement as not in use, and so do refused
+///   open files: Apple's protected daemons (such as `progressd`) deny their descriptor list to
+///   every ordinary process. That is the macOS counterpart of Linux's non-dumpable process, and a
+///   recorded gap: a protected process that runs outside the tree but holds a file inside it is
+///   not seen;
+/// - a deleted executable (M8-D19 (a)): judged in the same way, except that a refused working
+///   directory leaves nothing to judge by: in use;
+/// - any other failed read of the working directory, or of the open files when they decide: read
+///   again.
+fn verdict(exe: Source, cwd: Source, fds: Source) -> Verdict {
+    use Source::{Deleted, Elsewhere, Failed, Refused, Under};
+    if [exe, cwd, fds].contains(&Under) {
+        return Verdict::InUse;
     }
-    let by_design = |e: &io::Error| e.kind() == io::ErrorKind::PermissionDenied;
-    match libproc::cwd_path(pid) {
-        Ok(Some(p)) if p.starts_with(tree) => return Ok(true),
-        Ok(_) => {}
-        Err(e) if by_design(&e) => return Ok(false),
-        Err(e) => return Err(e),
+    match (exe, cwd, fds) {
+        (Failed | Refused, _, _) => Verdict::Reread,
+        (Deleted, Refused, _) => Verdict::InUse,
+        (_, Refused, _) => Verdict::NotInUse,
+        (_, Failed | Deleted, _) => Verdict::Reread,
+        (_, _, Refused | Elsewhere) => Verdict::NotInUse,
+        (_, _, Failed | Deleted) => Verdict::Reread,
+        // Every `Under` answered above.
+        (_, _, Under) => Verdict::InUse,
     }
-    match libproc::fd_paths(pid) {
-        Ok(paths) => Ok(paths.iter().any(|p| p.starts_with(tree))),
-        Err(e) if by_design(&e) => Ok(false),
-        Err(e) => Err(e),
+}
+
+/// Source one, the executable path; `Deleted` for `ENOENT`, the one error that is not a failure.
+fn exe_source(pid: u32, tree: &Path) -> Source {
+    match libproc::exe_path(pid) {
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Source::Deleted,
+        other => dir_source(other, tree),
+    }
+}
+
+/// A source that names at most one path (`None`: the process is gone or has none).
+fn dir_source(read: io::Result<Option<PathBuf>>, tree: &Path) -> Source {
+    match read {
+        Ok(Some(p)) if p.starts_with(tree) => Source::Under,
+        Ok(_) => Source::Elsewhere,
+        Err(e) => error_source(&e),
+    }
+}
+
+/// The open files' source.
+fn files_source(read: io::Result<Vec<PathBuf>>, tree: &Path) -> Source {
+    match read {
+        Ok(paths) if paths.iter().any(|p| p.starts_with(tree)) => Source::Under,
+        Ok(_) => Source::Elsewhere,
+        Err(e) => error_source(&e),
+    }
+}
+
+fn error_source(e: &io::Error) -> Source {
+    if e.kind() == io::ErrorKind::PermissionDenied {
+        Source::Refused
+    } else {
+        Source::Failed
     }
 }
 
@@ -847,5 +956,98 @@ impl Child for BackgroundApp {
 
     fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Source::{Deleted, Elsewhere, Failed, Refused, Under};
+    use super::{Source, Verdict, verdict};
+
+    const ALL: [Source; 5] = [Under, Elsewhere, Refused, Deleted, Failed];
+    /// What the kernel can give for the working directory and the open files (`Deleted` is the
+    /// executable's only).
+    const READ: [Source; 4] = [Under, Elsewhere, Refused, Failed];
+
+    #[test]
+    fn an_executable_under_the_tree_is_in_use_whatever_the_rest() {
+        for cwd in ALL {
+            for fds in ALL {
+                assert_eq!(verdict(Under, cwd, fds), Verdict::InUse, "{cwd:?} {fds:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_working_directory_or_an_open_file_under_the_tree_is_in_use() {
+        for exe in ALL {
+            for other in ALL {
+                assert_eq!(
+                    verdict(exe, Under, other),
+                    Verdict::InUse,
+                    "{exe:?} {other:?}"
+                );
+                assert_eq!(
+                    verdict(exe, other, Under),
+                    Verdict::InUse,
+                    "{exe:?} {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_executable_elsewhere_is_judged_by_what_is_readable() {
+        // A protected daemon: a refused working directory ends the judgement.
+        for fds in ALL {
+            if fds != Under {
+                assert_eq!(
+                    verdict(Elsewhere, Refused, fds),
+                    Verdict::NotInUse,
+                    "{fds:?}"
+                );
+            }
+        }
+        assert_eq!(verdict(Elsewhere, Elsewhere, Refused), Verdict::NotInUse);
+        assert_eq!(verdict(Elsewhere, Elsewhere, Elsewhere), Verdict::NotInUse);
+    }
+
+    #[test]
+    fn a_deleted_executable_is_judged_by_its_working_directory_and_open_files() {
+        // Nothing about it can be told: fail closed (Q105 A).
+        for fds in ALL {
+            assert_eq!(verdict(Deleted, Refused, fds), Verdict::InUse, "{fds:?}");
+        }
+        assert_eq!(verdict(Deleted, Elsewhere, Refused), Verdict::NotInUse);
+        assert_eq!(verdict(Deleted, Elsewhere, Elsewhere), Verdict::NotInUse);
+    }
+
+    #[test]
+    fn any_failed_read_that_decides_is_read_again() {
+        for exe in [Failed, Refused] {
+            for cwd in ALL {
+                for fds in ALL {
+                    if cwd != Under && fds != Under {
+                        assert_eq!(
+                            verdict(exe, cwd, fds),
+                            Verdict::Reread,
+                            "{exe:?} {cwd:?} {fds:?}"
+                        );
+                    }
+                }
+            }
+        }
+        for exe in [Elsewhere, Deleted] {
+            for fds in READ {
+                if fds != Under {
+                    assert_eq!(
+                        verdict(exe, Failed, fds),
+                        Verdict::Reread,
+                        "{exe:?} {fds:?}"
+                    );
+                }
+            }
+            assert_eq!(verdict(exe, Elsewhere, Failed), Verdict::Reread, "{exe:?}");
+        }
     }
 }

@@ -1153,31 +1153,13 @@ fn row_crash_rolls_back(bins: &Bins) -> Vec<String> {
     let r = w.record().expect("a record");
     assert_eq!(r.current.as_deref(), Some("1.0.0"));
     assert_eq!(r.bad, ["1.2.0"]);
-    // The applier collects after it relaunched the previous version. The in-use scan fails closed
-    // on a process caught ending (the crashed 1.2.0 may be one), so the tree can survive this
-    // pass: it is gone after the next applied update, which is what "collected" promises.
-    std::thread::sleep(Duration::from_secs(2));
-    let kept_once = w.versions() == ["1.2.0"];
+    // The applier collects after it relaunched the previous version: the bad tree is gone by
+    // the time it has ended (the crashed 1.2.0, caught ending, does not hold it: M8-D19 (b)).
     assert!(
-        kept_once || w.versions().is_empty(),
-        "only the bad tree may remain: {:?}",
+        w.versions().is_empty(),
+        "the bad tree is collected by the rollback: {:?}",
         w.versions()
     );
-    w.publish(&Release::plain("1.3.0"));
-    w.run_app(&w.entry(), &["--update", "--no-ui"]);
-    wait_for("the update to 1.3.0", || {
-        w.record()
-            .is_some_and(|r| r.current.as_deref() == Some("1.3.0") && r.pending.is_none())
-    });
-    w.wait_runtime_gone();
-    let _ = std::fs::write(&w.out, b"");
-    assert!(
-        !w.versions().contains(&"1.2.0".to_owned()),
-        "the bad tree is collected by the next apply: {:?}",
-        w.versions()
-    );
-    let r = w.record().expect("a record");
-    assert!(r.bad.contains(&"1.2.0".to_owned()), "1.2.0 stays bad");
     lines
 }
 
