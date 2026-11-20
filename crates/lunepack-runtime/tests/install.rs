@@ -106,34 +106,6 @@ fn write_file(path: &Path, bytes: &[u8], exec: bool) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
 }
 
-/// macOS: every case holds the gate for as long as it runs, an uninstall case alone. An
-/// uninstall's in-use scan fails closed on a process of the user it cannot read, and a process
-/// another case starts or ends at that moment can be unreadable for an instant (the same scan
-/// on Linux reads `/proc`, where that window is closed, F9), so uninstalls run with no other
-/// case running.
-#[cfg(target_os = "macos")]
-static GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-#[cfg(target_os = "macos")]
-type Gate = Box<dyn std::any::Any>;
-#[cfg(not(target_os = "macos"))]
-struct Gate;
-
-#[cfg(target_os = "macos")]
-fn gate(alone: bool) -> Gate {
-    use std::sync::PoisonError;
-    if alone {
-        Box::new(GATE.write().unwrap_or_else(PoisonError::into_inner))
-    } else {
-        Box::new(GATE.read().unwrap_or_else(PoisonError::into_inner))
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn gate(_alone: bool) -> Gate {
-    Gate
-}
-
 /// One case's world: a release on a `file:` feed, a bootstrap tree, an empty home.
 struct Lab {
     _tmp: tempfile::TempDir,
@@ -143,23 +115,11 @@ struct Lab {
     root: PathBuf,
     out: PathBuf,
     boot: PathBuf,
-    /// Dropped last, after the directory is removed.
-    _gate: Gate,
 }
 
 impl Lab {
     /// Publishes 1.0.0 and writes its bootstrap tree.
     fn new() -> Lab {
-        Lab::with_gate(false)
-    }
-
-    /// [`Lab::new`] for a case that runs `uninstall`: on macOS no other case runs meanwhile.
-    fn alone() -> Lab {
-        Lab::with_gate(true)
-    }
-
-    fn with_gate(alone: bool) -> Lab {
-        let gate = gate(alone);
         let h = common::Home::new("install-", SUITE_APP_ID, None, false);
         let out = h.base.join("out");
         std::fs::create_dir_all(&out).expect("out");
@@ -171,7 +131,6 @@ impl Lab {
             data: h.data,
             root: h.root,
             out,
-            _gate: gate,
         };
         lab.publish();
         lab
@@ -642,7 +601,7 @@ fn install_and_uninstall_take_no_arguments() {
     ignore = "covered by uninstall_macos::the_bundle_the_root_and_our_launch_agent_go_and_foreign_items_stay"
 )]
 fn uninstall_removes_what_it_wrote_and_keeps_a_foreign_desktop_file() {
-    let lab = Lab::alone();
+    let lab = Lab::new();
     lab.installed();
     let applications = lab.data.join("applications");
     let foreign = applications.join("org.example.other.desktop");
@@ -671,7 +630,7 @@ fn uninstall_removes_what_it_wrote_and_keeps_a_foreign_desktop_file() {
     ignore = "covered by uninstall_macos::a_foreign_launch_agent_at_our_name_is_kept_and_reported"
 )]
 fn uninstall_keeps_a_foreign_file_at_its_entry_name_and_reports_it() {
-    let lab = Lab::alone();
+    let lab = Lab::new();
     lab.installed();
     let foreign = b"[Desktop Entry]\nName=Not lunepack's\n";
     std::fs::remove_file(lab.desktop_entry()).expect("remove");
@@ -695,7 +654,7 @@ fn uninstall_keeps_a_foreign_file_at_its_entry_name_and_reports_it() {
 
 #[test]
 fn uninstall_from_a_copy_of_the_tree_outside_r_is_refused() {
-    let lab = Lab::alone();
+    let lab = Lab::new();
     lab.installed();
     let before = listing(&lab.root);
     // A bare copy of the tree: not installed.
@@ -746,7 +705,7 @@ fn uninstall_from_a_copy_of_the_tree_outside_r_is_refused() {
 
 #[test]
 fn uninstall_through_a_symlinked_root_is_refused_and_the_target_is_untouched() {
-    let lab = Lab::alone();
+    let lab = Lab::new();
     lab.installed();
     // R moves elsewhere and a symlink takes its place.
     let target = lab.base.join("moved-root");
@@ -787,7 +746,7 @@ fn uninstall_through_a_symlinked_root_is_refused_and_the_target_is_untouched() {
     ignore = "covered by uninstall_macos::an_instance_running_from_the_bundle_or_a_version_tree_refuses_with_nothing_removed"
 )]
 fn uninstall_while_a_process_runs_from_r_is_refused() {
-    let lab = Lab::alone();
+    let lab = Lab::new();
     lab.installed();
     let sleeper = lab.tree().join("helper-sleep");
     let sleep = ["/bin/sleep", "/usr/bin/sleep"]
@@ -818,7 +777,7 @@ fn uninstall_while_a_process_runs_from_r_is_refused() {
 
 #[test]
 fn a_symlink_inside_a_tree_pointing_outside_r_is_removed_not_followed() {
-    let lab = Lab::alone();
+    let lab = Lab::new();
     lab.installed();
     let outside = lab.base.join("outside");
     write_file(&outside.join("keep.txt"), b"keep me\n", false);
@@ -911,7 +870,7 @@ fn assert_installed(lab: &Lab) {
 
 #[test]
 fn uninstall_goes_through_a_tombstone_and_leaves_none() {
-    let lab = Lab::alone();
+    let lab = Lab::new();
     lab.installed();
     let run = lab.run(&lab.installed_runtime(), "uninstall");
     assert_eq!(run.code, EXIT_OK, "{run:?}");
@@ -933,7 +892,7 @@ fn uninstall_goes_through_a_tombstone_and_leaves_none() {
 
 #[test]
 fn an_uninstall_cut_off_inside_the_tombstone_removal_is_recovered_by_reinstall() {
-    let lab = Lab::alone();
+    let lab = Lab::new();
     lab.installed();
     write_outside(&lab);
     let tomb = lab.cut_off_uninstall();
@@ -975,7 +934,7 @@ fn a_leftover_tombstone_beside_an_empty_root_does_not_stop_install() {
     ignore = "covered by uninstall_macos::tombstones_of_an_earlier_cut_off_run_are_removed_without_following_links"
 )]
 fn uninstall_removes_a_leftover_tombstone_and_nothing_else_beside_r() {
-    let lab = Lab::alone();
+    let lab = Lab::new();
     lab.installed();
     write_outside(&lab);
     // A cut-off uninstall's tombstone of an earlier install of this app.
