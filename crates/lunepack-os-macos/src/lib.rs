@@ -6,6 +6,8 @@
 //! (no shell) to read the "Reduce motion" accessibility setting, so the runtime's graph gets no
 //! window-stack library.
 
+#[cfg(any(target_os = "macos", test))]
+mod code_status;
 #[cfg(target_os = "macos")]
 mod integration;
 #[cfg(target_os = "macos")]
@@ -15,6 +17,8 @@ pub mod libproc;
 mod notice;
 #[cfg(target_os = "macos")]
 mod process;
+#[cfg(target_os = "macos")]
+mod publisher;
 
 #[cfg(target_os = "macos")]
 pub use integration::{MacEnv, MacIntegration};
@@ -22,6 +26,8 @@ pub use integration::{MacEnv, MacIntegration};
 pub use notice::{NoticeKind, notice};
 #[cfg(target_os = "macos")]
 pub use process::MacProcess;
+#[cfg(target_os = "macos")]
+pub use publisher::MacPublisherCheck;
 
 use std::io::Read;
 use std::process::{Command, Stdio};

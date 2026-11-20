@@ -1361,6 +1361,96 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         assert_clean(&fx.run().1);
     }
 
+    // M9-D10: `security-framework` only through the HTTP adapter and the macOS OS adapter --------------
+
+    fn with_macos_adapter() -> Fx {
+        let mut fx = Fx::clean();
+        fx.crates.insert(
+            "lunepack-os-macos".into(),
+            manifest(
+                "lunepack-os-macos",
+                OVERRIDE_LINTS,
+                r#"lunepack-core = { path = "../lunepack-core" }"#,
+            ),
+        );
+        fx
+    }
+
+    fn security_crates() -> String {
+        [
+            lock_crate(
+                "security-framework",
+                "3.7.0",
+                Some("[\"security-framework-sys 2.17.0\"]"),
+            ),
+            lock_crate("security-framework-sys", "2.17.0", None),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn x_security_framework_through_its_two_adapters_passes() {
+        let mut fx = with_macos_adapter();
+        fx.lock_member_extra.insert(
+            "lunepack-os-macos".into(),
+            "dependencies = [\"lunepack-core\", \"security-framework\"]\n".into(),
+        );
+        fx.lock_member_extra.insert(
+            "lunepack-http".into(),
+            "dependencies = [\"lunepack-core\", \"security-framework\"]\n".into(),
+        );
+        fx.lock_extra = Some(security_crates());
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn x_security_framework_in_another_member_fails_and_names_the_path_and_both_vias() {
+        // The seeded violation: the facade takes the binding itself.
+        let mut fx = with_macos_adapter();
+        fx.lock_member_extra.insert(
+            "lunepack-os-macos".into(),
+            "dependencies = [\"lunepack-core\", \"security-framework\"]\n".into(),
+        );
+        fx.lock_member_extra.insert(
+            "lunepack".into(),
+            "dependencies = [\"lunepack-core\", \"security-framework\"]\n".into(),
+        );
+        fx.lock_extra = Some(security_crates());
+        let vs = fx.run().1;
+        let detail = detail_of(&vs, "lunepack", "reach");
+        assert!(
+            detail.contains("lunepack -> security-framework"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("`lunepack-http` or `lunepack-os-macos`"),
+            "both vias are named: {detail}"
+        );
+        assert!(!has(&vs, "lunepack-os-macos", "reach"), "{}", render(&vs));
+    }
+
+    #[test]
+    fn x_security_framework_reached_through_a_third_party_crate_fails() {
+        let mut fx = with_macos_adapter();
+        fx.lock_member_extra.insert(
+            "lunepack-cli".into(),
+            "dependencies = [\"lunepack-core\", \"shiny 1.0.0\"]\n".into(),
+        );
+        fx.lock_extra = Some(
+            [
+                security_crates(),
+                lock_crate("shiny", "1.0.0", Some("[\"security-framework\"]")),
+            ]
+            .concat(),
+        );
+        let vs = fx.run().1;
+        let detail = detail_of(&vs, "lunepack-cli", "reach");
+        assert!(
+            detail.contains("lunepack-cli -> shiny -> security-framework"),
+            "{detail}"
+        );
+    }
+
     #[test]
     fn x_the_ring_row_still_names_its_one_via() {
         let fx = with_graph(
