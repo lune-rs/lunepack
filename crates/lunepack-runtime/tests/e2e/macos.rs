@@ -1104,8 +1104,36 @@ fn row_install(bins: &Bins) -> Vec<String> {
     lines
 }
 
-/// Row 3: the update to 1.1.0 through the library (`--update`), then 1.2.0 ... the command line is
-/// driven by the shell app in row 9.
+/// A started process that is killed and reaped when dropped, so a failed assertion leaves none.
+struct Held(std::process::Child);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The file the executable of process `pid` runs from now, from `lsof` (the system's own path of
+/// the running vnode, which follows a rename of a directory above it). Checked once against a
+/// known answer by its caller: the path before the swap.
+fn exe_path_of(pid: u32) -> PathBuf {
+    let mut cmd = Command::new("/usr/sbin/lsof");
+    cmd.args(["-p", &pid.to_string(), "-a", "-d", "txt", "-Fn"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let out = run_limited(cmd, Duration::from_secs(60), "lsof");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix('n').map(PathBuf::from))
+        .unwrap_or_else(|| panic!("lsof named no executable of pid {pid}"))
+}
+
+/// Row 3: the update to 1.1.0 through the library (`--update`), then to 1.2.0 and 1.3.0 while an
+/// instance of 1.0.0 keeps running: it runs from `versions/1.0.0` after the first swap, GC keeps
+/// that tree while the instance runs, and removes it once the instance has exited (the command
+/// line is driven by the shell app in row 9).
 fn row_update(bins: &Bins) -> Vec<String> {
     let w = World::new(bins);
     w.publish(&V1);
@@ -1116,6 +1144,29 @@ fn row_update(bins: &Bins) -> Vec<String> {
     w.assert_installed("1.0.0");
     w.run_app(&w.entry(), &[]);
     w.expect_lines(&first_install_lines(), false);
+
+    // An old instance: 1.0.0 started from `B`, kept running across the swaps.
+    let mut cmd = w.command(&w.entry());
+    cmd.args(["--hold", "300"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let old = Held(cmd.spawn().expect("start the old instance"));
+    wait_for("the old instance to hold", || {
+        w.lines().iter().any(|l| l == "1.0.0 hold")
+    });
+    w.expect_lines(
+        &[
+            "1.0.0 start".to_owned(),
+            "1.0.0 nothing-pending".to_owned(),
+            "1.0.0 hold".to_owned(),
+        ],
+        false,
+    );
+    assert_eq!(
+        exe_path_of(old.0.id()),
+        w.entry(),
+        "the instrument names the executable under B before any swap"
+    );
 
     w.run_app(&w.entry(), &["--update", "--no-ui"]);
     let lines = w.expect_lines(&confirmed_update_lines("1.0.0", "1.1.0"), false);
@@ -1134,6 +1185,49 @@ fn row_update(bins: &Bins) -> Vec<String> {
     assert_eq!(r.current.as_deref(), Some("1.1.0"));
     assert_eq!(r.previous.as_deref(), Some("1.0.0"));
     assert_no_quarantine(&w.bundle());
+    assert_eq!(
+        exe_path_of(old.0.id()),
+        w.root.join("versions/1.0.0/Contents/MacOS").join(ENTRY),
+        "the old instance runs from versions/1.0.0 after the swap"
+    );
+
+    // 1.2.0: 1.0.0 is now older than the previous version (1.1.0), so GC would remove it, but the
+    // old instance still runs from it.
+    w.publish(&Release::plain("1.2.0"));
+    w.run_app(&w.entry(), &["--update", "--no-ui"]);
+    w.expect_lines(&confirmed_update_lines("1.1.0", "1.2.0"), false);
+    w.wait_runtime_gone();
+    assert_eq!(w.bundle_version().as_deref(), Some("1.2.0"));
+    assert_eq!(
+        w.versions(),
+        ["1.0.0", "1.1.0"],
+        "GC kept the tree an old instance runs from"
+    );
+    assert!(
+        w.root
+            .join("versions/1.0.0/Contents/MacOS")
+            .join(ENTRY)
+            .is_file(),
+        "the old instance's executable is still there"
+    );
+    assert_eq!(
+        exe_path_of(old.0.id()),
+        w.root.join("versions/1.0.0/Contents/MacOS").join(ENTRY),
+        "the old instance still runs from versions/1.0.0"
+    );
+
+    // The old instance exits; the next update's GC removes its tree.
+    drop(old);
+    w.publish(&Release::plain("1.3.0"));
+    w.run_app(&w.entry(), &["--update", "--no-ui"]);
+    w.expect_lines(&confirmed_update_lines("1.2.0", "1.3.0"), false);
+    w.wait_runtime_gone();
+    assert_eq!(w.bundle_version().as_deref(), Some("1.3.0"));
+    assert_eq!(
+        w.versions(),
+        ["1.2.0"],
+        "GC removed versions/1.0.0 and versions/1.1.0 after the old instance exited"
+    );
     lines
 }
 
@@ -1705,9 +1799,17 @@ fn installer_runtime_running(under: &Path) -> bool {
 }
 
 /// Row 5: states a crash can leave, built with plain renames from an updated install, healed by
-/// the next start (the live bundle's runtime), or by the installer rerun when `B` is missing.
+/// the next start (the live bundle's runtime), or by the installer rerun when `B` is missing; once
+/// on the plain tree, once on the code-signed one, which must still verify afterwards.
 fn row_crash_states(bins: &Bins) -> Vec<String> {
+    let mut report = crash_states(bins, false);
+    report.extend(crash_states(bins, true));
+    report
+}
+
+fn crash_states(bins: &Bins, signed: bool) -> Vec<String> {
     let mut report = Vec::new();
+    let variant = if signed { "signed" } else { "plain" };
     for state in [
         "record-ahead",
         "swap-holds-new",
@@ -1715,8 +1817,13 @@ fn row_crash_states(bins: &Bins) -> Vec<String> {
         "out-present",
     ] {
         let w = World::new(bins);
-        w.publish(&V1);
-        w.publish(&V2);
+        for release in [&V1, &V2] {
+            if signed {
+                w.publish_signed(release);
+            } else {
+                w.publish(release);
+            }
+        }
         let dmg = w.build_dmg("1.0.0");
         assert_eq!(w.install_from_dmg(&dmg), 0);
         w.run_app(&w.entry(), &["--update", "--no-ui"]);
@@ -1781,7 +1888,14 @@ fn row_crash_states(bins: &Bins) -> Vec<String> {
             !w.root.join("versions/.out").exists(),
             "{state}: no .out is left"
         );
-        report.push(format!("{state}: healed"));
+        if signed {
+            codesign_verify(&w.bundle())
+                .unwrap_or_else(|e| panic!("{state}: codesign --verify --deep --strict B: {e}"));
+        }
+        report.push(format!(
+            "{variant} {state}: healed{}",
+            if signed { ", codesign-clean" } else { "" }
+        ));
     }
     report
 }
