@@ -14,8 +14,18 @@
 //! real per-user program files folder under a unique test app id and display name, and removes
 //! what it created (the install folders, the Start-menu shortcut, the uninstall entry, its temp
 //! directories) when it ends.
+//!
+//! macOS (M8 step 8) runs in a temporary home too. Its installer is an app, not one file: the
+//! cases build `Install <name>.app` with the built runtime in `Contents/MacOS`, a `lunepack-ui`
+//! wrapper script beside it (it starts this binary as the UI, as on Linux) and the payload file
+//! (FORMAT.md 14 without the runtime part) in `Contents/Resources`; the "setup file" of a case is
+//! that payload file. The installer UI that is the runtime's parent (`--ui-stdio`) is this binary
+//! with the first argument `--fake-installer-ui`. The cases that are about a trailer appended to
+//! the runtime, or about the UI read out of the pack, are skipped there by name.
 
-#[cfg(any(target_os = "linux", windows))]
+mod common;
+
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn main() {
     #[cfg(windows)]
     if std::env::current_exe()
@@ -27,16 +37,18 @@ fn main() {
     }
     match std::env::args().nth(1).as_deref() {
         Some("--engine") => cases::fake_ui(),
+        #[cfg(target_os = "macos")]
+        Some("--fake-installer-ui") => cases::fake_installer_ui(),
         _ => cases::run_all(),
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn main() {
-    println!("lunepack-runtime setup tests: Linux and Windows only, skipped");
+    println!("lunepack-runtime setup tests: Linux, Windows and macOS only, skipped");
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 mod cases {
     use std::io::Write as _;
     #[cfg(unix)]
@@ -55,8 +67,10 @@ mod cases {
     };
     use lunepack_crypto::{Ed25519Signer, Ed25519Verifier, Sha256Hasher, generate_key_file};
     use lunepack_fs::StdFs;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use lunepack_testkit::SUITE_APP_ID;
+
+    use crate::common;
     use lunepack_testkit::{ChainFixture, FakeCodec, SUITE_CHANNEL};
 
     const RUNTIME: &str = env!("CARGO_BIN_EXE_lunepack-runtime");
@@ -83,12 +97,44 @@ mod cases {
     const OTHER_TARGET: Target = Target::WindowsX86_64;
     #[cfg(all(windows, not(target_arch = "aarch64")))]
     const OTHER_TARGET: Target = Target::WindowsAarch64;
+    #[cfg(target_os = "macos")]
+    const TARGET: Target = common::TARGET;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const OTHER_TARGET: Target = Target::MacosX86_64;
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    const OTHER_TARGET: Target = Target::MacosAarch64;
 
     /// The layout scheme and the tree's file names of this OS.
     #[cfg(target_os = "linux")]
     const SCHEME: LayoutScheme = LayoutScheme::XDG;
     #[cfg(windows)]
     const SCHEME: LayoutScheme = LayoutScheme::WINDOWS;
+    #[cfg(target_os = "macos")]
+    const SCHEME: LayoutScheme = common::SCHEME;
+    #[cfg(target_os = "macos")]
+    const APP_FILE: &str = common::APP_PATH;
+    #[cfg(target_os = "macos")]
+    const RUNTIME_FILE: &str = common::RUNTIME_PATH;
+    /// The release's UI: the update window's helper app inside the bundle (M8-D6).
+    #[cfg(target_os = "macos")]
+    const UI_FILE: &str = lunepack_core::update_config::MACOS_HELPER_UI;
+    /// The installer app's payload file and its runtime and UI (M8-D7), inside the installer.
+    #[cfg(target_os = "macos")]
+    const PAYLOAD_FILE: &str = lunepack_core::update_config::MACOS_INSTALLER_PAYLOAD;
+    #[cfg(target_os = "macos")]
+    const INSTALLER_RUNTIME: &str = "Contents/MacOS/lunepack-runtime";
+    #[cfg(target_os = "macos")]
+    const INSTALLER_UI: &str = "Contents/MacOS/lunepack-ui";
+    /// Why a case does not run on macOS.
+    #[cfg(target_os = "macos")]
+    const NOT_ON_MACOS: &str = "the macOS installer is a bundle with a payload file (step 8)";
+    /// The cases about a trailer appended to the runtime, or about the UI read out of the pack,
+    /// with the reason they do not run on macOS. Each has a macOS counterpart below.
+    #[cfg(target_os = "macos")]
+    const SKIPPED_ON_MACOS: &[&str] = &[
+        "a_ui_proceeds_and_launches_and_its_directory_goes",
+        "malformed_truncated_overlapping_and_mislabelled_files_are_refused",
+    ];
     #[cfg(target_os = "linux")]
     const APP_FILE: &str = "bin/app";
     #[cfg(windows)]
@@ -116,6 +162,8 @@ mod cases {
     const EXIT_CANCELLED: i32 = 5;
     const EXIT_VERIFY: i32 = 7;
     const EXIT_ALREADY_INSTALLED: i32 = 23;
+    #[cfg(target_os = "macos")]
+    const EXIT_UNSUPPORTED_LOCATION: i32 = 28;
 
     // ---- the fake UI ------------------------------------------------------------------------
 
@@ -221,12 +269,15 @@ mod cases {
     struct Lab {
         _tmp: tempfile::TempDir,
         base: PathBuf,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         home: PathBuf,
         /// The data home: `$HOME/.local/share` (Linux), the per-user program files folder
-        /// (Windows, canonical).
+        /// (Windows, canonical), `$HOME/Library/Application Support` (macOS).
         #[cfg_attr(target_os = "linux", allow(dead_code))]
         data_home: PathBuf,
+        /// macOS: the installer app, `Install <name>.app`.
+        #[cfg(target_os = "macos")]
+        installer: PathBuf,
         root: PathBuf,
         out: PathBuf,
         setup: PathBuf,
@@ -244,11 +295,25 @@ mod cases {
 
     impl Lab {
         fn new(twist: Twist) -> Lab {
-            let tmp = tempfile::Builder::new()
-                .prefix("setup-")
-                .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-                .expect("tmp");
-            let base = std::fs::canonicalize(tmp.path()).expect("canonical");
+            #[cfg(not(target_os = "macos"))]
+            let (tmp, base) = {
+                let tmp = tempfile::Builder::new()
+                    .prefix("setup-")
+                    .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                    .expect("tmp");
+                let base = std::fs::canonicalize(tmp.path()).expect("canonical");
+                (tmp, base)
+            };
+            // A home with `~/Applications` and the data home, under the system's temporary
+            // directory (`common::scratch`).
+            #[cfg(target_os = "macos")]
+            let common::Home {
+                tmp,
+                base,
+                home,
+                data,
+                root,
+            } = common::Home::new("setup-", SUITE_APP_ID, None, false);
             let out = base.join("out");
             std::fs::create_dir_all(&out).expect("dirs");
             let keys = tempfile::tempdir().expect("keys");
@@ -298,10 +363,62 @@ mod cases {
                     signers,
                 }
             };
+            #[cfg(target_os = "macos")]
+            let lab = {
+                let installer = base.join("Install Setup test.app");
+                Lab {
+                    setup: common::join_rel(&installer, PAYLOAD_FILE),
+                    installer,
+                    _tmp: tmp,
+                    base,
+                    home,
+                    data_home: data,
+                    root,
+                    out,
+                    app_id: SUITE_APP_ID.to_owned(),
+                    name: "Setup test".to_owned(),
+                    signers,
+                }
+            };
             let name = lab.name.clone();
             let bytes = lab.build(twist, &name);
+            #[cfg(target_os = "macos")]
+            lab.make_installer();
             lab.write_setup(&bytes);
             lab
+        }
+
+        /// macOS: the installer app around the payload file: the built runtime and, beside it,
+        /// a `lunepack-ui` that notes its directory and starts this binary as the UI.
+        #[cfg(target_os = "macos")]
+        fn make_installer(&self) {
+            let runtime = common::join_rel(&self.installer, INSTALLER_RUNTIME);
+            common::place(Path::new(RUNTIME), &runtime);
+            let me = std::env::current_exe().expect("test exe");
+            let ui = format!(
+                "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s\\n' \"$d\" >> \"${OUT_VAR}/ui-dir\"\n\
+                 exec '{}' --engine\n",
+                me.display()
+            );
+            let ui_path = common::join_rel(&self.installer, INSTALLER_UI);
+            std::fs::write(&ui_path, ui).expect("ui");
+            std::fs::set_permissions(&ui_path, std::fs::Permissions::from_mode(0o755))
+                .expect("mode");
+            std::fs::create_dir_all(self.setup.parent().expect("resources")).expect("resources");
+        }
+
+        /// macOS: the installer's runtime.
+        #[cfg(target_os = "macos")]
+        fn installer_runtime(&self) -> PathBuf {
+            common::join_rel(&self.installer, INSTALLER_RUNTIME)
+        }
+
+        /// macOS: the live bundle a first install makes, `~/Applications/<name>.app`.
+        #[cfg(target_os = "macos")]
+        fn bundle(&self) -> PathBuf {
+            self.home
+                .join("Applications")
+                .join(format!("{}.app", self.name))
         }
 
         fn app_id(&self) -> AppId {
@@ -354,7 +471,8 @@ mod cases {
                 publisher: Some("Example Org".to_owned()),
                 file_types: Vec::new(),
                 url_schemes: Vec::new(),
-                autostart: false,
+                // macOS: the LaunchAgent is the integration a rerun can repair (M8-D12).
+                autostart: cfg!(target_os = "macos"),
             };
             let config = UpdateConfig::new(
                 &config_root,
@@ -370,7 +488,7 @@ mod cases {
             .expect("config bytes");
             let runtime = std::fs::read(RUNTIME).expect("runtime");
             let me = std::env::current_exe().expect("test exe");
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             let (app, ui) = (
                 format!("#!/bin/sh\n: > \"${OUT_VAR}/app-ran\"\n").into_bytes(),
                 format!(
@@ -391,8 +509,8 @@ mod cases {
                 (APP_FILE, app, true),
                 (RUNTIME_FILE, runtime.clone(), true),
                 (UI_FILE, ui, true),
-                ("share/readme.txt", b"read me\n".repeat(20), false),
-                ("lunepack-update.json", config, false),
+                (common::README_PATH, b"read me\n".repeat(20), false),
+                (common::CONFIG_PATH, config, false),
             ];
             #[cfg(windows)]
             files.push((STUB_FILE, b"lunepack test stub".to_vec(), true));
@@ -411,7 +529,15 @@ mod cases {
             ks.keys = vec![fx.release_key(1, t - DAY, t + 1000 * DAY)];
             let ks_bytes = fx.envelope(PayloadKind::Keys, &ks.to_payload(), &[0]);
 
+            // The setup file is the runtime with the payload after it; the macOS payload file is
+            // the payload alone, its parts from offset 0.
+            #[cfg(not(target_os = "macos"))]
             let mut bytes = runtime;
+            #[cfg(target_os = "macos")]
+            let mut bytes = {
+                drop(runtime);
+                Vec::new()
+            };
             let mut place = |part: &[u8]| {
                 while !(bytes.len() as u64).is_multiple_of(PART_ALIGN) {
                     bytes.push(0);
@@ -481,6 +607,9 @@ mod cases {
         /// Runs the setup file with `args`; `ui` is the fake UI's script, `None` for no UI at
         /// all (no display on Linux, `LUNEPACK_NO_UI` on Windows).
         fn run(&self, args: &[&str], ui: Option<&str>) -> Run {
+            #[cfg(target_os = "macos")]
+            return self.run_program(&self.installer_runtime(), args, ui);
+            #[cfg(not(target_os = "macos"))]
             self.run_program(&self.setup, args, ui)
         }
 
@@ -509,7 +638,10 @@ mod cases {
                     }
                 }
             }
-            #[cfg(windows)]
+            #[cfg(target_os = "macos")]
+            cmd.env("HOME", &self.home);
+            // macOS: `LUNEPACK_NO_UI` also keeps a native notice off the screen.
+            #[cfg(any(windows, target_os = "macos"))]
             match ui {
                 Some(script) => {
                     cmd.env(FAKE_VAR, script);
@@ -551,6 +683,12 @@ mod cases {
                 .unwrap_or_default()
         }
 
+        /// macOS: the installer reads no UI out of the pack, so it makes no UI directory.
+        #[cfg(target_os = "macos")]
+        fn ui_dirs_left(&self) -> Vec<String> {
+            Vec::new()
+        }
+
         /// Windows: this case's UI directories under the temp dir (their marker names its app).
         #[cfg(windows)]
         fn ui_dirs_left(&self) -> Vec<String> {
@@ -581,8 +719,17 @@ mod cases {
                 "current"
             );
             let layout = UserLayout::from_root(root.to_path_buf(), SCHEME);
+            #[cfg(not(target_os = "macos"))]
             let tree = layout.version_dir(&Version::parse(V100).expect("version"));
-            assert!(tree.join(APP_FILE).is_file(), "the entry");
+            // macOS: the live bundle in `~/Applications`, named after the app, holds the version.
+            #[cfg(target_os = "macos")]
+            let tree = {
+                let bundle = self.home.join("Applications").join(format!("{name}.app"));
+                assert_eq!(common::bundle_of(&layout), bundle, "the pointer");
+                common::assert_live(&layout, V100);
+                bundle
+            };
+            assert!(common::join_rel(&tree, APP_FILE).is_file(), "the entry");
             #[cfg(target_os = "linux")]
             {
                 let _ = name;
@@ -593,6 +740,8 @@ mod cases {
                         .is_file()
                 );
             }
+            #[cfg(target_os = "macos")]
+            assert!(self.launch_agent().is_file(), "the LaunchAgent");
             #[cfg(windows)]
             {
                 assert!(root.join("app.exe").is_file(), "the stub");
@@ -607,7 +756,37 @@ mod cases {
                 "the install root exists"
             );
             assert!(self.ui_dirs_left().is_empty(), "a UI directory was left");
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                visible(&self.home.join("Applications")),
+                Vec::<String>::new(),
+                "something was placed in the apps folder"
+            );
         }
+
+        /// macOS: the autostart LaunchAgent of the app (M8-D12).
+        #[cfg(target_os = "macos")]
+        fn launch_agent(&self) -> PathBuf {
+            self.home
+                .join("Library/LaunchAgents")
+                .join(format!("{}.lunepack.plist", self.app_id))
+        }
+    }
+
+    /// The names in `dir` that do not start with a dot (a volume's own `.fseventsd` and the like
+    /// are not ours), sorted; none when `dir` cannot be read.
+    #[cfg(target_os = "macos")]
+    fn visible(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| !n.starts_with('.'))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
     }
 
     /// Windows: everything a case may have made outside its temporary directory goes: the install
@@ -993,6 +1172,14 @@ mod cases {
             &["/s"],
             &["/S", "/S"],
             &["/S", "--silent"],
+            #[cfg(target_os = "macos")]
+            &["--ui-stdio", "--silent"],
+            #[cfg(target_os = "macos")]
+            &["--silent", "--ui-stdio"],
+            #[cfg(target_os = "macos")]
+            &["--ui-stdio", "--ui-stdio"],
+            #[cfg(target_os = "macos")]
+            &["--ui-stdio=1"],
         ] {
             let run = lab.run(args, None);
             assert_eq!(run.code, EXIT_USAGE, "{args:?}: {run:?}");
@@ -1258,7 +1445,9 @@ mod cases {
             .home
             .join(".local/share/applications")
             .join(format!("{SUITE_APP_ID}.desktop"));
-        #[cfg(target_os = "linux")]
+        #[cfg(target_os = "macos")]
+        let entry = lab.launch_agent();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let wanted = std::fs::read(&entry).expect("the entry");
         std::fs::remove_file(&entry).expect("remove the entry");
         let again = lab.run(&["--silent"], None);
@@ -1322,6 +1511,499 @@ mod cases {
         for kept in [&unmarked, &live, &not_ours] {
             assert!(kept.join("payload").exists(), "{kept:?} was removed");
         }
+    }
+
+    // ---- macOS cases (M8 step 8) ---------------------------------------------------------------
+
+    /// The installer UI that is the runtime's parent (`--fake-installer-ui <engine> <script>`):
+    /// starts the installer's runtime with `--ui-stdio` (stderr to `engine-stderr` in the out
+    /// directory, its pid to `engine-pid`), says hello, answers every `Ping`, notes the prompts and
+    /// answers them (`launch`: finish with a launch; `die`: exits with code 9 on the first frame
+    /// after the welcome was answered, mid-install, without a word; `kill`: is killed (SIGKILL,
+    /// as a crash ends it, with no crash report) at that point instead), then on `Close` waits for the
+    /// runtime and notes its exit code (`engine-exit`) and how many bytes its standard output
+    /// carried after `Close` (`after-close`). Every frame the runtime writes on its standard
+    /// output must be a valid frame; anything else ends this UI with code 12.
+    #[cfg(target_os = "macos")]
+    pub fn fake_installer_ui() {
+        let args: Vec<String> = std::env::args().collect();
+        let (engine, script) = (&args[2], args[3].as_str());
+        let out = PathBuf::from(std::env::var_os(OUT_VAR).expect("out"));
+        let stderr = std::fs::File::create(out.join("engine-stderr")).expect("stderr");
+        let mut child = Command::new(engine)
+            .arg("--ui-stdio")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .expect("engine");
+        note("engine-pid", &child.id().to_string());
+        let mut to_engine = child.stdin.take().expect("stdin");
+        let mut from_engine = child.stdout.take().expect("stdout");
+        let mut welcomed = false;
+        loop {
+            let msg = match ui::read_frame::<_, EngineMsg>(&mut from_engine) {
+                Ok(msg) => msg,
+                Err(ui::ProtocolError::Closed) => break,
+                Err(_) => std::process::exit(12),
+            };
+            let reply = match msg {
+                EngineMsg::Hello { build_id, app, .. } => {
+                    note(
+                        "ui-hello",
+                        &format!("{} {}\n", app.name, app.publisher.unwrap_or_default()),
+                    );
+                    Some(UiMsg::Hello { build_id })
+                }
+                EngineMsg::Ping { n } => Some(UiMsg::Pong { n }),
+                EngineMsg::Prompt { id, kind } => {
+                    note("ui-prompts", &format!("{kind:?}\n"));
+                    let value = match kind {
+                        PromptKind::Welcome => {
+                            welcomed = true;
+                            ChoiceValue::Proceed
+                        }
+                        PromptKind::Done => ChoiceValue::Finish {
+                            launch: script == "launch",
+                        },
+                        _ => ChoiceValue::Close,
+                    };
+                    Some(UiMsg::Choice { id, value })
+                }
+                EngineMsg::Close => {
+                    note("ui-closed", "");
+                    break;
+                }
+                _ if welcomed && script == "die" => std::process::exit(9),
+                _ if welcomed && script == "kill" => {
+                    let _ = Command::new("/bin/kill")
+                        .args(["-KILL", &std::process::id().to_string()])
+                        .status();
+                    std::process::exit(137);
+                }
+                _ => None,
+            };
+            if let Some(reply) = reply {
+                let _ = ui::write_frame(&mut to_engine, &reply);
+            }
+        }
+        // After `Close` the runtime's standard output carries nothing more (its result goes to
+        // standard error).
+        let mut rest = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut from_engine, &mut rest);
+        note("after-close", &rest.len().to_string());
+        drop(to_engine);
+        let status = child.wait().expect("engine");
+        note(
+            "engine-exit",
+            &status.code().map_or("signal".to_owned(), |c| c.to_string()),
+        );
+    }
+
+    /// macOS: runs the fake installer UI over the installer's runtime with `script`; returns its
+    /// run (the runtime's final line is in `engine-stderr`).
+    #[cfg(target_os = "macos")]
+    fn run_ui_parent(lab: &Lab, script: &str) -> Run {
+        let me = std::env::current_exe().expect("test exe");
+        let engine = lab.installer_runtime();
+        let engine = engine.to_str().expect("utf-8");
+        // `None`: `LUNEPACK_NO_UI` keeps a native notice away; the parent UI is used anyway.
+        lab.run_program(&me, &["--fake-installer-ui", engine, script], None)
+    }
+
+    /// macOS: waits until the process `pid` (a runtime whose parent is gone) has ended.
+    #[cfg(target_os = "macos")]
+    fn wait_gone(pid: u32) {
+        let start = Instant::now();
+        while lunepack_os_macos::MacProcess::new()
+            .process_id(pid)
+            .expect("probe")
+            .is_some()
+        {
+            assert!(start.elapsed() < RUN_LIMIT, "the runtime did not end");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// M8-D7: the installer app's UI is the runtime's parent (`--ui-stdio`): the frames go over
+    /// the runtime's own standard streams, which carry nothing else; the install, the done prompt
+    /// and the launch go as with a UI child, and the result goes to standard error only.
+    #[cfg(target_os = "macos")]
+    fn the_installer_ui_drives_the_install_over_its_runtimes_streams() {
+        let lab = Lab::new(Twist::default());
+        let run = run_ui_parent(&lab, "launch");
+        assert_eq!(run.code, EXIT_OK, "{run:?}");
+        assert!(lab.out.join("ui-closed").exists(), "no Close: {run:?}");
+        assert_eq!(lab.noted("engine-exit"), "0");
+        assert_eq!(lab.noted("after-close"), "0", "bytes after Close on stdout");
+        assert_eq!(lab.noted("ui-hello"), format!("{} Example Org\n", lab.name));
+        assert_eq!(lab.noted("ui-prompts"), "Welcome\nDone\n");
+        let stderr = lab.noted("engine-stderr");
+        assert!(
+            stderr.contains("\"command\":\"setup\"")
+                && stderr.contains("\"outcome\":\"installed\""),
+            "{stderr}"
+        );
+        lab.assert_installed();
+        assert!(
+            wait_for(&lab.out.join("app-ran")),
+            "the app was not launched"
+        );
+        assert!(lab.noted("ui-dir").is_empty(), "a UI child was started");
+    }
+
+    /// The UI parent dies mid-install: the runtime cannot stop it and is not stopped by it; it
+    /// finishes headless with the same outcome (installed, exit 0).
+    #[cfg(target_os = "macos")]
+    fn a_ui_parent_that_dies_mid_install_leaves_the_same_outcome() {
+        let lab = Lab::new(Twist::default());
+        let run = run_ui_parent(&lab, "die");
+        assert_eq!(run.code, 9, "{run:?}");
+        let pid: u32 = lab.noted("engine-pid").trim().parse().expect("pid");
+        wait_gone(pid);
+        assert_eq!(lab.noted("ui-prompts"), "Welcome\n");
+        let stderr = lab.noted("engine-stderr");
+        assert!(stderr.contains("\"outcome\":\"installed\""), "{stderr}");
+        lab.assert_installed();
+        assert!(!lab.out.join("app-ran").exists(), "the app was launched");
+    }
+
+    /// The sandbox profile under which `/usr/bin/osascript` cannot start: the native alert of a
+    /// run that lost its UI (M8-D11) is then refused before any window opens, and everything else
+    /// runs as usual.
+    #[cfg(target_os = "macos")]
+    const NO_ALERT_PROFILE: &str =
+        "(version 1)(allow default)(deny process-exec (literal \"/usr/bin/osascript\"))";
+
+    /// F6: the UI parent is killed mid-install with the native notice on (no `LUNEPACK_NO_UI`;
+    /// the alert itself is kept off the screen by a sandbox that refuses to start `osascript`).
+    /// The orphaned runtime finishes the install headless, goes through the notice path and
+    /// exits; it never lingers.
+    #[cfg(target_os = "macos")]
+    fn a_ui_parent_killed_mid_install_with_the_notice_on_leaves_no_runtime() {
+        // The instrument: under the profile `osascript` cannot run, while other programs can.
+        let refused = Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                NO_ALERT_PROFILE,
+                "/usr/bin/osascript",
+                "-e",
+                "return 1",
+            ])
+            .output()
+            .expect("sandbox-exec");
+        assert!(!refused.status.success(), "osascript ran in the sandbox");
+        let allowed = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", NO_ALERT_PROFILE, "/usr/bin/true"])
+            .status()
+            .expect("sandbox-exec");
+        assert!(allowed.success(), "the sandbox refuses everything");
+
+        let lab = Lab::new(Twist::default());
+        let me = std::env::current_exe().expect("test exe");
+        let me = me.to_str().expect("utf-8");
+        let engine = lab.installer_runtime();
+        let engine = engine.to_str().expect("utf-8");
+        // `Some`: `LUNEPACK_NO_UI` is removed, so the runtime's notice path is on.
+        let run = lab.run_program(
+            Path::new("/usr/bin/sandbox-exec"),
+            &[
+                "-p",
+                NO_ALERT_PROFILE,
+                me,
+                "--fake-installer-ui",
+                engine,
+                "kill",
+            ],
+            Some("kill"),
+        );
+        assert_eq!(run.code, -1, "the UI was not killed: {run:?}");
+        let died = Instant::now();
+        let pid: u32 = lab.noted("engine-pid").trim().parse().expect("pid");
+        wait_gone(pid);
+        // The install itself and the refused alert take well under this on a loaded machine; a
+        // runtime that lingers or spins after its parent died does not end at all.
+        assert!(
+            died.elapsed() < Duration::from_secs(60),
+            "the runtime ran {:?} after its UI died",
+            died.elapsed()
+        );
+        assert_eq!(lab.noted("ui-prompts"), "Welcome\n");
+        let stderr = lab.noted("engine-stderr");
+        assert!(stderr.contains("\"outcome\":\"installed\""), "{stderr}");
+        lab.assert_installed();
+        assert!(!lab.out.join("app-ran").exists(), "the app was launched");
+    }
+
+    /// The payload file cut, flipped, lengthened or not a regular file: a payload that does not
+    /// verify is exit 7 with nothing written; a link or a directory in its place is no installer
+    /// (the ordinary runtime, whose grammar refuses an empty command line).
+    #[cfg(target_os = "macos")]
+    fn a_payload_cut_flipped_or_misplaced_is_refused() {
+        let lab = Lab::new(Twist::default());
+        let good = lab.bytes();
+        let t = lab.trailer();
+        let len = good.len();
+        let trailer_at = len - TRAILER_SIZE as usize;
+        let cut_pack = {
+            let mut b = good[..(t.pack.offset + t.pack.length - 1) as usize].to_vec();
+            b.extend_from_slice(&good[trailer_at..]);
+            b
+        };
+        let flip = |at: usize| {
+            let mut b = good.clone();
+            b[at] ^= 0x01;
+            b
+        };
+        let mut longer = good.clone();
+        longer.extend_from_slice(&[0u8; 8]);
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("one byte short", good[..len - 1].to_vec()),
+            ("eight bytes short", good[..len - 8].to_vec()),
+            ("the trailer alone", good[trailer_at..].to_vec()),
+            ("the pack cut", cut_pack),
+            ("eight bytes after the trailer", longer),
+            ("the magic", flip(len - 1)),
+            ("the trailer body", flip(trailer_at + 10)),
+            ("the footer", flip(len - 40)),
+            (
+                "the key set",
+                flip((t.keys.offset + t.keys.length / 2) as usize),
+            ),
+        ];
+        for (name, bytes) in cases {
+            lab.write_setup(&bytes);
+            let run = lab.run(&["--silent"], None);
+            assert_eq!(run.code, EXIT_VERIFY, "{name}: {run:?}");
+            assert!(
+                run.stdout.contains("\"kind\":\"verify\""),
+                "{name}: {run:?}"
+            );
+            lab.assert_nothing_installed();
+        }
+        // A malformed payload with an argument the installer does not take is still exit 7.
+        lab.write_setup(&flip(len - 1));
+        let run = lab.run(&["install"], None);
+        assert_eq!(run.code, EXIT_VERIFY, "{run:?}");
+        // Not a regular file: a link to a good payload, then a directory.
+        let elsewhere = lab.base.join("payload-elsewhere");
+        std::fs::write(&elsewhere, &good).expect("payload");
+        std::fs::remove_file(&lab.setup).expect("remove");
+        std::os::unix::fs::symlink(&elsewhere, &lab.setup).expect("link");
+        let run = lab.run(&[], None);
+        assert_eq!(run.code, EXIT_USAGE, "link: {run:?}");
+        std::fs::remove_file(&lab.setup).expect("remove");
+        std::fs::create_dir(&lab.setup).expect("dir");
+        let run = lab.run(&[], None);
+        assert_eq!(run.code, EXIT_USAGE, "directory: {run:?}");
+        lab.assert_nothing_installed();
+    }
+
+    /// macOS: runs `program` with `args`, which must succeed.
+    #[cfg(target_os = "macos")]
+    fn sh(program: &str, args: &[&std::ffi::OsStr]) {
+        let out = Command::new(program).args(args).output().expect(program);
+        assert!(
+            out.status.success(),
+            "{program}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A disk image attached at a mount point of the case, detached when dropped.
+    #[cfg(target_os = "macos")]
+    struct Mounted(PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl Mounted {
+        fn attach(image: &Path, at: &Path, read_only: bool) -> Mounted {
+            let mut args: Vec<&std::ffi::OsStr> = vec![
+                "attach".as_ref(),
+                "-nobrowse".as_ref(),
+                "-noautoopen".as_ref(),
+                "-mountpoint".as_ref(),
+                at.as_os_str(),
+            ];
+            if read_only {
+                args.push("-readonly".as_ref());
+            }
+            args.push(image.as_os_str());
+            sh("/usr/bin/hdiutil", &args);
+            Mounted(at.to_path_buf())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            for force in [false, true] {
+                let mut cmd = Command::new("/usr/bin/hdiutil");
+                cmd.arg("detach");
+                if force {
+                    cmd.arg("-force");
+                }
+                let detached = cmd
+                    .arg(&self.0)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if detached {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+
+    /// M8-D4 (Revision 1): only the target's place is judged. An installer run from a read-only
+    /// disk image (as from the `.dmg`) installs.
+    #[cfg(target_os = "macos")]
+    fn a_setup_run_from_a_read_only_mount_installs() {
+        let lab = Lab::new(Twist::default());
+        let src = lab.base.join("dmg-src");
+        std::fs::create_dir(&src).expect("src");
+        let copy = src.join(lab.installer.file_name().expect("name"));
+        sh(
+            "/usr/bin/ditto",
+            &[lab.installer.as_os_str(), copy.as_os_str()],
+        );
+        let image = lab.base.join("installer.dmg");
+        sh(
+            "/usr/bin/hdiutil",
+            &[
+                "create".as_ref(),
+                "-quiet".as_ref(),
+                "-srcfolder".as_ref(),
+                src.as_os_str(),
+                "-format".as_ref(),
+                "UDRO".as_ref(),
+                "-volname".as_ref(),
+                "LP Setup Test".as_ref(),
+                image.as_os_str(),
+            ],
+        );
+        let at = lab.base.join("mnt");
+        std::fs::create_dir(&at).expect("mount point");
+        let _mounted = Mounted::attach(&image, &at, true);
+        let runtime = common::join_rel(
+            &at.join(lab.installer.file_name().expect("name")),
+            INSTALLER_RUNTIME,
+        );
+        assert!(
+            std::fs::write(at.join("probe"), b"x").is_err(),
+            "the image is writable"
+        );
+        let run = lab.run_program(&runtime, &["--silent"], None);
+        assert_eq!(run.code, EXIT_OK, "{run:?}");
+        lab.assert_installed();
+        run.assert_no_path(&lab);
+    }
+
+    /// M8-D16: the live bundle went to the Trash; a setup installs anew into a fresh bundle, with
+    /// a new install id and the floors kept (raised here through the core's writers first).
+    #[cfg(target_os = "macos")]
+    fn a_setup_over_an_orphaned_install_installs_and_keeps_the_floors() {
+        use lunepack_core::state::Floors;
+
+        let lab = Lab::new(Twist::default());
+        let run = lab.run(&["--silent"], None);
+        assert_eq!(run.code, EXIT_OK, "{run:?}");
+        let fs = StdFs::new();
+        let store = UserScope {
+            dir: UserLayout::from_root(lab.root.clone(), SCHEME).state_dir(),
+            app_id: lab.app_id(),
+        };
+        let loaded = store.load(&fs, &Sha256Hasher).expect("load");
+        let record = loaded.record.clone().expect("record");
+        let raised = record.raise_floors(&Floors {
+            root: None,
+            keyset_version: record.floors.keyset_version + 5,
+            feed_seq: [(Channel::parse(SUITE_CHANNEL).expect("channel"), 42)].into(),
+        });
+        let raised = store
+            .commit(&fs, &loaded, &raised, &Sha256Hasher)
+            .expect("commit");
+        // Dragged to the Trash.
+        let trash = lab.home.join(".Trash");
+        std::fs::create_dir(&trash).expect("trash");
+        let trashed = trash.join(lab.bundle().file_name().expect("name"));
+        std::fs::rename(lab.bundle(), &trashed).expect("trash the bundle");
+        let run = lab.run(&["--silent"], None);
+        assert_eq!(run.code, EXIT_OK, "{run:?}");
+        assert!(run.stdout.contains("\"outcome\":\"installed\""), "{run:?}");
+        lab.assert_installed();
+        let after = lab.record_at(&lab.root).expect("record");
+        assert_ne!(after.install_id, raised.install_id, "the install id");
+        assert_eq!(after.floors, raised.floors, "the floors");
+        assert!(
+            common::join_rel(&trashed, APP_FILE).is_file(),
+            "the trashed copy was touched"
+        );
+    }
+
+    /// M8-D4: an apps folder on another volume than `R` is exit 28 `other_volume`, with nothing
+    /// written: no bundle, no install root.
+    #[cfg(target_os = "macos")]
+    fn a_setup_whose_apps_folder_is_on_another_volume_is_28() {
+        let lab = Lab::new(Twist::default());
+        let image = lab.base.join("apps.dmg");
+        sh(
+            "/usr/bin/hdiutil",
+            &[
+                "create".as_ref(),
+                "-quiet".as_ref(),
+                "-size".as_ref(),
+                "8m".as_ref(),
+                "-fs".as_ref(),
+                "HFS+".as_ref(),
+                "-volname".as_ref(),
+                "LP Apps".as_ref(),
+                image.as_os_str(),
+            ],
+        );
+        let apps = lab.home.join("Applications");
+        let _mounted = Mounted::attach(&image, &apps, false);
+        let before = visible(&apps);
+        let run = lab.run(&["--silent"], None);
+        assert_eq!(run.code, EXIT_UNSUPPORTED_LOCATION, "{run:?}");
+        assert!(
+            run.stdout.contains("\"reason\":\"other_volume\""),
+            "{run:?}"
+        );
+        assert_eq!(visible(&apps), before, "the apps folder changed");
+        assert!(
+            std::fs::symlink_metadata(&lab.root).is_err(),
+            "the install root exists"
+        );
+    }
+
+    /// Restores a folder's mode when dropped.
+    #[cfg(target_os = "macos")]
+    struct Mode(PathBuf, u32);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    /// M8-D4: an apps folder the user cannot write is exit 28 `not_writable`, nothing written.
+    #[cfg(target_os = "macos")]
+    fn a_setup_whose_apps_folder_is_not_writable_is_28() {
+        let lab = Lab::new(Twist::default());
+        let apps = lab.home.join("Applications");
+        let _restore = Mode(apps.clone(), 0o700);
+        std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let run = lab.run(&["--silent"], None);
+        assert_eq!(run.code, EXIT_UNSUPPORTED_LOCATION, "{run:?}");
+        assert!(
+            run.stdout.contains("\"reason\":\"not_writable\""),
+            "{run:?}"
+        );
+        lab.assert_nothing_installed();
     }
 
     pub fn run_all() {
@@ -1404,6 +2086,46 @@ mod cases {
                 "stale_temp_directories_go_only_with_a_dead_owners_marker",
                 stale_temp_directories_go_only_with_a_dead_owners_marker,
             ),
+            #[cfg(target_os = "macos")]
+            (
+                "the_installer_ui_drives_the_install_over_its_runtimes_streams",
+                the_installer_ui_drives_the_install_over_its_runtimes_streams,
+            ),
+            #[cfg(target_os = "macos")]
+            (
+                "a_ui_parent_that_dies_mid_install_leaves_the_same_outcome",
+                a_ui_parent_that_dies_mid_install_leaves_the_same_outcome,
+            ),
+            #[cfg(target_os = "macos")]
+            (
+                "a_ui_parent_killed_mid_install_with_the_notice_on_leaves_no_runtime",
+                a_ui_parent_killed_mid_install_with_the_notice_on_leaves_no_runtime,
+            ),
+            #[cfg(target_os = "macos")]
+            (
+                "a_payload_cut_flipped_or_misplaced_is_refused",
+                a_payload_cut_flipped_or_misplaced_is_refused,
+            ),
+            #[cfg(target_os = "macos")]
+            (
+                "a_setup_run_from_a_read_only_mount_installs",
+                a_setup_run_from_a_read_only_mount_installs,
+            ),
+            #[cfg(target_os = "macos")]
+            (
+                "a_setup_over_an_orphaned_install_installs_and_keeps_the_floors",
+                a_setup_over_an_orphaned_install_installs_and_keeps_the_floors,
+            ),
+            #[cfg(target_os = "macos")]
+            (
+                "a_setup_whose_apps_folder_is_on_another_volume_is_28",
+                a_setup_whose_apps_folder_is_on_another_volume_is_28,
+            ),
+            #[cfg(target_os = "macos")]
+            (
+                "a_setup_whose_apps_folder_is_not_writable_is_28",
+                a_setup_whose_apps_folder_is_not_writable_is_28,
+            ),
         ];
         let filter: Vec<String> = std::env::args()
             .skip(1)
@@ -1413,6 +2135,14 @@ mod cases {
         let mut ran = 0;
         for (name, case) in cases {
             if !filter.is_empty() && !filter.iter().any(|f| name.contains(f.as_str())) {
+                continue;
+            }
+            #[cfg(target_os = "macos")]
+            if SKIPPED_ON_MACOS.contains(name) {
+                println!(
+                    "test {name} ... skipped on {} ({NOT_ON_MACOS})",
+                    common::OS_NAME
+                );
                 continue;
             }
             ran += 1;

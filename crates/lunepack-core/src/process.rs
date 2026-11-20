@@ -105,6 +105,10 @@ pub enum ExitKind {
     Failure(i32),
     /// Ended by a signal (its number).
     Signal(i32),
+    /// Ended, with a status this process cannot observe: an app started through the OS's launch
+    /// service ([`Process::spawn_app_background`]) is not this process's child, and macOS gives a
+    /// process's exit status to its parent only (M8-D13).
+    Unknown,
 }
 
 /// What [`Process::wait_exit`] saw.
@@ -292,6 +296,21 @@ pub trait Process: Send + Sync {
     /// the others unless the spec says [`ChildStdio::Piped`]. The caller reaps it through the
     /// returned [`Child`].
     fn spawn_child(&self, spec: &SpawnSpec) -> Result<Box<dyn Child>>;
+
+    /// Starts the app whose entry is `spec.program` without bringing it to the front (M8-D13,
+    /// `apply-and-restart --background`), and returns a handle to watch and end it as a
+    /// [`Child`]. The default is [`Process::spawn_child`]: off macOS the option changes nothing.
+    ///
+    /// An implementation that starts the app through the OS (it is then not this process's child)
+    /// passes `spec`'s environment changes through its environment only, never its command line;
+    /// identifies the app's process by a rule that never guesses, and never signals a process it
+    /// did not identify; reports an app that ended as [`ExitKind::Unknown`] (its status is not
+    /// observable), and a launch that failed before the app was identified as
+    /// [`ExitKind::Failure`]; and falls back to [`Process::spawn_child`] when the app cannot be
+    /// started that way.
+    fn spawn_app_background(&self, spec: &SpawnSpec) -> Result<Box<dyn Child>> {
+        self.spawn_child(spec)
+    }
 
     /// Waits up to `timeout` for the process `id` to end. It only waits: it never signals, and
     /// never reaps a process that is not its own child. An id whose pid is gone, is a zombie, or

@@ -14,7 +14,8 @@ use lunepack_core::{
     AppId, AttemptOutcome, ConfirmOutcome, CurrentRef, Floors, Fs, Hasher, Health, InstallState,
     Lifecycle, LifecycleError, LifecycleEvent, Loaded, PendingRef, PreviousRef, Scope,
     Sha256Digest, StagedRef, StateError, Target, TokenCheck, Version, apply, confirm,
-    count_attempt, deliver_events, gc_keep, install_first, reconcile_current, rollback,
+    count_attempt, deliver_events, gc_keep, install_first, reconcile_current, reinstall_orphaned,
+    reset_orphaned, rollback,
 };
 use lunepack_testkit::{FakeHasher, MemFs, RecoverMode};
 use serde_json::{Map, Value, json};
@@ -119,6 +120,147 @@ fn install_first_sets_current_and_queues_installed_and_first_run() {
     assert_eq!(
         install_first(&s, v("2.0.0"), 1, ID),
         Err(LifecycleError::AlreadyInstalled)
+    );
+}
+
+// ---- reset_orphaned (M8-D16) ------------------------------------------------------------------
+
+#[test]
+fn reset_orphaned_keeps_the_floors_and_leaves_a_record_a_first_install_resumes_from() {
+    let floors = Floors {
+        root: Some(lunepack_core::RootParts {
+            version: 3,
+            threshold: 1,
+            keys: vec![lunepack_core::PublicKey::from_bytes([9; 32])],
+        }),
+        keyset_version: 5,
+        feed_seq: [(lunepack_core::Channel::parse("stable").unwrap(), 41)]
+            .into_iter()
+            .collect(),
+    };
+    let mut old = pending()
+        .set_staged(Some((staged("1.2.0"), 300)))
+        .raise_floors(&floors);
+    old.bad = vec![v("0.9.0")];
+    old.extra.insert("future".to_owned(), json!({"kept": true}));
+    let out = reset_orphaned(&old, [3; 16]).unwrap();
+    assert_eq!(out.floors, old.floors);
+    assert_eq!(out.current, None);
+    assert_eq!(out.install_id, [3; 16]);
+    assert_eq!(
+        (&out.previous, &out.pending, &out.health, &out.staged),
+        (&None, &None, &None, &None)
+    );
+    assert!(out.staged_issued.is_none() && out.bad.is_empty() && out.lifecycle.is_none());
+    assert_eq!(out.extra, old.extra, "unknown members are kept");
+    assert_eq!(
+        (out.app_id.clone(), out.scope, out.target),
+        (old.app_id.clone(), old.scope, old.target)
+    );
+    // From it a first install ends exactly where reinstall_orphaned would have.
+    let via_reset = install_first(&out, v("2.0.0"), 500, [3; 16]).unwrap();
+    let direct = reinstall_orphaned(&old, v("2.0.0"), 500, [3; 16]).unwrap();
+    assert_eq!(via_reset.floors, direct.floors);
+    assert_eq!(via_reset.current, direct.current);
+    assert_eq!(events_of(&via_reset), events_of(&direct));
+    assert_eq!(
+        (
+            &via_reset.previous,
+            &via_reset.pending,
+            &via_reset.staged,
+            &via_reset.bad
+        ),
+        (
+            &direct.previous,
+            &direct.pending,
+            &direct.staged,
+            &direct.bad
+        )
+    );
+    // A record with no current version is not orphaned.
+    assert!(matches!(
+        reset_orphaned(&out, [4; 16]),
+        Err(LifecycleError::NotInstalled)
+    ));
+}
+
+// ---- reinstall_orphaned (M8-D16) --------------------------------------------------------------
+
+#[test]
+fn reinstall_orphaned_keeps_exactly_the_floors_and_starts_everything_else_anew() {
+    let floors = Floors {
+        root: Some(lunepack_core::RootParts {
+            version: 3,
+            threshold: 1,
+            keys: vec![lunepack_core::PublicKey::from_bytes([9; 32])],
+        }),
+        keyset_version: 5,
+        feed_seq: [(lunepack_core::Channel::parse("stable").unwrap(), 41)]
+            .into_iter()
+            .collect(),
+    };
+    // A record with every member in use: previous, pending, health, staged with its issued, a bad
+    // version, queued events and an unknown member.
+    let mut old = pending()
+        .set_staged(Some((staged("1.2.0"), 300)))
+        .raise_floors(&floors);
+    old.bad = vec![v("0.9.0")];
+    old.extra.insert("future".to_owned(), json!({"kept": true}));
+    assert!(old.previous.is_some() && old.pending.is_some() && old.health.is_some());
+    assert!(old.staged_issued_bound().is_some() && old.lifecycle.is_some());
+
+    let new_id = [3; 16];
+    let out = reinstall_orphaned(&old, v("2.0.0"), 500, new_id).unwrap();
+    assert_eq!(out.floors, old.floors, "the floors carry over");
+    assert_eq!(
+        out.current,
+        Some(CurrentRef {
+            version: v("2.0.0"),
+            issued: 500
+        })
+    );
+    assert_eq!(out.install_id, new_id);
+    assert_eq!(
+        (&out.previous, &out.pending, &out.health),
+        (&None, &None, &None)
+    );
+    assert_eq!((&out.staged, &out.staged_issued), (&None, &None));
+    assert!(out.bad.is_empty());
+    assert_eq!(
+        events_of(&out),
+        vec![
+            LifecycleEvent::Installed {
+                version: v("2.0.0")
+            },
+            LifecycleEvent::FirstRun {
+                version: v("2.0.0")
+            },
+        ]
+    );
+    assert_eq!(
+        (&out.app_id, out.scope, out.target),
+        (&old.app_id, old.scope, old.target)
+    );
+    assert_eq!(
+        out.extra, old.extra,
+        "unknown members are kept (FORMAT.md 12.8)"
+    );
+
+    // It commits over the old record like any transition.
+    let (fs, loaded) = stored(&old);
+    let committed = commit(&fs, &state_dir(), &loaded, &out, &H).unwrap();
+    assert_eq!(committed.floors, floors.max(&old.floors));
+
+    // A record with no current version is not orphaned: install_first takes it.
+    assert_eq!(
+        reinstall_orphaned(&empty(), v("2.0.0"), 1, new_id),
+        Err(LifecycleError::NotInstalled)
+    );
+    let mut machine = installed();
+    machine.scope = Scope::Machine;
+    assert_eq!(
+        reinstall_orphaned(&machine, v("2.0.0"), 1, new_id),
+        Err(LifecycleError::MachineScope)
     );
 }
 

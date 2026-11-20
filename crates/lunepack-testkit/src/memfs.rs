@@ -11,13 +11,20 @@
 //!
 //! Crashes: every mutating call is a numbered op (`create_new`, each `write`, `sync`, `truncate`,
 //! `rename`, `remove_file`, `remove_dir_all_nofollow`, `create_dir_all`, `sync_dir`, `copy_file`,
-//! `set_exec`, `symlink`, and two for `replace_symlink` (the temporary link, then the rename over
+//! `set_exec`, `symlink`, `exchange`, `create_dir_private`, and two for `replace_symlink` (the temporary link, then the rename over
 //! the old one); `open_append` and the reads are not). [`MemFs::crash_after`]`(n)` makes op
 //! number `n` (zero-based) and everything after it, reads and locks included, fail with
 //! [`FsErrorKind::Crashed`]; op `n` has no effect. [`MemFs::op_count`] says how many ops ran, so a
 //! test runs an operation once to learn its op count `k` and then once per crash point `0..k`.
 //! [`MemFs::recover`] builds the disk a restart would find, as a new [`MemFs`], under a
 //! [`RecoverMode`]. The bytes of an op that was cut short are modelled by the mode, not by the op.
+//!
+//! Places (M8): [`Fs::place`] reports the node's id as its inode (stable across
+//! [`MemFs::recover`]) and, for everything else, the [`MemPlace`] set with [`MemFs::set_place`] on
+//! the path or its nearest ancestor (default: device 1, `apfs`, writable, owned by the caller).
+//! [`Fs::exchange`] swaps two entries as one op unless [`MemFs::set_exchange_supported`]`(false)`
+//! makes it answer [`FsErrorKind::Unsupported`] (a volume with no atomic swap) at no op.
+//! [`Fs::create_dir_private`] marks the directory, which [`MemFs::is_private_dir`] reports.
 //!
 //! Locks: [`Fs::try_lock`] is a table keyed by path (it creates no file). Handles from
 //! [`MemFs::process`] stand for other processes on the same disk; [`MemFs::kill_process`] releases
@@ -27,17 +34,49 @@
 //! lexically, so `/a/b` and `C:\a\b` name the same entry.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lunepack_core::{
-    DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, ReadAt,
+    DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, PlaceFacts,
+    ReadAt,
 };
 
 const ROOT: u64 = 0;
+
+/// The volume and permission facts [`Fs::place`] reports for a path of a [`MemFs`] (its inode is
+/// the node's own).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemPlace {
+    /// The device.
+    pub device: u64,
+    /// The volume is read-only.
+    pub read_only: bool,
+    /// The volume's file system type.
+    pub fs_type: String,
+    /// The entry is the caller's.
+    pub owned_by_caller: bool,
+    /// The entry is the superuser's.
+    pub owned_by_root: bool,
+    /// The caller may create entries in it.
+    pub writable: bool,
+}
+
+impl Default for MemPlace {
+    fn default() -> Self {
+        MemPlace {
+            device: 1,
+            read_only: false,
+            fs_type: "apfs".to_owned(),
+            owned_by_caller: true,
+            owned_by_root: false,
+            writable: true,
+        }
+    }
+}
 /// Most symlinks followed in one resolution.
 const MAX_LINKS: u32 = 40;
 
@@ -119,6 +158,12 @@ struct State {
     locks: BTreeMap<Vec<OsString>, (u64, u64)>,
     next_lock: u64,
     next_process: u64,
+    /// Place facts by path (the nearest ancestor's apply).
+    places: BTreeMap<Vec<OsString>, MemPlace>,
+    /// Whether exchange is supported.
+    exchange: bool,
+    /// Directories made by `create_dir_private`.
+    private: HashSet<u64>,
 }
 
 impl State {
@@ -140,6 +185,22 @@ impl State {
             locks: BTreeMap::new(),
             next_lock: 1,
             next_process: 1,
+            places: BTreeMap::new(),
+            exchange: true,
+            private: HashSet::new(),
+        }
+    }
+
+    /// The place facts of the nearest ancestor of `path` (itself included) that has some.
+    fn place_of(&self, path: &Path) -> MemPlace {
+        let mut key = key_of(path);
+        loop {
+            if let Some(place) = self.places.get(&key) {
+                return place.clone();
+            }
+            if key.pop().is_none() {
+                return MemPlace::default();
+            }
         }
     }
 
@@ -278,10 +339,15 @@ impl State {
         }
     }
 
-    /// Reachable nodes of the image, copied under `mode`, as a fresh state.
+    /// Reachable nodes of the image, copied under `mode`, as a fresh state. A node keeps its id
+    /// (its inode), as on a real disk; the places, the exchange switch and the private marks are
+    /// the disk's and carry over.
     fn image(&self, mode: RecoverMode) -> State {
         let mut out = State::new();
         out.next_process = self.next_process;
+        out.next_id = self.next_id;
+        out.places = self.places.clone();
+        out.exchange = self.exchange;
         let mut map: HashMap<u64, u64> = HashMap::new();
         map.insert(ROOT, ROOT);
         let mut queue = vec![ROOT];
@@ -302,8 +368,7 @@ impl State {
                 let id = match map.entry(child) {
                     Entry::Occupied(known) => *known.get(),
                     Entry::Vacant(slot) => {
-                        let id = out.next_id;
-                        out.next_id += 1;
+                        let id = child;
                         slot.insert(id);
                         if matches!(node, Node::Dir { .. }) {
                             queue.push(child);
@@ -322,6 +387,12 @@ impl State {
                 },
             );
         }
+        out.private = self
+            .private
+            .iter()
+            .copied()
+            .filter(|id| out.nodes.contains_key(id))
+            .collect();
         out
     }
 }
@@ -436,6 +507,27 @@ impl MemFs {
     /// The mutating ops that ran so far (the crashed one is not counted).
     pub fn op_count(&self) -> u64 {
         lock(&self.state).ops
+    }
+
+    /// Sets the facts [`Fs::place`] reports for `path` and every path below it that has none of
+    /// its own.
+    pub fn set_place(&self, path: &Path, place: MemPlace) {
+        lock(&self.state).places.insert(key_of(path), place);
+    }
+
+    /// Makes [`Fs::exchange`] work (the default) or answer [`FsErrorKind::Unsupported`].
+    pub fn set_exchange_supported(&self, supported: bool) {
+        lock(&self.state).exchange = supported;
+    }
+
+    /// Whether the directory at `path` (final symlink not followed) was made by
+    /// [`Fs::create_dir_private`].
+    pub fn is_private_dir(&self, path: &Path) -> bool {
+        let st = lock(&self.state);
+        st.walk(path, false)
+            .ok()
+            .and_then(|w| w.node)
+            .is_some_and(|id| st.private.contains(&id))
     }
 
     /// The disk a restart finds, as a new, healthy [`MemFs`]: no locks held, op count 0.
@@ -701,6 +793,22 @@ impl Fs for MemFs {
         }
     }
 
+    fn is_exec(&self, path: &Path) -> Result<bool, FsError> {
+        let st = lock(&self.state);
+        st.alive(path)?;
+        let walk = st.walk(path, false)?;
+        match walk.node.and_then(|id| st.nodes.get(&id)) {
+            None => Err(FsError::new(FsErrorKind::NotFound, path, None)),
+            Some(Node::File { exec, .. }) => Ok(*exec),
+            Some(Node::Symlink(_)) => Err(FsError::new(FsErrorKind::IsSymlink, path, None)),
+            _ => Err(FsError::new(
+                FsErrorKind::Other,
+                path,
+                Some(io::Error::other("not a regular file")),
+            )),
+        }
+    }
+
     fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
         let mut st = lock(&self.state);
         st.begin_op(link_path)?;
@@ -745,6 +853,70 @@ impl Fs for MemFs {
         let live = st.dir_live_mut(dir, link)?;
         live.remove(&temp_name);
         live.insert(name, temp_id);
+        Ok(())
+    }
+
+    fn exchange(&self, a: &Path, b: &Path) -> Result<(), FsError> {
+        let mut st = lock(&self.state);
+        st.alive(a)?;
+        if !st.exchange {
+            return Err(FsError::new(FsErrorKind::Unsupported, a, None));
+        }
+        // Validate first: a refusal changes nothing and costs no op.
+        let wa = st.walk(a, false)?;
+        let wb = st.walk(b, false)?;
+        let (Some((dir_a, name_a)), Some(id_a)) = (wa.entry, wa.node) else {
+            return Err(FsError::new(FsErrorKind::NotFound, a, None));
+        };
+        let (Some((dir_b, name_b)), Some(id_b)) = (wb.entry, wb.node) else {
+            return Err(FsError::new(FsErrorKind::NotFound, b, None));
+        };
+        let (ka, kb) = (key_of(a), key_of(b));
+        if ka.starts_with(&kb) || kb.starts_with(&ka) {
+            return Err(FsError::new(
+                FsErrorKind::Other,
+                a,
+                Some(io::Error::from(io::ErrorKind::InvalidInput)),
+            ));
+        }
+        st.begin_op(a)?;
+        st.dir_live_mut(dir_a, a)?.insert(name_a, id_b);
+        st.dir_live_mut(dir_b, b)?.insert(name_b, id_a);
+        Ok(())
+    }
+
+    fn place(&self, path: &Path) -> Result<PlaceFacts, FsError> {
+        let st = lock(&self.state);
+        st.alive(path)?;
+        let walk = st.walk(path, false)?;
+        let id = walk
+            .node
+            .ok_or_else(|| FsError::new(FsErrorKind::NotFound, path, None))?;
+        if matches!(st.nodes.get(&id), Some(Node::Symlink(_))) {
+            return Err(FsError::new(FsErrorKind::IsSymlink, path, None));
+        }
+        let place = st.place_of(path);
+        Ok(PlaceFacts {
+            device: place.device,
+            inode: id,
+            read_only: place.read_only,
+            fs_type: place.fs_type,
+            owned_by_caller: place.owned_by_caller,
+            owned_by_root: place.owned_by_root,
+            writable: place.writable,
+        })
+    }
+
+    fn create_dir_private(&self, path: &Path) -> Result<(), FsError> {
+        let mut st = lock(&self.state);
+        st.begin_op(path)?;
+        let (dir, name) = st.new_entry(path)?;
+        let id = st.add(Node::Dir {
+            live: BTreeMap::new(),
+            durable: BTreeMap::new(),
+        });
+        st.dir_live_mut(dir, path)?.insert(name, id);
+        st.private.insert(id);
         Ok(())
     }
 

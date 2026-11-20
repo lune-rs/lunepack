@@ -1,6 +1,8 @@
 //! Filesystem adapter implementing the core filesystem trait ([`lunepack_core::Fs`]) over `std`,
-//! plus the OS advisory lock through `fs4` (M4-D15). No `unsafe` code: every call is a safe std or
-//! `fs4` API.
+//! plus the OS advisory lock through `fs4` (M4-D15). Almost every call is a safe std or `fs4` API.
+//! The only `unsafe` code is in `unix_sys.rs` (`faccessat`, `geteuid`, `statfs` / `statvfs` for
+//! [`Fs::place`]) and `macos.rs` (`renamex_np` for [`Fs::exchange`]); each block is one libc call
+//! on a `CString` with a `// SAFETY:` comment.
 //!
 //! Care taken beyond plain `std`:
 //!
@@ -15,6 +17,9 @@
 //! - `replace_symlink` makes a temporary link in the link's own directory and renames it over the
 //!   old one, so a reader sees the old target or the new one; it refuses a file or directory at
 //!   the link;
+//! - on macOS `copy_file` copies the data and the permission bits with plain reads and writes, so
+//!   no extended attribute (`com.apple.quarantine`) reaches the copy (M8-D10; std's copy carries
+//!   them);
 //! - errors name only the file name of the path (`lunepack_core::FsError`).
 //!
 //! Transient locks (M7-D12): on Windows a rename or a removal can fail because another process (a
@@ -39,8 +44,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use lunepack_core::{
-    DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, ReadAt,
+    DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, PlaceFacts,
+    ReadAt,
 };
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(unix)]
+mod unix_sys;
 
 /// `FILE_FLAG_BACKUP_SEMANTICS`: needed to open a directory handle on Windows.
 #[cfg(windows)]
@@ -358,7 +369,14 @@ impl Fs for StdFs {
         if lstat(to_new)?.is_some() {
             return Err(FsError::new(FsErrorKind::AlreadyExists, to_new, None));
         }
-        fs::copy(from, to_new).map(drop).map_err(err("copy", from))
+        #[cfg(target_os = "macos")]
+        {
+            macos::copy_file(from, to_new)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            fs::copy(from, to_new).map(drop).map_err(err("copy", from))
+        }
     }
 
     fn set_exec(&self, path: &Path, exec: bool) -> Result<(), FsError> {
@@ -442,6 +460,82 @@ impl Fs for StdFs {
             let _ = fs::remove_file(&temp);
             FsError::from_io(link, e).during("rename")
         })
+    }
+
+    fn exchange(&self, a: &Path, b: &Path) -> Result<(), FsError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::exchange(a, b)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = b;
+            Err(FsError::new(FsErrorKind::Unsupported, a, None).during("exchange"))
+        }
+    }
+
+    fn place(&self, path: &Path) -> Result<PlaceFacts, FsError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Some(meta) = lstat(path)? else {
+                return Err(FsError::new(FsErrorKind::NotFound, path, None).during("place"));
+            };
+            if meta.file_type().is_symlink() {
+                return Err(FsError::new(FsErrorKind::IsSymlink, path, None).during("place"));
+            }
+            let (fs_type, read_only) = unix_sys::volume(path)?;
+            Ok(PlaceFacts {
+                device: meta.dev(),
+                inode: meta.ino(),
+                read_only,
+                fs_type,
+                owned_by_caller: meta.uid() == unix_sys::effective_uid(),
+                owned_by_root: meta.uid() == 0,
+                writable: unix_sys::writable(path)?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Err(FsError::new(FsErrorKind::Unsupported, path, None).during("place"))
+        }
+    }
+
+    fn is_exec(&self, path: &Path) -> Result<bool, FsError> {
+        let Some(meta) = lstat(path)? else {
+            return Err(FsError::new(FsErrorKind::NotFound, path, None).during("is_exec"));
+        };
+        if meta.file_type().is_symlink() {
+            return Err(FsError::new(FsErrorKind::IsSymlink, path, None).during("is_exec"));
+        }
+        if !meta.is_file() {
+            return Err(other(path, "not a regular file").during("is_exec"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            Ok(meta.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+    }
+
+    fn create_dir_private(&self, path: &Path) -> Result<(), FsError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            // One level only (`recursive` is off); the mode only ever loses bits to the umask.
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(path)
+                .map_err(err("mkdir", path))
+        }
+        #[cfg(not(unix))]
+        {
+            Err(FsError::new(FsErrorKind::Unsupported, path, None).during("mkdir"))
+        }
     }
 
     fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {

@@ -6,13 +6,17 @@
 //! Each case publishes releases into a `file:` feed under a temporary directory: documents signed
 //! with Ed25519 keys generated at test time, every frame stored, the config of each tree written
 //! by the core's writer. The installed tree's own runtime is run, with `HOME` set to an empty
-//! temporary home. Linux and Windows (M7 step 10): on Windows the install is built by hand (the
-//! data home there is the shell's known folder, which a test cannot redirect, so no `install` is
-//! run), and the cases that need a shell, procfs or POSIX signals (the `apply-and-restart`
-//! hand-off to a shell script app, a closed stdout through `sh`, zombies) are Linux only; the
-//! Windows E2E (step 13) covers that hand-off with a real app.
+//! temporary home. Linux, macOS and Windows: on Linux and macOS the install is the runtime's own
+//! `install` from a published bootstrap tree (macOS: a bundle, so the paths in a release come
+//! from `tests/common`, and the live version is `B`), on Windows it is built by hand (the data
+//! home there is the shell's known folder, which a test cannot redirect, so no `install` is run),
+//! and the cases that need a shell or POSIX signals (the `apply-and-restart` hand-off to a shell
+//! script app, a closed stdout through `sh`, zombies) run on every Unix; the Windows E2E (step
+//! 13) covers that hand-off with a real app.
 
-#![cfg(any(target_os = "linux", windows))]
+#![cfg(any(target_os = "linux", target_os = "macos", windows))]
+
+mod common;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -20,57 +24,38 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use lunepack::{InstallMeta, RelPath, Target, TrustedRoot, UpdateConfig, Version};
+use lunepack::{InstallMeta, RelPath, TrustedRoot, UpdateConfig, Version};
 use lunepack_core::state::{InstallState, UserScope};
 use lunepack_core::{
-    AppId, Channel, CodecId, EncodedFrame, Encoder, Hasher as _, LayoutScheme, PayloadKind,
-    ReleaseLayout, Signer, UserLayout, pack_file,
+    AppId, Channel, CodecId, EncodedFrame, Encoder, Hasher as _, PayloadKind, ReleaseLayout,
+    Signer, UserLayout, pack_file,
 };
 use lunepack_crypto::{Ed25519Signer, Ed25519Verifier, Sha256Hasher, generate_key_file};
 use lunepack_fs::StdFs;
 use lunepack_testkit::{ChainFixture, FakeCodec, SUITE_APP_ID, SUITE_CHANNEL};
 
-const RUNTIME: &str = env!("CARGO_BIN_EXE_lunepack-runtime");
+use common::{APP_PATH, README_PATH, RUNTIME, RUNTIME_PATH, SCHEME, TARGET};
+
 const BIN: &str = "lp-cli-test";
 const DAY: u64 = 86_400;
 const LIMIT: Duration = Duration::from_secs(120);
 const USAGE_STDERR: &str = "lunepack-runtime: usage error\n";
 /// The file (in the lab's home) where the launched app writes its arguments.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const APP_ARGS: &str = "app-args";
 /// How long the launched app runs before it confirms.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const APP_SLEEP_SECS: u64 = 3;
-/// The layout scheme of this OS (what the runtime's platform picks).
-#[cfg(windows)]
-const SCHEME: LayoutScheme = LayoutScheme::WINDOWS;
-#[cfg(not(windows))]
-const SCHEME: LayoutScheme = LayoutScheme::XDG;
-/// The runtime's and the app's file names in a tree.
-#[cfg(windows)]
-const RUNTIME_FILE: &str = "bin/lunepack-runtime.exe";
-#[cfg(not(windows))]
-const RUNTIME_FILE: &str = "bin/lunepack-runtime";
-#[cfg(windows)]
-const APP_FILE: &str = "bin/app.exe";
-#[cfg(not(windows))]
-const APP_FILE: &str = "bin/app";
 /// The golden lines of `apply-and-restart`: its result, `nothing_staged`, `unexpected_version`.
-#[cfg(target_os = "linux")]
-const GOLDEN_SCHEDULED: usize = 38;
-const GOLDEN_NOTHING_STAGED: usize = 39;
-const GOLDEN_UNEXPECTED: usize = 40;
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const TARGET: Target = Target::LinuxAarch64;
-#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
-const TARGET: Target = Target::LinuxX86_64;
-#[cfg(all(windows, target_arch = "aarch64"))]
-const TARGET: Target = Target::WindowsAarch64;
-#[cfg(all(windows, not(target_arch = "aarch64")))]
-const TARGET: Target = Target::WindowsX86_64;
+#[cfg(unix)]
+const GOLDEN_SCHEDULED: usize = 39;
+const GOLDEN_NOTHING_STAGED: usize = 40;
+const GOLDEN_UNEXPECTED: usize = 41;
 
 const GOLDEN_OBJECTS: &str = include_str!("golden/objects.jsonl");
+/// The golden line of a check that adopted the running bundle and found no update (M8-D9).
+#[cfg(target_os = "macos")]
+const GOLDEN_ADOPTED: usize = 46;
 
 fn app_id() -> AppId {
     AppId::parse(SUITE_APP_ID).expect("app id")
@@ -108,15 +93,6 @@ fn write_file(path: &Path, bytes: &[u8], exec: bool) {
     let _ = exec;
 }
 
-/// `path` without Windows' `\\?\` prefix (a canonical path there).
-fn plain_path(path: PathBuf) -> PathBuf {
-    let text = path.to_string_lossy().into_owned();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
-        _ => path,
-    }
-}
-
 /// The `file:` URL of a feed directory (always with a trailing `/`).
 fn file_url(dir: &Path) -> String {
     #[cfg(windows)]
@@ -145,17 +121,18 @@ fn copy_tree(from: &Path, to: &Path) {
 }
 
 /// The golden line `n` of the final objects (0-based).
-/// The app of a tree: on Linux a shell script that records its arguments, stays up a while and
-/// confirms through its runtime; on Windows a placeholder (no case runs it).
+/// The app of a tree: on Unix a shell script that records its arguments, stays up a while and
+/// confirms through its runtime (the runtime is its sibling, in a bundle too); on Windows a
+/// placeholder (no case runs it).
 fn app_bytes(version: &str) -> Vec<u8> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         format!(
             "#!/bin/sh\n# {version}\nprintf '%s\\n' \"$@\" > \"$HOME/{APP_ARGS}\"\nsleep {APP_SLEEP_SECS}\nexec \"${{0%/*}}/lunepack-runtime\" confirm\n"
         )
         .into_bytes()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         format!("app {version}").into_bytes()
     }
@@ -180,13 +157,14 @@ struct Lab {
 impl Lab {
     /// Publishes 1.0.0 and installs it.
     fn installed() -> Lab {
-        let tmp = tempfile::Builder::new()
-            .prefix("cli-")
-            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-            .expect("tmp");
-        let base = plain_path(std::fs::canonicalize(tmp.path()).expect("canonical"));
-        let home = base.join("home");
-        std::fs::create_dir_all(&home).expect("home");
+        let lab = Lab::published();
+        lab.install_1_0_0();
+        lab
+    }
+
+    /// Publishes 1.0.0 (and writes its bootstrap tree); installs nothing.
+    fn published() -> Lab {
+        let h = common::Home::new("cli-", SUITE_APP_ID, Some("CLI test"), false);
         let keys = tempfile::tempdir().expect("keys");
         let signers = (0..2)
             .map(|i| {
@@ -195,28 +173,24 @@ impl Lab {
             })
             .collect();
         let mut lab = Lab {
-            root: if cfg!(windows) {
-                home.join("Programs").join("CLI test")
-            } else {
-                home.join(".local/share").join(SUITE_APP_ID)
-            },
-            boot: base.join("boot"),
-            _tmp: tmp,
-            base,
-            home,
+            root: h.root,
+            boot: h.base.join("boot"),
+            _tmp: h.tmp,
+            base: h.base,
+            home: h.home,
             signers,
             t: now(),
             publishes: 0,
         };
         lab.publish(&["1.0.0"]);
-        lab.install_1_0_0();
         lab
     }
 
-    /// Linux: the runtime's own `install` from the bootstrap tree, with `HOME` the lab's home.
-    #[cfg(target_os = "linux")]
+    /// Linux and macOS: the runtime's own `install` from the bootstrap tree, with `HOME` the lab's
+    /// home (macOS: the bootstrap bundle is installed as the live bundle in `~/Applications`).
+    #[cfg(unix)]
     fn install_1_0_0(&self) {
-        let run = self.run(&self.boot.join(RUNTIME_FILE), &["install"], &[]);
+        let run = self.run(&self.boot.join(RUNTIME_PATH), &["install"], &[]);
         assert_eq!(run.code, 0, "install: {run:?}");
     }
 
@@ -255,12 +229,10 @@ impl Lab {
         self.base.join("release")
     }
 
-    /// The installed runtime of `version`.
+    /// The installed runtime of `version`: in its tree, which on macOS is the live bundle once it
+    /// holds `version`.
     fn runtime_of(&self, version: &str) -> PathBuf {
-        self.layout()
-            .versions_dir()
-            .join(version)
-            .join(RUNTIME_FILE)
+        common::tree_of(&self.layout(), version).join(RUNTIME_PATH)
     }
 
     /// Writes keys, a feed that lists exactly `versions` (ascending), their manifests and packs,
@@ -299,7 +271,7 @@ impl Lab {
         let mut releases = Vec::new();
         for (index, version) in versions.iter().enumerate() {
             let meta = InstallMeta {
-                entry: RelPath::parse(APP_FILE).expect("entry"),
+                entry: RelPath::parse(APP_PATH).expect("entry"),
                 name: "CLI test".to_owned(),
                 comment: None,
                 icon: None,
@@ -327,10 +299,10 @@ impl Lab {
                 // Started by the applier, the app records its arguments, stays up a while (so an
                 // applier that kept a caller's stdio would hold a capture open), then confirms its
                 // health through its own runtime.
-                (APP_FILE, app_bytes(version), true),
-                (RUNTIME_FILE, std::fs::read(RUNTIME).expect("runtime"), true),
-                ("share/readme.txt", b"read me\n".repeat(20), false),
-                ("lunepack-update.json", config, false),
+                (APP_PATH, app_bytes(version), true),
+                (RUNTIME_PATH, std::fs::read(RUNTIME).expect("runtime"), true),
+                (README_PATH, b"read me\n".repeat(20), false),
+                (common::CONFIG_PATH, config, false),
             ];
             let mut layout = ReleaseLayout::new(app_id(), version, TARGET).expect("layout");
             for (path, bytes, exec) in &files {
@@ -379,6 +351,7 @@ impl Lab {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        common::quiet_ui(&mut cmd);
         cmd
     }
 
@@ -554,6 +527,11 @@ const BAD_LINES: &[&[&str]] = &[
     &["confirm", "--expect-schema", "x"],
     &["confirm", "--expect-schema", "1", "--expect-schema", "1"],
     &["confirm", "--wait-pid", "42"],
+    // `--background` (M8-D13): `apply-and-restart` only, once.
+    &["check", "--background"],
+    &["download", "--background"],
+    &["apply-and-restart", "--background", "--background"],
+    &["apply-and-restart", "--background=1"],
     &["apply-and-restart", "--wait-pid"],
     &["apply-and-restart", "--wait-pid", "0"],
     &["apply-and-restart", "--wait-pid", "1"],
@@ -701,8 +679,7 @@ fn download_stages_the_update_and_is_repeatable() {
     assert_eq!(record.staged.expect("staged").version.to_string(), "1.1.0");
     assert!(
         lab.layout()
-            .versions_dir()
-            .join("1.1.0/lunepack-update.json")
+            .version_config_path(&Version::parse("1.1.0").expect("version"))
             .is_file()
     );
 
@@ -825,6 +802,13 @@ fn confirm_with_the_right_token_confirms_and_with_another_changes_nothing() {
     store
         .commit(&fs, &loaded, &next, &Sha256Hasher)
         .expect("commit");
+    // And what its reconcile would have made of it: the live version is 1.1.0 (macOS: its tree
+    // is the live bundle; elsewhere nothing to do).
+    common::project(
+        &lab.layout(),
+        &lab.home.join("Applications/CLI test.app"),
+        "1.1.0",
+    );
 
     let right = token(7);
     let wrong = token(8);
@@ -868,7 +852,7 @@ fn confirm_with_the_right_token_confirms_and_with_another_changes_nothing() {
 #[test]
 fn a_tree_that_is_not_installed_has_nothing_to_check_or_download() {
     let lab = Lab::installed();
-    let boot = lab.boot.join(RUNTIME_FILE);
+    let boot = lab.boot.join(RUNTIME_PATH);
     for command in ["check", "download"] {
         let run = lab.run(&boot, &[command, "--json"], &[]);
         assert_eq!(run.code, 3, "{command}: {run:?}");
@@ -887,10 +871,136 @@ fn a_tree_that_is_not_installed_has_nothing_to_check_or_download() {
     assert_eq!(run.line(), golden(9));
 }
 
+// ---- a bundle the user moved (macOS, M8-D17) -----------------------------------------------------
+
+/// `check` and `download` from a bundle the user moved follow it first, under the lock, and then
+/// act on the install where it now is.
+#[cfg(target_os = "macos")]
+#[test]
+fn check_and_download_from_a_moved_bundle_follow_it_first() {
+    for command in ["check", "download"] {
+        let mut lab = Lab::installed();
+        lab.publish(&["1.0.0", "1.1.0"]);
+        let old = common::bundle_of(&lab.layout());
+        let moved = lab.home.join("Documents").join("CLI test.app");
+        std::fs::create_dir_all(moved.parent().expect("parent")).expect("dirs");
+        std::fs::rename(&old, &moved).expect("move");
+        let run = lab.run(&moved.join(RUNTIME_PATH), &[command, "--json"], &[]);
+        assert_eq!(run.code, 0, "{command}: {run:?}");
+        assert_eq!(
+            std::fs::read_link(lab.root.join("bundle")).expect("pointer"),
+            moved,
+            "{command}"
+        );
+        assert!(std::fs::symlink_metadata(&old).is_err(), "{command}");
+        let staged = lab.record().expect("record").staged.is_some();
+        assert_eq!(staged, command == "download", "{command}");
+    }
+}
+
+// ---- adoption of a dragged bundle (macOS, M8-D9 (b)) ---------------------------------------------
+
+/// Copies the directory `from` to `to`: files (with their mode) and directories only.
+#[cfg(target_os = "macos")]
+fn copy_bundle(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("dirs");
+    for entry in std::fs::read_dir(from).expect("read_dir") {
+        let entry = entry.expect("entry");
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if entry.file_type().expect("type").is_dir() {
+            copy_bundle(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).expect("copy");
+        }
+    }
+}
+
+/// A released bundle dragged into `~/Applications` is adopted by its first `check`, which says
+/// so (`adopted`, and the `adopt` progress phase), and is installed from then on.
+#[cfg(target_os = "macos")]
+#[test]
+fn check_adopts_a_bundle_dragged_into_the_applications_folder() {
+    let lab = Lab::published();
+    let bundle = lab.home.join("Applications").join("CLI test.app");
+    copy_bundle(&lab.boot, &bundle);
+    assert!(!lab.root.exists());
+    let run = lab.run(&bundle.join(RUNTIME_PATH), &["check", "--json"], &[]);
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.last_line(), golden(GOLDEN_ADOPTED));
+    assert!(
+        run.stdout
+            .lines()
+            .any(|l| l.contains("\"type\":\"progress\",\"phase\":\"adopt\"")),
+        "{run:?}"
+    );
+    run.assert_clean(&lab, &[]);
+    let record = lab.record().expect("record");
+    assert_eq!(
+        record.current.expect("current").version.to_string(),
+        "1.0.0"
+    );
+    assert_eq!(
+        std::fs::read_link(lab.root.join("bundle")).expect("pointer"),
+        bundle
+    );
+    // From now on it is the install: a check is a plain one.
+    let run = lab.run(&bundle.join(RUNTIME_PATH), &["check", "--json"], &[]);
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.line(), golden(0));
+}
+
+/// A freshly adopted bundle has the layout of any install (`R/versions` among it), so an
+/// uninstall right after the adopting check, with no update in between, removes `B` and `R`.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_adopted_bundle_uninstalls_before_any_update() {
+    let lab = Lab::published();
+    let bundle = lab.home.join("Applications").join("CLI test.app");
+    copy_bundle(&lab.boot, &bundle);
+    let run = lab.run(&bundle.join(RUNTIME_PATH), &["check", "--json"], &[]);
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.last_line(), golden(GOLDEN_ADOPTED));
+    assert!(
+        lab.root.join("versions").is_dir(),
+        "R/versions after adoption"
+    );
+    let run = lab.run(&bundle.join(RUNTIME_PATH), &["uninstall", "--silent"], &[]);
+    assert_eq!(run.code, 0, "{run:?}");
+    run.assert_clean(&lab, &[]);
+    assert!(
+        std::fs::symlink_metadata(&bundle).is_err(),
+        "B is gone: {run:?}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&lab.root).is_err(),
+        "R is gone: {run:?}"
+    );
+}
+
+/// The same bundle anywhere but directly in an apps folder is a development run: `not_installed`
+/// before any request (the feed is gone, so a request would have been a transport error) and
+/// nothing written.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_bundle_outside_an_applications_folder_is_not_adopted_and_makes_no_request() {
+    let lab = Lab::published();
+    std::fs::remove_dir_all(lab.release_dir()).expect("remove the release");
+    for dir in ["Downloads", "Applications/Sub"] {
+        let bundle = lab.home.join(dir).join("CLI test.app");
+        copy_bundle(&lab.boot, &bundle);
+        for command in ["check", "download"] {
+            let run = lab.run(&bundle.join(RUNTIME_PATH), &[command, "--json"], &[]);
+            assert_eq!(run.code, 3, "{dir} {command}: {run:?}");
+            assert!(run.line().contains("\"kind\":\"not_installed\""), "{run:?}");
+        }
+    }
+    assert!(!lab.root.exists(), "nothing was written");
+}
+
 // ---- a closed stdout --------------------------------------------------------------------------
 
 /// Linux only: the reader goes away through `sh`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn a_closed_stdout_cancels_and_the_next_run_goes_on() {
     let mut lab = Lab::installed();
@@ -922,7 +1032,7 @@ fn a_closed_stdout_cancels_and_the_next_run_goes_on() {
 
 // ---- apply-and-restart --------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn now_ms() -> u64 {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -946,7 +1056,7 @@ impl Lab {
     }
 
     /// Waits for the applier's final event in the log; returns the whole log.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn applier_end(&self) -> String {
         let start = Instant::now();
         loop {
@@ -965,7 +1075,7 @@ impl Lab {
 
     /// The applier confirmed 1.1.0, which was started with `args`; nothing it logged holds a
     /// path of the case.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn assert_applied(&self, log: &str, args: &[&str]) {
         assert!(
             log.lines().any(|l| l.contains("\"command\":\"apply\"")
@@ -1003,7 +1113,7 @@ impl Lab {
 }
 
 /// The `time_ms` of the first log line of `phase`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn phase_time(log: &str, phase: &str) -> u64 {
     let needle = format!("\"phase\":\"{phase}\"");
     let line = log
@@ -1012,26 +1122,6 @@ fn phase_time(log: &str, phase: &str) -> u64 {
         .unwrap_or_else(|| panic!("no {phase} line: {log}"));
     let (_, rest) = line.split_once("\"time_ms\":").expect("time_ms");
     rest.trim_end_matches('}').parse().expect("time_ms")
-}
-
-/// The start time (`/proc/<pid>/stat` field 22) of a running process.
-#[cfg(target_os = "linux")]
-fn start_ticks(pid: u32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
-    let (_, rest) = stat.rsplit_once(')').expect("comm");
-    rest.split_whitespace()
-        .nth(19)
-        .expect("starttime")
-        .parse()
-        .expect("ticks")
-}
-
-/// The state letter (`/proc/<pid>/stat` field 3) of a process.
-#[cfg(target_os = "linux")]
-fn state_of(pid: u32) -> char {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
-    let (_, rest) = stat.rsplit_once(')').expect("comm");
-    rest.trim_start().chars().next().expect("state")
 }
 
 /// The error object of `apply-and-restart` for `kind` (the golden's line for `check`, renamed).
@@ -1046,7 +1136,7 @@ fn golden_error(kind: &str) -> String {
 }
 
 /// Linux only: a shell script app and procfs.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn a_shell_capture_returns_at_once_while_the_applier_goes_on() {
     let lab = Lab::staged();
@@ -1072,7 +1162,7 @@ fn a_shell_capture_returns_at_once_while_the_applier_goes_on() {
 }
 
 /// Linux only: a shell script app and procfs.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn the_applier_waits_for_the_parent_recorded_at_start() {
     let lab = Lab::staged();
@@ -1098,7 +1188,7 @@ fn the_applier_waits_for_the_parent_recorded_at_start() {
 }
 
 /// Linux only: a shell script app and procfs.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn a_shell_caller_passes_its_own_pid_and_is_waited_for() {
     let lab = Lab::staged();
@@ -1139,7 +1229,7 @@ fn a_shell_caller_passes_its_own_pid_and_is_waited_for() {
 }
 
 /// Linux only: a shell script app and procfs.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn a_wait_pid_is_named_with_its_start_time_and_a_reused_pid_is_not_waited_for() {
     let lab = Lab::staged();
@@ -1176,7 +1266,7 @@ fn a_wait_pid_is_named_with_its_start_time_and_a_reused_pid_is_not_waited_for() 
     assert_eq!(run.code, 0, "{run:?}");
     let mut other = Command::new("sleep").arg("60").spawn().expect("sleep");
     let other_pid = other.id();
-    let stale_start = start_ticks(other_pid) + 1;
+    let stale_start = common::start_ticks(other_pid) + 1;
     let started = Instant::now();
     let run = lab.run(
         &lab.runtime_of("1.1.0"),
@@ -1213,18 +1303,18 @@ fn a_wait_target_that_is_not_running_starts_nothing() {
     let run = lab.cmd(&["apply-and-restart", "--json", "--wait-pid", "4294967295"]);
     assert_eq!(run.code, 19, "{run:?}");
     assert_eq!(run.line(), golden_error("process"));
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     zombie_target(&lab);
     lab.assert_nothing_started();
 }
 
 /// A zombie (Linux): it has exited, so there is nothing to wait for.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn zombie_target(lab: &Lab) {
     let mut zombie = Command::new("true").spawn().expect("true");
     let pid = zombie.id();
     let start = Instant::now();
-    while state_of(pid) != 'Z' {
+    while !common::is_zombie(pid) {
         assert!(start.elapsed() < LIMIT, "no zombie");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1255,6 +1345,10 @@ fn apply_and_restart_with_nothing_staged_or_another_version_starts_nothing() {
         "apply-and-restart: error: nothing_staged (exit 12)\n"
     );
     assert_eq!(lab.log(), "");
+    // `--background` is part of the grammar on every OS (M8-D13): the same answer.
+    let run = lab.cmd(&["apply-and-restart", "--background", "--json"]);
+    assert_eq!(run.code, 12, "{run:?}");
+    assert_eq!(run.line(), golden(GOLDEN_NOTHING_STAGED));
 
     let lab = Lab::staged();
     let run = lab.cmd(&["apply-and-restart", "--json", "--expect-version", "1.2.0"]);

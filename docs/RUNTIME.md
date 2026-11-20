@@ -26,7 +26,12 @@ the per-user programs folder (by default `%LOCALAPPDATA%\Programs`) named after 
 its first install, kept for the life of the install, with the trees in `app\<version>\` and the runtime's
 state under a hidden `.lunepack\` (`docs/FORMAT.md` 16). An app on Windows finds its runtime as
 `lunepack-runtime.exe` beside its entry, from its own resolved executable path
-(`GetModuleFileNameW`), never from the stub's path at `R`: the stub is a launcher, not the app.
+(`GetModuleFileNameW`), never from the stub's path at `R`: the stub is a launcher, not the app. On macOS `R`
+is `<data home>/<app id>` with the data home `~/Library/Application Support`, the trees of kept versions are
+in `versions/<version>/`, and the app itself is a bundle `B` in `~/Applications` that `R/bundle` points at; an
+app finds its runtime as `lunepack-runtime` in `Contents/MacOS` beside its entry, from its own resolved
+executable path, and the configuration it reads is `Contents/Resources/lunepack-update.json` of that bundle
+(`docs/FORMAT.md` 17, and "macOS" below).
 
 A runtime speaks exactly one schema version, and a runtime belongs to one version tree (D28): every
 final object names that tree in `tree_version`, so an app can tell when it reached another version's
@@ -44,13 +49,13 @@ lunepack-runtime <command> [options] [-- <args>]
 | `download` | `--channel <name>`, `--expect-version <version>` | Runs `check`, then downloads and stages the update it found. |
 | `startup` | `-- <args>` | Delivers the lifecycle events queued for this version and says whether to go on. |
 | `confirm` | none | Confirms that this version works. |
-| `apply-and-restart` | `--wait-pid <pid>`, `--expect-version <version>`, `--no-ui`, `-- <args>` | Starts the applier for the staged version, which applies it and starts the new version with `<args>` once the waited-for process has exited. With `--no-ui` the applier shows no update window. |
+| `apply-and-restart` | `--wait-pid <pid>`, `--expect-version <version>`, `--no-ui`, `--background`, `-- <args>` | Starts the applier for the staged version, which applies it and starts the new version with `<args>` once the waited-for process has exited. With `--no-ui` the applier shows no update window. With `--background` (macOS only; no effect elsewhere) the new version is started without being brought to the front. |
 
 Global options, accepted by every command: `--json` (output JSON Lines instead of text) and
 `--expect-schema <N>` (the schema the caller understands; anything but `1` is the error
 `schema_mismatch`, before anything else happens).
 
-The grammar is closed. Every option may appear once; a flag (`--json`, `--no-ui`, `--silent`) takes
+The grammar is closed. Every option may appear once; a flag (`--json`, `--no-ui`, `--background`, `--silent`) takes
 no value. An unknown option, a repeated one, an option
 that does not belong to the command, a value that does not parse (a channel name outside the rule of
 `docs/FORMAT.md` 10.5, a version that is not in its canonical text, a number with a sign or leading
@@ -78,7 +83,7 @@ With `--json`, stdout holds only UTF-8 JSON Lines, one object per line, each wit
 {"schema":1,"type":"result","command":"download","tree_version":"1.0.0","version":"1.1.0","staged":true}
 ```
 
-`progress`: `phase` is one of `check`, `scan`, `download`, `stage` (and, in the runtime's own log,
+`progress`: `phase` is one of `check`, `scan`, `download`, `stage` and, in a macOS adoption, `adopt` (and, in the runtime's own log,
 `install`, `wait`, `apply`, `launch`, `confirm`, `rollback`, `uninstall`); `done` and `total` are
 non-negative integers (bytes, 0 when unknown); `file` is null or `{path, done, total, source}` with
 `path` the signed relative path and `source` one of `unchanged`, `range`, `full_pack`. At most ten
@@ -89,7 +94,7 @@ line a second on stderr and the final line is one human line on stdout (an error
 
 | Command | Members |
 |---|---|
-| `check` | `update`: `null`, or `{version, download_size_max, time_checked}` (`time_checked` is false when the clock was implausible and expiry checks were skipped) |
+| `check` | `update`: `null`, or `{version, download_size_max, time_checked}` (`time_checked` is false when the clock was implausible and expiry checks were skipped); `adopted`: `true`, present only in the run that adopted the running bundle (macOS, "Adoption" below) |
 | `download` | `version` and `staged`: the staged version and `true`; or `null` and `false` when the channel offers nothing new |
 | `startup` | `events`: `[{kind: "installed", version}, {kind: "updated", from, to}, {kind: "first_run", version}, ...]`, oldest first; `action`: `"continue"` or `"exit"`; `pending` |
 | `confirm` | `outcome`: `"confirmed"` or `"nothing_pending"` |
@@ -113,7 +118,7 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 4 | `busy` | another lunepack operation holds the install lock |
 | 5 | `cancelled` | the operation was cancelled, or stdout stopped accepting output |
 | 6 | `stale` | the update is no longer applicable |
-| 7 | `verify` | a document, hash or signature was refused |
+| 7 | `verify` | a document, hash or signature was refused; on macOS also a bundle that is not byte for byte the release its configuration names (adoption) |
 | 8 | `transport` | the feed or pack could not be fetched |
 | 9 | `fs` | a filesystem operation failed |
 | 10 | `state` | the install state failed or is newer than this build |
@@ -131,9 +136,10 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 22 | `rollback_unavailable` | (apply) the previous version cannot be started; the new one stays pending |
 | 23 | `already_installed` | (install) the install already has a current version; `current` is linked from its record first, so a run cut off after its commit still ends startable |
 | 24 | `integration` | (install, uninstall) the desktop integration failed or is in the way |
-| 25 | `in_use` | (uninstall) a process still runs from the install |
+| 25 | `in_use` | (uninstall) a process still runs from the install. On macOS a process of the user whose executable file was deleted is judged by its working directory and open files, not by that executable ("macOS" below) |
 | 26 | `install_mismatch` | (install, uninstall) the install is not the one this environment derives; for install also an existing `R` that is not lunepack's (not a real directory, or holding files it did not make) |
-| 27 | `no_release` | (install) the channel offers no release for this install yet (none, none whose rollout admits it, or none at or above the bootstrap's own version); nothing was installed, retry later |
+| 27 | `no_release` | (install) the channel offers no release for this install yet (none, none whose rollout admits it, or none at or above the bootstrap's own version); nothing was installed, retry later. (macOS adoption) the feed lists no release of the version and target the bundle's own configuration names; nothing was adopted |
+| 28 | `unsupported_location` | (macOS, every mode) the running app or the install's bundle is somewhere lunepack does not update: the error object carries `reason`, one of `translocated`, `read_only`, `other_volume`, `not_owned`, `not_writable`; move the app to the Applications folder of the user and open it from there |
 | 70 | `internal` | anything else (a worker panic, a library error this build does not know) |
 
 The table lives in one place in the runtime (`crates/lunepack-runtime/src/modes.rs`) and is pinned
@@ -180,6 +186,17 @@ applied while the app still runs. So:
 - any caller that runs the command through a wrapper (a shell, `env`, a launcher library) passes
   its own pid with `--wait-pid`.
 
+`--background` (macOS only; accepted everywhere and a no-op elsewhere) makes the applier start the app
+without bringing it to the front: the new version, the previous one after a rollback, and the current one
+again after a refused apply. It asks LaunchServices to open the bundle without activating it, so the app is
+not the applier's child and its exit status is not observable. A new version that crashes before it confirms
+its health is therefore noticed at the health deadline (`[update] health_timeout_secs`, `docs/CLI.md`), not
+at once, and is then rolled back as an unconfirmed one. The token still travels in the app's environment
+only. An app that activates itself in its own code still comes to the front, whatever the option; and when
+the bundle's own `Info.plist` cannot be read or names another executable than the entry, the app is started
+as a child exactly as without the option (the update completes; only the focus is not protected). Details
+in "macOS" below.
+
 ## Internal modes
 
 The runtime also has three modes for lunepack's own use: `apply`, `install` and `uninstall`. They
@@ -190,7 +207,7 @@ calls `apply-and-restart`, which starts `apply` itself.
 
 | Mode | Started by | What it does |
 |---|---|---|
-| `apply --wait-pid <pid> --wait-start <ticks> --version <version> [--no-ui] [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. An apply that fails after the wait changes nothing and starts the version that exited again (without the token), unless the state moved on (another version current or pending, or the version to apply marked bad): then another applier, such as a second instance's, or a rollback has started the app already. Exit codes 20 to 22 are its own. |
+| `apply --wait-pid <pid> --wait-start <ticks> --version <version> [--no-ui] [--background] [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. An apply that fails after the wait changes nothing and starts the version that exited again (without the token), unless the state moved on (another version current or pending, or the version to apply marked bad): then another applier, such as a second instance's, or a rollback has started the app already. Exit codes 20 to 22 are its own. |
 | `install [--silent]` | the first-install flow, from a bootstrap tree | Installs the newest release the tree's own channel offers (M5-D8): the root, feed and channel come only from that tree's update configuration. Exit codes 23, 24, 26 and 27 are its own. |
 | `uninstall [--silent]` | the uninstall flow, from a tree of the install | Removes the install this runtime stands in and the desktop integration lunepack made (M5-D10): the install root leaves its path in one rename before it is deleted, so a cut-off uninstall leaves it whole or gone, and the next install or uninstall deletes what is left. Exit codes 24, 25 and 26 are its own. |
 
@@ -214,7 +231,8 @@ it runs as described above, unchanged. With the magic it is a setup file:
 
 - A trailer that does not parse (FORMAT.md 14.2) ends the run with `verify` (7) and one `error`
   object on stdout; it never falls back to another mode.
-- The command line is empty or `--silent`; anything else is a usage error (2).
+- The command line is empty or `--silent`; anything else is a usage error (2). (On macOS the installer
+  is an app, not a file, and its runtime also takes the internal `--ui-stdio`: "macOS" below.)
 - The payload is verified under the trailer's root before anything is shown or written: the key
   set, the manifest with no feed (release keys valid now), the whole pack, and the update
   configuration read out of the pack, which must name exactly that root. A failure is `verify`
@@ -307,6 +325,145 @@ total; the last error is reported unchanged.
 the renamed folder, but its Start-menu shortcut no longer points at the install, and updates report the
 shortcut as a conflict until the app is reinstalled.
 
+## macOS
+
+The macOS runtime is `lunepack-runtime` in `Contents/MacOS` beside the entry. An app that is installed per
+user lives in a bundle `B` in `~/Applications` that the install records (`docs/FORMAT.md` 17); everything
+here is per user (M8-D2), and a per-machine install is a later milestone.
+
+**Which copy is the install.** The runtime decides from its own resolved path, before it reads any state
+or the network, and in this order:
+
+1. A runtime inside a translocated app (a `nullfs` mount, or a path with an `AppTranslocation` component) or
+   on a read-only volume (a mounted disk image) is exit 28 `unsupported_location` with `reason`
+   `translocated` or `read_only`, in every mode (`check` included, so a translocated app is told to move
+   instead of being told it is not installed). Nothing is read, written or fetched. Move the app to the
+   Applications folder of the user and open it from there. Gatekeeper translocates a quarantined app that
+   was started from where it was downloaded. Whether that happens to an app is the system's decision and
+   depends on its signature and notarization; translocation has not been exercised on a real quarantined
+   app (it needs a notarized one, M9), so this refusal is proven only with the mount and path as the
+   system names them.
+2. A tree that is `R/versions/<its own version>` is an old instance of the install (a process the
+   previous version started before an update keeps running from the path the update gave its tree). It
+   is the install's.
+3. A bundle that `R/bundle` names is the install's. A second copy of an installed app is a development run
+   (`check` and `download` answer 3 `not_installed`, `startup` goes on with no events): one install per app
+   id per user.
+4. A bundle the user moved within its volume (Finder moved it; the old pointer's target is gone, and the
+   bundle has the device and inode `R/bundle.id` records and the record's current version) is followed: the
+   next start re-points `R/bundle` and refreshes the integration, under the install lock. A copy, a bundle
+   extracted again, a bundle moved to another volume or one in the Trash is never followed.
+5. A bundle directly in `~/Applications` or `/Applications` whose install is gone or never was (the
+   adoption cases below) is adoptable.
+6. Anything else, such as a build folder, `~/Downloads` or the Desktop, is a development run: exit 3, no
+   network, nothing written.
+
+Before a mode moves or removes anything of an install (the applier, startup's repair of a swap, uninstall,
+the installer), the place of `B` is checked: its folder and `R/versions` on one volume (else `other_volume`),
+`B` owned by the user (else `not_owned`; a root-owned `B` is a per-machine install by ownership, D10, and is
+`machine_scope`, exit 17) and the user able to create entries in `B`'s folder (else `not_writable`; the folder need not be the
+user's own, so an administrator's app in `/Applications` keeps updating). It is exit 28 with that `reason`,
+nothing committed and, in the applier, the app started again.
+
+**Adoption** (`check`, and so `download`). A copy that is adoptable is adopted by the update check, and
+nowhere else: not by `startup`, which makes no request, and not by `confirm` or `apply-and-restart`. This is
+how a bundle dragged out of a `.zip`, or a copy the user put back after trashing the app, or one that
+replaced the live bundle at its own path (Finder's Replace), becomes an install:
+
+- **The place rule.** Only a bundle directly in `~/Applications` or `/Applications` is adopted, and only when
+  `R` holds no record, a record with no current version, or an orphaned or replaced one (`docs/FORMAT.md`
+  17.4); a bundle in a build folder, `~/Downloads`, the Desktop, a subfolder or the Trash never causes a
+  request. A live install makes any other copy `not_installed`.
+- **Network only there.** The check already uses the network. It verifies the root, key set and feed from
+  the bundle's own configuration, as `install` does from its bootstrap tree, takes the release that is
+  exactly the bundle's version for its target (none is 27 `no_release`), verifies its manifest, and then proves
+  the bundle equal to it: the same paths, sizes, SHA-256 hashes, executable bits and link targets, no extra
+  entry. Any difference is 7 `verify`; a transport failure is 8; `busy` is 4; a place that cannot be updated
+  is 28. Nothing is executed and no extended attribute is changed.
+- **The result.** The progress phase `adopt` covers the hashing (the check holds the install lock meanwhile,
+  as it does across the network, so a concurrent call is `busy`, and a large app's first check takes
+  longer). On success the check carries `"adopted": true` in that run only, the events `installed` and
+  `first_run` are queued and delivered by the app's next `startup`, and the same check reports the update.
+  A failure leaves the bundle untouched and the app runs as a development run; the next check tries
+  again. What may remain is a record without a current version and floors raised from verified documents
+  only (as after a cut-off `install`).
+- **A replaced bundle.** Until its first check adopts it, a bundle that replaced the live one at its own
+  path is a development run: `startup` succeeds and `installed()` says none, `uninstall` from it is 3, and an
+  installer run over it still answers 23 (the recovery for a copy that does not verify is to move it to
+  the Trash and run the installer, which treats the install as orphaned). An adoption that replaces an
+  orphaned or replaced install keeps its anti-rollback floors and gets a new install id.
+- **A cut after the identity write.** An adoption of a same-version orphan that is cut off after its
+  identity was written leaves a disk that a Finder move leaves too; the next start follows it as a move. The
+  install keeps its record and loses only the new install id and the two events. This is accepted.
+
+**An update** is the record first, then a swap: the new tree is staged in `R/versions/<new>`, the record
+commits it, and the applier makes `B` hold it with `renamex_np(RENAME_SWAP)`, or, on a volume that does not
+support it, the journaled two-rename (`docs/FORMAT.md` 17.3). The previous bundle is kept as
+`R/versions/<previous>` for the rollback and removed only by garbage collection after a confirmation. The new
+version is started from `B`'s own entry with the token in its environment (never on a command line),
+`--background` as described above, and the rest is the health handshake as on Linux. A crash at any point is
+healed by the next start or apply. Without `--background` the relaunch is a direct start of the entry, as
+on Linux and Windows, so the new app is the applier's child and a crash before it confirms is seen at once.
+
+**The update window** is a helper app nested in the bundle,
+`Contents/Helpers/lunepack-update.app/Contents/MacOS/lunepack-ui`, found from the runtime's own path
+(`pack --ui`, `docs/CLI.md`); without it the runtime looks for `lunepack-ui` beside itself, the installer
+app's layout, and without that runs headless. Nothing else about the window changes.
+
+**The installer.** A `macos-*` release is installed from `Install <name>.app` in the `.dmg` that
+`lunepack setup` writes (`docs/FORMAT.md` 14.4). Its main executable is the release's `lunepack-ui`, which
+starts the runtime beside it with the internal `--ui-stdio`: the UI is the runtime's parent, and the frames of
+the channel go over the runtime's own standard input and output, which then carry nothing else (the
+result and events go to standard error). The runtime never signals its parent, treats every message of
+it as untrusted as any UI's, and carries on headless when it is lost. Without a UI, or with `--silent`, the
+runtime installs from its payload with no window. The payload is verified first (exit 7), then the install
+goes into `~/Applications/<name>.app` and `R` (exit codes of `install`; 23 for an existing install, whose
+integration it repairs). Only the place of the new bundle is judged, never the installer's own: an installer
+on a read-only image or translocated installs. No uninstaller is in the image: uninstall is
+`lunepack-runtime uninstall [--silent]` from the installed bundle. `--ui-stdio` is same build only (D28) and
+carries no promise to callers.
+
+**Uninstall** (`uninstall [--silent]`, M8-D15) takes `B` from its own path and requires it to be what
+`R/bundle` names and its place to pass the checks above (28 otherwise; 26 for a bundle that is not the install's, and
+for a moved bundle not yet followed: start the app once, and it follows). It refuses (25) while any process
+of the user runs from `B` or from a tree in `R`, then removes, under the lock, `B` (renamed to
+`.<app id>.removing-<16 hex>` in its folder, then deleted), `R` (M5-D10's tombstone, then deleted) and the
+LaunchAgent entry if it is the app's, in that order. A foreign file beside `B`, another app's LaunchAgent and
+another entry of the apps folder are never touched. An entry that is not lunepack's is left and reported
+(`uninstalled_with_leftovers`). The interactive uninstall may offer to open the folder of a leftover
+(`/usr/bin/open`, the same rule as `xdg-open`). A tombstone of `B` that a cut-off uninstall left in the apps
+folder is removed by the next uninstall, install, installer run or adoption (a real directory named exactly
+`.<app id>.removing-<16 hex>`; nothing else there).
+
+**Declarations.** `autostart = true` writes `~/Library/LaunchAgents/<app id>.lunepack.plist` (`Label` the
+same, `ProgramArguments` the entry inside `B`, `RunAtLoad`, `LimitLoadToSessionType` `Aqua`). It is never
+loaded with `launchctl`, so it takes effect at the next sign-in; it is replaced or removed only when its
+`Label` is ours. `file_types` and `url_schemes` are not applied: macOS reads them from the app's own
+`Info.plist`.
+
+**Outcome notice.** An interactive install, setup or uninstall that ends with no window that showed its
+outcome shows one native alert, as on Windows, through `/usr/bin/osascript` running one fixed script that
+reads the title, the text and the kind from its arguments (no string is ever put into script source). The
+text is fixed (the app's name, the result and the closed result code), the alert dismisses itself after 120
+seconds and the process is killed shortly after, except that an exit 28 says "Move <name> to your Applications
+folder and open it from there." (M8-D4), and it is shown only when the run is provably interactive
+and never under `--silent`, `--no-ui`, `LUNEPACK_NO_UI`, for a cancellation the user chose, or after a window
+showed the outcome.
+
+**In use (exit 25).** The scan reads, for every process of the user, its executable, working directory and open
+files, and compares them with the tree as the kernel names it (so a swap that moved a running app's tree is
+seen under its new path). Files that a process only maps (a library loaded from the tree) are not read. A
+process of the user that cannot be read counts as in use, with two exceptions: a system daemon that the
+kernel refuses to show beyond its executable is judged by what is readable, and a process whose executable
+file was deleted is judged by its working
+directory and open files alone, counting as in use only if one of them lies in the tree, or if the kernel
+refuses its working directory too (M5-D9 amended by M8-D19). A read that fails on a process that is starting
+or ending is repeated up to three more times, ten milliseconds apart, and a process that has meanwhile ended
+is not in use. `docs/THREAT-MODEL.md` lists what that does not see.
+
+**Extended attributes.** lunepack neither sets nor removes `com.apple.quarantine` and copies none into a new
+tree (`docs/FORMAT.md` 17.3).
+
 ## The window
 
 `install`, `uninstall`, `apply` and a setup file show their progress and ask their questions in a
@@ -319,7 +476,9 @@ that fails changes no outcome and no exit code. No window is started under `--si
 `uninstall`) or `--no-ui` (`apply`, `apply-and-restart`), when `LUNEPACK_NO_UI` is set to anything
 but empty or `0`, on Linux when neither `DISPLAY` nor `WAYLAND_DISPLAY` is set, or when
 `lunepack-ui` is missing; the mode then runs headless and every question takes its default
-(proceed; the app is not launched). The app-facing commands never start one.
+(proceed; the app is not launched). The app-facing commands never start one. On macOS there is no display
+test (a window server is assumed), the update window is the helper app's `lunepack-ui` (below), and the
+installer's window is the installer app's own main executable, which starts the runtime (`--ui-stdio`).
 
 `install` asks before it installs, and `uninstall` before it removes: cancelling there, or the window
 being lost there (it exits, crashes, stops answering or breaks the protocol), ends the mode with

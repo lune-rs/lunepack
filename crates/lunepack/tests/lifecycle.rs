@@ -903,6 +903,7 @@ fn a_staged_version_starts_the_own_runtime_detached_with_exactly_this_argv() {
             wait_for: None,
             restart_args: vec!["--flag".into(), "two words".into()],
             ui: UiChoice::Auto,
+            background: false,
         },
     )
     .expect("scheduled");
@@ -966,6 +967,31 @@ fn a_staged_version_starts_the_own_runtime_detached_with_exactly_this_argv() {
         &args[7..],
         &["--no-ui", "--", "--no-ui"].map(OsString::from)
     );
+    // In the background (M8-D13): `--background` before the separator, and only when asked; the
+    // spawn of the applier itself is detached as always.
+    apply_and_restart_for(
+        &inst,
+        ApplyOptions {
+            restart_args: vec!["--background".into()],
+            ui: UiChoice::Never,
+            background: true,
+            ..ApplyOptions::default()
+        },
+    )
+    .expect("scheduled");
+    let spawn = &lab.process.spawns()[3];
+    assert!(spawn.detached && !spawn.background);
+    assert_eq!(
+        &spawn.args[7..],
+        &["--no-ui", "--background", "--", "--background"].map(OsString::from)
+    );
+    for (i, spawn) in lab.process.spawns()[..3].iter().enumerate() {
+        let before = spawn.args.iter().take_while(|a| *a != "--");
+        assert!(
+            !before.into_iter().any(|a| a == "--background"),
+            "spawn {i} carries --background"
+        );
+    }
 }
 
 #[test]
@@ -1668,13 +1694,13 @@ fn a_file_feed_from_the_config_is_served_by_the_directory_source() {
     assert_eq!(info.version(), &version(V110));
 }
 
-/// The native composition: on Linux and Windows the process adapter finds the test binary, whose
-/// tree holds no update config; elsewhere processes are unsupported. The native layout scheme is
-/// the OS's own.
+/// The native composition: on Linux, macOS and Windows the process adapter finds the test binary,
+/// whose tree holds no update config; elsewhere processes are unsupported. The native layout
+/// scheme is the OS's own.
 #[test]
-fn the_native_platform_wires_the_process_adapter_on_linux_and_windows_only() {
+fn the_native_platform_wires_the_process_adapter_on_linux_macos_and_windows_only() {
     let got = Installation::from_current_exe_with(Platform::native());
-    if cfg!(any(target_os = "linux", windows)) {
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         assert!(matches!(got, Err(Error::NoUpdateConfig)), "{got:?}");
     } else {
         assert!(matches!(got, Err(Error::Unsupported)), "{got:?}");
@@ -1684,6 +1710,8 @@ fn the_native_platform_wires_the_process_adapter_on_linux_and_windows_only() {
         scheme,
         if cfg!(windows) {
             LayoutScheme::WINDOWS
+        } else if cfg!(target_os = "macos") {
+            LayoutScheme::MACOS
         } else {
             LayoutScheme::XDG
         }

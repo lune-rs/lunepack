@@ -153,14 +153,32 @@ pub fn ui_wanted(quiet: bool, env: &dyn Fn(&str) -> Option<OsString>) -> bool {
     true
 }
 
+/// The update window's helper app inside a bundle (macOS, M8-D6), relative to the bundle's
+/// `Contents` directory.
+#[cfg(target_os = "macos")]
+const HELPER_UI: &str = "Helpers/lunepack-update.app/Contents/MacOS/lunepack-ui";
+
 /// The UI binary of the runtime at `runtime_exe` (its resolved path): `lunepack-ui` in the same
-/// directory, and only when it is a regular file there (not a link).
+/// directory, and only when it is a regular file there (not a link). On macOS an installed
+/// bundle's runtime finds it first as the helper app nested in the bundle,
+/// `Contents/Helpers/lunepack-update.app/Contents/MacOS/lunepack-ui` (M8-D6); the installer app
+/// keeps it beside its runtime (M8-D7).
 pub fn ui_program(fs: &dyn Fs, runtime_exe: &Path) -> Option<PathBuf> {
-    let program = runtime_exe.parent()?.join(UI_FILE);
-    match fs.symlink_metadata(&program) {
-        Ok(Some(meta)) if meta.kind == FileKind::File => Some(program),
-        _ => None,
+    let is_file =
+        |p: &Path| matches!(fs.symlink_metadata(p), Ok(Some(m)) if m.kind == FileKind::File);
+    let dir = runtime_exe.parent()?;
+    #[cfg(target_os = "macos")]
+    {
+        // `<bundle>/Contents/MacOS/lunepack-runtime`: `Contents` is the directory above.
+        if let Some(contents) = dir.parent() {
+            let helper = contents.join(HELPER_UI);
+            if is_file(&helper) {
+                return Some(helper);
+            }
+        }
     }
+    let program = dir.join(UI_FILE);
+    is_file(&program).then_some(program)
 }
 
 /// What the stop log says.
@@ -198,6 +216,12 @@ struct Shared {
     child_id: ProcessId,
     spawned: Instant,
     done: AtomicBool,
+    /// The reader has ended: everything the UI wrote before its end of the channel closed was
+    /// read, or the reader stopped on its own.
+    reader_done: AtomicBool,
+    /// The UI is this process's parent (`--ui-stdio`, [`UiHost::over_parent`]): it is never
+    /// stopped or waited for, only no longer written to.
+    peer: bool,
 }
 
 fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -208,7 +232,7 @@ fn exit_code(kind: ExitKind) -> Option<i32> {
     match kind {
         ExitKind::Success => Some(0),
         ExitKind::Failure(code) => Some(code),
-        ExitKind::Signal(_) => None,
+        ExitKind::Signal(_) | ExitKind::Unknown => None,
     }
 }
 
@@ -292,6 +316,24 @@ impl Shared {
         }
     }
 
+    /// Whether the UI said hello, once what it wrote before a stop was read: a stop seen by the
+    /// watchdog or the writer (the UI's exit, a stall) can come before the reader got to a hello
+    /// still in the pipe, so the reader gets up to `limit` to reach the end of the channel first.
+    /// A UI that said hello and was then lost must get the lost answer (cancel before any
+    /// change, M6-D5), never the headless one.
+    fn said_hello(&self, limit: Duration) -> bool {
+        let until = Instant::now() + limit;
+        loop {
+            if self.conv().hello {
+                return true;
+            }
+            if self.reader_done.load(Ordering::Acquire) || Instant::now() >= until {
+                return self.conv().hello;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// The child's exit code once it has ended, waiting up to `limit` for it.
     fn exit_status(&self, limit: Duration) -> Option<Option<i32>> {
         let until = Instant::now() + limit;
@@ -331,6 +373,15 @@ fn writer(shared: Arc<Shared>, rx: Receiver<EngineMsg>, mut out: Box<dyn Write +
 
 fn reader(
     shared: Arc<Shared>,
+    input: Box<dyn Read + Send>,
+    choices: SyncSender<(u32, ChoiceValue)>,
+) {
+    read_frames(&shared, input, choices);
+    shared.reader_done.store(true, Ordering::Release);
+}
+
+fn read_frames(
+    shared: &Shared,
     mut input: Box<dyn Read + Send>,
     choices: SyncSender<(u32, ChoiceValue)>,
 ) {
@@ -350,6 +401,15 @@ fn reader(
         };
         let mut conv = shared.conv();
         if conv.stop.is_some() {
+            // Stopped already (its exit seen by the watchdog, say): only a valid hello the UI
+            // wrote before still counts, so that a UI that said hello and then died is a lost UI
+            // and not an absent one. Nothing else is acted on.
+            if !conv.hello
+                && let UiMsg::Hello { build_id } = &msg
+                && ui::check_hello(build_id).is_ok()
+            {
+                conv.hello = true;
+            }
             return;
         }
         if !conv.hello {
@@ -526,6 +586,61 @@ impl UiHost {
             });
             return host;
         };
+        host.connect(bounds, hello, child, input, output, false);
+        host
+    }
+
+    /// The UI of an installer app (macOS, M8-D7): the UI is this process's parent, which started
+    /// it with `--ui-stdio`, and the frames go over this process's own standard output (`output`)
+    /// and input (`input`), as they would over a child's. Everything the UI sends is checked as a
+    /// child's is (C10). The parent is never signalled and never waited for: a UI that stalls,
+    /// hangs, breaks the protocol, exits or closes its end is no longer written to, and the run
+    /// goes on headless under the M6-D5 rules. `parent` names it (pid and start time), so its exit
+    /// is seen even while its end of the channel stays open. `LUNEPACK_NO_UI` does not apply: no
+    /// UI is started here.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn over_parent(
+        bounds: Bounds,
+        process: Arc<dyn Process>,
+        parent: ProcessId,
+        input: Box<dyn Read + Send>,
+        output: Box<dyn Write + Send>,
+        flow: Flow,
+        app: AppCard,
+        details: Details,
+    ) -> UiHost {
+        let mut host = UiHost::headless(flow);
+        let hello = EngineMsg::Hello {
+            build_id: ui::build_id(),
+            flow,
+            app,
+            details,
+        };
+        if hello.encode().is_err() {
+            return host;
+        }
+        let peer = Box::new(Parent {
+            process,
+            id: parent,
+            gone: false,
+        });
+        host.connect(bounds, hello, peer, output, input, true);
+        host
+    }
+
+    /// Starts the threads of a conversation with `child` over `input` (the UI's standard input)
+    /// and `output` (its standard output), and sends `hello`.
+    fn connect(
+        &mut self,
+        bounds: Bounds,
+        hello: EngineMsg,
+        child: Box<dyn Child>,
+        input: Box<dyn Write + Send>,
+        output: Box<dyn Read + Send>,
+        peer: bool,
+    ) {
+        let flow = self.flow;
         let (tx, rx) = mpsc::sync_channel::<EngineMsg>(WRITE_QUEUE);
         let (choice_tx, choice_rx) = mpsc::sync_channel(4);
         let shared = Arc::new(Shared {
@@ -548,6 +663,8 @@ impl UiHost {
             child: Mutex::new(child),
             spawned: Instant::now(),
             done: AtomicBool::new(false),
+            reader_done: AtomicBool::new(false),
+            peer,
         });
         let threads = [
             spawn_named("lunepack-ui-writer", {
@@ -563,13 +680,16 @@ impl UiHost {
                 move || watchdog(shared)
             }),
         ];
+        if !threads[1] {
+            // No reader: nothing more will ever be read.
+            shared.reader_done.store(true, Ordering::Release);
+        }
         if threads.iter().any(|ok| !ok) {
             shared.stop(UiStop::SpawnFailed, None);
         }
         shared.send(hello);
-        host.shared = Some(shared);
-        host.choices = Some(choice_rx);
-        host
+        self.shared = Some(shared);
+        self.choices = Some(choice_rx);
     }
 
     /// The sink that shows the run's events in the UI, when there is a UI.
@@ -648,12 +768,14 @@ impl UiHost {
         }
     }
 
-    /// Asks `kind` and waits for the answer. A headless host, and a UI that stopped before its
-    /// hello, answer with the headless default at once: proceed, finish without launching, close,
-    /// acknowledge. A UI lost after its hello answers with the lost default (M6-D5): cancel at a
-    /// prompt before any change (welcome, confirm), the headless default at one after the
-    /// outcome. A `reveal` keeps the prompt open: `on_reveal` gets its index (at most one a
-    /// second; the reducer already checked it against the outcome's leftovers).
+    /// Asks `kind` and waits for the answer. A headless host answers with the headless default at
+    /// once: proceed, finish without launching, close, acknowledge; so does a UI that stopped
+    /// before its hello, once the reader has read what the UI wrote before it ended (up to
+    /// [`EXIT_PEEK`]): a hello found there counts. A UI lost after its hello answers with the lost
+    /// default (M6-D5): cancel at a prompt before any change (welcome, confirm), the headless
+    /// default at one after the outcome. A `reveal` keeps the prompt open: `on_reveal` gets its
+    /// index (at most one a second; the reducer already checked it against the outcome's
+    /// leftovers).
     pub fn prompt(
         &self,
         kind: PromptKind,
@@ -671,7 +793,7 @@ impl UiHost {
             return headless;
         };
         let lost = || {
-            if shared.conv().hello {
+            if shared.said_hello(EXIT_PEEK) {
                 lost_answer(kind, self.flow)
             } else {
                 headless
@@ -760,18 +882,69 @@ impl UiHost {
             }
             // The writer writes what it holds, then ends, which closes the UI's input.
             guard(&shared.tx).take();
-            // A UI that ended by itself on a failure or a signal did not end normally, whatever
-            // the engine was doing when it did; the stop is then logged (a clean exit is not).
-            match shared.exit_status(shared.bounds.close_wait) {
-                Some(code) if code != Some(0) => shared.stop_exited(code),
-                Some(_) => {}
-                None => {
-                    let _ = guard(&shared.child).terminate(KILL_GRACE);
+            if shared.peer {
+                // The parent outlives this process: only the frames still queued are written,
+                // within the close bound.
+                let until = Instant::now() + shared.bounds.close_wait;
+                while shared.queued.load(Ordering::Acquire) > 0
+                    && !shared.stopped()
+                    && Instant::now() < until
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            } else {
+                // A UI that ended by itself on a failure or a signal did not end normally,
+                // whatever the engine was doing when it did; the stop is then logged (a clean
+                // exit is not).
+                match shared.exit_status(shared.bounds.close_wait) {
+                    Some(code) if code != Some(0) => shared.stop_exited(code),
+                    Some(_) => {}
+                    None => {
+                        let _ = guard(&shared.child).terminate(KILL_GRACE);
+                    }
                 }
             }
             shared.done.store(true, Ordering::Release);
         }
         self.report(events);
+    }
+}
+
+/// The parent that is the UI (`--ui-stdio`), in the place of a child. It is never signalled:
+/// [`Child::terminate`] does nothing, so a stop only ends the conversation. It counts as ended
+/// once no process runs with its pid and start time.
+struct Parent {
+    process: Arc<dyn Process>,
+    id: ProcessId,
+    gone: bool,
+}
+
+impl Child for Parent {
+    fn id(&self) -> ProcessId {
+        self.id
+    }
+
+    fn try_wait(&mut self) -> Result<Option<ExitKind>, lunepack_core::Error> {
+        if !self.gone {
+            // A look, not a wait; a process that cannot be read is taken to run.
+            self.gone = matches!(
+                self.process.wait_exit(&self.id, Duration::ZERO),
+                Ok(lunepack::WaitOutcome::Exited)
+            );
+        }
+        Ok(self.gone.then_some(ExitKind::Unknown))
+    }
+
+    fn terminate(&mut self, _grace: Duration) -> Result<(), lunepack_core::Error> {
+        Ok(())
+    }
+
+    fn take_stdin(&mut self) -> Option<Box<dyn Write + Send>> {
+        None
+    }
+
+    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+        None
     }
 }
 
@@ -894,7 +1067,7 @@ pub fn card(name: &str, version: &str, from: Option<&str>) -> AppCard {
 mod tests {
     use super::*;
 
-    use lunepack_testkit::{ChildScript, FakeChildPipes, FakeProcess};
+    use lunepack_testkit::{ChildScript, FakeChildPipes, FakeProcess, abs_path};
 
     fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
         move |name| {
@@ -986,6 +1159,35 @@ mod tests {
         assert!(s.env_set.is_empty());
         assert_eq!(s.env_remove, vec![OsString::from(HEALTH_TOKEN_VAR)]);
         assert_eq!(s.stdio, ChildStdio::Piped);
+    }
+
+    /// An installed bundle's runtime finds the update window as the helper app nested in the
+    /// bundle (M8-D6); the installer app's UI beside the runtime is the fallback (M8-D7); a linked
+    /// or absent helper is none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_runtime_of_a_bundle_finds_the_helper_app_first() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let contents = tmp.path().join("Hello.app/Contents");
+        let macos = contents.join("MacOS");
+        let helper_dir = contents.join("Helpers/lunepack-update.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).expect("dirs");
+        std::fs::create_dir_all(&helper_dir).expect("dirs");
+        let exe = macos.join("lunepack-runtime");
+        std::fs::write(&exe, b"").expect("exe");
+        let fs = lunepack_fs::StdFs::new();
+        assert!(ui_program(&fs, &exe).is_none(), "nothing to start yet");
+        // The installer's layout: the UI beside the runtime.
+        std::fs::write(macos.join(UI_FILE), b"").expect("sibling");
+        assert_eq!(ui_program(&fs, &exe), Some(macos.join(UI_FILE)));
+        // The helper app wins when the bundle has one.
+        let helper = helper_dir.join("lunepack-ui");
+        std::fs::write(&helper, b"").expect("helper");
+        assert_eq!(ui_program(&fs, &exe), Some(helper.clone()));
+        // A helper that is a link is not started; the sibling is.
+        std::fs::remove_file(&helper).expect("remove");
+        std::os::unix::fs::symlink("/bin/true", &helper).expect("link");
+        assert_eq!(ui_program(&fs, &exe), Some(macos.join(UI_FILE)));
     }
 
     #[test]
@@ -1146,6 +1348,204 @@ mod tests {
         assert_eq!(UiStop::of_exit_code(Some(14)), UiStop::BuildMismatch);
         for code in [Some(0), Some(10), Some(11), Some(13), Some(1), None] {
             assert_eq!(UiStop::of_exit_code(code), UiStop::Exited);
+        }
+    }
+
+    // ---- the UI as the parent (`--ui-stdio`, M8 step 8) ----
+
+    const PARENT: ProcessId = ProcessId {
+        pid: 4242,
+        start_ticks: 7,
+    };
+
+    /// A host over a parent UI: the fake's pipes stand in for this process's standard streams.
+    /// Returns the host and the parent's ends (what it reads, where it writes).
+    fn parent_host(process: &FakeProcess, bounds: Bounds) -> (UiHost, FakeChildPipes) {
+        let mut pipes = process
+            .spawn_child(&SpawnSpec {
+                program: abs_path("/fake/pipes"),
+                args: Vec::new(),
+                env_set: Vec::new(),
+                env_remove: Vec::new(),
+                stdio: ChildStdio::Piped,
+            })
+            .expect("pipes");
+        let (output, input) = (
+            pipes.take_stdin().expect("stdin"),
+            pipes.take_stdout().expect("stdout"),
+        );
+        let ends = process.take_child_pipes(pipes.id()).expect("ends");
+        process.mark_running(PARENT);
+        let host = UiHost::over_parent(
+            bounds,
+            Arc::new(process.clone()),
+            PARENT,
+            input,
+            output,
+            Flow::Install,
+            card("App", "1.0.0", None),
+            Details {
+                location: None,
+                size_bytes: None,
+            },
+        );
+        (host, ends)
+    }
+
+    /// The parent UI: hello, pongs, `proceed` at the welcome; after `answer_welcome` frames it
+    /// stops reading when `stop_reading`.
+    fn parent_ui(ends: FakeChildPipes, stop_reading: bool) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let FakeChildPipes {
+                stdin: mut from_engine,
+                stdout: mut to_engine,
+            } = ends;
+            while let Ok(msg) = ui::read_frame::<_, EngineMsg>(&mut from_engine) {
+                let reply = match msg {
+                    EngineMsg::Hello { build_id, .. } => UiMsg::Hello { build_id },
+                    EngineMsg::Ping { n } => UiMsg::Pong { n },
+                    EngineMsg::Prompt { id, .. } => UiMsg::Choice {
+                        id,
+                        value: ChoiceValue::Proceed,
+                    },
+                    _ => continue,
+                };
+                let hello = matches!(reply, UiMsg::Hello { .. });
+                if ui::write_frame(&mut to_engine, &reply).is_err() {
+                    return;
+                }
+                if hello && stop_reading {
+                    // Holds both ends open and reads nothing more.
+                    std::thread::sleep(Duration::from_secs(3));
+                    return;
+                }
+            }
+        })
+    }
+
+    fn wait_stopped(host: &UiHost) -> Stopped {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(stopped) = host.stopped() {
+                return stopped;
+            }
+            assert!(Instant::now() < until, "the host never stopped the UI");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_parent_ui_answers_over_the_own_streams_and_its_exit_is_never_a_signal() {
+        let process = FakeProcess::new("/fake/lunepack-runtime");
+        let bounds = Bounds {
+            watch_tick: Duration::from_millis(20),
+            ..Bounds::default()
+        };
+        let (host, ends) = parent_host(&process, bounds);
+        let ui = parent_ui(ends, false);
+        let events = Events::new(None, None);
+        assert_eq!(
+            host.prompt(PromptKind::Welcome, &events, &mut |_| {}),
+            ChoiceValue::Proceed
+        );
+        // The parent is gone (its end of the channel may stay open, as a crashed parent's
+        // inherited descriptor would): the host stops talking and answers as when a UI is lost.
+        process.mark_exited(PARENT);
+        assert_eq!(wait_stopped(&host).reason, UiStop::Exited);
+        assert_eq!(
+            host.prompt(PromptKind::Done, &events, &mut |_| {}),
+            ChoiceValue::Finish { launch: false }
+        );
+        let start = Instant::now();
+        host.close(&events);
+        assert!(start.elapsed() < Duration::from_secs(2), "close waited");
+        ui.join().expect("ui");
+        assert!(process.terminated().is_empty(), "a process was signalled");
+    }
+
+    #[test]
+    fn a_parent_ui_that_stops_reading_is_dropped_and_never_signalled() {
+        let process = FakeProcess::new("/fake/lunepack-runtime");
+        process.set_pipe_capacity(256);
+        let bounds = Bounds {
+            stall: Duration::from_millis(100),
+            ping_every: Duration::from_millis(10),
+            pong_wait: Duration::from_millis(300),
+            close_wait: Duration::from_millis(300),
+            watch_tick: Duration::from_millis(20),
+            ..Bounds::default()
+        };
+        let (host, ends) = parent_host(&process, bounds);
+        let ui = parent_ui(ends, true);
+        let events = Events::new(None, None);
+        // Before any change: the lost answer is cancel (M6-D5).
+        assert_eq!(
+            host.prompt(PromptKind::Welcome, &events, &mut |_| {}),
+            ChoiceValue::Cancel
+        );
+        assert!(matches!(
+            wait_stopped(&host).reason,
+            UiStop::Stalled | UiStop::Hung
+        ));
+        let start = Instant::now();
+        host.close(&events);
+        assert!(start.elapsed() < Duration::from_secs(2), "close waited");
+        assert!(process.terminated().is_empty(), "a process was signalled");
+        ui.join().expect("ui");
+    }
+
+    /// F11 (consent race): the UI's end is seen (here the parent's exit, by the watchdog) before
+    /// the reader got to what the UI wrote before it ended. A valid hello among that is a UI that
+    /// was shown and then lost: the welcome cancels (M6-D5); none, or a refused one, is no UI:
+    /// the headless answer, within the drain bound.
+    #[test]
+    fn a_hello_read_after_the_uis_end_was_seen_still_counts() {
+        let bounds = Bounds {
+            watch_tick: Duration::from_millis(10),
+            ..Bounds::default()
+        };
+        let good = UiMsg::Hello {
+            build_id: ui::build_id(),
+        };
+        let other = UiMsg::Hello {
+            build_id: "0.0.0+ui1.other".to_owned(),
+        };
+        for (wrote, want) in [
+            (Some(good), ChoiceValue::Cancel),
+            (Some(other), ChoiceValue::Proceed),
+            (None, ChoiceValue::Proceed),
+        ] {
+            let process = FakeProcess::new("/fake/lunepack-runtime");
+            let (host, ends) = parent_host(&process, bounds);
+            let FakeChildPipes {
+                stdin: _from_engine,
+                stdout: to_engine,
+            } = ends;
+            process.mark_exited(PARENT);
+            assert_eq!(wait_stopped(&host).reason, UiStop::Exited);
+            let wrote_any = wrote.is_some();
+            // Nothing written: the channel is left open until the end, and the drain bound
+            // decides.
+            let mut open = Some(to_engine);
+            if let Some(msg) = &wrote
+                && let Some(mut end) = open.take()
+            {
+                ui::write_frame(&mut end, msg).expect("hello");
+            }
+            let events = Events::new(None, None);
+            let start = Instant::now();
+            let got = host.prompt(PromptKind::Welcome, &events, &mut |_| {});
+            assert_eq!(got, want, "{wrote:?}");
+            let took = start.elapsed();
+            assert!(took < EXIT_PEEK + Duration::from_secs(1), "{took:?}");
+            if !wrote_any {
+                assert!(
+                    took >= EXIT_PEEK,
+                    "the drain bound was not waited: {took:?}"
+                );
+            }
+            host.close(&events);
+            drop(open);
         }
     }
 }

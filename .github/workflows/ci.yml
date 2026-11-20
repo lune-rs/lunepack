@@ -216,3 +216,35 @@ jobs:
           path: ${{ runner.temp }}/defender-detections.txt
           if-no-files-found: ignore
           retention-days: 7
+
+  e2e-macos:
+    # the end-to-end suite of the macOS runtime (M8 step 11, scripts/e2e-macos.sh --ci, rows 1-12):
+    # per-user install from a `.dmg`, updates by a bundle swap, rollbacks, adoption of a bundle
+    # dragged out of a `.zip`, uninstall, and the row that starts the installed bundle through
+    # LaunchServices. It runs under a throwaway HOME inside one temp root on the runner; no signing
+    # identity (ad-hoc only), no sudo. The instrument records (spctl, syspolicy_check, xattr:
+    # names and verdicts only) are uploaded as an artifact whatever the suite did. A skip is not a
+    # pass: the script sets LUNEPACK_E2E_REQUIRE and exits non-zero on a failed row.
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: macOS end-to-end suite
+        run: |
+          set -euo pipefail
+          ./scripts/e2e-macos.sh --ci 2>&1 | tee "$RUNNER_TEMP/e2e-macos.log"
+      - name: Instrument records (names and verdicts only)
+        if: always()
+        run: |
+          set -euo pipefail
+          grep -E '^  (instrument |signed: )' "$RUNNER_TEMP/e2e-macos.log" > "$RUNNER_TEMP/e2e-macos-instruments.txt" || true
+      # actions/upload-artifact v7.0.2, as in runtime-musl
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: e2e-macos-instruments
+          path: ${{ runner.temp }}/e2e-macos-instruments.txt
+          if-no-files-found: ignore
+          retention-days: 7

@@ -492,6 +492,47 @@ pub enum LayoutError {
     /// The install root's state directory holds a record of another app id (M7-D16 rule 3).
     #[error("the install folder belongs to another app")]
     ForeignRecord,
+    /// `R/bundle` is not a symlink holding an absolute, plain, canonical path whose last name ends
+    /// in `.app`, or it is missing where reconcile needs it (M8-D1). Refused, never repaired.
+    #[error("the bundle pointer is not a canonical path to an app bundle")]
+    BundlePointer,
+    /// A path the bundle layout is given is not absolute and plain, or passes through a symlink
+    /// (M8-D1: every path is canonical).
+    #[error("a bundle layout path is not canonical")]
+    NotCanonical,
+    /// A symlink, a file or anything else that is not a real directory stands where a bundle tree
+    /// should be (the live bundle, a slot or a version tree); nothing is moved.
+    #[error("a bundle tree is not a real directory")]
+    NotATree,
+    /// A bundle tree's update config cannot be read or parsed; the tree is left where it is.
+    #[error("a bundle tree's update config cannot be read")]
+    TreeUnreadable,
+    /// A bundle tree holds another app's update config; nothing is moved.
+    #[error("a bundle tree belongs to another app")]
+    ForeignTree,
+    /// The record's current version is in no tree reconcile can place (M8 step 1); nothing is
+    /// moved or deleted.
+    #[error("the current version's bundle tree is missing")]
+    BundleMissing,
+    /// Parking a tree under its version's name would replace an existing entry (M8-D5: reconcile
+    /// never overwrites or deletes).
+    #[error("a version tree with this version already exists")]
+    Duplicate,
+    /// The install is orphaned (M8-D16): the record has a current version, the bundle pointer's
+    /// target is missing and no tree holds that version. Nothing is renamed or deleted.
+    #[error("the installed app bundle is gone")]
+    Orphaned,
+    /// Both bundle names a first install may use are taken (M8-D1).
+    #[error("an app with this app's name already exists in the Applications folder")]
+    BundleNameTaken,
+    /// The bundle or the running tree is somewhere lunepack does not update (M8-D4); the reason is
+    /// one of a closed set.
+    #[error("unsupported location: {0}")]
+    Location(crate::layout::LocationReason),
+    /// The bundle is owned by the superuser: a per-machine install by ownership (D10, M8-D4), which
+    /// a per-user caller never updates.
+    #[error("the app bundle is a per-machine install")]
+    MachineBundle,
     /// A filesystem operation failed.
     #[error("{0}")]
     Fs(#[from] FsError),
@@ -861,4 +902,14 @@ pub enum Error {
     /// A layout rule refused.
     #[error("layout: {0}")]
     Layout(#[from] LayoutError),
+    /// A tree on disk is not exactly its signed manifest ([`crate::verify_tree`], M8-D9): the
+    /// kind of difference and the manifest index of the entry (none for an entry the manifest does
+    /// not list). No path or content is carried.
+    #[error("the tree differs from its signed manifest ({difference:?}, entry {entry:?})")]
+    TreeDiffers {
+        /// What differs.
+        difference: crate::stage::TreeDifference,
+        /// The manifest entry it differs at.
+        entry: Option<usize>,
+    },
 }

@@ -19,3 +19,5 @@
 {"schema":1,"type":"warning","code":"ui_stopped","version":null,"reason":"exited","ui_exit_code":11}
 {"schema":1,"type":"result","command":"apply","tree_version":"1.0.0","outcome":"confirmed","version":"1.1.0"}
 {"schema":1,"type":"error","command":"install","tree_version":null,"kind":"integration","exit_code":24}
+{"schema":1,"type":"error","command":"install","tree_version":null,"kind":"unsupported_location","exit_code":28,"reason":"other_volume"}
+{"schema":1,"type":"progress","phase":"adopt","done":512,"total":4096,"file":null}

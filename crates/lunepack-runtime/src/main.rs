@@ -162,6 +162,8 @@ fn uninstall_mode(
     }
 }
 
+/// Linux, and macOS (the bundle `B`, the install root `R` and the LaunchAgent, M8-D5, M8-D15):
+/// the uninstall runs in this process, from the installed tree.
 #[cfg(not(windows))]
 fn uninstall_mode(
     ad: &modes::Adapters,
@@ -244,12 +246,14 @@ fn hand_off_phase_2(_ad: &modes::Adapters, _args: &modes::HandOffArgs) -> Kind {
 }
 
 /// Whether process `pid` started at `start` runs; a process that cannot be read counts as running.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn alive(pid: u32, start: u64) -> bool {
     #[cfg(target_os = "linux")]
     let found = lunepack_os_linux::LinuxProcess::new().process_id(pid);
     #[cfg(windows)]
     let found = lunepack_os_windows::WindowsProcess::new().process_id(pid);
+    #[cfg(target_os = "macos")]
+    let found = lunepack_os_macos::MacProcess::new().process_id(pid);
     match found {
         Ok(Some(id)) => id.start_ticks == start,
         Ok(None) => false,
@@ -278,8 +282,17 @@ fn stderr_events() -> Events {
 
 /// Ends a headless mode: `last` to the sinks, then as the one line on stdout.
 fn conclude(events: Events, last: &Event) {
+    conclude_to(events, last, true);
+}
+
+/// [`conclude`], with the line on stdout only when `stdout` (a standard output that carries a
+/// UI's frames, `--ui-stdio`, gets nothing else).
+fn conclude_to(events: Events, last: &Event, stdout: bool) {
     events.emit(last);
     events.finish(SINK_DRAIN);
+    if !stdout {
+        return;
+    }
     let mut line = events::to_json_line(last);
     line.push('\n');
     let mut out = std::io::stdout().lock();
@@ -289,7 +302,7 @@ fn conclude(events: Events, last: &Event) {
 
 /// The interactive modes whose end may need a native notice.
 #[derive(Clone, Copy)]
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 enum Operation {
     Install,
     Uninstall,
@@ -299,12 +312,12 @@ enum Operation {
 }
 
 /// The title of a native notice for a setup run that failed before the app's name was verified.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 const SETUP_TITLE: &str = "Setup";
 
 /// The fixed text of a native notice: the app's validated display name, what happened and the
 /// closed result code (D36). Never a path, a value or an error's own text.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn notice_text(name: &str, operation: Operation, kind: Kind) -> String {
     let (done, failed) = match operation {
         Operation::Install => ("was installed.", "could not be installed"),
@@ -313,6 +326,10 @@ fn notice_text(name: &str, operation: Operation, kind: Kind) -> String {
     };
     match (operation, kind) {
         (_, Kind::Ok) => format!("{name} {done}"),
+        // M8-D4: a copy somewhere lunepack does not update is told where to go, whatever the mode.
+        (_, Kind::UnsupportedLocation(_)) => {
+            format!("Move {name} to your Applications folder and open it from there.")
+        }
         // A setup rerun over the installed app repaired its integration; nothing failed.
         (Operation::Install, Kind::AlreadyInstalled) => format!("{name} is already installed."),
         _ => format!("{name} {failed} (code {}).", kind.code()),
@@ -320,7 +337,7 @@ fn notice_text(name: &str, operation: Operation, kind: Kind) -> String {
 }
 
 /// Whether a native notice reports a normal end (the information icon) rather than a failure.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn notice_is_info(operation: Operation, kind: Kind) -> bool {
     matches!(
         (operation, kind),
@@ -347,8 +364,27 @@ fn notice(quiet: bool, seen: bool, name: &str, operation: Operation, kind: Kind)
     let _ = lunepack_os_windows::message_box(name, &notice_text(name, operation, kind), level);
 }
 
+/// macOS (M8-D11): the same rule as Windows: one native alert, through `osascript` with the fixed
+/// script and the text as arguments only, after the outcome is committed; never under `--silent`,
+/// `--no-ui` or `LUNEPACK_NO_UI`, never for a cancellation the user chose, and not when the UI
+/// itself showed the outcome. The alert is bounded and its failure (no window server, no
+/// `osascript`) changes nothing.
+#[cfg(target_os = "macos")]
+fn notice(quiet: bool, seen: bool, name: &str, operation: Operation, kind: Kind) {
+    let env = |var: &str| std::env::var_os(var);
+    if seen || kind == Kind::Cancelled || !ui_host::ui_wanted(quiet, &env) {
+        return;
+    }
+    let level = if notice_is_info(operation, kind) {
+        lunepack_os_macos::NoticeKind::Info
+    } else {
+        lunepack_os_macos::NoticeKind::Error
+    };
+    let _ = lunepack_os_macos::notice(name, &notice_text(name, operation, kind), level);
+}
+
 /// Other platforms print their outcome on the terminal; no native notice.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn notice(_quiet: bool, _seen: bool, _name: &str, _operation: Operation, _kind: Kind) {}
 
 /// A path as the UI shows it: Windows' `\\?\X:\` prefix of a canonical path is dropped.
@@ -372,6 +408,7 @@ fn headless_fail(command: &'static str, kind: Kind) -> Kind {
             tree_version: None,
             kind: kind.name(),
             exit_code: kind.code(),
+            reason: kind.reason(),
         },
     );
     kind
@@ -394,7 +431,15 @@ fn data_home() -> Result<PathBuf, Kind> {
     Ok(std::fs::canonicalize(&dir).unwrap_or(dir))
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+/// `$HOME/Library/Application Support`, canonical (M8-D1): the facade's own rule.
+#[cfg(target_os = "macos")]
+fn data_home() -> Result<PathBuf, Kind> {
+    lunepack::Platform::native()
+        .data_home_dir()
+        .map_err(|e| Kind::of(&e))
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn data_home() -> Result<PathBuf, Kind> {
     Err(Kind::Unsupported)
 }
@@ -419,7 +464,16 @@ fn initial_parent() -> cli::WaitTarget {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn initial_parent() -> cli::WaitTarget {
+    use lunepack::Process as _;
+    match lunepack_os_macos::MacProcess::new().parent() {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) | Err(_) => Err(Kind::Process),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn initial_parent() -> cli::WaitTarget {
     Err(Kind::Unsupported)
 }
@@ -448,7 +502,18 @@ fn wait_target(wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarge
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn wait_target(wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarget {
+    let Some(pid) = wait_pid else {
+        return parent;
+    };
+    match lunepack_os_macos::MacProcess::new().process_id(pid) {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) | Err(_) => Err(Kind::Process),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn wait_target(_wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarget {
     parent
 }
@@ -516,6 +581,7 @@ fn fail(command: &'static str, kind: Kind) -> Kind {
         tree_version: None,
         kind: kind.name(),
         exit_code: kind.code(),
+        reason: kind.reason(),
     });
     events.finish(SINK_DRAIN);
     kind
@@ -630,14 +696,151 @@ fn unparsed_setup_quiet(args: &[std::ffi::OsString]) -> bool {
     modes::parse_setup(args).unwrap_or(true)
 }
 
-/// Setup files are Linux and Windows only in this release (M8 takes macOS's).
-#[cfg(not(any(target_os = "linux", windows)))]
+/// The macOS installer (M8-D7, [`setup`]): `None` when this runtime is not the installer app's
+/// (the ordinary runtime), else the run's exit kind. A payload file that is malformed is
+/// `verify`; a command line other than nothing, `--silent` or `--ui-stdio` is a usage error.
+///
+/// With `--ui-stdio` the standard output carries the UI's frames and nothing else: the result
+/// goes to the standard error stream only (where the events go too).
+#[cfg(target_os = "macos")]
+fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
+    use lunepack::Process as _;
+    use setup::InstallerRun;
+
+    let process = lunepack_os_macos::MacProcess::new();
+    let exe = process.current_exe().ok()?;
+    let how = setup::parse_installer(args);
+    let ui_stdio = how == Ok(InstallerRun::UiStdio);
+    let quiet = installer_quiet(how);
+    let found = match setup::detect_installer(
+        &lunepack_fs::StdFs::new(),
+        &exe,
+        &lunepack_crypto::Sha256Hasher,
+        &lunepack_crypto::Ed25519Verifier,
+    ) {
+        setup::Detect::None => return None,
+        setup::Detect::Malformed => {
+            conclude_to(
+                stderr_events(),
+                &setup::failed(Kind::Verify, None),
+                !ui_stdio,
+            );
+            notice(quiet, false, SETUP_TITLE, Operation::Setup, Kind::Verify);
+            return Some(Kind::Verify);
+        }
+        setup::Detect::Setup(found) => found,
+    };
+    let Ok(how) = how else {
+        eprintln!("{USAGE_LINE}");
+        return Some(Kind::Usage);
+    };
+    Some(run(|ad| {
+        let fail = |kind: Kind, name: Option<&str>| {
+            conclude_to(stderr_events(), &setup::failed(kind, None), !ui_stdio);
+            // A refused root comes after the payload was verified: the notice names the app.
+            match name {
+                Some(name) => notice(quiet, false, name, Operation::Install, kind),
+                None => notice(quiet, false, SETUP_TITLE, Operation::Setup, kind),
+            }
+            kind
+        };
+        let data_home = match data_home() {
+            Ok(dir) => dir,
+            Err(kind) => return fail(kind, None),
+        };
+        // M8-D2: the live bundle goes in `~/Applications`; the data home is
+        // `<canonical HOME>/Library/Application Support` (M8-D1).
+        let Some(apps_dir) = data_home
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|home| home.join("Applications"))
+        else {
+            return fail(Kind::Fs, None);
+        };
+        // No UI is read out of the pack: the installer app carries it beside this runtime.
+        let prepared = match setup::prepare(ad, found, &data_home, None, false, None, &alive) {
+            Ok(prepared) => prepared.with_apps_dir(apps_dir),
+            Err(refused) => return fail(refused.kind, refused.name.as_deref()),
+        };
+        let (app, details) = setup::welcome(&prepared);
+        let env = |name: &str| std::env::var_os(name);
+        let ui = match how {
+            InstallerRun::Silent => UiHost::headless(Flow::Install),
+            InstallerRun::Ui => UiHost::start(
+                &ui_host::Start {
+                    process: std::sync::Arc::clone(&ad.process),
+                    fs: &*ad.fs,
+                    runtime_exe: &exe,
+                    env: &env,
+                    quiet: false,
+                },
+                Flow::Install,
+                app,
+                details,
+            ),
+            InstallerRun::UiStdio => match (process.parent(), own_streams()) {
+                (Ok(Some(parent)), Some((input, output))) => UiHost::over_parent(
+                    ui_host::Bounds::default(),
+                    std::sync::Arc::clone(&ad.process),
+                    parent,
+                    input,
+                    output,
+                    Flow::Install,
+                    app,
+                    details,
+                ),
+                // The parent is gone already, or the streams cannot be used: headless.
+                _ => UiHost::headless(Flow::Install),
+            },
+        };
+        let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
+        ui.report(&events);
+        let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui);
+        let seen = ui.outcome_acknowledged();
+        ui.close(&events);
+        conclude_to(events, &last, !ui_stdio);
+        notice(quiet, seen, prepared.name(), Operation::Install, kind);
+        kind
+    }))
+}
+
+/// Whether a macOS installer run is quiet for the notice (F14): only a run a person started may
+/// get one, which is no argument (a double-click on the installer's runtime) or the installer
+/// app's own UI (`--ui-stdio`, which a double-click on the app starts). `--silent` and a command
+/// line that does not parse are a command-line caller.
+#[cfg(target_os = "macos")]
+fn installer_quiet(how: Result<setup::InstallerRun, modes::UsageError>) -> bool {
+    !matches!(
+        how,
+        Ok(setup::InstallerRun::Ui | setup::InstallerRun::UiStdio)
+    )
+}
+
+/// This process's standard input and output as files of their own (duplicated descriptors, so
+/// no lock of the standard library's handles is held while a frame is written), for a UI that is
+/// the parent (`--ui-stdio`).
+#[cfg(target_os = "macos")]
+fn own_streams() -> Option<(
+    Box<dyn std::io::Read + Send>,
+    Box<dyn std::io::Write + Send>,
+)> {
+    use std::os::fd::AsFd as _;
+    let input = std::io::stdin().as_fd().try_clone_to_owned().ok()?;
+    let output = std::io::stdout().as_fd().try_clone_to_owned().ok()?;
+    Some((
+        Box::new(std::fs::File::from(input)),
+        Box::new(std::fs::File::from(output)),
+    ))
+}
+
+/// Setup files are Linux, Windows and macOS only.
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn setup_mode(_args: &[std::ffi::OsString]) -> Option<Kind> {
     None
 }
 
 /// Runs `body` on the native adapters.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn run(body: impl FnOnce(&modes::Adapters) -> Kind) -> Kind {
     use std::sync::Arc;
 
@@ -692,8 +895,20 @@ fn native_adapters() -> (
     )
 }
 
-/// Processes and the desktop integration have no adapter here yet (M8).
-#[cfg(not(any(target_os = "linux", windows)))]
+/// The process and desktop-integration adapters of this OS (per-user scope, M8).
+#[cfg(target_os = "macos")]
+fn native_adapters() -> (
+    std::sync::Arc<dyn lunepack::Process>,
+    std::sync::Arc<dyn lunepack::OsIntegration>,
+) {
+    (
+        std::sync::Arc::new(lunepack_os_macos::MacProcess::new()),
+        std::sync::Arc::new(lunepack_os_macos::MacIntegration::from_process_env()),
+    )
+}
+
+/// Processes and the desktop integration have no adapter on this OS.
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn run(_body: impl FnOnce(&modes::Adapters) -> Kind) -> Kind {
     fail("runtime", Kind::Unsupported)
 }
@@ -725,6 +940,24 @@ mod tests {
             notice_text("My App", Operation::Uninstall, Kind::InUse),
             "My App could not be uninstalled (code 25)."
         );
+    }
+
+    /// A copy in a place lunepack does not update is told to move (M8-D4), with no code or reason.
+    #[test]
+    fn an_unsupported_location_tells_the_user_to_move_the_app() {
+        for operation in [Operation::Install, Operation::Uninstall, Operation::Setup] {
+            for place in [
+                modes::Place::Translocated,
+                modes::Place::ReadOnly,
+                modes::Place::NotOwned,
+            ] {
+                assert_eq!(
+                    notice_text("My App", operation, Kind::UnsupportedLocation(place)),
+                    "Move My App to your Applications folder and open it from there."
+                );
+                assert!(!notice_is_info(operation, Kind::UnsupportedLocation(place)));
+            }
+        }
     }
 
     /// A malformed setup file is checked before its arguments: only an empty command line (a
@@ -763,6 +996,31 @@ mod tests {
             Operation::Uninstall,
             Kind::AlreadyInstalled
         ));
+    }
+
+    /// macOS (F14): the installer's notice only for a double-click (no argument) or its own UI.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_installer_shows_a_notice_only_for_a_double_click_or_its_own_ui() {
+        let os = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(!installer_quiet(setup::parse_installer(&os(&[]))));
+        assert!(!installer_quiet(setup::parse_installer(&os(&[
+            "--ui-stdio"
+        ]))));
+        for args in [
+            &["--silent"][..],
+            &["--no-such-option"],
+            &["/S"],
+            &["install"],
+            &["--ui-stdio", "--silent"],
+            &["--ui-stdio", "--ui-stdio"],
+            &["--ui-stdio=1"],
+        ] {
+            assert!(
+                installer_quiet(setup::parse_installer(&os(args))),
+                "{args:?}"
+            );
+        }
     }
 
     #[cfg(windows)]

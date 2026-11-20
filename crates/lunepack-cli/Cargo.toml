@@ -27,6 +27,8 @@ serde = { workspace = true }
 # The publisher state file (M3-R2-D1).
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+# The `.zip` writer's deflate and CRC-32 (M8-D9); pure-Rust backend only.
+flate2 = { workspace = true }
 # Stamps the Windows stub and setup runtime's icon and version info (M7-D14); pure Rust, used only
 # here (boundary check CONFINED) and pinned exactly (M7-D22, D17).
 editpe = { version = "=0.2.4", default-features = false, features = ["std"] }

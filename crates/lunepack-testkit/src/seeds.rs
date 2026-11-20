@@ -362,6 +362,27 @@ fn manifest_seeds(fx: &ChainFixture<'_>, out: &mut Out) {
         fx.manifest_document(FUZZ_VERSION, FUZZ_TARGET, &collision)
             .to_payload(),
     );
+    // Framework links through a link (M8-D20). The harness checks the manifest against the
+    // feed's target, `FUZZ_TARGET` (Linux, where the link rules are the macOS ones), so the seed
+    // is written for that target and not for a `macos-*` one.
+    let mut framework = PackBuilder::new();
+    framework
+        .file(
+            fx.hasher,
+            "Foo.framework/Versions/A/Foo",
+            b"framework binary",
+            CodecId::Stored,
+        )
+        .dir("Foo.framework/Versions/A/Resources")
+        .symlink("Foo.framework/Versions/Current", "A")
+        .symlink("Foo.framework/Foo", "Versions/Current/Foo")
+        .symlink("Foo.framework/Resources", "Versions/Current/Resources");
+    out.ok(
+        "manifest",
+        "framework-links",
+        fx.manifest_document(FUZZ_VERSION, FUZZ_TARGET, &framework)
+            .to_payload(),
+    );
     let mut escaping = PackBuilder::new();
     escaping.symlink("lib/x", "../../etc/passwd");
     out.bad(
@@ -405,7 +426,35 @@ fn tree_seeds(out: &mut Out) {
     out.bad("tree", "case-collision", "f A\nf a\n");
     out.bad("tree", "entry-under-a-file", "f a\nf a/b\n");
     out.bad("tree", "link-escapes", "l x>../../y\n");
-    out.bad("tree", "link-through-link", "d w\nl y>w\nl x>y/z\n");
+    // Links through links (M8-D20): a hop is followed, must end on a directory when not last,
+    // and at most `MAX_LINK_HOPS` are followed per link.
+    out.ok(
+        "tree",
+        "link-through-a-link-to-a-dir",
+        "d w\nl y>w\nl x>y/z\n",
+    );
+    out.ok(
+        "tree",
+        "framework-links",
+        "d Versions/A\nf Versions/A/Foo\nl Versions/Current>A\nl Foo>Versions/Current/Foo\n\
+         l Resources>Versions/Current/Resources\nd Versions/A/Resources\n",
+    );
+    out.ok("tree", "link-hops-at-the-bound", hop_chain(8));
+    out.bad("tree", "link-hop-escapes", "d a\nl a/s>..\nl x>a/s/../y\n");
+    out.bad("tree", "link-cycle", "l a>b/x\nl b>a/y\n");
+    out.bad("tree", "link-self", "l a>a/x\n");
+    out.bad("tree", "link-hops-overflow", hop_chain(9));
+    out.bad("tree", "link-hop-through-a-file", "f w\nl y>w\nl x>y/z\n");
+    out.bad("tree", "link-hop-dangling", "l y>nowhere\nl x>y/z\n");
+}
+
+/// `d d`, `l c0>d`, `l c1>c0` ... `l c{k}>c{k-1}`: the link `c{k}` follows `k` others.
+fn hop_chain(k: usize) -> String {
+    let mut text = String::from("d d\nl c0>d\n");
+    for i in 1..=k {
+        text.push_str(&format!("l c{i}>c{}\n", i - 1));
+    }
+    text
 }
 
 fn rules_seeds(out: &mut Out) {

@@ -27,8 +27,28 @@ use crate::version::Version;
 /// The config's file name, at the version tree's root on Linux and Windows (FORMAT.md 13.1). Fixed
 /// for format 1, so any version's runtime finds another version's config at the same place.
 pub const UPDATE_CONFIG_FILE: &str = "lunepack-update.json";
-/// The config's path inside a macOS bundle tree (assumed until M8).
+/// The config's path inside a macOS bundle tree (M8-D1; [`crate::LayoutScheme::MACOS`]).
 pub const UPDATE_CONFIG_PATH_MACOS: &str = "Contents/Resources/lunepack-update.json";
+/// A `macos-*` tree's `Info.plist`, which the packager requires of the input (M8, step 7).
+pub const MACOS_INFO_PLIST: &str = "Contents/Info.plist";
+/// The directory a `macos-*` entry sits in: `install.entry` is `Contents/MacOS/<file>`, so the
+/// runtime lands beside it (M8-D6).
+pub const MACOS_ENTRY_DIR: &str = "Contents/MacOS";
+/// The update window's helper app inside a `macos-*` tree (M8-D6).
+pub const MACOS_HELPER_APP: &str = "Contents/Helpers/lunepack-update.app";
+/// The helper app's `Info.plist`.
+pub const MACOS_HELPER_INFO_PLIST: &str =
+    "Contents/Helpers/lunepack-update.app/Contents/Info.plist";
+/// The helper app's executable: the release's UI binary ([`UI_FILE`]).
+pub const MACOS_HELPER_UI: &str = "Contents/Helpers/lunepack-update.app/Contents/MacOS/lunepack-ui";
+/// The helper app's icon, present only when the packager was given a `[macos] icon`; the
+/// `Info.plist`'s `CFBundleIconFile` names it without the extension.
+pub const MACOS_HELPER_ICON: &str =
+    "Contents/Helpers/lunepack-update.app/Contents/Resources/lunepack-update.icns";
+/// The installer app's payload file (M8-D7); never part of a release tree, so `pack` reserves it.
+pub const MACOS_INSTALLER_PAYLOAD: &str = "Contents/Resources/lunepack-setup.payload";
+/// A code-signed `macos-*` input holds this directory (M8-D8).
+pub const MACOS_CODE_SIGNATURE_DIR: &str = "Contents/_CodeSignature";
 /// The runtime's file name on Linux and macOS targets, in the directory of `install.entry` (C4).
 pub const RUNTIME_FILE: &str = "lunepack-runtime";
 /// The runtime's file name on Windows targets.
@@ -137,11 +157,10 @@ const FILE_TYPE_KEYS: [&str; 3] = ["ext", "mime", "name"];
 
 /// The config's path relative to a version tree of `target`.
 pub fn config_path(target: Target) -> &'static str {
-    match target {
-        Target::MacosX86_64 | Target::MacosAarch64 | Target::MacosUniversal => {
-            UPDATE_CONFIG_PATH_MACOS
-        }
-        _ => UPDATE_CONFIG_FILE,
+    if target.is_macos() {
+        UPDATE_CONFIG_PATH_MACOS
+    } else {
+        UPDATE_CONFIG_FILE
     }
 }
 

@@ -5,8 +5,9 @@
 //!
 //! The adapters the lifecycle calls use are a [`Platform`]: the native one wires the default
 //! filesystem, crypto and randomness everywhere, the Linux process and desktop integration
-//! adapters on Linux and the Windows ones (per-user, M7) on Windows. On other platforms the
-//! process and integration calls are [`Error::Unsupported`] until their adapters exist.
+//! adapters on Linux, the Windows ones (per-user, M7) on Windows and the macOS ones (per-user,
+//! M8) on macOS. On other platforms the process and integration calls are
+//! [`Error::Unsupported`] until their adapters exist.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -17,9 +18,10 @@ use std::time::{Duration, Instant};
 use lunepack_core::state::UserScope;
 use lunepack_core::update_config::{MAX_UPDATE_CONFIG_BYTES, runtime_file};
 use lunepack_core::{
-    AppId, Discovery, FeedKind, FileKind, Fs, FsErrorKind, Hasher, InstallMeta, LayoutScheme,
-    LockGuard, OsIntegration, Process, RelPath, Rng, UPDATE_CONFIG_FILE, UpdateConfig,
-    UpdateConfigError, UserLayout, Verifier, Version, discover, resolve_root, tree_candidates,
+    AppId, BundleDiscovery, BundleProbe, Discovery, FeedKind, FileKind, Fs, FsErrorKind, Hasher,
+    InstallMeta, LayoutError, LayoutScheme, LockGuard, OsIntegration, Process, Projection, RelPath,
+    Rng, UPDATE_CONFIG_FILE, UpdateConfig, UpdateConfigError, UserLayout, Verifier, Version,
+    discover, discover_bundle, resolve_root, tree_candidates,
 };
 
 use crate::{Error, Layout, UpdaterBuilder, check_config_feed};
@@ -48,6 +50,7 @@ pub struct Platform {
     pub(crate) rng: Arc<dyn Rng>,
     pub(crate) health_token: Option<OsString>,
     pub(crate) data_home: Option<PathBuf>,
+    pub(crate) home: Option<PathBuf>,
     pub(crate) layout_scheme: LayoutScheme,
     pub(crate) busy_wait: Duration,
 }
@@ -80,6 +83,7 @@ impl Platform {
             rng: Arc::new(lunepack_crypto::OsRng),
             health_token: std::env::var_os(HEALTH_TOKEN_VAR),
             data_home: None,
+            home: None,
             layout_scheme: native_layout_scheme(),
             busy_wait: DEFAULT_BUSY_WAIT,
         }
@@ -138,6 +142,14 @@ impl Platform {
         self
     }
 
+    /// The user's home directory (canonical), instead of `HOME`'s: macOS discovery needs it to
+    /// tell a bundle in the Trash from one that was moved (M8-D17). Used only under
+    /// [`LayoutScheme::MACOS`].
+    pub fn with_home(mut self, home: PathBuf) -> Platform {
+        self.home = Some(home);
+        self
+    }
+
     /// The per-user layout scheme (M7-D2): which names an install root has and how it is found.
     /// Independent of the data home, so a test can use [`LayoutScheme::WINDOWS`] in a temporary
     /// data home on any OS.
@@ -157,20 +169,55 @@ impl Platform {
         self
     }
 
-    /// The per-user data home: the override, else the native one (Linux, Windows).
+    /// The per-user data home an install root lives in: the override, else the native one
+    /// (`XDG_DATA_HOME` or `$HOME/.local/share` on Linux, `$HOME/Library/Application Support`
+    /// on macOS, the user's program files folder on Windows).
+    pub fn data_home_dir(&self) -> Result<PathBuf, Error> {
+        self.data_home()
+    }
+
+    /// The per-user data home: the override, else the native one (Linux, macOS, Windows).
     fn data_home(&self) -> Result<PathBuf, Error> {
         if let Some(home) = &self.data_home {
             return Ok(home.clone());
         }
         native_data_home()
     }
+
+    /// The user's canonical home directory: the override, else `HOME`'s (M8-D1).
+    fn home(&self) -> Result<PathBuf, Error> {
+        if let Some(home) = &self.home {
+            return Ok(home.clone());
+        }
+        canonical_home(std::env::var_os("HOME").as_deref())
+    }
 }
 
-/// The native layout scheme: [`LayoutScheme::WINDOWS`] on Windows (M7-D2), [`LayoutScheme::XDG`]
-/// everywhere else.
+/// `HOME` as the macOS layout uses it (M8-D1 amended): set, non-empty, absolute, UTF-8 and an
+/// existing directory, canonicalised once (a `HOME` under `/var` is `/private/var`), else the
+/// home error of the desktop integration.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn canonical_home(raw: Option<&std::ffi::OsStr>) -> Result<PathBuf, Error> {
+    let home = || Error::from(lunepack_core::IntegrationError::Home);
+    let raw = raw
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|s| !s.is_empty() && Path::new(s).is_absolute())
+        .ok_or_else(home)?;
+    let canonical = std::fs::canonicalize(raw).map_err(|_| home())?;
+    if canonical.is_dir() {
+        Ok(canonical)
+    } else {
+        Err(home())
+    }
+}
+
+/// The native layout scheme: [`LayoutScheme::WINDOWS`] on Windows (M7-D2), [`LayoutScheme::MACOS`]
+/// on macOS (M8-D1), [`LayoutScheme::XDG`] everywhere else.
 fn native_layout_scheme() -> LayoutScheme {
     if cfg!(windows) {
         LayoutScheme::WINDOWS
+    } else if cfg!(target_os = "macos") {
+        LayoutScheme::MACOS
     } else {
         LayoutScheme::XDG
     }
@@ -209,23 +256,40 @@ fn native_data_home() -> Result<PathBuf, Error> {
         .map_err(|_| Error::Config("the per-user program files folder is not available"))
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn default_process() -> Arc<dyn Process> {
+    Arc::new(lunepack_os_macos::MacProcess::new())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn default_integration() -> Arc<dyn OsIntegration> {
+    Arc::new(lunepack_os_macos::MacIntegration::from_process_env())
+}
+
+/// `$HOME/Library/Application Support`, the parent of an install root (M8-D1).
+#[cfg(target_os = "macos")]
+fn native_data_home() -> Result<PathBuf, Error> {
+    let home = canonical_home(std::env::var_os("HOME").as_deref())?;
+    Ok(home.join("Library").join("Application Support"))
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn default_process() -> Arc<dyn Process> {
     Arc::new(unsupported::Unsupported)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 pub(crate) fn default_integration() -> Arc<dyn OsIntegration> {
     Arc::new(unsupported::Unsupported)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn native_data_home() -> Result<PathBuf, Error> {
     Err(Error::Unsupported)
 }
 
 /// The stand-in adapters of a platform without its own yet: every call is unsupported.
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 mod unsupported {
     use core::time::Duration;
     use std::path::{Path, PathBuf};
@@ -284,6 +348,67 @@ mod unsupported {
             Err(IntegrationError::Unsupported)
         }
     }
+}
+
+/// The update config's path inside the tree `tree`, as `scheme` places it.
+pub(crate) fn scheme_config_path(tree: &Path, scheme: LayoutScheme) -> PathBuf {
+    let mut out = tree.to_path_buf();
+    for name in scheme.config.split('/') {
+        out.push(name);
+    }
+    out
+}
+
+/// Where the running bundle `tree` stands under [`LayoutScheme::MACOS`] (M8-D1, M8-D4, M8-D9,
+/// M8-D17): the install's layout, when it is the install's, and how it was found
+/// ([`Found`]). `None` with [`Found::Adoptable`] for a bundle the update check may adopt, and
+/// with [`Found::Plain`] for any other copy. A refused place is [`Error::UnsupportedLocation`].
+fn bundle_layout(
+    platform: &Platform,
+    exe: &Path,
+    tree: &Path,
+    k: usize,
+    config: &UpdateConfig,
+) -> Result<(Option<UserLayout>, Found), Error> {
+    let facts = platform.fs.place(tree)?;
+    let data_home = platform.data_home()?;
+    let home = platform.home()?;
+    let probe = BundleProbe {
+        exe,
+        tree,
+        k,
+        config,
+        facts: &facts,
+        data_home: &data_home,
+        home: &home,
+    };
+    let scheme = platform.layout_scheme;
+    match discover_bundle(&*platform.fs, &*platform.hasher, &probe) {
+        Ok(BundleDiscovery::Installed { root, .. }) => {
+            Ok((Some(UserLayout::from_root(root, scheme)), Found::Plain))
+        }
+        Ok(BundleDiscovery::MovedFrom { root, .. }) => {
+            Ok((Some(UserLayout::from_root(root, scheme)), Found::Moved))
+        }
+        Ok(BundleDiscovery::Adoptable { .. }) => Ok((None, Found::Adoptable)),
+        Ok(BundleDiscovery::NotInstalled) => Ok((None, Found::Plain)),
+        Err(LayoutError::NotThisTree) => Err(config_rule(
+            "install.entry",
+            "the executable is not in the entry's directory",
+        )),
+        Err(e) => Err(Error::from(lunepack_core::Error::Layout(e))),
+    }
+}
+
+/// How a macOS bundle was found beside its layout (M8-D9, M8-D17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Found {
+    /// Where its layout says (or a copy that is not the install's).
+    Plain,
+    /// The install's bundle, moved on its volume.
+    Moved,
+    /// Not installed, and adoptable by the update check.
+    Adoptable,
 }
 
 /// An update-config rule broken by where the file is, not by its bytes.
@@ -362,6 +487,11 @@ pub struct Installation {
     tree: PathBuf,
     config: UpdateConfig,
     layout: Option<UserLayout>,
+    /// The running bundle is the install's, found where it was moved to (M8-D17): the install
+    /// follows it under the lock ([`Installation::follow_move`], and `startup_for`).
+    moved: bool,
+    /// The running bundle is not installed and the update check may adopt it (M8-D9).
+    adoptable: bool,
 }
 
 impl fmt::Debug for Installation {
@@ -371,6 +501,7 @@ impl fmt::Debug for Installation {
             .field("app_id", &self.config.app_id.as_str())
             .field("version", &self.config.version.to_string())
             .field("installed", &self.layout.is_some())
+            .field("adoptable", &self.adoptable)
             .finish_non_exhaustive()
     }
 }
@@ -404,6 +535,15 @@ impl Installation {
     /// - An installed tree (`R/versions/<its version>` under [`LayoutScheme::XDG`],
     ///   `R\app\<its version>` under [`LayoutScheme::WINDOWS`], whatever `R` is named) also has
     ///   its install state under `R` loaded, which must carry the config's app id.
+    /// - Under [`LayoutScheme::MACOS`] the config is at `Contents/Resources/lunepack-update.json`
+    ///   of the bundle, and the running tree's location is judged first (M8-D4): a tree
+    ///   translocated by Gatekeeper, or on a read-only volume (a mounted disk image), is
+    ///   [`Error::UnsupportedLocation`], whatever else is true of it. The tree is then the
+    ///   install's when `R/bundle` names it or it is an old instance in `R/versions`; a bundle
+    ///   moved on its volume is the install's too ([`Installation::moved`], M8-D17). A bundle
+    ///   directly in `~/Applications` or `/Applications` while the app has no live install for
+    ///   the user is not installed but adoptable ([`Installation::adoptable`], M8-D9); any other
+    ///   copy is not installed.
     pub fn from_exe_with(exe: &Path, platform: Platform) -> Result<Installation, Error> {
         // The native filesystem refuses symlinked components: resolve the exe (a launch through
         // `R/current` or a command link lands in its real tree).
@@ -413,19 +553,27 @@ impl Installation {
             exe.to_path_buf()
         };
         for (tree, k) in tree_candidates(&exe) {
-            let Some(config) = read_config(&*platform.fs, &tree.join(UPDATE_CONFIG_FILE))? else {
+            let scheme = platform.layout_scheme;
+            let config_path = scheme_config_path(&tree, scheme);
+            let Some(config) = read_config(&*platform.fs, &config_path)? else {
                 continue;
             };
-            let scheme = platform.layout_scheme;
-            let layout = match discover(&exe, &tree, k, &config, scheme) {
-                Ok(Discovery::Installed { root, .. }) => Some(UserLayout::from_root(root, scheme)),
-                Ok(Discovery::NotInstalled) => None,
-                Err(_) => {
-                    return Err(config_rule(
-                        "install.entry",
-                        "the executable is not in the entry's directory",
-                    ));
-                }
+            let (layout, found) = if scheme.projection == Projection::Bundle {
+                bundle_layout(&platform, &exe, &tree, k, &config)?
+            } else {
+                let layout = match discover(&exe, &tree, k, &config, scheme) {
+                    Ok(Discovery::Installed { root, .. }) => {
+                        Some(UserLayout::from_root(root, scheme))
+                    }
+                    Ok(Discovery::NotInstalled) => None,
+                    Err(_) => {
+                        return Err(config_rule(
+                            "install.entry",
+                            "the executable is not in the entry's directory",
+                        ));
+                    }
+                };
+                (layout, Found::Plain)
             };
             if let Some(layout) = &layout {
                 let store = UserScope {
@@ -439,6 +587,8 @@ impl Installation {
                 tree,
                 config,
                 layout,
+                moved: found == Found::Moved,
+                adoptable: found == Found::Adoptable,
             });
         }
         Err(Error::NoUpdateConfig)
@@ -466,6 +616,8 @@ impl Installation {
             tree: layout.version_dir(version),
             config,
             layout: Some(layout.clone()),
+            moved: false,
+            adoptable: false,
         })
     }
 
@@ -487,6 +639,55 @@ impl Installation {
     /// The install's layout, when the tree is installed.
     pub fn layout(&self) -> Option<&UserLayout> {
         self.layout.as_ref()
+    }
+
+    /// Whether this macOS bundle, not installed, may be adopted by the update check (M8-D9): it
+    /// lies directly in `~/Applications` or `/Applications`, and the app has no live install for
+    /// the user (no record, one with no current version, or an orphaned one).
+    /// [`Updater::check`](crate::Updater::check) on its updater proves the bundle equal to its
+    /// signed release and makes it the install; [`Installation::is_installed`] stays `false`
+    /// for this value, and a new one is found installed once that check has run.
+    pub fn adoptable(&self) -> bool {
+        self.adoptable
+    }
+
+    /// Whether this macOS bundle is the install's, found where the user moved it (M8-D17): the
+    /// install is followed to its new place by [`follow_move`](crate::follow_move), which
+    /// [`startup_for`](crate::startup_for) does under the lock, and not before.
+    pub fn moved(&self) -> bool {
+        self.moved
+    }
+
+    /// The tree the install's current version runs from: under [`LayoutScheme::MACOS`] the live
+    /// bundle `R/bundle` names (the running tree itself when the install was found moved),
+    /// otherwise `None` (the current tree is `<versions>/<current>`, M4-D4).
+    pub(crate) fn live_tree(&self) -> Result<Option<PathBuf>, Error> {
+        let Some(layout) = &self.layout else {
+            return Ok(None);
+        };
+        if layout.scheme().projection != Projection::Bundle {
+            return Ok(None);
+        }
+        if self.moved {
+            return Ok(Some(self.tree.clone()));
+        }
+        layout
+            .current_tree_with(&*self.platform.fs)
+            .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))
+    }
+
+    /// The path of the entry that starts `version`'s tree once it is current: under the bundle
+    /// layout the live bundle's, since the version's own tree is where it was staged only until
+    /// the swap puts it in the bundle; elsewhere `tree_entry`.
+    pub(crate) fn live_entry(
+        &self,
+        tree_entry: PathBuf,
+        entry: &RelPath,
+    ) -> Result<PathBuf, Error> {
+        Ok(match self.live_tree()? {
+            Some(bundle) => join_rel(&bundle, entry),
+            None => tree_entry,
+        })
     }
 
     /// The version tree's root directory.
@@ -546,6 +747,32 @@ impl Installation {
         Ok(UserLayout::from_root(root.into_path(), p.layout_scheme))
     }
 
+    /// The [`Layout`] the updater of this install runs on: the installed tree's, whose live tree
+    /// under the bundle layout is the bundle (M8-D1; the unchanged-file scan reads it), else the
+    /// layout under [`Installation::install_root`] with this tree as the bootstrap's current tree.
+    pub(crate) fn updater_layout(&self) -> Result<Layout, Error> {
+        Ok(match &self.layout {
+            Some(layout) => {
+                let mut user = Layout::user(layout);
+                if let (Layout::User { current_tree, .. }, Some(live)) =
+                    (&mut user, self.live_tree()?)
+                {
+                    *current_tree = Some(live);
+                }
+                user
+            }
+            None => {
+                let user = self.install_layout()?;
+                Layout::User {
+                    state_dir: user.state_dir(),
+                    cache_dir: user.cache_dir(),
+                    versions_dir: user.versions_dir(),
+                    current_tree: Some(self.tree.clone()),
+                }
+            }
+        })
+    }
+
     /// An [`UpdaterBuilder`] for this install, from the config alone: its trusted root, feed and
     /// channel (a later [`UpdaterBuilder::channel`] may follow another channel), and the
     /// platform's filesystem, crypto, randomness and integration.
@@ -565,18 +792,7 @@ impl Installation {
             self.config
                 .root
                 .to_trusted(self.config.app_id.clone(), &*p.hasher, &*p.verifier)?;
-        let layout = match &self.layout {
-            Some(layout) => Layout::user(layout),
-            None => {
-                let user = self.install_layout()?;
-                Layout::User {
-                    state_dir: user.state_dir(),
-                    cache_dir: user.cache_dir(),
-                    versions_dir: user.versions_dir(),
-                    current_tree: Some(self.tree.clone()),
-                }
-            }
-        };
+        let layout = self.updater_layout()?;
         let mut builder = UpdaterBuilder::new(
             self.config.app_id.clone(),
             root,
@@ -589,6 +805,14 @@ impl Installation {
         .verifier(Arc::clone(&p.verifier))
         .rng(Arc::clone(&p.rng))
         .integration(Arc::clone(&p.integration));
+        // macOS (M8-D2): a first install puts the live bundle in the user's `~/Applications`.
+        if p.layout_scheme.projection == Projection::Bundle {
+            builder = builder.bundle_layout(p.home()?.join("Applications"));
+        }
+        // M8-D9: the check adopts the running bundle, which is the bootstrap's current tree.
+        if self.adoptable {
+            builder = builder.adopt_bundle(self.tree.clone());
+        }
         if kind == FeedKind::HttpLoopback {
             let options = lunepack_http::UreqOptions {
                 direct: true,
@@ -629,6 +853,8 @@ mod tests {
                 tree: PathBuf::from("/boot/tree"),
                 config,
                 layout: None,
+                moved: false,
+                adoptable: false,
             };
             let got = inst.updater_builder();
             assert!(
@@ -748,5 +974,129 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_is_canonicalised_once() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let real = std::fs::canonicalize(tmp.path()).expect("canonical");
+        std::fs::create_dir(real.join("home")).expect("home");
+        std::os::unix::fs::symlink(real.join("home"), real.join("alias")).expect("symlink");
+        let got = canonical_home(Some(real.join("alias").as_os_str())).expect("home");
+        assert_eq!(got, real.join("home"));
+        // Unset, empty, relative, missing and not-a-directory homes are the home error.
+        std::fs::write(real.join("file"), b"x").expect("file");
+        for bad in [
+            None,
+            Some(std::ffi::OsString::new()),
+            Some(std::ffi::OsString::from("relative")),
+            Some(real.join("missing").into_os_string()),
+            Some(real.join("file").into_os_string()),
+        ] {
+            let got = canonical_home(bad.as_deref());
+            assert!(
+                matches!(
+                    got,
+                    Err(Error::Integration(lunepack_core::IntegrationError::Home))
+                ),
+                "{got:?}"
+            );
+        }
+    }
+
+    /// The updater of a bundle install reads the live bundle `R/bundle` names, whichever tree runs;
+    /// a bundle found moved is its own live tree; a bootstrap's is itself.
+    #[test]
+    fn the_updater_of_a_bundle_install_reads_the_live_bundle() {
+        use lunepack_core::{Target, set_bundle_pointer, write_bundle_identity};
+        let fs = Arc::new(MemFs::new());
+        let home = lunepack_testkit::abs_path("/Users/u");
+        let data_home = home.join("Library").join("Application Support");
+        let mut config = sample_update_config();
+        config.target = Target::MacosAarch64;
+        config.install.entry = RelPath::parse("Contents/MacOS/hello").unwrap();
+        let layout =
+            UserLayout::from_root(data_home.join(config.app_id.as_str()), LayoutScheme::MACOS);
+        let bundle = home.join("Applications").join("Hello.app");
+        let old = layout.version_dir(&config.version);
+        for tree in [&bundle, &old] {
+            let exe = put_bundle(&fs, tree, &config);
+            assert!(exe.ends_with("Contents/MacOS/hello"));
+        }
+        fs.create_dir_all(&layout.state_dir()).unwrap();
+        set_bundle_pointer(&*fs, &layout, &bundle).unwrap();
+        write_bundle_identity(&*fs, &layout, &bundle).unwrap();
+        let record = lunepack_core::InstallState::new(
+            1,
+            config.app_id.clone(),
+            lunepack_core::Scope::User,
+            [3; 16],
+            config.target,
+        )
+        .install(config.version.clone(), 10, config.target, [3; 16]);
+        let store = UserScope {
+            dir: layout.state_dir(),
+            app_id: config.app_id.clone(),
+        };
+        let loaded = store.load(&*fs, &FakeHasher).unwrap();
+        store.commit(&*fs, &loaded, &record, &FakeHasher).unwrap();
+        let platform = || {
+            Platform::native()
+                .with_fs(Arc::clone(&fs) as Arc<dyn Fs>)
+                .with_hasher(Arc::new(FakeHasher))
+                .with_verifier(Arc::new(FakeVerifier))
+                .with_data_home(data_home.clone())
+                .with_home(home.clone())
+                .with_layout_scheme(LayoutScheme::MACOS)
+        };
+        let current_tree = |layout: Layout| match layout {
+            Layout::User { current_tree, .. } => current_tree,
+            other => panic!("not a user layout: {other:?}"),
+        };
+        // The bundle itself and an old instance both name the bundle.
+        for exe in [
+            bundle.join("Contents/MacOS/hello"),
+            old.join("Contents/MacOS/hello"),
+        ] {
+            let inst = Installation::from_exe_with(&exe, platform()).unwrap();
+            assert!(inst.is_installed());
+            assert_eq!(
+                current_tree(inst.updater_layout().unwrap()),
+                Some(bundle.clone())
+            );
+        }
+        // A copy that is not the install's is its own bootstrap tree.
+        let stray = home.join("Downloads").join("Hello.app");
+        put_bundle(&fs, &stray, &config);
+        let inst =
+            Installation::from_exe_with(&stray.join("Contents/MacOS/hello"), platform()).unwrap();
+        assert!(!inst.is_installed());
+        assert_eq!(current_tree(inst.updater_layout().unwrap()), Some(stray));
+        // The bundle moved: the moved bundle is the live tree.
+        let moved = home.join("Documents").join("Hello.app");
+        fs.create_dir_all(moved.parent().unwrap()).unwrap();
+        fs.rename(&bundle, &moved).unwrap();
+        let inst =
+            Installation::from_exe_with(&moved.join("Contents/MacOS/hello"), platform()).unwrap();
+        assert!(inst.moved());
+        assert_eq!(current_tree(inst.updater_layout().unwrap()), Some(moved));
+    }
+
+    /// A bundle tree at `tree` (the config and the entry); returns the entry's path.
+    fn put_bundle(fs: &MemFs, tree: &Path, config: &UpdateConfig) -> PathBuf {
+        use std::io::Write as _;
+        let write = |path: PathBuf, bytes: &[u8]| {
+            fs.create_dir_all(path.parent().unwrap()).unwrap();
+            let mut f = fs.create_new(&path).unwrap();
+            f.write_all(bytes).unwrap();
+            f.sync().unwrap();
+            path
+        };
+        write(
+            tree.join("Contents/Resources").join(UPDATE_CONFIG_FILE),
+            &config.to_bytes().unwrap(),
+        );
+        write(tree.join("Contents/MacOS/hello"), b"app")
     }
 }

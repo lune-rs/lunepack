@@ -15,7 +15,8 @@ use lunepack_core::{
     AppId, CancelToken, Channel, ClockReading, Codec, CodecId, DecodeReport, DirEntryInfo, Error,
     FileKind, FileWrite, FrameView, Fs, FsError, FsErrorKind, LockGuard, Meta, PayloadKind, Phase,
     Progress, ReadAt, RollbackFloor, Source, SourceFor, StageEnv, StageError, StageInput, Target,
-    VerifiedEntry, VerifiedManifest, decoder_memory, scan, stage, verify_feed, verify_manifest,
+    TreeDifference, VerifiedEntry, VerifiedManifest, decoder_memory, scan, stage, verify_feed,
+    verify_manifest, verify_tree,
 };
 use lunepack_testkit::{
     ChainFixture, FakeClock, FakeCodec, FakeHasher, Fault, MemFs, PackBuilder, RecoverMode,
@@ -967,6 +968,454 @@ fn scan_results_feed_stage_as_unchanged_sources() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// verify_tree (M8-D9): a tree on disk proved equal to its manifest, reading only.
+
+/// The reads a `verify_tree` makes, by kind and path; every call goes to `inner`.
+struct Reads<'a> {
+    inner: &'a dyn Fs,
+    log: Mutex<Vec<(&'static str, PathBuf)>>,
+}
+
+impl<'a> Reads<'a> {
+    fn new(inner: &'a dyn Fs) -> Self {
+        Reads {
+            inner,
+            log: Mutex::new(Vec::new()),
+        }
+    }
+    fn note(&self, what: &'static str, path: &Path) {
+        self.log.lock().unwrap().push((what, path.to_path_buf()));
+    }
+    fn log(&self) -> Vec<(&'static str, PathBuf)> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+/// A reader that records the furthest byte read.
+struct Far {
+    inner: Box<dyn ReadAt>,
+    end: std::sync::Arc<AtomicUsize>,
+}
+
+impl ReadAt for Far {
+    fn size(&self) -> Result<u64, FsError> {
+        self.inner.size()
+    }
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.end
+            .fetch_max(offset as usize + buf.len(), Ordering::SeqCst);
+        self.inner.read_exact_at(offset, buf)
+    }
+}
+
+impl Fs for Reads<'_> {
+    fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>, FsError> {
+        self.note("read_capped", path);
+        self.inner.read_capped(path, max)
+    }
+    fn open_read(&self, path: &Path) -> Result<Box<dyn ReadAt>, FsError> {
+        self.note("open_read", path);
+        self.inner.open_read(path)
+    }
+    fn create_new(&self, path: &Path) -> Result<Box<dyn FileWrite>, FsError> {
+        self.note("WRITE", path);
+        self.inner.create_new(path)
+    }
+    fn open_append(&self, path: &Path) -> Result<Box<dyn FileWrite>, FsError> {
+        self.note("WRITE", path);
+        self.inner.open_append(path)
+    }
+    fn truncate(&self, path: &Path, len: u64) -> Result<(), FsError> {
+        self.note("WRITE", path);
+        self.inner.truncate(path, len)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.note("WRITE", from);
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> Result<(), FsError> {
+        self.note("WRITE", path);
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all_nofollow(&self, path: &Path) -> Result<(), FsError> {
+        self.note("WRITE", path);
+        self.inner.remove_dir_all_nofollow(path)
+    }
+    fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
+        self.note("WRITE", path);
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &Path) -> Result<Vec<DirEntryInfo>, FsError> {
+        self.note("list_dir", path);
+        self.inner.list_dir(path)
+    }
+    fn symlink_metadata(&self, path: &Path) -> Result<Option<Meta>, FsError> {
+        self.note("lstat", path);
+        self.inner.symlink_metadata(path)
+    }
+    fn sync_dir(&self, path: &Path) -> Result<(), FsError> {
+        self.note("WRITE", path);
+        self.inner.sync_dir(path)
+    }
+    fn copy_file(&self, from: &Path, to_new: &Path) -> Result<(), FsError> {
+        self.note("WRITE", to_new);
+        self.inner.copy_file(from, to_new)
+    }
+    fn set_exec(&self, path: &Path, exec: bool) -> Result<(), FsError> {
+        self.note("WRITE", path);
+        self.inner.set_exec(path, exec)
+    }
+    fn is_exec(&self, path: &Path) -> Result<bool, FsError> {
+        self.note("is_exec", path);
+        self.inner.is_exec(path)
+    }
+    fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
+        self.note("WRITE", link_path);
+        self.inner.symlink(target, link_path)
+    }
+    fn read_link(&self, path: &Path) -> Result<String, FsError> {
+        self.note("read_link", path);
+        self.inner.read_link(path)
+    }
+    fn replace_symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
+        self.note("WRITE", link_path);
+        self.inner.replace_symlink(target, link_path)
+    }
+    fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {
+        self.note("WRITE", path);
+        self.inner.try_lock(path)
+    }
+}
+
+/// A `MemFs` holding `pack()` staged by the real stage engine at `tree()`, and its manifest.
+fn staged_tree() -> (MemFs, VerifiedManifest) {
+    let fx = ChainFixture::fake();
+    let p = pack();
+    let m = verify(&fx, &p);
+    let mem = MemFs::new();
+    seed_cache(&mem, &m, &p);
+    simple(&mem, &m, frame_sources(&m), 1).unwrap();
+    (mem, m)
+}
+
+fn verify_on(fs: &dyn Fs, m: &VerifiedManifest) -> Result<(), lunepack_core::TreeMismatch> {
+    verify_tree(m, &tree(), fs, &H, &CancelToken::new(), &|_| {})
+}
+
+/// The difference `verify_tree` reports, and the manifest index of `path` (or `None`).
+fn differs(got: Result<(), lunepack_core::TreeMismatch>) -> (TreeDifference, Option<usize>) {
+    match got {
+        Err(lunepack_core::TreeMismatch::Differs { difference, entry }) => (difference, entry),
+        other => panic!("expected a difference, got {other:?}"),
+    }
+}
+
+fn index_of(m: &VerifiedManifest, path: &str) -> Option<usize> {
+    m.entries().iter().position(|e| e.path().as_str() == path)
+}
+
+#[test]
+fn verify_tree_passes_an_equal_tree_and_writes_nothing() {
+    let (mem, m) = staged_tree();
+    let reads = Reads::new(&mem);
+    let events = Mutex::new(Vec::new());
+    verify_tree(&m, &tree(), &reads, &H, &CancelToken::new(), &|e| {
+        events.lock().unwrap().push(e)
+    })
+    .unwrap();
+    assert!(
+        reads.log().iter().all(|(what, _)| *what != "WRITE"),
+        "{:?}",
+        reads.log()
+    );
+    let events = events.into_inner().unwrap();
+    assert!(
+        events
+            .iter()
+            .all(|e| e.phase == Phase::Adopt && e.file.is_none())
+    );
+    let total: u64 = contents().values().map(|v| v.len() as u64).sum();
+    let last = events.last().unwrap();
+    assert_eq!((last.done, last.total), (total, total));
+}
+
+#[test]
+fn verify_tree_refuses_every_kind_of_difference() {
+    type Edit = Box<dyn Fn(&MemFs)>;
+    let t = tree();
+    let cases: Vec<(&str, Edit, TreeDifference, Option<&str>)> = vec![
+        (
+            "one byte changed",
+            Box::new({
+                let t = t.clone();
+                move |fs: &MemFs| {
+                    let mut bytes = data(700, 4);
+                    bytes[350] ^= 1;
+                    put(fs, &t.join("data/blob"), &bytes);
+                }
+            }),
+            TreeDifference::Content,
+            Some("data/blob"),
+        ),
+        (
+            "a file missing",
+            Box::new({
+                let t = t.clone();
+                move |fs: &MemFs| fs.remove_file(&t.join("data/keep")).unwrap()
+            }),
+            TreeDifference::Missing,
+            Some("data/keep"),
+        ),
+        (
+            "an extra file",
+            Box::new({
+                let t = t.clone();
+                move |fs: &MemFs| put(fs, &t.join("share/extra"), b"x")
+            }),
+            TreeDifference::Extra,
+            None,
+        ),
+        (
+            "an extra empty directory",
+            Box::new({
+                let t = t.clone();
+                move |fs: &MemFs| fs.create_dir_all(&t.join("data/more")).unwrap()
+            }),
+            TreeDifference::Extra,
+            None,
+        ),
+        (
+            "an exec bit differs",
+            Box::new({
+                let t = t.clone();
+                move |fs: &MemFs| fs.set_exec(&t.join("data/blob"), true).unwrap()
+            }),
+            TreeDifference::Exec,
+            Some("data/blob"),
+        ),
+        (
+            "an exec bit is missing",
+            Box::new({
+                let t = t.clone();
+                move |fs: &MemFs| fs.set_exec(&t.join("bin/app"), false).unwrap()
+            }),
+            TreeDifference::Exec,
+            Some("bin/app"),
+        ),
+        (
+            "a symlink target differs",
+            Box::new({
+                let t = t.clone();
+                move |fs: &MemFs| {
+                    fs.remove_file(&t.join("lib/x.so")).unwrap();
+                    fs.symlink("x.so.2", &t.join("lib/x.so")).unwrap();
+                }
+            }),
+            TreeDifference::Target,
+            Some("lib/x.so"),
+        ),
+        (
+            "a symlink where a file is expected",
+            Box::new({
+                let t = t.clone();
+                move |fs: &MemFs| {
+                    fs.remove_file(&t.join("share/README")).unwrap();
+                    fs.symlink("../data/keep", &t.join("share/README")).unwrap();
+                }
+            }),
+            TreeDifference::Kind,
+            Some("share/README"),
+        ),
+        (
+            "a file where a symlink is expected",
+            Box::new({
+                let t = t.clone();
+                move |fs: &MemFs| {
+                    fs.remove_file(&t.join("lib/x.so")).unwrap();
+                    put(fs, &t.join("lib/x.so"), &data(2000, 2));
+                }
+            }),
+            TreeDifference::Kind,
+            Some("lib/x.so"),
+        ),
+        (
+            "a directory where a file is expected",
+            Box::new({
+                let t = t.clone();
+                move |fs: &MemFs| {
+                    fs.remove_file(&t.join("share/empty")).unwrap();
+                    fs.create_dir_all(&t.join("share/empty")).unwrap();
+                }
+            }),
+            TreeDifference::Kind,
+            Some("share/empty"),
+        ),
+        (
+            "an empty directory the manifest lists is missing",
+            Box::new({
+                let t = t.clone();
+                move |fs: &MemFs| fs.remove_dir_all_nofollow(&t.join("share/doc")).unwrap()
+            }),
+            TreeDifference::Missing,
+            Some("share/doc"),
+        ),
+    ];
+    for (what, edit, want, path) in cases {
+        let (mem, m) = staged_tree();
+        verify_on(&mem, &m).unwrap_or_else(|e| panic!("{what}: before the edit: {e:?}"));
+        edit(&mem);
+        let got = differs(verify_on(&mem, &m));
+        let want_entry = path.map(|p| index_of(&m, p).unwrap());
+        assert_eq!(got, (want, want_entry), "{what}");
+    }
+}
+
+#[test]
+fn verify_tree_never_follows_or_opens_a_symlink_outside_the_tree() {
+    let (mem, m) = staged_tree();
+    put(&mem, Path::new("/outside/secret"), &data(2000, 2));
+    // The listed link now points outside, at a file with the right bytes.
+    mem.remove_file(&tree().join("lib/x.so")).unwrap();
+    mem.symlink("/outside/secret", &tree().join("lib/x.so"))
+        .unwrap();
+    let reads = Reads::new(&mem);
+    let got = differs(verify_on(&reads, &m));
+    assert_eq!(got, (TreeDifference::Target, index_of(&m, "lib/x.so")));
+    // A link where a file is expected, pointing outside: refused by kind.
+    let (mem, m) = staged_tree();
+    put(&mem, Path::new("/outside/secret"), &data(500, 3));
+    mem.remove_file(&tree().join("share/README")).unwrap();
+    mem.symlink("/outside/secret", &tree().join("share/README"))
+        .unwrap();
+    let second = Reads::new(&mem);
+    let got = differs(verify_on(&second, &m));
+    assert_eq!(got, (TreeDifference::Kind, index_of(&m, "share/README")));
+    for (what, path) in reads.log().into_iter().chain(second.log()) {
+        assert!(!path.starts_with("/outside"), "{what} {path:?}");
+        if what != "lstat" && what != "list_dir" {
+            assert!(
+                !(path.ends_with("lib/x.so") && what != "read_link")
+                    && !path.ends_with("share/README"),
+                "{what} {path:?} went through a link"
+            );
+        }
+    }
+}
+
+/// Opens through `inner` and records, per path, the furthest byte read.
+struct FarReads<'a> {
+    reads: Reads<'a>,
+    end: std::sync::Arc<AtomicUsize>,
+}
+
+impl Fs for FarReads<'_> {
+    fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>, FsError> {
+        self.reads.read_capped(path, max)
+    }
+    fn open_read(&self, path: &Path) -> Result<Box<dyn ReadAt>, FsError> {
+        let inner = self.reads.open_read(path)?;
+        Ok(Box::new(Far {
+            inner,
+            end: std::sync::Arc::clone(&self.end),
+        }))
+    }
+    fn create_new(&self, path: &Path) -> Result<Box<dyn FileWrite>, FsError> {
+        self.reads.create_new(path)
+    }
+    fn open_append(&self, path: &Path) -> Result<Box<dyn FileWrite>, FsError> {
+        self.reads.open_append(path)
+    }
+    fn truncate(&self, path: &Path, len: u64) -> Result<(), FsError> {
+        self.reads.truncate(path, len)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.reads.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> Result<(), FsError> {
+        self.reads.remove_file(path)
+    }
+    fn remove_dir_all_nofollow(&self, path: &Path) -> Result<(), FsError> {
+        self.reads.remove_dir_all_nofollow(path)
+    }
+    fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
+        self.reads.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &Path) -> Result<Vec<DirEntryInfo>, FsError> {
+        self.reads.list_dir(path)
+    }
+    fn symlink_metadata(&self, path: &Path) -> Result<Option<Meta>, FsError> {
+        self.reads.symlink_metadata(path)
+    }
+    fn sync_dir(&self, path: &Path) -> Result<(), FsError> {
+        self.reads.sync_dir(path)
+    }
+    fn copy_file(&self, from: &Path, to_new: &Path) -> Result<(), FsError> {
+        self.reads.copy_file(from, to_new)
+    }
+    fn set_exec(&self, path: &Path, exec: bool) -> Result<(), FsError> {
+        self.reads.set_exec(path, exec)
+    }
+    fn is_exec(&self, path: &Path) -> Result<bool, FsError> {
+        self.reads.is_exec(path)
+    }
+    fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
+        self.reads.symlink(target, link_path)
+    }
+    fn read_link(&self, path: &Path) -> Result<String, FsError> {
+        self.reads.read_link(path)
+    }
+    fn replace_symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
+        self.reads.replace_symlink(target, link_path)
+    }
+    fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {
+        self.reads.try_lock(path)
+    }
+}
+
+#[test]
+fn verify_tree_refuses_a_longer_file_without_reading_past_its_size() {
+    let (mem, m) = staged_tree();
+    let mut longer = data(700, 4);
+    longer.extend_from_slice(&[0u8; 4096]);
+    put(&mem, &tree().join("data/blob"), &longer);
+    let far = FarReads {
+        reads: Reads::new(&mem),
+        end: std::sync::Arc::new(AtomicUsize::new(0)),
+    };
+    let got = differs(verify_on(&far, &m));
+    assert_eq!(got, (TreeDifference::Size, index_of(&m, "data/blob")));
+    // Sizes are compared before any byte is hashed: nothing was read at all.
+    assert_eq!(far.end.load(Ordering::SeqCst), 0);
+    assert!(
+        far.reads
+            .log()
+            .iter()
+            .all(|(what, _)| *what != "open_read" && *what != "read_capped")
+    );
+    // An equal tree reads each file exactly to its size, never past it.
+    let (mem, m) = staged_tree();
+    let far = FarReads {
+        reads: Reads::new(&mem),
+        end: std::sync::Arc::new(AtomicUsize::new(0)),
+    };
+    verify_on(&far, &m).unwrap();
+    let largest = contents().values().map(Vec::len).max().unwrap();
+    assert_eq!(far.end.load(Ordering::SeqCst), largest);
+}
+
+#[test]
+fn verify_tree_honours_its_cancel_token() {
+    let (mem, m) = staged_tree();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let got = verify_tree(&m, &tree(), &mem, &H, &cancel, &|_| {});
+    assert!(
+        matches!(got, Err(lunepack_core::TreeMismatch::Cancelled)),
+        "{got:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Unix: a planted symlink on a real directory.
 
 #[cfg(unix)]
@@ -1128,6 +1577,10 @@ mod real {
             let mode = if exec { 0o755 } else { 0o644 };
             fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| err(path, e))
         }
+        fn is_exec(&self, path: &Path) -> Result<bool, FsError> {
+            let m = fs::symlink_metadata(path).map_err(|e| err(path, e))?;
+            Ok(m.permissions().mode() & 0o111 != 0)
+        }
         fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
             std::os::unix::fs::symlink(target, link_path).map_err(|e| err(link_path, e))
         }
@@ -1220,5 +1673,55 @@ mod real {
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o111;
         assert_ne!(mode(&tree.join("run")), 0);
         assert_eq!(mode(&tree.join("a/b")), 0);
+    }
+
+    /// A name that differs from the manifest's only in case is never matched through a lookup
+    /// (M8-D9): on a case-insensitive volume (the default on macOS) opening `data/blob` would
+    /// reach `data/Blob`, but the walk lists `Blob`, which the manifest does not name.
+    #[test]
+    fn verify_tree_refuses_a_case_variant_name_on_a_case_insensitive_volume() {
+        let fx = ChainFixture::fake();
+        let p = pack();
+        let m = verify(&fx, &p);
+        let scratch = Scratch::new();
+        let base = &scratch.0;
+        let versions = base.join("versions");
+        let pack = base.join("pack");
+        fs::write(&pack, &p.bytes).unwrap();
+        let input = StageInput {
+            manifest: &m,
+            versions_dir: versions.clone(),
+            sources: vec![SourceFor::Pack(pack.clone()); m.entries().len()],
+        };
+        let env = StageEnv {
+            fs: &TestFs,
+            codec: &FakeCodec::new(),
+            hasher: &H,
+            workers: 1,
+            budget_bytes: 256 << 20,
+            cancel: &CancelToken::new(),
+            progress: &|_| {},
+        };
+        let tree = stage(&input, &env).unwrap().tree;
+        verify_tree(&m, &tree, &TestFs, &H, &CancelToken::new(), &|_| {}).unwrap();
+        fs::rename(tree.join("data/blob"), tree.join("data/Blob")).unwrap();
+        if fs::symlink_metadata(tree.join("data/blob")).is_err() {
+            println!(
+                "skipped: the temporary volume is case-sensitive, so no lookup could match a \
+                 case variant here"
+            );
+            return;
+        }
+        let got = verify_tree(&m, &tree, &TestFs, &H, &CancelToken::new(), &|_| {});
+        assert!(
+            matches!(
+                got,
+                Err(lunepack_core::TreeMismatch::Differs {
+                    difference: TreeDifference::Extra,
+                    entry: None
+                })
+            ),
+            "{got:?}"
+        );
     }
 }
