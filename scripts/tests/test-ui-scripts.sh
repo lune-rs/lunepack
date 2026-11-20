@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tests for scripts/ui-golden.sh (argument handling only: nothing here starts Docker or a render)
+# Tests for scripts/ui-golden.sh (argument handling only: nothing here starts Docker or a render),
+# scripts/macos-user-check.sh (its arguments and refusals only: nothing here builds or opens anything)
 # and scripts/ci/ui-size.sh (its arguments, and its fail-closed reading of the packager's output,
 # with a stub in place of the `lunepack` command).
 set -euo pipefail
@@ -12,6 +13,7 @@ esac
 here=$(cd "$here" && pwd)
 GOLDEN=$here/../ui-golden.sh
 SIZE=$here/../ci/ui-size.sh
+USER_CHECK=$here/../macos-user-check.sh
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=lib.sh
 . "$here/lib.sh"
@@ -95,5 +97,37 @@ t_check "an input size that is not the binary's fails closed" rc_is 1
 stub 'echo "totals: 1 file(s), 6 input bytes, 0 pack bytes"'
 run_cmd bash "$SIZE" "$T_TMP/ui" "$T_TMP/cli"
 t_check "an empty frame fails closed" rc_is 1
+
+# --- macos-user-check.sh --------------------------------------------------------------------
+run_cmd bash "$USER_CHECK" --bogus
+t_check "user check: an unknown option is a usage error" rc_is 2
+t_check "user check: usage is printed" out_has "usage:"
+
+run_cmd bash "$USER_CHECK" extra
+t_check "user check: a stray argument is a usage error" rc_is 2
+
+run_cmd bash "$USER_CHECK" --no-gui --real-applications
+t_check "user check: --no-gui with --real-applications is a usage error" rc_is 2
+
+run_cmd bash "$USER_CHECK" --help
+t_check "user check: --help exits 0" rc_is 0
+t_check "user check: --help prints usage" out_has "usage:"
+
+if [ "$(uname -s)" != Darwin ]; then
+  run_cmd bash "$USER_CHECK"
+  t_check "user check: a run off macOS is refused" rc_is 1
+  t_check "user check: the refusal says macOS only" out_has "macOS only"
+else
+  # No terminal on the output (run_cmd redirects it): the walk asks questions, so it refuses
+  # before it builds anything or makes its root.
+  before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'lunepack-usercheck.*' 2>/dev/null | wc -l | tr -d ' ')
+  run_cmd bash "$USER_CHECK"
+  t_check "user check: a run without a terminal is refused" rc_is 1
+  t_check "user check: the refusal names the terminal" out_has "without a terminal"
+  after=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'lunepack-usercheck.*' 2>/dev/null | wc -l | tr -d ' ')
+  t_check "user check: the refusal made no temporary root" test "$before" = "$after"
+  run_cmd bash "$USER_CHECK" --real-applications
+  t_check "user check: --real-applications without a terminal is refused too" rc_is 1
+fi
 
 t_finish
