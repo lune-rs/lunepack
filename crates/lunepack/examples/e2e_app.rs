@@ -66,11 +66,17 @@ struct Flags {
     crash: bool,
     exit_without_confirm: bool,
     slow_confirm: Option<u64>,
+    /// `hold <secs>`: stay alive that long after confirming (macOS rows read `ps` meanwhile).
+    hold: Option<u64>,
 }
 
 fn read_flags(tree: &Path) -> Flags {
     let mut flags = Flags::default();
-    let Ok(text) = std::fs::read_to_string(tree.join(FLAGS_FILE)) else {
+    // A macOS bundle keeps the marker under `Contents/Resources` (a file at the bundle's root
+    // would break a signature's seal).
+    let text = std::fs::read_to_string(tree.join(FLAGS_FILE))
+        .or_else(|_| std::fs::read_to_string(tree.join("Contents/Resources").join(FLAGS_FILE)));
+    let Ok(text) = text else {
         return flags;
     };
     for line in text.lines() {
@@ -79,6 +85,7 @@ fn read_flags(tree: &Path) -> Flags {
             (Some("crash-on-start"), None) => flags.crash = true,
             (Some("exit-without-confirm"), None) => flags.exit_without_confirm = true,
             (Some("slow-confirm"), Some(secs)) => flags.slow_confirm = secs.parse().ok(),
+            (Some("hold"), Some(secs)) => flags.hold = secs.parse().ok(),
             _ => {}
         }
     }
@@ -143,6 +150,16 @@ fn main() -> ExitCode {
         }
     }
 
+    // The macOS rows compare this with `ps` (the token must never be in an argv): it is noted
+    // only when the row asks for it, and goes to the detail file, never to the outcome file.
+    if std::env::var_os("LUNEPACK_E2E_NOTE_TOKEN").is_some() {
+        let token = std::env::var("LUNEPACK_HEALTH_TOKEN").unwrap_or_default();
+        note(DETAIL_VAR, &format!("{version} token {token}"));
+    }
+    if let Some(secs) = flags.hold {
+        out("hold");
+        std::thread::sleep(Duration::from_secs(secs));
+    }
     if let Some(secs) = arg_value(&args, "--hold") {
         out("hold");
         std::thread::sleep(Duration::from_secs(secs));
@@ -155,7 +172,8 @@ fn main() -> ExitCode {
     }
     if args.iter().any(|a| a == "--update") {
         let no_ui = args.iter().any(|a| a == "--no-ui");
-        return match update(&inst, no_ui) {
+        let background = args.iter().any(|a| a == "--background");
+        return match update(&inst, no_ui, background) {
             Ok(line) => {
                 out(&line);
                 ExitCode::SUCCESS
@@ -235,7 +253,7 @@ fn check_runs(inst: &Installation, runs: u64, out: &dyn Fn(&str)) {
 
 /// Check, download, stage and hand over. Returns the last outcome line; the earlier ones are
 /// written on the way.
-fn update(inst: &Installation, no_ui: bool) -> Result<String, &'static str> {
+fn update(inst: &Installation, no_ui: bool, background: bool) -> Result<String, &'static str> {
     let version = inst.tree_version().to_string();
     let out = |line: &str| note(OUT_VAR, &format!("{version} {line}"));
     let builder = inst.updater_builder().map_err(|_| "builder")?;
@@ -259,7 +277,7 @@ fn update(inst: &Installation, no_ui: bool) -> Result<String, &'static str> {
         } else {
             lunepack::UiChoice::Auto
         },
-        background: false,
+        background,
     })
     .map_err(|_| "apply")?;
     Ok("apply-scheduled".to_owned())

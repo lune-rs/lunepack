@@ -26,6 +26,8 @@
 mod cli_extra;
 #[cfg(target_os = "linux")]
 mod lab;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "linux")]
 mod scenarios;
 #[cfg(target_os = "linux")]
@@ -82,23 +84,68 @@ fn main() -> ExitCode {
     })
 }
 
-/// The files the environment names (only the Linux build reads them).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// The files the environment names (only the Linux and macOS builds read them).
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 struct Paths<'a> {
     runtime: &'a PathBuf,
     cli: &'a PathBuf,
     app: &'a PathBuf,
     shell: &'a PathBuf,
     fake_ui: &'a PathBuf,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     real_ui: &'a PathBuf,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run(_: &Paths<'_>) -> ExitCode {
     eprintln!(
-        "e2e: refusing to run: the suite is Linux only (scripts/e2e.sh runs it in a container)"
+        "e2e: refusing to run: the suite is Linux (scripts/e2e.sh) or macOS (scripts/e2e-macos.sh) only"
     );
     ExitCode::FAILURE
+}
+
+/// The macOS suite (M8 step 10): `scripts/e2e-macos.sh` makes the temporary root and sets `HOME`
+/// and `LUNEPACK_E2E_ROOT`; the rows are in [`macos`].
+#[cfg(target_os = "macos")]
+fn run(paths: &Paths<'_>) -> ExitCode {
+    for path in [
+        paths.runtime,
+        paths.cli,
+        paths.app,
+        paths.shell,
+        paths.fake_ui,
+    ] {
+        if !path.is_file() {
+            eprintln!("e2e: FAIL: a binary named in the environment is not a file");
+            return ExitCode::FAILURE;
+        }
+    }
+    if std::env::var_os("LUNEPACK_E2E_ROOT").is_none() {
+        eprintln!("e2e: refusing to run without LUNEPACK_E2E_ROOT (scripts/e2e-macos.sh sets it)");
+        return ExitCode::FAILURE;
+    }
+    let bins = macos::Bins {
+        runtime: paths.runtime.clone(),
+        cli: paths.cli.clone(),
+        app: paths.app.clone(),
+        shell_app: paths.shell.clone(),
+        fake_ui: paths.fake_ui.clone(),
+    };
+    let ci = std::env::var("LUNEPACK_E2E_CI").is_ok_and(|v| v == "1");
+    match macos::run_all(&bins, ci) {
+        Ok(log) => {
+            println!("e2e: outcome log ({} lines)", log.len());
+            for line in &log {
+                println!("{line}");
+            }
+            println!("e2e: PASS");
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("e2e: FAIL: {why}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

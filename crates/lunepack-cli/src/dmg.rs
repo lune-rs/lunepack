@@ -28,6 +28,8 @@ const SYSTEM_HDIUTIL: &str = "/usr/bin/hdiutil";
 const CREATE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// How long `hdiutil verify` may run.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How many times `hdiutil verify` is tried while the image is still busy (a pause between).
+const VERIFY_ATTEMPTS: u32 = 6;
 /// The pause before the one retry after "Resource busy".
 const BUSY_PAUSE: Duration = Duration::from_secs(5);
 /// Most bytes of `hdiutil`'s output kept for an error message.
@@ -215,7 +217,7 @@ impl Hdiutil {
             if ran.success {
                 return Ok(());
             }
-            let busy = ran.output.to_ascii_lowercase().contains("resource busy");
+            let busy = is_busy(&ran.output);
             if busy && attempt == 1 {
                 if fs::symlink_metadata(out).is_ok() {
                     fs::remove_file(out)
@@ -228,18 +230,34 @@ impl Hdiutil {
         }
     }
 
-    /// `hdiutil verify <dmg>`.
+    /// `hdiutil verify <dmg>`, with the same one retry after a pause when the image is still busy
+    /// (right after `create`, `hdiutil verify` sometimes answers "Resource temporarily
+    /// unavailable").
     pub fn verify(&self, dmg: &Path, scratch: &Path) -> Result<()> {
-        let ran = self.run(
-            &["verify".as_ref(), dmg.as_os_str()],
-            scratch,
-            self.verify_timeout,
-        )?;
-        if !ran.success {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let ran = self.run(
+                &["verify".as_ref(), dmg.as_os_str()],
+                scratch,
+                self.verify_timeout,
+            )?;
+            if ran.success {
+                return Ok(());
+            }
+            if is_busy(&ran.output) && attempt < VERIFY_ATTEMPTS {
+                std::thread::sleep(self.busy_pause);
+                continue;
+            }
             bail!("hdiutil verify failed: {}", ran.output.trim());
         }
-        Ok(())
     }
+}
+
+/// Whether `hdiutil` failed because the image or device is busy for the moment.
+fn is_busy(output: &str) -> bool {
+    let text = output.to_ascii_lowercase();
+    text.contains("resource busy") || text.contains("resource temporarily unavailable")
 }
 
 #[cfg(all(test, unix))]
@@ -323,6 +341,29 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err}").contains("Resource busy"), "{err}");
         assert_eq!(calls(tmp.path()).len(), 2);
+    }
+
+    #[test]
+    fn verify_retries_while_the_image_is_busy_and_then_gives_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dmg = tmp.path().join("x.dmg");
+        let h = fake(
+            tmp.path(),
+            "if [ \"$n\" -lt 3 ]; then echo 'verify: Resource temporarily unavailable' >&2; exit 1; fi\nexit 0",
+        );
+        h.verify(&dmg, tmp.path()).unwrap();
+        assert_eq!(calls(tmp.path()).len(), 3);
+        let tmp2 = tempfile::tempdir().unwrap();
+        let h = fake(
+            tmp2.path(),
+            "echo 'verify: Resource temporarily unavailable' >&2; exit 1",
+        );
+        let err = h.verify(&dmg, tmp2.path()).unwrap_err();
+        assert!(
+            format!("{err}").contains("temporarily unavailable"),
+            "{err}"
+        );
+        assert_eq!(calls(tmp2.path()).len(), 3);
     }
 
     #[test]
