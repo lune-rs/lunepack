@@ -47,7 +47,8 @@ use lunepack_core::{
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
-use crate::config::{Config, FixedClock};
+use crate::codesign::{InstallerFile, OsCodeSign, installer_app_plan};
+use crate::config::{CodeSignSection, Config, FixedClock};
 use crate::dmg::{self, Hdiutil, InstallerApp};
 use crate::place;
 use crate::plist;
@@ -332,6 +333,8 @@ pub fn build(
 ) -> Result<Vec<u8>> {
     let (hasher, verifier, codec) = (Sha256Hasher, Ed25519Verifier, LzmaCodec);
     let loaded = load(dir, config, version, target, clock)?;
+    // OS signing of the finished file (M9-D2, M9-D5), for a Windows target with `[codesign.windows]`.
+    let section = config.codesign_for(loaded.target);
     let target = loaded.target;
     if !matches!(
         target,
@@ -362,12 +365,26 @@ pub fn build(
     let trailer = loaded.place_payload(&mut out);
     out.extend_from_slice(&trailer.encode()?);
 
+    // Signed after the file is complete, and read back below as signed: the setup data ends where
+    // the unsigned file ended, and the certificate table follows (M7-D11).
+    let unsigned_len = out.len() as u64;
+    if let Some(section) = section {
+        out = sign_setup_file(section, &out, file_name)?;
+    }
+
     // Read back as the runtime reads it: the locator finds the end of the setup data (a setup file,
     // never an ordinary file or a malformed one), the trailer is the bytes before it, then the
     // payload under it.
     let end = match locate_file(&Bytes(&out)).context("internal error: the locator cannot read")? {
-        Located::Setup { end } if end == out.len() as u64 => end,
-        _ => bail!("internal error: the written file is not read back as a setup file"),
+        Located::Setup { end } if end == unsigned_len => end,
+        _ => bail!(
+            "the finished setup file is not read back as a setup file{}",
+            if section.is_some() {
+                " (did the signing tool change the file beyond adding its signature?)"
+            } else {
+                ""
+            }
+        ),
     };
     let tail = &out[(end - TRAILER_SIZE) as usize..end as usize];
     let parsed = SetupTrailer::parse(tail, end, &hasher, &verifier)
@@ -388,6 +405,27 @@ pub fn build(
          the release's update config names?)",
     )?;
     Ok(out)
+}
+
+/// Signs the finished Windows setup file `bytes` with `sign_installer` (M9-D5) in a scratch
+/// directory under the system temp dir, and returns the signed bytes. The file keeps its final
+/// name (a signing tool may show it). The scratch directory is removed on every path.
+fn sign_setup_file(section: &CodeSignSection, bytes: &[u8], file_name: &str) -> Result<Vec<u8>> {
+    let scratch = tempfile::Builder::new()
+        .prefix(place::TMP_PREFIX)
+        .tempdir()
+        .context("cannot create a scratch directory for the signing tool")?;
+    let name = if file_name.is_empty() {
+        "setup.exe"
+    } else {
+        file_name
+    };
+    let at = scratch.path().join(name);
+    fs::write(&at, bytes).with_context(|| format!("cannot write {}", at.display()))?;
+    let signer =
+        OsCodeSign::for_installer(section.clone(), name.to_owned(), scratch.path().to_owned());
+    signer.sign_installer_file(&at, InstallerFile::SetupExe, name)?;
+    fs::read(&at).with_context(|| format!("cannot read {}", at.display()))
 }
 
 /// The stem of the bundle's file name (M8-D1's rule, as the runtime applies it at the first
@@ -483,7 +521,7 @@ fn installer_parts(loaded: &Loaded) -> Result<InstallerParts> {
 /// Writes the installer `.dmg` of the release to `out` (M8-D7, M8-D9): the installer app built in a
 /// scratch directory next to `out`, `hdiutil create` and `hdiutil verify`, then the image moved to
 /// `out` without replacing anything. Returns the image's size.
-fn write_dmg(loaded: &Loaded, out: &Path) -> Result<u64> {
+fn write_dmg(loaded: &Loaded, out: &Path, section: Option<&CodeSignSection>) -> Result<u64> {
     if fs::symlink_metadata(out).is_ok() {
         bail!("{} already exists", out.display());
     }
@@ -511,11 +549,30 @@ fn write_dmg(loaded: &Loaded, out: &Path) -> Result<u64> {
             icon: parts.icon.as_deref(),
         },
     )?;
+    // M9-D5, in this order: the app's items, the app, then (when configured) its notarization and
+    // staple; only then is the image built, signed, notarized and stapled.
+    let signer = section.map(|section| {
+        OsCodeSign::for_installer(
+            section.clone(),
+            parts.dir_name.clone(),
+            scratch.path().to_owned(),
+        )
+    });
+    if let Some(signer) = &signer {
+        signer.run(&src.join(&parts.dir_name), &installer_app_plan())?;
+    }
     let image = scratch.path().join("installer.dmg");
     let hdiutil = Hdiutil::system();
     let volume = dmg::volume_name(&loaded.update.install.name);
     hdiutil.create(&volume, &src, &image, scratch.path())?;
     hdiutil.verify(&image, scratch.path())?;
+    if let Some(signer) = &signer {
+        let shown = out.file_name().map_or_else(
+            || "installer.dmg".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        signer.sign_installer_file(&image, InstallerFile::Dmg, &shown)?;
+    }
     let size = fs::metadata(&image)
         .with_context(|| format!("cannot read {}", image.display()))?
         .len();
@@ -649,7 +706,7 @@ pub fn setup(config_path: &Path, args: &SetupArgs) -> Result<()> {
         let size = if args.zip {
             write_zip(&loaded, &out)?
         } else {
-            write_dmg(&loaded, &out)?
+            write_dmg(&loaded, &out, config.codesign_for(loaded.target))?
         };
         println!("setup: {file_name} ({size} bytes)");
         return Ok(());

@@ -1270,4 +1270,78 @@ mod real_windows {
             "signtool finds no signature in the packed file"
         );
     }
+
+    /// `lunepack setup` signs the finished `Setup.exe` with `sign_installer` (real `signtool`) and
+    /// reads it back as signed: the trailer is found before the certificate table (M7-D11).
+    #[test]
+    fn real_signtool_signs_setup_exe_and_it_reads_back() {
+        let Some(signtool) = signtool() else {
+            eprintln!("skipped: no signtool.exe under Windows Kits\\10\\bin");
+            return;
+        };
+        let Some(cert) = Cert::new() else {
+            eprintln!("skipped: cannot create a self-signed certificate (PowerShell)");
+            return;
+        };
+        let w = World::new();
+        let update = "\n[update]\nfeed = \"https://updates.example.com/hello\"\n\
+                      [install]\nentry = \"bin/app.exe\"\nname = \"Hello\"\n";
+        w.set_config(update);
+        let dir = w.release_dir("rel");
+        let input = tempfile::tempdir().unwrap();
+        write(input.path(), "bin/app.exe", &unsigned_pe());
+        let pe = w.dir.path().join("runtime.exe");
+        fs::write(&pe, unsigned_pe()).unwrap();
+        let out = w.pack(
+            input.path(),
+            &dir,
+            "windows-x86_64",
+            &["--runtime", s(&pe), "--stub", s(&pe)],
+            &[],
+        );
+        assert_ok(&out, "windows pack");
+
+        let sign = tpl(&[
+            s(&signtool),
+            "sign",
+            "/fd",
+            "sha256",
+            "/sha1",
+            "{env:LUNEPACK_TEST_THUMB}",
+            "/s",
+            "My",
+            "{path}",
+        ]);
+        w.set_config(&format!(
+            "{update}\n[codesign.windows]\nsign = {sign}\nsign_installer = {sign}\n"
+        ));
+        let setup = w.dir.path().join("Hello-Setup.exe");
+        let at = (T0 + 3600).to_string();
+        let out = w.run(
+            &[
+                "setup",
+                s(&dir),
+                "--version",
+                "1.0.0",
+                "--target",
+                "windows-x86_64",
+                "--out",
+                s(&setup),
+                "--at",
+                &at,
+            ],
+            &[("LUNEPACK_TEST_THUMB", &cert.0)],
+        );
+        assert_ok(&out, "setup with real signtool");
+        let bytes = fs::read(&setup).unwrap();
+        assert!(
+            lunepack_core::pe_is_signed(&bytes, bytes.len() as u64),
+            "Setup.exe has no certificate table"
+        );
+        assert!(
+            stdout(&out).contains("code-sign: Hello-Setup.exe"),
+            "{}",
+            stdout(&out)
+        );
+    }
 }

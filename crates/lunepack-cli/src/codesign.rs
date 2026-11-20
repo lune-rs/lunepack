@@ -44,7 +44,7 @@ const SIGNATURE_DIRS: [&str; 5] = [
 
 /// A refused or failed sign stage. The text names paths and template keys, never an argv.
 #[derive(Debug)]
-struct StageError(String);
+pub struct StageError(String);
 
 impl fmt::Display for StageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -67,6 +67,10 @@ pub struct OsCodeSign {
     /// The bundle directory's name inside the notarization zip: `<bundle name>.app`.
     bundle_name: String,
     env: EnvLookup,
+    /// Signs an installer's items (`sign_installer`, M9-D2) instead of the release tree's.
+    installer: bool,
+    /// Where the notarization zip is written; by default beside the signed tree.
+    scratch: Option<PathBuf>,
 }
 
 impl OsCodeSign {
@@ -86,11 +90,31 @@ impl OsCodeSign {
             section,
             bundle_name,
             env,
+            installer: false,
+            scratch: None,
+        }
+    }
+
+    /// The hook for the installer of `lunepack setup` (M9-D2, M9-D5): every item takes
+    /// `sign_installer`. `app_name` is the installer app's directory name (`Install <name>.app`)
+    /// and `scratch` the directory the notarization zip goes to.
+    pub fn for_installer(
+        section: CodeSignSection,
+        app_name: String,
+        scratch: PathBuf,
+    ) -> OsCodeSign {
+        OsCodeSign {
+            installer: true,
+            scratch: Some(scratch),
+            ..OsCodeSign::new(section, app_name)
         }
     }
 
     /// The template of `key` for an item of `kind`.
     fn template_for(&self, kind: SignKind) -> (&'static str, &ArgvTemplate) {
+        if self.installer {
+            return ("sign_installer", &self.section.sign_installer);
+        }
         match kind {
             SignKind::PeFile | SignKind::MachOFile => ("sign", &self.section.sign),
             SignKind::NestedBundle => ("sign_bundle", &self.section.sign_bundle),
@@ -121,10 +145,15 @@ impl OsCodeSign {
                 }
             }
         }
+        self.check_env_of(&used)
+    }
+
+    /// The `{env:}` check for `used` (key, template) pairs.
+    fn check_env_of(&self, used: &[(&'static str, &ArgvTemplate)]) -> Result<(), StageError> {
         let mut seen = BTreeSet::new();
         for (key, template) in used {
             for name in template.env_names() {
-                if !seen.insert((key, name)) {
+                if !seen.insert((*key, name)) {
                     continue;
                 }
                 if (self.env)(name).is_none_or(|v| v.is_empty()) {
@@ -155,7 +184,7 @@ impl OsCodeSign {
             .map_err(|e| StageError(format!("code-sign: {shown}: {key} failed: {e}")))
     }
 
-    fn run(&self, root: &Path, plan: &[SignItem]) -> Result<(), StageError> {
+    pub fn run(&self, root: &Path, plan: &[SignItem]) -> Result<(), StageError> {
         let root = absolute(root)?;
         self.check_env(plan)?;
         let section = &self.section;
@@ -208,7 +237,11 @@ impl OsCodeSign {
         };
         let shown = self.bundle_name.as_str();
         say(&format!("code-sign: {shown}: notarize"));
-        let zip_path = root.parent().map(|p| p.join("lunepack-notarize.zip"));
+        let zip_path = self
+            .scratch
+            .as_deref()
+            .or(root.parent())
+            .map(|p| p.join("lunepack-notarize.zip"));
         let result = (|| {
             let zip = if notarize.uses_zip() {
                 let at = zip_path
@@ -247,6 +280,164 @@ impl OsCodeSign {
             )),
         }
     }
+}
+
+/// What a single installer file is (M9-D5): a Windows `Setup.exe`, or the macOS `.dmg`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallerFile {
+    /// `Setup.exe`: signed with `sign_installer`, then `verify`.
+    SetupExe,
+    /// The disk image: signed with `sign_installer`, then notarized and stapled when configured.
+    /// `{path}`, `{bundle}` and `{zip}` are all the image (`notarytool` takes an image as it
+    /// takes a zip).
+    Dmg,
+}
+
+impl OsCodeSign {
+    /// Signs the installer file at `path` (M9-D5), shown as `shown` in lines and errors, and
+    /// checks it is in a signed form afterwards.
+    pub fn sign_installer_file(
+        &self,
+        path: &Path,
+        kind: InstallerFile,
+        shown: &str,
+    ) -> Result<(), StageError> {
+        let path = absolute(path)?;
+        let section = &self.section;
+        let mut used: Vec<(&'static str, &ArgvTemplate)> =
+            vec![("sign_installer", &section.sign_installer)];
+        match kind {
+            InstallerFile::SetupExe => used.extend(section.verify.as_ref().map(|t| ("verify", t))),
+            InstallerFile::Dmg => {
+                used.extend(section.notarize.as_ref().map(|t| ("notarize", t)));
+                used.extend(section.staple.as_ref().map(|t| ("staple", t)));
+            }
+        }
+        self.check_env_of(&used)?;
+        say(&format!("code-sign: {shown}"));
+        let ctx = ExpandCtx {
+            path: &path,
+            bundle: None,
+            zip: None,
+        };
+        self.run_template(
+            "sign_installer",
+            shown,
+            &section.sign_installer,
+            &ctx,
+            section.timeout,
+        )?;
+        let signed = match kind {
+            InstallerFile::SetupExe => {
+                let file = File::open(&path).map_err(|e| read_error(shown, &e))?;
+                let len = file.metadata().map_err(|e| read_error(shown, &e))?.len();
+                let mut head = Vec::new();
+                file.take(PLAN_HEAD_BYTES as u64)
+                    .read_to_end(&mut head)
+                    .map_err(|e| read_error(shown, &e))?;
+                pe_is_signed(&head, len)
+            }
+            InstallerFile::Dmg => dmg_is_signed_file(&path).map_err(|e| read_error(shown, &e))?,
+        };
+        if !signed {
+            return fail(format!(
+                "code-sign: {shown} is not signed after sign_installer"
+            ));
+        }
+        match kind {
+            InstallerFile::SetupExe => {
+                if let Some(verify) = &section.verify {
+                    self.run_template("verify", shown, verify, &ctx, section.timeout)?;
+                }
+            }
+            InstallerFile::Dmg => {
+                if let (Some(notarize), Some(staple)) = (&section.notarize, &section.staple) {
+                    // An image is submitted as it is: it stands for the bundle and the zip too.
+                    let ctx = ExpandCtx {
+                        path: &path,
+                        bundle: Some(&path),
+                        zip: Some(&path),
+                    };
+                    say(&format!("code-sign: {shown}: notarize"));
+                    self.run_template("notarize", shown, notarize, &ctx, section.notarize_timeout)?;
+                    say(&format!("code-sign: {shown}: staple"));
+                    self.run_template("staple", shown, staple, &ctx, section.timeout)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_error(shown: &str, e: &io::Error) -> StageError {
+    StageError(format!("code-sign: cannot read {shown}: {e}"))
+}
+
+/// The items of the installer app (`Install <name>.app`), inner to outer: its runtime, then the
+/// app. Its executable, the UI, is signed with the app (M9-D4's main executable).
+pub fn installer_app_plan() -> Vec<SignItem> {
+    let runtime =
+        lunepack_core::RelPath::parse(&format!("Contents/MacOS/{}", crate::dmg::RUNTIME_NAME)).ok();
+    vec![
+        SignItem {
+            path: runtime,
+            kind: SignKind::MachOFile,
+        },
+        SignItem {
+            path: None,
+            kind: SignKind::OuterBundle,
+        },
+    ]
+}
+
+/// Bytes of a disk image's trailer (the UDIF `koly` block).
+const KOLY_LEN: usize = 512;
+/// Where the trailer holds the code signature's offset and length (big-endian `u64` each).
+const KOLY_SIG_OFFSET: usize = 0x128;
+const KOLY_SIG_LENGTH: usize = 0x130;
+
+/// Whether a disk image of `len` bytes, whose last bytes are `tail`, carries a code signature: a
+/// `koly` trailer whose signature range is non-empty and lies before the trailer (probed with
+/// `codesign` on this Mac: an unsigned image has both fields zero). False for anything else.
+pub fn dmg_is_signed(tail: &[u8], len: u64) -> bool {
+    let Some(koly) = tail
+        .len()
+        .checked_sub(KOLY_LEN)
+        .and_then(|at| tail.get(at..))
+    else {
+        return false;
+    };
+    if len < KOLY_LEN as u64 || !koly.starts_with(b"koly") {
+        return false;
+    }
+    let be = |at: usize| {
+        koly.get(at..at + 8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map(u64::from_be_bytes)
+    };
+    match (be(KOLY_SIG_OFFSET), be(KOLY_SIG_LENGTH)) {
+        (Some(offset), Some(length)) => {
+            offset != 0
+                && length != 0
+                && offset
+                    .checked_add(length)
+                    .is_some_and(|end| end <= len - KOLY_LEN as u64)
+        }
+        _ => false,
+    }
+}
+
+fn dmg_is_signed_file(path: &Path) -> io::Result<bool> {
+    use std::io::{Seek as _, SeekFrom};
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len < KOLY_LEN as u64 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(len - KOLY_LEN as u64))?;
+    let mut tail = vec![0u8; KOLY_LEN];
+    file.read_exact(&mut tail)?;
+    Ok(dmg_is_signed(&tail, len))
 }
 
 impl CodeSign for OsCodeSign {
@@ -342,4 +533,61 @@ fn is_exec(meta: &fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_exec(_meta: &fs::Metadata) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(sig: Option<(u64, u64)>, body: usize) -> Vec<u8> {
+        let mut koly = vec![0u8; KOLY_LEN];
+        koly[..4].copy_from_slice(b"koly");
+        if let Some((offset, length)) = sig {
+            koly[KOLY_SIG_OFFSET..KOLY_SIG_OFFSET + 8].copy_from_slice(&offset.to_be_bytes());
+            koly[KOLY_SIG_LENGTH..KOLY_SIG_LENGTH + 8].copy_from_slice(&length.to_be_bytes());
+        }
+        let mut out = vec![7u8; body];
+        out.extend_from_slice(&koly);
+        out
+    }
+
+    fn signed(bytes: &[u8]) -> bool {
+        dmg_is_signed(bytes, bytes.len() as u64)
+    }
+
+    #[test]
+    fn a_disk_image_is_signed_when_its_trailer_names_a_range_before_it() {
+        assert!(signed(&image(Some((1000, 300)), 2000)));
+        assert!(
+            signed(&image(Some((1000, 1000)), 2000)),
+            "ends at the trailer"
+        );
+        // Unsigned, a zero field, a range into or past the trailer, an overflow.
+        assert!(!signed(&image(None, 2000)));
+        assert!(!signed(&image(Some((0, 300)), 2000)));
+        assert!(!signed(&image(Some((1000, 0)), 2000)));
+        assert!(!signed(&image(Some((1000, 1001)), 2000)));
+        assert!(!signed(&image(Some((u64::MAX, 2)), 2000)));
+    }
+
+    #[test]
+    fn a_disk_image_check_is_total_on_short_or_foreign_input() {
+        assert!(!signed(&[]));
+        assert!(!signed(&[0u8; 100]));
+        assert!(!signed(&vec![0u8; KOLY_LEN]), "no koly magic");
+        let mut bad = image(Some((10, 10)), 100);
+        let at = bad.len() - KOLY_LEN;
+        bad[at] = b'x';
+        assert!(!signed(&bad));
+        // A tail shorter than the file is read at its own end.
+        let whole = image(Some((100, 50)), 4096);
+        assert!(dmg_is_signed(
+            &whole[whole.len() - KOLY_LEN..],
+            whole.len() as u64
+        ));
+        assert!(!dmg_is_signed(
+            &whole[whole.len() - 10..],
+            whole.len() as u64
+        ));
+    }
 }
