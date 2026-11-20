@@ -83,6 +83,12 @@ png = "0.18"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # WinVerifyTrust for the publisher check (M9-D8); the provider-data types it hands back sit
+    # behind the cryptography features.
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Console",
