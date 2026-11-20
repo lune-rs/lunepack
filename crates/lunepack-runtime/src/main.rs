@@ -326,6 +326,10 @@ fn notice_text(name: &str, operation: Operation, kind: Kind) -> String {
     };
     match (operation, kind) {
         (_, Kind::Ok) => format!("{name} {done}"),
+        // M8-D4: a copy somewhere lunepack does not update is told where to go, whatever the mode.
+        (_, Kind::UnsupportedLocation(_)) => {
+            format!("Move {name} to your Applications folder and open it from there.")
+        }
         // A setup rerun over the installed app repaired its integration; nothing failed.
         (Operation::Install, Kind::AlreadyInstalled) => format!("{name} is already installed."),
         _ => format!("{name} {failed} (code {}).", kind.code()),
@@ -936,6 +940,24 @@ mod tests {
             notice_text("My App", Operation::Uninstall, Kind::InUse),
             "My App could not be uninstalled (code 25)."
         );
+    }
+
+    /// A copy in a place lunepack does not update is told to move (M8-D4), with no code or reason.
+    #[test]
+    fn an_unsupported_location_tells_the_user_to_move_the_app() {
+        for operation in [Operation::Install, Operation::Uninstall, Operation::Setup] {
+            for place in [
+                modes::Place::Translocated,
+                modes::Place::ReadOnly,
+                modes::Place::NotOwned,
+            ] {
+                assert_eq!(
+                    notice_text("My App", operation, Kind::UnsupportedLocation(place)),
+                    "Move My App to your Applications folder and open it from there."
+                );
+                assert!(!notice_is_info(operation, Kind::UnsupportedLocation(place)));
+            }
+        }
     }
 
     /// A malformed setup file is checked before its arguments: only an empty command line (a

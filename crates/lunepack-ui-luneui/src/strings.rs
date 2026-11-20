@@ -107,8 +107,17 @@ pub fn failure_reason(code: u32, name: &str) -> String {
             "This install isn't the one this computer expects, so nothing was changed.".to_string()
         }
         27 => "No release is available yet. Try again later.".to_string(),
+        // M8-D4: a copy in a place lunepack does not update (translocated, a disk image, another
+        // volume, not the user's).
+        28 => unsupported_location_text(name),
         _ => format!("Something went wrong (error {code})."),
     }
+}
+
+/// What the user is told when the app runs from, or is installed in, a place that is not updated
+/// (exit 28, M8-D4).
+pub fn unsupported_location_text(name: &str) -> String {
+    format!("Move {name} to your Applications folder and open it from there.")
 }
 
 /// The runtime's `kind` for an exit code, for the details a person can copy.
@@ -140,6 +149,7 @@ pub fn kind_name(code: u32) -> &'static str {
         25 => "in_use",
         26 => "install_mismatch",
         27 => "no_release",
+        28 => "unsupported_location",
         _ => "internal",
     }
 }
@@ -303,4 +313,18 @@ pub fn uninstall_failed_note(name: &str) -> String {
 /// The "and N more" row of a long list of leftovers.
 pub fn and_more(n: usize) -> String {
     format!("and {n} more")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_28_tells_the_user_to_move_the_app() {
+        assert_eq!(
+            failure_reason(28, "My App"),
+            "Move My App to your Applications folder and open it from there."
+        );
+        assert_eq!(kind_name(28), "unsupported_location");
+    }
 }

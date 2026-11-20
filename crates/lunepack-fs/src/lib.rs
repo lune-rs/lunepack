@@ -491,6 +491,7 @@ impl Fs for StdFs {
                 read_only,
                 fs_type,
                 owned_by_caller: meta.uid() == unix_sys::effective_uid(),
+                owned_by_root: meta.uid() == 0,
                 writable: unix_sys::writable(path)?,
             })
         }

@@ -360,8 +360,8 @@ or the network, and in this order:
 
 Before a mode moves or removes anything of an install (the applier, startup's repair of a swap, uninstall,
 the installer), the place of `B` is checked: its folder and `R/versions` on one volume (else `other_volume`),
-`B` owned by the user (else `not_owned`; a root-owned `B` is refused as that, never read as a per-machine
-install) and the user able to create entries in `B`'s folder (else `not_writable`; the folder need not be the
+`B` owned by the user (else `not_owned`; a root-owned `B` is a per-machine install by ownership, D10, and is
+`machine_scope`, exit 17) and the user able to create entries in `B`'s folder (else `not_writable`; the folder need not be the
 user's own, so an administrator's app in `/Applications` keeps updating). It is exit 28 with that `reason`,
 nothing committed and, in the applier, the app started again.
 
@@ -443,7 +443,8 @@ loaded with `launchctl`, so it takes effect at the next sign-in; it is replaced 
 outcome shows one native alert, as on Windows, through `/usr/bin/osascript` running one fixed script that
 reads the title, the text and the kind from its arguments (no string is ever put into script source). The
 text is fixed (the app's name, the result and the closed result code), the alert dismisses itself after 120
-seconds and the process is killed shortly after, and it is shown only when the run is provably interactive
+seconds and the process is killed shortly after, except that an exit 28 says "Move <name> to your Applications
+folder and open it from there." (M8-D4), and it is shown only when the run is provably interactive
 and never under `--silent`, `--no-ui`, `LUNEPACK_NO_UI`, for a cancellation the user chose, or after a window
 showed the outcome.
 

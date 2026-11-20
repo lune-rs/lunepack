@@ -141,6 +141,8 @@ impl From<lunepack_core::Error> for Error {
             lunepack_core::Error::Layout(LayoutError::Location(reason)) => {
                 Error::UnsupportedLocation { reason }
             }
+            // M8-D4: a root-owned bundle is a per-machine install (D10).
+            lunepack_core::Error::Layout(LayoutError::MachineBundle) => Error::MachineScope,
             // M8-D16: the bundle the record names is gone and no tree holds its version; for the
             // app that runs, this install does not exist.
             lunepack_core::Error::Layout(LayoutError::Orphaned) => Error::NotInstalled,
