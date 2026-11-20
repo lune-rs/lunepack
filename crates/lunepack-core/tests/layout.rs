@@ -1902,6 +1902,17 @@ mod bundle {
         }
     }
 
+    /// A second bundle in an apps folder. `/Applications` is a macOS place and the product
+    /// compares its bytes literally, so a Windows run (path-neutral fixtures only) uses a second
+    /// bundle in the user's apps folder instead.
+    fn system_apps_bundle() -> PathBuf {
+        if cfg!(windows) {
+            apps().join("Other.app")
+        } else {
+            abs_path("/Applications/Hello.app")
+        }
+    }
+
     /// An orphaned install (M8-D16): the record names 1.0.0, the pointer dangles and no tree
     /// holds 1.0.0.
     fn orphaned() -> (MemFs, UserLayout) {
@@ -1913,7 +1924,7 @@ mod bundle {
 
     #[test]
     fn a_bundle_in_an_apps_folder_with_no_install_root_is_adoptable() {
-        for tree in [bundle(), abs_path("/Applications/Hello.app")] {
+        for tree in [bundle(), system_apps_bundle()] {
             let fs = MemFs::new();
             put_tree(&fs, &tree, "1.0.0");
             let ops = fs.op_count();
@@ -1945,7 +1956,7 @@ mod bundle {
     fn a_bundle_over_an_orphaned_record_is_adoptable() {
         // The same version, and another one, dragged in as a new directory. (At the old
         // bundle's own path the pointer names it, which is the step-1 rule for `Installed`.)
-        let other = abs_path("/Applications/Hello.app");
+        let other = system_apps_bundle();
         for version in ["1.0.0", "1.1.0"] {
             let (fs, _) = orphaned();
             put_tree(&fs, &other, version);

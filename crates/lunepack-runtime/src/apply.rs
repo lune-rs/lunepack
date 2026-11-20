@@ -919,11 +919,11 @@ mod tests {
     }
 
     fn data_home() -> PathBuf {
-        home().join("Library/Application Support")
+        home().join("Library").join("Application Support")
     }
 
     fn bundle() -> PathBuf {
-        home().join("Applications/Hello.app")
+        home().join("Applications").join("Hello.app")
     }
 
     fn app_layout() -> UserLayout {
