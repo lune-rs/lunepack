@@ -216,6 +216,9 @@ struct Shared {
     child_id: ProcessId,
     spawned: Instant,
     done: AtomicBool,
+    /// The reader has ended: everything the UI wrote before its end of the channel closed was
+    /// read, or the reader stopped on its own.
+    reader_done: AtomicBool,
     /// The UI is this process's parent (`--ui-stdio`, [`UiHost::over_parent`]): it is never
     /// stopped or waited for, only no longer written to.
     peer: bool,
@@ -313,6 +316,24 @@ impl Shared {
         }
     }
 
+    /// Whether the UI said hello, once what it wrote before a stop was read: a stop seen by the
+    /// watchdog or the writer (the UI's exit, a stall) can come before the reader got to a hello
+    /// still in the pipe, so the reader gets up to `limit` to reach the end of the channel first.
+    /// A UI that said hello and was then lost must get the lost answer (cancel before any
+    /// change, M6-D5), never the headless one.
+    fn said_hello(&self, limit: Duration) -> bool {
+        let until = Instant::now() + limit;
+        loop {
+            if self.conv().hello {
+                return true;
+            }
+            if self.reader_done.load(Ordering::Acquire) || Instant::now() >= until {
+                return self.conv().hello;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// The child's exit code once it has ended, waiting up to `limit` for it.
     fn exit_status(&self, limit: Duration) -> Option<Option<i32>> {
         let until = Instant::now() + limit;
@@ -352,6 +373,15 @@ fn writer(shared: Arc<Shared>, rx: Receiver<EngineMsg>, mut out: Box<dyn Write +
 
 fn reader(
     shared: Arc<Shared>,
+    input: Box<dyn Read + Send>,
+    choices: SyncSender<(u32, ChoiceValue)>,
+) {
+    read_frames(&shared, input, choices);
+    shared.reader_done.store(true, Ordering::Release);
+}
+
+fn read_frames(
+    shared: &Shared,
     mut input: Box<dyn Read + Send>,
     choices: SyncSender<(u32, ChoiceValue)>,
 ) {
@@ -371,6 +401,15 @@ fn reader(
         };
         let mut conv = shared.conv();
         if conv.stop.is_some() {
+            // Stopped already (its exit seen by the watchdog, say): only a valid hello the UI
+            // wrote before still counts, so that a UI that said hello and then died is a lost UI
+            // and not an absent one. Nothing else is acted on.
+            if !conv.hello
+                && let UiMsg::Hello { build_id } = &msg
+                && ui::check_hello(build_id).is_ok()
+            {
+                conv.hello = true;
+            }
             return;
         }
         if !conv.hello {
@@ -624,6 +663,7 @@ impl UiHost {
             child: Mutex::new(child),
             spawned: Instant::now(),
             done: AtomicBool::new(false),
+            reader_done: AtomicBool::new(false),
             peer,
         });
         let threads = [
@@ -640,6 +680,10 @@ impl UiHost {
                 move || watchdog(shared)
             }),
         ];
+        if !threads[1] {
+            // No reader: nothing more will ever be read.
+            shared.reader_done.store(true, Ordering::Release);
+        }
         if threads.iter().any(|ok| !ok) {
             shared.stop(UiStop::SpawnFailed, None);
         }
@@ -724,12 +768,14 @@ impl UiHost {
         }
     }
 
-    /// Asks `kind` and waits for the answer. A headless host, and a UI that stopped before its
-    /// hello, answer with the headless default at once: proceed, finish without launching, close,
-    /// acknowledge. A UI lost after its hello answers with the lost default (M6-D5): cancel at a
-    /// prompt before any change (welcome, confirm), the headless default at one after the
-    /// outcome. A `reveal` keeps the prompt open: `on_reveal` gets its index (at most one a
-    /// second; the reducer already checked it against the outcome's leftovers).
+    /// Asks `kind` and waits for the answer. A headless host answers with the headless default at
+    /// once: proceed, finish without launching, close, acknowledge; so does a UI that stopped
+    /// before its hello, once the reader has read what the UI wrote before it ended (up to
+    /// [`EXIT_PEEK`]): a hello found there counts. A UI lost after its hello answers with the lost
+    /// default (M6-D5): cancel at a prompt before any change (welcome, confirm), the headless
+    /// default at one after the outcome. A `reveal` keeps the prompt open: `on_reveal` gets its
+    /// index (at most one a second; the reducer already checked it against the outcome's
+    /// leftovers).
     pub fn prompt(
         &self,
         kind: PromptKind,
@@ -747,7 +793,7 @@ impl UiHost {
             return headless;
         };
         let lost = || {
-            if shared.conv().hello {
+            if shared.said_hello(EXIT_PEEK) {
                 lost_answer(kind, self.flow)
             } else {
                 headless
@@ -1446,5 +1492,60 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2), "close waited");
         assert!(process.terminated().is_empty(), "a process was signalled");
         ui.join().expect("ui");
+    }
+
+    /// F11 (consent race): the UI's end is seen (here the parent's exit, by the watchdog) before
+    /// the reader got to what the UI wrote before it ended. A valid hello among that is a UI that
+    /// was shown and then lost: the welcome cancels (M6-D5); none, or a refused one, is no UI:
+    /// the headless answer, within the drain bound.
+    #[test]
+    fn a_hello_read_after_the_uis_end_was_seen_still_counts() {
+        let bounds = Bounds {
+            watch_tick: Duration::from_millis(10),
+            ..Bounds::default()
+        };
+        let good = UiMsg::Hello {
+            build_id: ui::build_id(),
+        };
+        let other = UiMsg::Hello {
+            build_id: "0.0.0+ui1.other".to_owned(),
+        };
+        for (wrote, want) in [
+            (Some(good), ChoiceValue::Cancel),
+            (Some(other), ChoiceValue::Proceed),
+            (None, ChoiceValue::Proceed),
+        ] {
+            let process = FakeProcess::new("/fake/lunepack-runtime");
+            let (host, ends) = parent_host(&process, bounds);
+            let FakeChildPipes {
+                stdin: _from_engine,
+                stdout: to_engine,
+            } = ends;
+            process.mark_exited(PARENT);
+            assert_eq!(wait_stopped(&host).reason, UiStop::Exited);
+            let wrote_any = wrote.is_some();
+            // Nothing written: the channel is left open until the end, and the drain bound
+            // decides.
+            let mut open = Some(to_engine);
+            if let Some(msg) = &wrote
+                && let Some(mut end) = open.take()
+            {
+                ui::write_frame(&mut end, msg).expect("hello");
+            }
+            let events = Events::new(None, None);
+            let start = Instant::now();
+            let got = host.prompt(PromptKind::Welcome, &events, &mut |_| {});
+            assert_eq!(got, want, "{wrote:?}");
+            let took = start.elapsed();
+            assert!(took < EXIT_PEEK + Duration::from_secs(1), "{took:?}");
+            if !wrote_any {
+                assert!(
+                    took >= EXIT_PEEK,
+                    "the drain bound was not waited: {took:?}"
+                );
+            }
+            host.close(&events);
+            drop(open);
+        }
     }
 }
