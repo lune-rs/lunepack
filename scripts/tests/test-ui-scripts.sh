@@ -166,12 +166,14 @@ else
   printf 'not a key\n' >"$keys/planted-key-file"
   chmod 600 "$keys/planted-key-file"
   roots_before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'lunepack-signcheck.*' 2>/dev/null | wc -l | tr -d ' ')
+  # shellcheck disable=SC2329 # named as a command to run_cmd
   sign_env() { # <identity> <key> <key id> <issuer>: every credential variable, set or not
     env -u LUNEPACK_SIGN_IDENTITY -u LUNEPACK_NOTARY_KEY -u LUNEPACK_NOTARY_KEY_ID -u LUNEPACK_NOTARY_ISSUER \
       ${1:+LUNEPACK_SIGN_IDENTITY="$1"} ${2:+LUNEPACK_NOTARY_KEY="$2"} \
       ${3:+LUNEPACK_NOTARY_KEY_ID="$3"} ${4:+LUNEPACK_NOTARY_ISSUER="$4"} \
       bash "$SIGN_CHECK"
   }
+  # shellcheck disable=SC2329 # named as a command to t_check
   planted_absent() {
     ! grep -qF -e "$planted_identity" -e "$planted_key_id" -e "$planted_issuer" -e "planted-key" "$OUT"
   }
