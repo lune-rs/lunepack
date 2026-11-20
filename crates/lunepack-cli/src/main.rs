@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use lunepack_core::{CodeSign, Error, RelPath};
+use lunepack_core::{CodeSign, Error, SignItem};
 
 #[derive(Parser)]
 #[command(
@@ -89,7 +89,7 @@ enum KeysCommand {
 struct NoCodeSign;
 
 impl CodeSign for NoCodeSign {
-    fn sign_tree(&self, _root: &std::path::Path, _order: &[RelPath]) -> Result<(), Error> {
+    fn sign_tree(&self, _root: &std::path::Path, _plan: &[SignItem]) -> Result<(), Error> {
         Ok(())
     }
 }

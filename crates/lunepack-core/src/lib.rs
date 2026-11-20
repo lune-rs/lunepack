@@ -1,6 +1,7 @@
 //! Pure update-framework logic and the traits behind every external or replaceable capability; depends on no adapter or I/O crate.
 
 pub mod cancel;
+pub mod codesign;
 pub mod digest;
 pub mod encoding;
 pub mod envelope;
@@ -40,6 +41,10 @@ pub mod version;
 pub mod write;
 
 pub use cancel::CancelToken;
+pub use codesign::{
+    ArgvTemplate, ExpandCtx, Expanded, PlanEntry, PlanEntryKind, SignItem, SignKind, SignPlanError,
+    TemplateError, TemplateRole, macho_slices_signed, pe_is_signed, sign_plan,
+};
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
 pub use error::{
@@ -116,7 +121,7 @@ pub use transport::{
 };
 pub use trust::{ClockReading, KeyEntry, KeyRing, PublicKey, RollbackFloor};
 pub use update_config::{
-    FeedKind, FileType, InstallMeta, UPDATE_CONFIG_FILE, UpdateConfig, check_feed,
+    FeedKind, FileType, InstallMeta, PublisherPolicy, UPDATE_CONFIG_FILE, UpdateConfig, check_feed,
     desktop_safe_path,
 };
 pub use version::Version;

@@ -24,8 +24,8 @@ use lunepack_core::update_config::{
 };
 use lunepack_core::{
     CodeSign, Codec, CodecId, Encoder, EntryKind, Hasher, InstallMeta, ManifestDocument,
-    PackedFile, RelPath, ReleaseLayout, STUB_FILE, Sha256Digest, Target, UPDATE_CONFIG_FILE,
-    pack_file, validate_tree,
+    PackedFile, RelPath, ReleaseLayout, STUB_FILE, Sha256Digest, SignItem, SignKind, Target,
+    UPDATE_CONFIG_FILE, pack_file, validate_tree,
 };
 
 /// Fixed per-job allowance on top of the input, output and encoder estimates: 16 MiB of slack for
@@ -842,7 +842,15 @@ pub fn build(
         say("update: placed the runtime and the update config")?;
     }
 
-    let order = sign_order(&tree)?;
+    // Interim (M9): the files of `sign_order`, until the sign stage builds the plan with
+    // `lunepack_core::sign_plan`. The only production hook, `NoCodeSign`, reads no item.
+    let order: Vec<SignItem> = sign_order(&tree)?
+        .into_iter()
+        .map(|path| SignItem {
+            path: Some(path),
+            kind: SignKind::PeFile,
+        })
+        .collect();
     set.code_sign
         .sign_tree(&tree, &order)
         .context("code signing failed")?;
@@ -970,8 +978,8 @@ mod tests {
     }
 
     impl CodeSign for Rewrite {
-        fn sign_tree(&self, root: &Path, order: &[RelPath]) -> Result<(), Error> {
-            *self.seen.lock().unwrap() = order.iter().map(|p| p.as_str().to_owned()).collect();
+        fn sign_tree(&self, root: &Path, order: &[SignItem]) -> Result<(), Error> {
+            *self.seen.lock().unwrap() = order.iter().map(|i| i.rel().to_owned()).collect();
             fs::write(root.join(self.path), self.bytes).expect("rewrite");
             Ok(())
         }

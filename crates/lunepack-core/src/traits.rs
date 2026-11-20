@@ -8,7 +8,6 @@ use std::io::Write;
 
 use crate::digest::Sha256Digest;
 use crate::error::{Error, Result};
-use crate::path::RelPath;
 
 /// A streaming SHA-256 computation, created by [`Hasher::sha256_start`].
 pub trait HashState: Send {
@@ -227,9 +226,14 @@ pub trait Signer: Send + Sync + std::fmt::Debug {
 }
 
 /// The code-signing hook (C2 stage 2). It runs on the assembled tree before any file is hashed;
-/// `order` lists the paths to sign from inner to outer (a bundle's contents before the bundle).
-/// The identity implementation changes nothing.
+/// `plan` is [`crate::codesign::sign_plan`]'s list of the items to sign, inner to outer (a
+/// bundle's contents before the bundle, the tree root last). The identity implementation changes
+/// nothing.
 pub trait CodeSign: Send + Sync {
-    /// Signs the items of `order` under `root` in place.
-    fn sign_tree(&self, root: &std::path::Path, order: &[RelPath]) -> Result<(), Error>;
+    /// Signs the items of `plan` under `root` in place, in order.
+    fn sign_tree(
+        &self,
+        root: &std::path::Path,
+        plan: &[crate::codesign::SignItem],
+    ) -> Result<(), Error>;
 }
