@@ -205,7 +205,6 @@ pub struct CodeSignSection {
     /// `sign_outer`: the app bundle (macOS); defaults to `sign_bundle`.
     pub sign_outer: ArgvTemplate,
     /// `sign_installer`: `Setup.exe`, the installer app's items and the `.dmg`; defaults to `sign`.
-    #[allow(dead_code)] // read by `lunepack setup` (M9 step 4)
     pub sign_installer: ArgvTemplate,
     /// `verify`: run on the signed outer object.
     pub verify: Option<ArgvTemplate>,
