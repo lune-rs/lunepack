@@ -2213,3 +2213,133 @@ fn the_integration_suite_passes_a_correct_integration_and_catches_broken_ones() 
         "an integration that accepts unsafe input must fail"
     );
 }
+
+// ---- the publisher check (M9 step 5) ---------------------------------------------------------------
+
+mod publisher {
+    use lunepack_core::{PublisherCheck, PublisherError, SignedTree};
+    use lunepack_testkit::{
+        FakePublisherCheck, MarkerPublisher, PublisherFixtures, PublisherSuite, run_publisher_suite,
+    };
+
+    fn scratch(tag: &str) -> tempfile_dir::Dir {
+        tempfile_dir::Dir::new(tag)
+    }
+
+    /// A scratch directory removed when dropped (this crate has no `tempfile`).
+    mod tempfile_dir {
+        use std::path::{Path, PathBuf};
+
+        pub struct Dir(PathBuf);
+
+        impl Dir {
+            pub fn new(tag: &str) -> Dir {
+                let path = std::env::temp_dir()
+                    .join(format!("lunepack-publisher-{tag}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&path);
+                std::fs::create_dir_all(&path).unwrap();
+                Dir(std::fs::canonicalize(&path).unwrap())
+            }
+
+            pub fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    fn passes(check: &dyn PublisherCheck, tag: &str) -> bool {
+        let dir = scratch(tag);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_publisher_suite(check, PublisherSuite::Signed(&MarkerPublisher), dir.path());
+        }))
+        .is_ok()
+    }
+
+    /// Wraps the model check and damages one answer.
+    struct Broken(&'static str);
+
+    impl PublisherCheck for Broken {
+        fn same_publisher(
+            &self,
+            installed: &SignedTree,
+            candidate: &SignedTree,
+        ) -> Result<bool, PublisherError> {
+            let real = MarkerPublisher.same_publisher(installed, candidate);
+            match (self.0, real) {
+                // Approves another publisher.
+                ("accepts_different", Ok(false)) => Ok(true),
+                // Does not notice a tampered candidate.
+                ("ignores_tamper", Err(PublisherError::CandidateInvalid)) => Ok(true),
+                // Mixes up the two sides.
+                ("swaps_sides", Err(PublisherError::InstalledUnsigned)) => {
+                    Err(PublisherError::CandidateUnsigned)
+                }
+                // Reports an unsigned candidate as a local fault.
+                ("unsigned_is_os", Err(PublisherError::CandidateUnsigned)) => {
+                    Err(PublisherError::Os)
+                }
+                (_, real) => real,
+            }
+        }
+    }
+
+    #[test]
+    fn the_marker_model_passes_the_suite_and_each_broken_check_fails_it() {
+        assert!(passes(&MarkerPublisher, "ok"), "a correct check must pass");
+        for broken in [
+            "accepts_different",
+            "ignores_tamper",
+            "swaps_sides",
+            "unsigned_is_os",
+        ] {
+            assert!(
+                !passes(&Broken(broken), broken),
+                "{broken}: the suite must fail it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_not_applicable_suite_catches_a_check_that_answers() {
+        let dir = scratch("na");
+        let fake =
+            FakePublisherCheck::new(std::iter::repeat_n(Err(PublisherError::NotApplicable), 4));
+        run_publisher_suite(&fake, PublisherSuite::NotApplicable, dir.path());
+        assert_eq!(fake.calls().len(), 2, "the suite asked twice");
+        let says_yes = FakePublisherCheck::new([Ok(true), Ok(true)]);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_publisher_suite(&says_yes, PublisherSuite::NotApplicable, dir.path());
+        }))
+        .is_err();
+        assert!(failed, "a platform with no check must not answer yes");
+    }
+
+    #[test]
+    fn the_fake_answers_its_script_in_order_records_calls_and_then_fails_closed() {
+        let fake = FakePublisherCheck::new([Ok(true), Ok(false), Err(PublisherError::Os)]);
+        let dir = scratch("fake");
+        let (a, b) = (
+            MarkerPublisher
+                .signed(&dir.path().join("a"), "x")
+                .unwrap_or_else(|| unreachable!()),
+            MarkerPublisher
+                .unsigned(&dir.path().join("b"))
+                .unwrap_or_else(|| unreachable!()),
+        );
+        assert_eq!(fake.same_publisher(&a, &b), Ok(true));
+        assert_eq!(fake.same_publisher(&b, &a), Ok(false));
+        assert_eq!(fake.same_publisher(&a, &a), Err(PublisherError::Os));
+        // A spent script is a local fault, never an approval.
+        assert_eq!(fake.same_publisher(&a, &b), Err(PublisherError::Os));
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0], (a.clone(), b.clone()));
+        assert_eq!(calls[1], (b, a));
+    }
+}

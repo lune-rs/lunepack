@@ -14,6 +14,7 @@ mod http_server;
 mod integration;
 mod memfs;
 mod process;
+mod publisher;
 mod rng;
 mod seeds;
 mod signer;
@@ -39,6 +40,9 @@ pub use memfs::{MemFs, MemPlace, RecoverMode};
 pub use process::{
     ChildScript, FakeChildPipes, FakePipeReader, FakePipeWriter, FakeProcess, SpawnRecord,
     run_process_suite,
+};
+pub use publisher::{
+    FakePublisherCheck, MarkerPublisher, PublisherFixtures, PublisherSuite, run_publisher_suite,
 };
 pub use rng::FakeRng;
 pub use seeds::{Seed, fuzz_seeds, sample_update_config};

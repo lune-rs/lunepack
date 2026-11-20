@@ -42,14 +42,15 @@ pub mod write;
 
 pub use cancel::CancelToken;
 pub use codesign::{
-    ArgvTemplate, ExpandCtx, Expanded, PlanEntry, PlanEntryKind, SignItem, SignKind, SignPlanError,
-    TemplateError, TemplateRole, macho_slices_signed, pe_is_signed, sign_plan,
+    ArgvTemplate, Decision, ExpandCtx, Expanded, PlanEntry, PlanEntryKind, PublisherOutcome,
+    SignItem, SignKind, SignPlanError, TemplateError, TemplateRole, decide, macho_slices_signed,
+    pe_is_signed, sign_plan,
 };
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
 pub use error::{
-    DesktopPathError, Error, FeedRule, LayoutError, LifecycleError, Result, StageError, StateError,
-    UpdateConfigError,
+    DesktopPathError, Error, FeedRule, LayoutError, LifecycleError, PublisherError, Result,
+    StageError, StateError, UpdateConfigError,
 };
 pub use feed::{
     ArtifactRef, CheckedRef, FeedDocument, FeedTargetEntry, ReleaseDoc, Rollout, RolloutDoc,
@@ -113,7 +114,7 @@ pub use stub::{LaunchTarget, STUB_CONTRACT_VERSION, STUB_FILE, StubError, launch
 pub use target::Target;
 pub use traits::{
     Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,
-    HashState, Hasher, Rng, SignatureAlg, Signer, StreamView, Verifier,
+    HashState, Hasher, PublisherCheck, Rng, SignatureAlg, SignedTree, Signer, StreamView, Verifier,
 };
 pub use transport::{
     BlockingResponse, BlockingTransport, Body, BoxFuture, ByteRange, Head, Request, Response,
