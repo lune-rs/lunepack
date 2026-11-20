@@ -27,6 +27,18 @@
 //! M7-D16, M7-D17); a refusal there ends the run with nothing written under the data home.
 //!
 //! Nothing from the payload runs, or is written anywhere, before its signature or hash checked.
+//!
+//! macOS (M8-D7): the installer is an app, `<I>` = `Install <name>.app`, whose main executable
+//! is the release's UI and whose `Contents/MacOS/lunepack-runtime` is this runtime. The runtime
+//! is in setup mode when its resolved path is that one and
+//! `<I>/Contents/Resources/lunepack-setup.payload` is a regular file ([`detect_installer`]):
+//! FORMAT.md 14's payload and trailer without the runtime part, verified exactly as a setup
+//! file's. Its command line is empty (the UI beside it is started as on the other systems, never
+//! extracted), `--silent`, or the internal `--ui-stdio` ([`InstallerRun`]): the UI is the parent
+//! and the frames go over this process's own standard streams ([`UiHost::over_parent`]). The
+//! install goes into the live bundle in the apps folder (M8-D1, D2) by the facade's bundle
+//! install; only that folder's place is judged (M8-D4), never the installer's own (a read-only
+//! disk image, a translocated copy).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -77,6 +89,81 @@ pub enum Detect {
     Setup(Found),
     /// The magic, then something malformed.
     Malformed,
+}
+
+/// How the macOS installer's runtime was started (M8-D7).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallerRun {
+    /// No argument: the UI beside the runtime is started, when one may be.
+    Ui,
+    /// `--silent`: no UI, every prompt its default (D41).
+    Silent,
+    /// `--ui-stdio` (internal): the installer's UI started this runtime and talks to it over its
+    /// standard input and output.
+    UiStdio,
+}
+
+/// The option the installer's UI starts the runtime with.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const UI_STDIO_ARG: &str = "--ui-stdio";
+
+/// The macOS installer's command line: nothing, `--silent` or `--ui-stdio`, once; anything else
+/// is a usage error.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn parse_installer(args: &[OsString]) -> Result<InstallerRun, crate::modes::UsageError> {
+    match args {
+        [] => Ok(InstallerRun::Ui),
+        [flag] if flag == "--silent" => Ok(InstallerRun::Silent),
+        [flag] if flag == UI_STDIO_ARG => Ok(InstallerRun::UiStdio),
+        _ => Err(crate::modes::UsageError),
+    }
+}
+
+/// The installer's runtime (macOS, M8-D7): when `exe` (the resolved executable) is
+/// `<I>/Contents/MacOS/lunepack-runtime` and `<I>/Contents/Resources/lunepack-setup.payload` is a
+/// regular file (not a link), that file parsed as a payload file
+/// ([`lunepack_core::setup::parse_payload_file`]); a payload file that cannot be read or parsed
+/// is [`Detect::Malformed`] (exit 7), never an ordinary run. Anything else is [`Detect::None`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn detect_installer(
+    fs: &dyn Fs,
+    exe: &Path,
+    hasher: &dyn Hasher,
+    verifier: &dyn Verifier,
+) -> Detect {
+    let named = |path: Option<&Path>, name: &str| {
+        path.and_then(Path::file_name)
+            .is_some_and(|n| n == std::ffi::OsStr::new(name))
+    };
+    let macos_dir = exe.parent();
+    let contents = macos_dir.and_then(Path::parent);
+    if !named(Some(exe), "lunepack-runtime")
+        || !named(macos_dir, "MacOS")
+        || !named(contents, "Contents")
+    {
+        return Detect::None;
+    }
+    let Some(installer) = contents.and_then(Path::parent) else {
+        return Detect::None;
+    };
+    let payload = lunepack_core::update_config::MACOS_INSTALLER_PAYLOAD
+        .split('/')
+        .fold(installer.to_path_buf(), |dir, name| dir.join(name));
+    match fs.symlink_metadata(&payload) {
+        Ok(Some(meta)) if meta.kind == lunepack::FileKind::File => {}
+        _ => return Detect::None,
+    }
+    let Ok(file) = fs.open_read(&payload) else {
+        return Detect::Malformed;
+    };
+    match lunepack_core::setup::parse_payload_file(file.as_ref(), hasher, verifier) {
+        Ok(trailer) => Detect::Setup(Found {
+            trailer,
+            file: Arc::from(file),
+        }),
+        Err(_) => Detect::Malformed,
+    }
 }
 
 /// Looks for a setup trailer in `exe` (the resolved executable) through the core's locator
@@ -139,6 +226,8 @@ pub struct Prepared {
     data_home: PathBuf,
     /// The UI's private directory, when one was made.
     ui_dir: Option<PathBuf>,
+    /// macOS: the apps folder the live bundle goes in (M8-D2).
+    apps_dir: Option<PathBuf>,
 }
 
 impl Prepared {
@@ -155,6 +244,14 @@ impl Prepared {
     /// The UI's directory, when the UI was extracted.
     pub fn ui_dir(&self) -> Option<&Path> {
         self.ui_dir.as_deref()
+    }
+
+    /// macOS: the install is a bundle install into `apps_dir` (the canonical `~/Applications`,
+    /// M8-D2), which the welcome screen shows as the location.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn with_apps_dir(mut self, apps_dir: PathBuf) -> Prepared {
+        self.apps_dir = Some(apps_dir);
+        self
     }
 
     /// Removes the UI's directory (after the UI has exited). Best effort.
@@ -223,6 +320,7 @@ pub fn prepare(
         install_root,
         data_home: data_home.to_path_buf(),
         ui_dir: None,
+        apps_dir: None,
     };
     if want_ui && let (Some(home), Some(own)) = (ui_home, own) {
         prepared.ui_dir = extract_ui(ad, &prepared, home, own, alive);
@@ -407,7 +505,9 @@ pub fn welcome(prepared: &Prepared) -> (lunepack_core::ui::AppCard, lunepack_cor
         .filter(|p| p.chars().count() <= lunepack_core::ui::MAX_NAME);
     let details = lunepack_core::ui::Details {
         location: prepared
-            .install_root
+            .apps_dir
+            .as_ref()
+            .unwrap_or(&prepared.install_root)
             .to_str()
             .map(str::to_owned)
             .and_then(|t| ui_host::within(t, lunepack_core::ui::MAX_LOCATION)),
@@ -468,6 +568,7 @@ pub fn failed(kind: Kind, version: Option<Version>) -> Event {
         tree_version: version,
         kind: kind.name(),
         exit_code: kind.code(),
+        reason: kind.reason(),
     }
 }
 
@@ -513,7 +614,11 @@ fn install(ad: &Adapters, prepared: &Prepared, events: &Events) -> Result<Versio
     .verifier(Arc::clone(&ad.verifier))
     .codec(Arc::clone(&ad.codec))
     .rng(Arc::clone(&ad.rng))
-    .integration(Arc::clone(&ad.integration))
+    .integration(Arc::clone(&ad.integration));
+    let updater = match &prepared.apps_dir {
+        Some(apps_dir) => updater.bundle_layout(apps_dir.clone()),
+        None => updater,
+    }
     .build()
     .map_err(|e| Kind::of(&e))?;
     events.emit(&Event::phase(Phase::Install, Some(prepared.version())));
@@ -558,8 +663,12 @@ fn install(ad: &Adapters, prepared: &Prepared, events: &Events) -> Result<Versio
 /// Starts the installed version's entry, detached, with no arguments and without a health token;
 /// a failure is a warning.
 fn launch(ad: &Adapters, prepared: &Prepared, version: &Version, events: &Events) {
-    let tree = UserLayout::from_root(prepared.install_root.clone(), ad.platform.layout_scheme())
-        .version_dir(version);
+    let layout = UserLayout::from_root(prepared.install_root.clone(), ad.platform.layout_scheme());
+    // The bundle layout (macOS) puts the installed version in the live bundle.
+    let tree = match layout.bundle_path(&*ad.fs) {
+        Ok(Some(bundle)) => bundle,
+        _ => layout.version_dir(version),
+    };
     let entry = prepared
         .verified
         .config

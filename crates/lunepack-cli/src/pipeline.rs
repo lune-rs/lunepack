@@ -18,8 +18,9 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use anyhow::{Context, Result, anyhow, bail};
 use lunepack_core::path::MAX_PATH_DEPTH;
 use lunepack_core::update_config::{
-    RUNTIME_FILE, RUNTIME_FILE_WINDOWS, UI_FILE, UI_FILE_WINDOWS, config_path, runtime_file,
-    ui_file,
+    MACOS_CODE_SIGNATURE_DIR, MACOS_HELPER_APP, MACOS_HELPER_ICON, MACOS_HELPER_INFO_PLIST,
+    MACOS_HELPER_UI, MACOS_INFO_PLIST, MACOS_INSTALLER_PAYLOAD, RUNTIME_FILE, RUNTIME_FILE_WINDOWS,
+    UI_FILE, UI_FILE_WINDOWS, config_path, runtime_file, ui_file,
 };
 use lunepack_core::{
     CodeSign, Codec, CodecId, Encoder, EntryKind, Hasher, InstallMeta, ManifestDocument,
@@ -134,7 +135,9 @@ fn make_symlink(_text: &str, at: &Path) -> Result<()> {
 
 /// What a pack with `[update]` adds to the tree (M5-D7): the runtime beside the entry, the UI
 /// binary beside it when `--ui` is given (M6), the Windows stub beside it for a `windows-*` target
-/// (M7), and the update configuration at its fixed place (FORMAT.md 13.1).
+/// (M7), and the update configuration at its fixed place (FORMAT.md 13.1). For a `macos-*` target
+/// the UI is the executable of the helper app `Contents/Helpers/lunepack-update.app`, with its
+/// `Info.plist` and, optionally, its icon (M8-D6).
 pub struct UpdatePlan<'a> {
     /// The target of the pack.
     pub target: Target,
@@ -149,6 +152,83 @@ pub struct UpdatePlan<'a> {
     pub stub: Option<&'a [u8]>,
     /// The update configuration's canonical bytes.
     pub config: &'a [u8],
+    /// The helper app's `Info.plist` bytes (M8-D6); `Some` exactly for a `macos-*` target with
+    /// `--ui`.
+    pub helper_plist: Option<&'a [u8]>,
+    /// The helper app's `.icns` bytes, already checked; only with `helper_plist`.
+    pub helper_icon: Option<&'a [u8]>,
+}
+
+/// One file `pack` places into the assembled tree, or finds already placed in a signed bundle.
+struct Placement<'a> {
+    /// The path relative to the tree.
+    path: String,
+    bytes: &'a [u8],
+    exec: bool,
+}
+
+/// Every file `plan` places, in the order they are written and, for a signed bundle, compared.
+fn placements<'a>(plan: &UpdatePlan<'a>) -> Vec<Placement<'a>> {
+    let dir = parent_of(plan.install.entry.as_str());
+    let beside = |name: &str| {
+        if dir.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{dir}/{name}")
+        }
+    };
+    let mut out = vec![Placement {
+        path: beside(runtime_file(plan.target)),
+        bytes: plan.runtime,
+        exec: true,
+    }];
+    if plan.target.is_macos() {
+        out.push(Placement {
+            path: config_path(plan.target).to_owned(),
+            bytes: plan.config,
+            exec: false,
+        });
+        if let (Some(ui), Some(plist)) = (plan.ui, plan.helper_plist) {
+            out.push(Placement {
+                path: MACOS_HELPER_UI.to_owned(),
+                bytes: ui,
+                exec: true,
+            });
+            out.push(Placement {
+                path: MACOS_HELPER_INFO_PLIST.to_owned(),
+                bytes: plist,
+                exec: false,
+            });
+            if let Some(icon) = plan.helper_icon {
+                out.push(Placement {
+                    path: MACOS_HELPER_ICON.to_owned(),
+                    bytes: icon,
+                    exec: false,
+                });
+            }
+        }
+        return out;
+    }
+    if let Some(ui) = plan.ui {
+        out.push(Placement {
+            path: beside(ui_file(plan.target)),
+            bytes: ui,
+            exec: true,
+        });
+    }
+    if let Some(stub) = plan.stub {
+        out.push(Placement {
+            path: beside(STUB_FILE),
+            bytes: stub,
+            exec: true,
+        });
+    }
+    out.push(Placement {
+        path: config_path(plan.target).to_owned(),
+        bytes: plan.config,
+        exec: false,
+    });
+    out
 }
 
 /// The directory part of a tree path (`""` for a path at the root).
@@ -156,15 +236,38 @@ fn parent_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
+/// Whether the input at `input` is a code-signed `macos-*` bundle: it holds
+/// `Contents/_CodeSignature` (M8-D8). `pack` then never modifies it.
+pub fn is_signed_bundle(input: &Path, target: Target) -> bool {
+    target.is_macos() && fs::symlink_metadata(input.join(MACOS_CODE_SIGNATURE_DIR)).is_ok()
+}
+
 /// Fails when the input holds a name the update setup reserves (M5-D17): the configuration's file
 /// name at any depth, so nothing can shadow the root's in the nearest-ancestor discovery, or the
 /// runtime's or the UI's name (either form) in the entry's directory. The UI's name is reserved
 /// whether or not `--ui` is given, since the runtime starts a UI from its own directory. Names
 /// compare ignoring ASCII case, as a case-insensitive file system would.
-pub fn check_reserved(input: &Path, entry: &RelPath, target: Target) -> Result<()> {
-    let entry_dir = parent_of(entry.as_str());
+///
+/// For a `macos-*` target the helper app's directory and the installer payload's path are reserved
+/// as well (M8-D6, M8-D7). A signed bundle (M8-D8) legitimately holds the files `pack` would
+/// place, so exactly those paths are let through, and with `--ui` everything inside the helper app
+/// (its own signature among it); [`place_update`] then compares the placed files.
+pub fn check_reserved(input: &Path, plan: &UpdatePlan<'_>) -> Result<()> {
+    let entry_dir = parent_of(plan.install.entry.as_str());
+    let target = plan.target;
+    let placed: Vec<String> = if is_signed_bundle(input, target) {
+        placements(plan).into_iter().map(|p| p.path).collect()
+    } else {
+        Vec::new()
+    };
+    // Exact text: a path that differs only in case from a placed one is still reserved.
+    let is_placed = |text: &str| placed.iter().any(|p| p == text);
+    let helper_signed = placed.iter().any(|p| p == MACOS_HELPER_UI);
     for (path, ..) in walk(input)? {
         let text = path.as_str();
+        if is_placed(text) {
+            continue;
+        }
         let name = text.rsplit_once('/').map_or(text, |(_, name)| name);
         if name.eq_ignore_ascii_case(UPDATE_CONFIG_FILE) {
             bail!(
@@ -177,6 +280,24 @@ pub fn check_reserved(input: &Path, entry: &RelPath, target: Target) -> Result<(
             bail!(
                 "the input tree holds {text:?}; the name {STUB_FILE} is reserved for the launcher stub of a Windows target"
             );
+        }
+        if target.is_macos() {
+            for (reserved, what) in [
+                (MACOS_HELPER_APP, "the update window's helper app"),
+                (MACOS_INSTALLER_PAYLOAD, "the installer app's payload"),
+            ] {
+                if helper_signed && reserved == MACOS_HELPER_APP {
+                    continue;
+                }
+                let under = text.len() > reserved.len()
+                    && text.as_bytes()[reserved.len()] == b'/'
+                    && text[..reserved.len()].eq_ignore_ascii_case(reserved);
+                if text.eq_ignore_ascii_case(reserved) || under {
+                    bail!(
+                        "the input tree holds {text:?}; the path {reserved} is reserved for {what}"
+                    );
+                }
+            }
         }
         if parent_of(text) == entry_dir {
             for (reserved, what) in [
@@ -246,9 +367,61 @@ fn write_new(path: &Path, bytes: &[u8], _exec: bool) -> Result<()> {
         .with_context(|| format!("cannot write {}", path.display()))
 }
 
+/// Creates the directories above `rel` in `tree`, one at a time through real directories only: a
+/// component that exists as anything but a directory (a symlink included) is refused, so a write
+/// can never be redirected out of the tree.
+fn ensure_dirs(tree: &Path, rel: &str) -> Result<()> {
+    let mut at = tree.to_path_buf();
+    for component in parent_of(rel).split('/').filter(|c| !c.is_empty()) {
+        at.push(component);
+        match fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                bail!("{rel} cannot be placed: a directory on its path is not a real directory")
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&at).with_context(|| format!("cannot create {}", at.display()))?
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("cannot read {}", at.display())));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The first of `list` that a signed `macos-*` bundle at `tree` does not hold byte for byte
+/// (M8-D8): missing, not a regular file, another size or content, or another exec bit.
+fn first_unplaced(tree: &Path, list: &[Placement<'_>]) -> Result<Option<String>> {
+    for p in list {
+        let at = tree.join(&p.path);
+        let rel = RelPath::parse(&p.path).context("internal error: a placement is not a path")?;
+        let Ok(meta) = regular_file_in(tree, &rel, "placement") else {
+            return Ok(Some(p.path.clone()));
+        };
+        if meta.len() != p.bytes.len() as u64 {
+            return Ok(Some(p.path.clone()));
+        }
+        #[cfg(unix)]
+        if is_exec(&meta) != p.exec {
+            return Ok(Some(p.path.clone()));
+        }
+        let have = fs::read(&at).with_context(|| format!("cannot read {}", at.display()))?;
+        if have != p.bytes {
+            return Ok(Some(p.path.clone()));
+        }
+    }
+    Ok(None)
+}
+
 /// Checks the entry and icon in the assembled tree at `tree`, then places the runtime, and the UI
 /// when given, beside the entry and the update configuration at its fixed path (M5-D7). Runs after
 /// `assemble` and before code signing, so every file is signed, hashed and packed like the app's own.
+///
+/// For a `macos-*` target the entry must be `Contents/MacOS/<file>` and `Contents/Info.plist` a
+/// regular file; the UI goes into the helper app (M8-D6). A signed bundle (M8-D8) is never
+/// written to: every file `pack` would place must already be there byte for byte, or this fails
+/// naming the first path that is not.
 pub fn place_update(tree: &Path, plan: &UpdatePlan<'_>) -> Result<()> {
     let install = plan.install;
     let meta = regular_file_in(tree, &install.entry, "install.entry")?;
@@ -262,24 +435,50 @@ pub fn place_update(tree: &Path, plan: &UpdatePlan<'_>) -> Result<()> {
     if let Some(icon) = &install.icon {
         regular_file_in(tree, icon, "install.icon")?;
     }
-    let dir = parent_of(install.entry.as_str());
-    let mut beside = tree.to_path_buf();
-    if !dir.is_empty() {
-        beside.push(dir);
+    if plan.target.is_macos() {
+        let plist = RelPath::parse(MACOS_INFO_PLIST).context("internal error: a bundle path")?;
+        regular_file_in(tree, &plist, MACOS_INFO_PLIST).map_err(|_| {
+            anyhow!("a macos-* input must hold {MACOS_INFO_PLIST} as a regular file")
+        })?;
     }
-    write_new(&beside.join(runtime_file(plan.target)), plan.runtime, true)?;
-    if let Some(ui) = plan.ui {
-        write_new(&beside.join(ui_file(plan.target)), ui, true)?;
+    let list = placements(plan);
+    if is_signed_bundle(tree, plan.target) {
+        if let Some(path) = first_unplaced(tree, &list)? {
+            bail!(
+                "the input bundle is code-signed ({MACOS_CODE_SIGNATURE_DIR}) and {path} is missing or differs from what pack would place; \
+                 pack never modifies a signed bundle: run `lunepack pack --assemble <dir>` with the same options, sign the assembled bundle, and pack that"
+            );
+        }
+        return Ok(());
     }
-    if let Some(stub) = plan.stub {
-        write_new(&beside.join(STUB_FILE), stub, true)?;
+    for p in &list {
+        ensure_dirs(tree, &p.path)?;
+        write_new(&tree.join(&p.path), p.bytes, p.exec)?;
     }
-    let config = tree.join(config_path(plan.target));
-    if let Some(parent) = config.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
+    Ok(())
+}
+
+/// `pack --assemble` (M8-D8): writes the tree stage 1 and the update placement would produce to the
+/// new directory `dest` and nothing else, so a signing tool can sign it before it is packed. The
+/// input must not be signed. An existing `dest` is refused; a failure removes the `dest` this call
+/// created.
+pub fn assemble_bundle(input: &Path, dest: &Path, plan: &UpdatePlan<'_>) -> Result<()> {
+    if !input.is_dir() {
+        bail!("--input {} is not a directory", input.display());
     }
-    write_new(&config, plan.config, false)
+    if is_signed_bundle(input, plan.target) {
+        bail!(
+            "--input holds {MACOS_CODE_SIGNATURE_DIR}: a signed bundle is packed as it is, nothing is assembled"
+        );
+    }
+    check_reserved(input, plan)?;
+    fs::create_dir(dest).with_context(|| format!("cannot create {}", dest.display()))?;
+    let built = copy_dir(input, dest, 0).and_then(|()| place_update(dest, plan));
+    if built.is_err() {
+        // `dest` did not exist a moment ago: `create_dir` above made it.
+        let _ = fs::remove_dir_all(dest);
+    }
+    built
 }
 
 /// Stage 1: copies the tree at `input` into `dest` (which must not exist): files (with their
@@ -634,7 +833,7 @@ pub fn build(
     if let Some(plan) = &set.update
         && input.is_dir()
     {
-        check_reserved(input, &plan.install.entry, plan.target)?;
+        check_reserved(input, plan)?;
     }
     assemble(input, &tree)?;
     say(&format!("assemble: copied {}", input.display()))?;

@@ -7,8 +7,31 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-[lints]
-workspace = true
+# An allowlisted crate (hard rule 2): a full copy of the workspace lints in which `unsafe_code` is
+# `deny` instead of `forbid`, so the few modules that need it opt in with `#![allow(unsafe_code)]`,
+# and every unsafe block carries a `// SAFETY:` comment.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
 
 [dependencies]
 lunepack-core.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# libproc (process identity, the in-use scan), kqueue (waiting for a non-child), setsid(2) for a
+# detached spawn and kill(2) for SIGTERM to an own child; nothing else.
+libc = { workspace = true }
+
+[dev-dependencies]
+lunepack-testkit.workspace = true
+
+# Own main: the test binary is also the helper program the process suite and the tests start
+# (its first argument names the helper mode), and the cases run one after another.
+[[test]]
+name = "process"
+harness = false

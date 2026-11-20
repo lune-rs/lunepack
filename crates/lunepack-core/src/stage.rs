@@ -341,6 +341,242 @@ impl JobErr {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Tree verification (M8-D9).
+
+/// How a tree differs from its manifest ([`verify_tree`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TreeDifference {
+    /// An entry the manifest lists is not in the tree.
+    Missing,
+    /// The tree holds an entry the manifest does not list (names compared as listed bytes).
+    Extra,
+    /// An entry is of another kind (file, directory, symlink) than listed.
+    Kind,
+    /// A file's size differs.
+    Size,
+    /// A file's executable bit differs.
+    Exec,
+    /// A file's SHA-256 differs.
+    Content,
+    /// A symlink's target text differs.
+    Target,
+}
+
+/// Why [`verify_tree`] did not prove a tree equal to its manifest. It names the kind of difference
+/// and the manifest index of the entry, never a byte of content.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TreeMismatch {
+    /// The tree differs from the manifest.
+    #[error("the tree differs from its manifest ({difference:?}, entry {entry:?})")]
+    Differs {
+        /// What differs.
+        difference: TreeDifference,
+        /// The manifest index of the entry; `None` for an entry the manifest does not list.
+        entry: Option<usize>,
+    },
+    /// The cancel token was cancelled.
+    #[error("cancelled")]
+    Cancelled,
+    /// The filesystem failed (the tree was not judged).
+    #[error("{0}")]
+    Fs(#[from] FsError),
+}
+
+impl From<TreeMismatch> for Error {
+    fn from(e: TreeMismatch) -> Self {
+        match e {
+            TreeMismatch::Differs { difference, entry } => Error::TreeDiffers { difference, entry },
+            TreeMismatch::Cancelled => Error::Cancelled,
+            TreeMismatch::Fs(e) => Error::Fs(e),
+        }
+    }
+}
+
+/// What the manifest expects at a relative path.
+#[derive(Clone, Copy)]
+enum TreeExpect {
+    /// A listed entry, by manifest index.
+    Listed(usize),
+    /// A directory no entry lists but some entry lies under.
+    Implied,
+}
+
+fn differs(difference: TreeDifference, entry: Option<usize>) -> TreeMismatch {
+    TreeMismatch::Differs { difference, entry }
+}
+
+/// Proves the tree at `tree` exactly equal to `manifest` (M8-D9), reading only:
+///
+/// - The tree is walked with [`Fs::list_dir`] and [`Fs::symlink_metadata`]; no symlink is ever
+///   followed or opened, and only directories the manifest expects (listed, or above a listed
+///   entry) are entered.
+/// - The set of relative paths must equal the manifest's, compared as listed bytes (a name that
+///   is not UTF-8, or that differs from the manifest's in case or Unicode normalisation, is an
+///   [`TreeDifference::Extra`] entry and the manifest's a [`TreeDifference::Missing`] one: a
+///   case- or normalisation-insensitive volume never matches a name through a lookup). An
+///   empty directory the manifest does not list is extra.
+/// - Per entry: its kind; for a file its size, executable bit ([`Fs::is_exec`]) and SHA-256 (at
+///   most its size in bytes is read, after the size matched); for a symlink its target text.
+///
+/// Sizes and bits of every file are compared before any byte is hashed. [`Phase::Adopt`] events
+/// (no file, total = the files' bytes) are delivered on the calling thread. The first difference
+/// found is the answer.
+pub fn verify_tree(
+    manifest: &VerifiedManifest,
+    tree: &Path,
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    cancel: &CancelToken,
+    progress: &dyn Fn(Progress),
+) -> Result<(), TreeMismatch> {
+    if cancel.is_cancelled() {
+        return Err(TreeMismatch::Cancelled);
+    }
+    let entries = manifest.entries();
+    let mut expected: BTreeMap<&str, TreeExpect> = BTreeMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        expected.insert(e.path().as_str(), TreeExpect::Listed(i));
+    }
+    for e in entries {
+        let text = e.path().as_str();
+        for (pos, _) in text.match_indices('/') {
+            expected.entry(&text[..pos]).or_insert(TreeExpect::Implied);
+        }
+    }
+    match fs.symlink_metadata(tree)? {
+        Some(Meta {
+            kind: FileKind::Dir,
+            ..
+        }) => {}
+        Some(_) => return Err(differs(TreeDifference::Kind, None)),
+        None => return Err(differs(TreeDifference::Missing, None)),
+    }
+
+    // The walk: every listed name must be expected, and of the expected kind.
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut files: Vec<(usize, PathBuf)> = Vec::new();
+    let mut dirs: Vec<(String, PathBuf)> = vec![(String::new(), tree.to_path_buf())];
+    while let Some((prefix, dir)) = dirs.pop() {
+        let mut listing = fs.list_dir(&dir)?;
+        listing.sort_by(|a, b| a.name.cmp(&b.name));
+        for item in listing {
+            let Some(name) = item.name.to_str() else {
+                return Err(differs(TreeDifference::Extra, None));
+            };
+            let rel = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let Some((&key, &expect)) = expected.get_key_value(rel.as_str()) else {
+                return Err(differs(TreeDifference::Extra, None));
+            };
+            let path = dir.join(&item.name);
+            let index = match expect {
+                TreeExpect::Listed(i) => Some(i),
+                TreeExpect::Implied => None,
+            };
+            let want = match index.map(|i| &entries[i]) {
+                None | Some(VerifiedEntry::Dir { .. }) => FileKind::Dir,
+                Some(VerifiedEntry::File { .. }) => FileKind::File,
+                Some(VerifiedEntry::Symlink { .. }) => FileKind::Symlink,
+            };
+            if item.kind != want {
+                return Err(differs(TreeDifference::Kind, index));
+            }
+            match index.map(|i| &entries[i]) {
+                None | Some(VerifiedEntry::Dir { .. }) => dirs.push((rel, path)),
+                Some(VerifiedEntry::File { .. }) => {
+                    files.push((index.unwrap_or_default(), path));
+                }
+                Some(VerifiedEntry::Symlink { target, .. }) => {
+                    if fs.read_link(&path)? != *target {
+                        return Err(differs(TreeDifference::Target, index));
+                    }
+                }
+            }
+            seen.insert(key);
+        }
+    }
+    if let Some((_, expect)) = expected.iter().find(|(k, _)| !seen.contains(*k)) {
+        let entry = match expect {
+            TreeExpect::Listed(i) => Some(*i),
+            TreeExpect::Implied => None,
+        };
+        return Err(differs(TreeDifference::Missing, entry));
+    }
+
+    // Sizes and bits first (cheap), then the bytes.
+    files.sort_by_key(|(i, _)| *i);
+    let mut total = 0u64;
+    for (i, path) in &files {
+        let VerifiedEntry::File { size, exec, .. } = &entries[*i] else {
+            continue;
+        };
+        match fs.symlink_metadata(path)? {
+            Some(Meta {
+                kind: FileKind::File,
+                len,
+            }) if len == *size => {}
+            Some(Meta {
+                kind: FileKind::File,
+                ..
+            }) => return Err(differs(TreeDifference::Size, Some(*i))),
+            Some(_) => return Err(differs(TreeDifference::Kind, Some(*i))),
+            None => return Err(differs(TreeDifference::Missing, Some(*i))),
+        }
+        if fs.is_exec(path)? != *exec {
+            return Err(differs(TreeDifference::Exec, Some(*i)));
+        }
+        total = total.saturating_add(*size);
+    }
+    let mut done = 0u64;
+    progress(Progress {
+        phase: Phase::Adopt,
+        done,
+        total,
+        file: None,
+    });
+    let mut buf = vec![0u8; IO_BUFFER_BYTES as usize];
+    for (i, path) in &files {
+        let VerifiedEntry::File { size, sha256, .. } = &entries[*i] else {
+            continue;
+        };
+        let reader = fs.open_read(path)?;
+        if reader.size()? != *size {
+            return Err(differs(TreeDifference::Size, Some(*i)));
+        }
+        let mut state = hasher.sha256_start();
+        let mut off = 0u64;
+        while off < *size {
+            if cancel.is_cancelled() {
+                return Err(TreeMismatch::Cancelled);
+            }
+            let n = (*size - off).min(buf.len() as u64) as usize;
+            reader.read_exact_at(off, &mut buf[..n])?;
+            state.update(&buf[..n]);
+            off += n as u64;
+            done = done.saturating_add(n as u64);
+            progress(Progress {
+                phase: Phase::Adopt,
+                done,
+                total,
+                file: None,
+            });
+        }
+        if state.finalize() != *sha256 {
+            return Err(differs(TreeDifference::Content, Some(*i)));
+        }
+    }
+    if cancel.is_cancelled() {
+        return Err(TreeMismatch::Cancelled);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
 // Scan (M4-D7).
 
 enum ScanResult {

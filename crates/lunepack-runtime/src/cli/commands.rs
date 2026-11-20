@@ -4,8 +4,8 @@
 //! to a [`Kind`].
 
 use lunepack::{
-    ApplyOptions, CancelToken, DownloadOptions, HEALTH_TOKEN_VAR, Installation, Platform, UiChoice,
-    blocking,
+    ApplyOptions, CancelToken, CheckOptions, CheckOutcome, DownloadOptions, HEALTH_TOKEN_VAR,
+    Installation, Platform, UiChoice, blocking,
 };
 
 use super::WaitTarget;
@@ -31,8 +31,16 @@ pub fn run(
     cancel: &CancelToken,
     wait: Option<WaitTarget>,
 ) -> Result<Body, Kind> {
+    // A bundle the user moved is followed under the lock before a mode that reads or changes the
+    // install uses it (M8-D17); a move that cannot be followed is not this install.
+    if matches!(
+        parsed.command,
+        Command::Check | Command::Download | Command::ApplyAndRestart
+    ) {
+        followed(inst)?;
+    }
     match parsed.command {
-        Command::Check => check(inst, parsed, cancel),
+        Command::Check => check(inst, parsed, output, cancel),
         Command::Download => download(inst, parsed, output, cancel),
         Command::Startup => startup(inst, parsed),
         Command::Confirm => confirm(inst),
@@ -40,9 +48,23 @@ pub fn run(
     }
 }
 
+/// Follows `inst`'s bundle to where the user moved it ([`lunepack::follow_move`]); a copy that is
+/// not the install's after all is `not_installed`.
+fn followed(inst: &Installation) -> Result<(), Kind> {
+    if !inst.moved() {
+        return Ok(());
+    }
+    match lunepack::follow_move(inst) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Kind::NotInstalled),
+        Err(e) => Err(Kind::of(&e)),
+    }
+}
+
 fn updater(inst: &Installation, parsed: &Parsed) -> Result<blocking::Updater, Kind> {
-    // No network and no state before this: a tree that is not installed has nothing to check.
-    if !inst.is_installed() {
+    // No network and no state before this: a tree that is not installed has nothing to check,
+    // unless it is a macOS bundle the check may adopt (M8-D9).
+    if !inst.is_installed() && !inst.adoptable() {
         return Err(Kind::NotInstalled);
     }
     let mut builder = inst.updater_builder().map_err(|e| Kind::of(&e))?;
@@ -53,14 +75,37 @@ fn updater(inst: &Installation, parsed: &Parsed) -> Result<blocking::Updater, Ki
     Ok(blocking::Updater::from(updater))
 }
 
-fn check(inst: &Installation, parsed: &Parsed, cancel: &CancelToken) -> Result<Body, Kind> {
+/// The check, with progress (only an adoption reports any, phase `adopt`).
+fn checked(
+    updater: &blocking::Updater,
+    output: &Output,
+    cancel: &CancelToken,
+) -> Result<CheckOutcome, Kind> {
+    let options = CheckOptions {
+        progress: Some(output.callback()),
+        cancel: None,
+    };
+    updater
+        .check_with(options, cancel)
+        .map_err(|e| Kind::of(&e))
+}
+
+fn check(
+    inst: &Installation,
+    parsed: &Parsed,
+    output: &Output,
+    cancel: &CancelToken,
+) -> Result<Body, Kind> {
     let updater = updater(inst, parsed)?;
-    let found = updater.check(cancel).map_err(|e| Kind::of(&e))?;
-    Ok(Body::Check(found.map(|info| UpdateSummary {
-        version: info.version().clone(),
-        download_size_max: info.download_size_max(),
-        time_checked: info.time_checked(),
-    })))
+    let outcome = checked(&updater, output, cancel)?;
+    Ok(Body::Check {
+        update: outcome.update.map(|info| UpdateSummary {
+            version: info.version().clone(),
+            download_size_max: info.download_size_max(),
+            time_checked: info.time_checked(),
+        }),
+        adopted: outcome.adopted,
+    })
 }
 
 /// `download` runs its own check: it never takes an update description from its caller, and it
@@ -72,7 +117,7 @@ fn download(
     cancel: &CancelToken,
 ) -> Result<Body, Kind> {
     let updater = updater(inst, parsed)?;
-    let Some(info) = updater.check(cancel).map_err(|e| Kind::of(&e))? else {
+    let Some(info) = checked(&updater, output, cancel)?.update else {
         return Ok(Body::Download(None));
     };
     if let Some(expected) = &parsed.expect_version
@@ -135,6 +180,7 @@ fn apply_and_restart(
             } else {
                 UiChoice::Auto
             },
+            background: parsed.background,
         },
     )
     .map_err(|e| Kind::of(&e))?;

@@ -378,6 +378,42 @@ impl SetupTrailer {
     }
 }
 
+/// Parses the macOS installer's payload file (M8-D7, FORMAT.md 14): a setup file's payload and
+/// trailer without the runtime part. Fail-closed, in this order: the file is at least
+/// [`TRAILER_SIZE`] bytes long and a multiple of [`PART_ALIGN`]; its last [`TRAILER_SIZE`] bytes
+/// are a trailer ([`has_magic`], then [`SetupTrailer::parse`] with the file's length); and the
+/// payload starts at offset 0 (the lowest part's offset). A file at the payload's place is meant
+/// to be one, so anything else is an error, never "no payload". The parts are then verified under
+/// the trailer's root by [`verify_setup`], as a setup file's are.
+pub fn parse_payload_file(
+    file: &dyn ReadAt,
+    hasher: &dyn Hasher,
+    verifier: &dyn Verifier,
+) -> Result<SetupTrailer> {
+    let len = file.size()?;
+    if len < TRAILER_SIZE {
+        return Err(malformed("setup payload: shorter than a trailer"));
+    }
+    if !len.is_multiple_of(PART_ALIGN) {
+        return Err(malformed("setup payload: length not a multiple of 8"));
+    }
+    let mut tail = vec![0u8; TRAILER_SIZE as usize];
+    file.read_exact_at(len - TRAILER_SIZE, &mut tail)?;
+    if !has_magic(&tail) {
+        return Err(malformed("setup payload: no trailer at its end"));
+    }
+    let trailer = SetupTrailer::parse(&tail, len, hasher, verifier)?;
+    let first = [trailer.keys, trailer.manifest, trailer.pack]
+        .iter()
+        .map(|p| p.offset)
+        .min()
+        .unwrap_or(u64::MAX);
+    if first != 0 {
+        return Err(malformed("setup payload: does not start with a part"));
+    }
+    Ok(trailer)
+}
+
 /// `length` bytes at `offset` of `file`, read as a file of their own (a payload part).
 pub struct ReadAtWindow<'a> {
     file: &'a dyn ReadAt,

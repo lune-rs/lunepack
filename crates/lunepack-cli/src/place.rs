@@ -132,6 +132,29 @@ pub fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
+/// Moves the file `from` to `to`, which must not exist: a hard link (which fails if `to` exists)
+/// puts it in place and `from` is then removed; where the file system has no hard links the
+/// fallback checks that `to` is free and renames (a racing writer is overwritten in that window,
+/// as in [`write_new`]). `from` and `to` must be on one file system.
+pub fn move_new(from: &Path, to: &Path) -> Result<()> {
+    match fs::hard_link(from, to) {
+        Ok(()) => {
+            // Best effort: the copy at `to` is complete, and the caller removes its scratch dir.
+            let _ = fs::remove_file(from);
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            bail!("{} already exists", to.display())
+        }
+        Err(_) => {
+            if fs::symlink_metadata(to).is_ok() {
+                bail!("{} already exists", to.display());
+            }
+            rename(from, to).with_context(|| format!("cannot place {}", to.display()))
+        }
+    }
+}
+
 /// Writes `bytes` to `path`, replacing it if it exists: temporary file in the same directory, then
 /// rename.
 pub fn replace(path: &Path, bytes: &[u8]) -> Result<()> {

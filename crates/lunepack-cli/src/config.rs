@@ -40,6 +40,16 @@ struct RawConfig {
     install: Option<RawInstall>,
     /// Windows-only packager inputs (M7-D14).
     windows: Option<RawWindows>,
+    /// macOS-only packager inputs (M8, step 7).
+    macos: Option<RawMacos>,
+}
+
+/// `[macos]`: inputs for the update window's helper app; not part of any signed document.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMacos {
+    /// An `.icns` file, relative to the config's directory.
+    icon: Option<String>,
 }
 
 /// `[windows]`: inputs for stamping a Windows stub and setup file; not part of any signed document.
@@ -164,6 +174,9 @@ pub struct Config {
     /// `[windows] icon`, resolved against the config's directory (M7-D14); checked as an ICO when
     /// the packager stamps a Windows stub or setup file.
     pub windows_icon: Option<PathBuf>,
+    /// `[macos] icon`, resolved against the config's directory (M8-D6); checked as an `.icns` file
+    /// when the packager builds the helper app of a `macos-*` pack with `--ui`.
+    pub macos_icon: Option<PathBuf>,
     signers: BTreeMap<String, SignerSpec>,
 }
 
@@ -309,6 +322,11 @@ impl Config {
             Some(i) => Some(dir.join(i)),
             None => None,
         };
+        let macos_icon = match raw.macos.and_then(|m| m.icon) {
+            Some(i) if i.is_empty() => bail!("{}: macos.icon is empty", ctx()),
+            Some(i) => Some(dir.join(i)),
+            None => None,
+        };
         let update = match (raw.update, raw.install) {
             (None, None) => None,
             (None, Some(_)) => bail!("{}: [install] needs [update]", ctx()),
@@ -323,6 +341,7 @@ impl Config {
             state_path,
             update,
             windows_icon,
+            macos_icon,
             signers,
         })
     }
@@ -413,6 +432,16 @@ mod tests {
         assert_eq!(c.windows_icon, Some(PathBuf::from("/cfg/art/app.ico")));
         assert!(parse("[windows]\nicon = \"\"\n").is_err());
         let e = parse("[windows]\nmanifest = \"x\"\n").unwrap_err();
+        assert!(format!("{e:#}").contains("unknown field"), "{e:#}");
+    }
+
+    #[test]
+    fn macos_icon_is_resolved_against_the_configs_directory() {
+        assert!(parse("").unwrap().macos_icon.is_none());
+        let c = parse("[macos]\nicon = \"art/app.icns\"\n").unwrap();
+        assert_eq!(c.macos_icon, Some(PathBuf::from("/cfg/art/app.icns")));
+        assert!(parse("[macos]\nicon = \"\"\n").is_err());
+        let e = parse("[macos]\nbundle = \"x\"\n").unwrap_err();
         assert!(format!("{e:#}").contains("unknown field"), "{e:#}");
     }
 

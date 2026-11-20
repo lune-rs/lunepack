@@ -55,19 +55,73 @@ fn choice(kind: PromptKind, flow: Option<Flow>) -> ChoiceValue {
 fn main() -> ExitCode {
     #[cfg(windows)]
     lunepack_os_windows::harden_dll_search();
-    if std::env::args_os().nth(1).as_deref() != Some("--engine".as_ref())
-        || std::env::args_os().count() != 2
+    let args: Vec<_> = std::env::args_os().collect();
+    // The macOS installer app's main executable (M8-D7): started with no argument as
+    // `<I>/Contents/MacOS/lunepack-ui`, it starts the runtime beside it with `--ui-stdio` and
+    // serves the frames over that child's pipes (the parent's role of the real UI).
+    #[cfg(unix)]
+    if args.len() == 1
+        && let Some(runtime) = installer_runtime()
+    {
+        return as_installer_parent(&runtime);
+    }
+    if args.get(1).map(std::ffi::OsString::as_os_str) != Some("--engine".as_ref())
+        || args.len() != 2
     {
         eprintln!("usage: e2e_fake_ui --engine");
         return ExitCode::from(2);
     }
     let die = std::env::var(MODE_VAR).is_ok_and(|mode| mode == "die");
     note("ui-spawns", "start\n");
-    let mut input = std::io::stdin().lock();
-    let mut out = std::io::stdout().lock();
+    serve(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+        die,
+    )
+}
+
+/// The runtime beside this executable when it is `lunepack-ui` in `Contents/MacOS`.
+#[cfg(unix)]
+fn installer_runtime() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    if exe.file_name()? != "lunepack-ui" {
+        return None;
+    }
+    let dir = exe.parent()?;
+    (dir.file_name()? == "MacOS").then(|| dir.join("lunepack-runtime"))
+}
+
+/// Runs the runtime with `--ui-stdio` and answers its frames; returns when the runtime ends.
+#[cfg(unix)]
+fn as_installer_parent(runtime: &Path) -> ExitCode {
+    use std::process::{Command, Stdio};
+    let die = std::env::var(MODE_VAR).is_ok_and(|mode| mode == "die");
+    note("ui-spawns", "start\n");
+    let Ok(mut child) = Command::new(runtime)
+        .arg("--ui-stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    else {
+        return ExitCode::from(1);
+    };
+    let (Some(mut to_child), Some(mut from_child)) = (child.stdin.take(), child.stdout.take())
+    else {
+        return ExitCode::from(1);
+    };
+    serve(&mut from_child, &mut to_child, die);
+    drop(to_child);
+    match child.wait() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        _ => ExitCode::from(1),
+    }
+}
+
+/// Answers the engine's frames from `input` on `out` until the engine closes.
+fn serve(input: &mut impl std::io::Read, out: &mut impl std::io::Write, die: bool) -> ExitCode {
     let mut flow = None;
     loop {
-        let Ok(msg) = ui::read_frame::<_, EngineMsg>(&mut input) else {
+        let Ok(msg) = ui::read_frame::<_, EngineMsg>(input) else {
             return ExitCode::SUCCESS;
         };
         let reply = match msg {
@@ -90,15 +144,32 @@ fn main() -> ExitCode {
                 })
             }
             EngineMsg::Progress { .. } | EngineMsg::Step { .. } | EngineMsg::Outcome(_) if die => {
-                std::process::abort();
+                die_abruptly();
             }
             EngineMsg::Close => return ExitCode::SUCCESS,
             _ => None,
         };
         if let Some(reply) = reply
-            && ui::write_frame(&mut out, &reply).is_err()
+            && ui::write_frame(out, &reply).is_err()
         {
             return ExitCode::SUCCESS;
         }
     }
+}
+
+/// Ends this process the way a crashed UI looks to the runtime (its pipes close, no exit status of
+/// its own), without a crash report: on macOS an abort would raise the system's "quit unexpectedly"
+/// dialog on the screen of whoever runs the suite, so the process kills itself with SIGKILL, which
+/// writes no report. Elsewhere it aborts (SIGABRT), as the Linux rows have always done.
+fn die_abruptly() -> ! {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", &std::process::id().to_string()])
+            .status();
+        // `kill` could not run: leave with a plain exit status (no signal, no report).
+        std::process::exit(137);
+    }
+    #[cfg(not(target_os = "macos"))]
+    std::process::abort()
 }

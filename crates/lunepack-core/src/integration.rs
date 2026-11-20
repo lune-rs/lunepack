@@ -102,7 +102,10 @@ pub struct IntegrationRequest {
     /// The app's id (it names the entry and is the marker removal checks).
     pub app_id: AppId,
     /// The install root `R` (absolute); on Linux, entries point through `R/current`; on Windows
-    /// they point into `R`'s version tree for [`IntegrationRequest::version`]. It need not exist.
+    /// they point into `R`'s version tree for [`IntegrationRequest::version`]. On macOS it is the
+    /// live bundle `B` (canonical, outside the data home): the entry points at
+    /// `B/<install.entry>`, and the install writes it before `R/bundle` exists (M8-D12). It need
+    /// not exist.
     pub install_root: PathBuf,
     /// The version whose tree `meta` was read from: the one that becomes (or, for `remove`, is)
     /// current. Windows entries point into its tree; Linux ignores it.

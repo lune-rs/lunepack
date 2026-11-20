@@ -4,7 +4,7 @@
 #
 # At every start it runs `startup --json -- "$@"` first and exits when the action is "exit"; then
 # it acts on the marker file `e2e-flags` at its tree's root (crash-on-start, exit-without-confirm,
-# slow-confirm <secs>), confirms its health, and with `--update` runs check, download and
+# slow-confirm <secs>, hold <secs>), confirms its health, and with `--update` runs check, download and
 # apply-and-restart (with `--no-ui` as well, the call carries `--no-ui`: no update window).
 # Outcomes go to the file LUNEPACK_E2E_OUT as `<tree version> <outcome>`, the executable's real
 # path to LUNEPACK_E2E_DETAIL (neither is written when its variable is unset).
@@ -13,7 +13,15 @@
 # the runtime is a subshell that exits at once: apply-and-restart therefore names this script's
 # own pid with --wait-pid (docs/RUNTIME.md, P8).
 
-self=$(readlink -f "$0") || self=
+# The resolved path of this script. `readlink -f` is not on a macOS before 12.3, so the directory is
+# resolved with `pwd -P` (the file itself is never a link in a tree).
+self=$(readlink -f "$0" 2>/dev/null) || self=
+if [ -z "$self" ]; then
+    case $0 in
+        */*) self=$(cd "${0%/*}" && pwd -P)/${0##*/} ;;
+        *) self= ;;
+    esac
+fi
 dir=${self%/*}
 runtime=$dir/lunepack-runtime
 version=-
@@ -61,11 +69,13 @@ out "start"
 
 update=
 noui=
+background=
 for arg in "$@"; do
     case $arg in
         --after-update) out "arg after-update" ;;
         --update) update=1 ;;
         --no-ui) noui=--no-ui ;;
+        --background) background=--background ;;
     esac
 done
 
@@ -90,27 +100,41 @@ case $startup in
         ;;
 esac
 
-# The tree's root: the nearest directory above this one that holds the update configuration.
+# The tree's root: the nearest directory above this one that holds the update configuration (at
+# the root on Linux and Windows, under Contents/Resources in a macOS bundle).
 tree=$dir
-while [ ! -f "$tree/lunepack-update.json" ]; do
+flagsfile=
+while [ ! -f "$tree/lunepack-update.json" ] && [ ! -f "$tree/Contents/Resources/lunepack-update.json" ]; do
     [ -n "$tree" ] || break
     tree=${tree%/*}
 done
+if [ -n "$tree" ]; then
+    if [ -f "$tree/e2e-flags" ]; then
+        flagsfile=$tree/e2e-flags
+    elif [ -f "$tree/Contents/Resources/e2e-flags" ]; then
+        flagsfile=$tree/Contents/Resources/e2e-flags
+    fi
+fi
 
 crash=
 noconfirm=
 slow=
-if [ -n "$tree" ] && [ -f "$tree/e2e-flags" ]; then
+hold=
+if [ -n "$flagsfile" ]; then
     while IFS=' ' read -r word rest; do
         case $word in
             crash-on-start) crash=1 ;;
             exit-without-confirm) noconfirm=1 ;;
             slow-confirm) slow=$rest ;;
+            hold) hold=$rest ;;
         esac
-    done <"$tree/e2e-flags"
+    done <"$flagsfile"
 fi
 case $slow in
     *[!0-9]*) slow= ;;
+esac
+case $hold in
+    *[!0-9]*) hold= ;;
 esac
 
 if [ -n "$crash" ]; then
@@ -148,6 +172,11 @@ case $rc in
         ;;
 esac
 
+if [ -n "$hold" ]; then
+    out "hold"
+    sleep "$hold"
+fi
+
 [ -n "$update" ] || exit 0
 
 call check --json
@@ -176,9 +205,9 @@ if [ "$rc" != 0 ] || [ -z "$staged" ]; then
 fi
 out "staged $staged"
 
-# $noui is empty or one word, so it is left unquoted on purpose.
+# $noui and $background are empty or one word, so they are left unquoted on purpose.
 # shellcheck disable=SC2086
-call apply-and-restart --json --wait-pid $$ --expect-version "$staged" $noui -- --after-update
+call apply-and-restart --json --wait-pid $$ --expect-version "$staged" $noui $background -- --after-update
 if [ "$rc" != 0 ]; then
     out "error apply"
     exit 1

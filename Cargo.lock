@@ -2123,6 +2123,7 @@ dependencies = [
  "lunepack-fs",
  "lunepack-http",
  "lunepack-os-linux",
+ "lunepack-os-macos",
  "lunepack-os-windows",
  "lunepack-testkit",
  "serde",
@@ -2143,6 +2144,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "editpe",
+ "flate2",
  "lunepack",
  "lunepack-codec-lzma",
  "lunepack-core",
@@ -2232,7 +2234,9 @@ dependencies = [
 name = "lunepack-os-macos"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "lunepack-core",
+ "lunepack-testkit",
 ]
 
 [[package]]
@@ -2255,6 +2259,7 @@ dependencies = [
  "lunepack-crypto",
  "lunepack-fs",
  "lunepack-os-linux",
+ "lunepack-os-macos",
  "lunepack-os-windows",
  "lunepack-testkit",
  "tempfile",

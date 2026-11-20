@@ -26,8 +26,14 @@ pub struct UpdateSummary {
 /// The command-specific members of a result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
-    /// `check`: the update, or none.
-    Check(Option<UpdateSummary>),
+    /// `check`: the update, or none, and whether this check adopted the running bundle (M8-D9;
+    /// the `adopted` member is written only when it did, so the object is unchanged otherwise).
+    Check {
+        /// The update, or none.
+        update: Option<UpdateSummary>,
+        /// The check adopted the running bundle before it checked.
+        adopted: bool,
+    },
     /// `download`: the version staged, or none when the channel offers nothing new.
     Download(Option<Version>),
     /// `startup`: the events delivered, whether the app goes on, whether its version is still
@@ -75,15 +81,22 @@ pub fn result_line(command: &str, tree_version: &Version, body: &Body) -> String
     out.push_str(",\"tree_version\":");
     json_version(&mut out, Some(tree_version));
     match body {
-        Body::Check(None) => out.push_str(",\"update\":null"),
-        Body::Check(Some(u)) => {
-            out.push_str(",\"update\":{\"version\":");
-            json_str(&mut out, &u.version.to_string());
-            let _ = write!(
-                out,
-                ",\"download_size_max\":{},\"time_checked\":{}}}",
-                u.download_size_max, u.time_checked
-            );
+        Body::Check { update, adopted } => {
+            match update {
+                None => out.push_str(",\"update\":null"),
+                Some(u) => {
+                    out.push_str(",\"update\":{\"version\":");
+                    json_str(&mut out, &u.version.to_string());
+                    let _ = write!(
+                        out,
+                        ",\"download_size_max\":{},\"time_checked\":{}}}",
+                        u.download_size_max, u.time_checked
+                    );
+                }
+            }
+            if *adopted {
+                out.push_str(",\"adopted\":true");
+            }
         }
         Body::Download(version) => {
             out.push_str(",\"version\":");
@@ -135,6 +148,10 @@ pub fn error_line(command: Option<&str>, tree_version: Option<&Version>, kind: K
     out.push_str(",\"kind\":");
     json_str(&mut out, kind.name());
     let _ = write!(out, ",\"exit_code\":{}", kind.code());
+    if let Some(reason) = kind.reason() {
+        out.push_str(",\"reason\":");
+        json_str(&mut out, reason);
+    }
     out.push('}');
     out
 }
@@ -142,8 +159,17 @@ pub fn error_line(command: Option<&str>, tree_version: Option<&Version>, kind: K
 /// The one human line of a result.
 pub fn human_result(command: &str, body: &Body) -> String {
     match body {
-        Body::Check(None) => format!("{command}: no update"),
-        Body::Check(Some(u)) => format!("{command}: update {} is available", u.version),
+        Body::Check { update, adopted } => {
+            let found = match update {
+                None => format!("{command}: no update"),
+                Some(u) => format!("{command}: update {} is available", u.version),
+            };
+            if *adopted {
+                format!("{found} (adopted this copy as the install)")
+            } else {
+                found
+            }
+        }
         Body::Download(None) => format!("{command}: no update"),
         Body::Download(Some(v)) => format!("{command}: staged {v}"),
         Body::Startup {
@@ -163,9 +189,10 @@ pub fn human_result(command: &str, body: &Body) -> String {
 
 /// The one human line of an error.
 pub fn human_error(command: Option<&str>, kind: Kind) -> String {
+    let reason = kind.reason().map(|r| format!(", {r}")).unwrap_or_default();
     match command {
-        Some(c) => format!("{c}: error: {} (exit {})", kind.name(), kind.code()),
-        None => format!("error: {} (exit {})", kind.name(), kind.code()),
+        Some(c) => format!("{c}: error: {} (exit {}{reason})", kind.name(), kind.code()),
+        None => format!("error: {} (exit {}{reason})", kind.name(), kind.code()),
     }
 }
 
@@ -183,24 +210,37 @@ mod tests {
     fn objects() -> String {
         let tree = v("1.0.0");
         let mut lines = vec![
-            result_line("check", &tree, &Body::Check(None)),
             result_line(
                 "check",
                 &tree,
-                &Body::Check(Some(UpdateSummary {
-                    version: v("1.1.0"),
-                    download_size_max: 123_456,
-                    time_checked: true,
-                })),
+                &Body::Check {
+                    update: None,
+                    adopted: false,
+                },
             ),
             result_line(
                 "check",
                 &tree,
-                &Body::Check(Some(UpdateSummary {
-                    version: v("2.0.0-rc.1"),
-                    download_size_max: 0,
-                    time_checked: false,
-                })),
+                &Body::Check {
+                    update: Some(UpdateSummary {
+                        version: v("1.1.0"),
+                        download_size_max: 123_456,
+                        time_checked: true,
+                    }),
+                    adopted: false,
+                },
+            ),
+            result_line(
+                "check",
+                &tree,
+                &Body::Check {
+                    update: Some(UpdateSummary {
+                        version: v("2.0.0-rc.1"),
+                        download_size_max: 0,
+                        time_checked: false,
+                    }),
+                    adopted: false,
+                },
             ),
             result_line("download", &tree, &Body::Download(Some(v("1.1.0")))),
             result_line("download", &tree, &Body::Download(None)),
@@ -249,6 +289,7 @@ mod tests {
         for kind in Kind::ALL.into_iter().filter(|k| *k != Kind::Ok) {
             lines.push(error_line(Some("check"), Some(&tree), kind));
         }
+
         // apply-and-restart (step 13): its result and the two errors a caller acts on.
         lines.push(result_line(
             "apply-and-restart",
@@ -264,6 +305,36 @@ mod tests {
             Some("apply-and-restart"),
             Some(&tree),
             Kind::UnexpectedVersion,
+        ));
+        // The other reasons of exit 28 (the representative in the loop above carries the first).
+        // Last, so the lines the integration tests address by number keep their places.
+        for place in crate::modes::Place::ALL.into_iter().skip(1) {
+            lines.push(error_line(
+                Some("check"),
+                Some(&tree),
+                Kind::UnsupportedLocation(place),
+            ));
+        }
+        // A check that adopted the running bundle (M8-D9), with and without an update after it.
+        lines.push(result_line(
+            "check",
+            &tree,
+            &Body::Check {
+                update: None,
+                adopted: true,
+            },
+        ));
+        lines.push(result_line(
+            "check",
+            &tree,
+            &Body::Check {
+                update: Some(UpdateSummary {
+                    version: v("1.1.0"),
+                    download_size_max: 123_456,
+                    time_checked: true,
+                }),
+                adopted: true,
+            },
         ));
         let mut text = lines.join("\n");
         text.push('\n');
@@ -340,7 +411,22 @@ mod tests {
             tree_version: None,
             kind: "integration",
             exit_code: 24,
+            reason: None,
         });
+        events.push(Event::Error {
+            command: "install",
+            tree_version: None,
+            kind: "unsupported_location",
+            exit_code: 28,
+            reason: Some("other_volume"),
+        });
+        // The proof of a bundle the check adopts (M8-D9).
+        events.push(Event::Progress(Progress {
+            phase: Phase::Adopt,
+            done: 512,
+            total: 4096,
+            file: None,
+        }));
         let mut text: Vec<String> = events.iter().map(to_json_line).collect();
         text.push(String::new());
         text.join("\n")
@@ -362,11 +448,14 @@ mod tests {
     fn human_lines_name_no_value_of_the_environment() {
         let line = human_result(
             "check",
-            &Body::Check(Some(UpdateSummary {
-                version: v("1.1.0"),
-                download_size_max: 1,
-                time_checked: true,
-            })),
+            &Body::Check {
+                update: Some(UpdateSummary {
+                    version: v("1.1.0"),
+                    download_size_max: 1,
+                    time_checked: true,
+                }),
+                adopted: false,
+            },
         );
         assert_eq!(line, "check: update 1.1.0 is available");
         assert_eq!(
@@ -374,5 +463,12 @@ mod tests {
             "download: error: unexpected_version (exit 15)"
         );
         assert_eq!(human_error(None, Kind::Usage), "error: usage (exit 2)");
+        assert_eq!(
+            human_error(
+                Some("check"),
+                Kind::UnsupportedLocation(crate::modes::Place::ReadOnly)
+            ),
+            "check: error: unsupported_location (exit 28, read_only)"
+        );
     }
 }

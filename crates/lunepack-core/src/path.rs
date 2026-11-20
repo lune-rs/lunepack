@@ -23,6 +23,11 @@ pub const MAX_PATH_BYTES: usize = 1024;
 pub const MAX_PATH_DEPTH: usize = 32;
 /// Longest component in UTF-8 bytes (the conservative bound for NTFS, APFS and ext4).
 pub const MAX_COMPONENT_BYTES: usize = 255;
+/// Most symlink entries followed while resolving one symlink's target (FORMAT.md 10.2): the sum,
+/// over every symlink entry the resolution steps onto, of one plus that entry's own count. Far
+/// below the kernels' own limits (32 on macOS, 40 on Linux), so an accepted link never meets
+/// `ELOOP`.
+pub const MAX_LINK_HOPS: usize = 8;
 
 /// Characters Windows refuses in a name; `:` also rules out drive letters and NTFS streams.
 const WINDOWS_RESERVED: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
@@ -315,12 +320,20 @@ pub enum LinkTargetError {
     /// An empty component.
     #[error("target has an empty component")]
     EmptyComponent,
-    /// Lexical resolution from the link's parent leaves the tree.
+    /// Resolution from the link's parent leaves the tree.
     #[error("target leaves the tree")]
     Escapes,
-    /// A non-final component of the resolution is another symlink entry.
-    #[error("target passes through the symlink {0}")]
-    ThroughSymlink(Untrusted),
+    /// A symlink entry followed in a non-final position does not end on a directory (it ends on a
+    /// file, or on a name with no entry). Names that symlink.
+    #[error("target passes through the symlink {0}, which does not end on a directory")]
+    HopNotDirectory(Untrusted),
+    /// The resolution steps onto a symlink entry whose own resolution is in progress. Names that
+    /// symlink.
+    #[error("target loops through the symlink {0}")]
+    Cycle(Untrusted),
+    /// The resolution follows more than [`MAX_LINK_HOPS`] symlink entries.
+    #[error("target follows more than {MAX_LINK_HOPS} symlinks")]
+    TooManyHops,
 }
 
 /// Why an entry set was rejected (FORMAT.md 10.2).
@@ -359,10 +372,24 @@ pub enum TreeError {
 
 /// Validates the entry set of one manifest for `target` (FORMAT.md 10.2): no two entries with equal
 /// fold keys, nothing under a `file` or `symlink` entry, no symlink on a Windows target, and every
-/// symlink target stays inside the tree without passing through another symlink.
+/// symlink target stays inside the tree.
+///
+/// A target is resolved from the link's parent on a stack of fold keys: `.` stays, `..` pops (and
+/// leaving the root is [`LinkTargetError::Escapes`]), any other name is pushed and looked up by fold
+/// key. A name that is a symlink entry, in any position, is a hop: its own target is resolved by the
+/// same rule and the stack becomes where it led, so a later `..` pops that place. A hop that is
+/// not the last component must end on a directory: the root, a `dir` entry or an implied parent
+/// directory ([`LinkTargetError::HopNotDirectory`]). The link's own end may be anything inside,
+/// a name with no entry included. A hop into a link whose resolution is in progress is
+/// [`LinkTargetError::Cycle`], and more than [`MAX_LINK_HOPS`] hops is
+/// [`LinkTargetError::TooManyHops`] (a long cycle may be reported as that first). Which link the
+/// first error names follows the entry order; the verdict does not.
 ///
 /// Cost: one fold key and one ordered-map insert per entry, one range lookup per non-directory
-/// entry, and per symlink one lookup per target component: `O(n log n)` in the entry count.
+/// entry, and, when there are symlinks, one node per entry in a component tree. Each symlink's
+/// target is resolved at most once (memoised; only results that do not depend on the depth they
+/// were reached at are kept), with one map lookup per target component: `O(n log n)` in the entry
+/// count plus the targets' bytes. Recursion is at most `MAX_LINK_HOPS + 1` frames deep.
 pub fn validate_tree<'a, I>(entries: I, target: Target) -> Result<(), TreeError>
 where
     I: IntoIterator<Item = (&'a RelPath, EntryKind<'a>)>,
@@ -403,21 +430,31 @@ where
             });
         }
     }
-    for (path, link) in links {
-        check_link_target(path, link, &by_key).map_err(|source| TreeError::LinkTarget {
+    if links.is_empty() {
+        return Ok(());
+    }
+    // Every target's text first, so a hop never walks a target that breaks a text rule.
+    for (path, link) in &links {
+        check_link_text(link).map_err(|source| TreeError::LinkTarget {
             path: untrusted(path),
             source,
         })?;
     }
+    let mut resolver = Resolver::new(&by_key);
+    for (path, _) in links {
+        let node = resolver.node_of(&path.fold_key());
+        resolver
+            .resolve(node, 0)
+            .map_err(|source| TreeError::LinkTarget {
+                path: untrusted(path),
+                source,
+            })?;
+    }
     Ok(())
 }
 
-/// Checks one symlink's target text and resolves it lexically from the link's parent directory.
-fn check_link_target(
-    link_path: &RelPath,
-    link: &str,
-    by_key: &BTreeMap<String, (&RelPath, EntryKind<'_>)>,
-) -> Result<(), LinkTargetError> {
+/// The text rules of one symlink target (FORMAT.md 10.2), before any resolution.
+fn check_link_text(link: &str) -> Result<(), LinkTargetError> {
     if link.is_empty() {
         return Err(LinkTargetError::Empty);
     }
@@ -435,35 +472,176 @@ fn check_link_target(
     if link.starts_with('/') {
         return Err(LinkTargetError::Absolute);
     }
-    let comps: Vec<&str> = link.split('/').collect();
-    if comps.iter().any(|c| c.is_empty()) {
+    if link.split('/').any(str::is_empty) {
         return Err(LinkTargetError::EmptyComponent);
     }
-    // The resolution stack holds the fold keys of components, starting at the link's parent.
-    let mut stack: Vec<String> = link_path.components().map(fold_key).collect();
-    stack.pop();
-    let last = comps.len() - 1;
-    for (i, comp) in comps.into_iter().enumerate() {
-        match comp {
-            // `.` names the directory the resolution is in, so it stays there. Pushing it as a
-            // name would let `./..` pop it and hide one level of escape.
-            "." => {}
-            ".." => {
-                if stack.pop().is_none() {
-                    return Err(LinkTargetError::Escapes);
-                }
+    Ok(())
+}
+
+/// The root of the component tree.
+const ROOT: usize = 0;
+
+/// One node of the component tree: the root, an entry, or an implied parent directory.
+struct Node<'a> {
+    parent: usize,
+    /// Children by the fold key of their last component.
+    children: BTreeMap<String, usize>,
+    /// The entry at this node; `None` for the root and implied directories (both directories).
+    entry: Option<(&'a RelPath, EntryKind<'a>)>,
+}
+
+/// Where a resolution stands: a node of the component tree, then `missing` more components that
+/// name no entry (nothing exists under a missing name, so their spelling no longer matters).
+#[derive(Debug, Clone, Copy)]
+struct Resolved {
+    node: usize,
+    missing: usize,
+    /// Symlink entries followed, counted as [`MAX_LINK_HOPS`] says.
+    hops: usize,
+}
+
+enum Memo {
+    Unseen,
+    InProgress,
+    Done(Result<Resolved, LinkTargetError>),
+}
+
+/// Resolves symlink targets over the component tree of one entry set, each at most once.
+struct Resolver<'a> {
+    nodes: Vec<Node<'a>>,
+    /// Indexed by node; only symlink nodes ever leave `Unseen`.
+    memo: Vec<Memo>,
+}
+
+impl<'a> Resolver<'a> {
+    fn new(by_key: &BTreeMap<String, (&'a RelPath, EntryKind<'a>)>) -> Self {
+        let mut nodes = vec![Node {
+            parent: ROOT,
+            children: BTreeMap::new(),
+            entry: None,
+        }];
+        for (key, entry) in by_key {
+            let mut at = ROOT;
+            for comp in key.split('/') {
+                at = match nodes[at].children.get(comp) {
+                    Some(&child) => child,
+                    None => {
+                        let child = nodes.len();
+                        nodes.push(Node {
+                            parent: at,
+                            children: BTreeMap::new(),
+                            entry: None,
+                        });
+                        nodes[at].children.insert(comp.to_owned(), child);
+                        child
+                    }
+                };
             }
-            name => {
-                stack.push(fold_key(name));
-                if i < last
-                    && let Some((other, EntryKind::Symlink { .. })) = by_key.get(&stack.join("/"))
-                {
-                    return Err(LinkTargetError::ThroughSymlink(untrusted(other)));
+            nodes[at].entry = Some(*entry);
+        }
+        let memo = nodes.iter().map(|_| Memo::Unseen).collect();
+        Resolver { nodes, memo }
+    }
+
+    /// The node of an entry's fold key (every entry has one).
+    fn node_of(&self, key: &str) -> usize {
+        key.split('/').fold(ROOT, |at, comp| {
+            *self.nodes[at]
+                .children
+                .get(comp)
+                .expect("every entry has a node")
+        })
+    }
+
+    fn is_dir(&self, at: &Resolved) -> bool {
+        at.missing == 0 && matches!(self.nodes[at.node].entry, None | Some((_, EntryKind::Dir)))
+    }
+
+    /// Resolves the symlink at `link`, reached through `depth` nested hops.
+    fn resolve(&mut self, link: usize, depth: usize) -> Result<Resolved, LinkTargetError> {
+        match &self.memo[link] {
+            Memo::Done(result) => return result.clone(),
+            Memo::InProgress => return Err(LinkTargetError::Cycle(self.name(link))),
+            Memo::Unseen => {}
+        }
+        // Each nested frame is one hop of the outermost link, so a depth past the bound means
+        // that link's count is past it too.
+        if depth > MAX_LINK_HOPS {
+            return Err(LinkTargetError::TooManyHops);
+        }
+        self.memo[link] = Memo::InProgress;
+        let result = self.walk(link, depth);
+        // `TooManyHops` can depend on the depth this link was reached at: never kept.
+        self.memo[link] = match &result {
+            Err(LinkTargetError::TooManyHops) => Memo::Unseen,
+            other => Memo::Done(other.clone()),
+        };
+        result
+    }
+
+    fn walk(&mut self, link: usize, depth: usize) -> Result<Resolved, LinkTargetError> {
+        let Some((_, EntryKind::Symlink { target })) = self.nodes[link].entry else {
+            unreachable!("only symlink entries are resolved");
+        };
+        let mut at = Resolved {
+            node: self.nodes[link].parent,
+            missing: 0,
+            hops: 0,
+        };
+        let comps: Vec<&str> = target.split('/').collect();
+        let last = comps.len() - 1;
+        for (i, comp) in comps.into_iter().enumerate() {
+            match comp {
+                // `.` names the directory the resolution is in, so it stays there. Pushing it as
+                // a name would let `./..` pop it and hide one level of escape.
+                "." => {}
+                ".." => {
+                    if at.missing > 0 {
+                        at.missing -= 1;
+                    } else if at.node == ROOT {
+                        return Err(LinkTargetError::Escapes);
+                    } else {
+                        at.node = self.nodes[at.node].parent;
+                    }
+                }
+                name => {
+                    if at.missing > 0 {
+                        at.missing += 1;
+                        continue;
+                    }
+                    let Some(&child) = self.nodes[at.node].children.get(fold_key(name).as_str())
+                    else {
+                        at.missing = 1;
+                        continue;
+                    };
+                    if !matches!(
+                        self.nodes[child].entry,
+                        Some((_, EntryKind::Symlink { .. }))
+                    ) {
+                        at.node = child;
+                        continue;
+                    }
+                    let hop = self.resolve(child, depth + 1)?;
+                    let hops = at.hops + 1 + hop.hops;
+                    if hops > MAX_LINK_HOPS {
+                        return Err(LinkTargetError::TooManyHops);
+                    }
+                    if i < last && !self.is_dir(&hop) {
+                        return Err(LinkTargetError::HopNotDirectory(self.name(child)));
+                    }
+                    at = Resolved { hops, ..hop };
                 }
             }
         }
+        Ok(at)
     }
-    Ok(())
+
+    fn name(&self, node: usize) -> Untrusted {
+        match self.nodes[node].entry {
+            Some((path, _)) => untrusted(path),
+            None => Untrusted::new(""),
+        }
+    }
 }
 
 fn untrusted(path: &RelPath) -> Untrusted {

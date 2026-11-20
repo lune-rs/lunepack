@@ -11,11 +11,13 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::path::PathBuf;
 
 use lunepack_core::state::{InstallState, Loaded, UserScope};
 use lunepack_core::{
-    AttemptOutcome, ChildStdio, ConfirmOutcome, FileKind, IntegrationRequest, LifecycleEvent,
-    ProcessId, Scope, SpawnSpec, TokenCheck, UserLayout, Version,
+    AttemptOutcome, ChildStdio, ConfirmOutcome, FileKind, IntegrationRequest, LayoutError,
+    LifecycleEvent, ProcessId, Projection, Scope, SpawnSpec, TokenCheck, UserLayout, Version,
+    read_bundle_identity, set_bundle_pointer,
 };
 
 use crate::Error;
@@ -75,6 +77,16 @@ pub struct ApplyOptions {
     pub restart_args: Vec<OsString>,
     /// Whether the applier shows its update window.
     pub ui: UiChoice,
+    /// Start the new version (and, after a rollback, the previous one) without bringing it to the
+    /// front (`apply --background`, M8-D13). macOS only: elsewhere the option is passed on and
+    /// changes nothing. With it, a version that crashes before it confirms its health is rolled
+    /// back at the health deadline rather than at once (macOS gives an app's exit status only to
+    /// its parent, and an app started this way is not the applier's child), and an app that
+    /// activates itself in code still comes to the front. The health token still reaches the app
+    /// through its environment only, and an app that cannot be identified as the one just started
+    /// is never signalled. When the bundle's `Info.plist` cannot be read, or names another
+    /// executable than the entry, the app is started as a child, as without the option.
+    pub background: bool,
 }
 
 impl fmt::Debug for ApplyOptions {
@@ -85,6 +97,7 @@ impl fmt::Debug for ApplyOptions {
             .field("wait_for", &self.wait_for)
             .field("restart_args", &self.restart_args.len())
             .field("ui", &self.ui)
+            .field("background", &self.background)
             .finish()
     }
 }
@@ -164,6 +177,97 @@ fn reconcile(inst: &Installation, layout: &UserLayout, record: &InstallState) ->
         .map_err(|e| Error::from(lunepack_core::Error::Layout(e)))
 }
 
+/// What the desktop integration is rooted at: `R`, except under the bundle layout, where it is the
+/// live bundle `B` (the request's `install_root`, M8-D12), which lies outside `R`.
+fn integration_root(inst: &Installation, layout: &UserLayout) -> PathBuf {
+    if layout.scheme().projection == Projection::Bundle
+        && let Ok(Some(bundle)) = layout.bundle_path(&*inst.platform.fs)
+    {
+        return bundle;
+    }
+    layout.root().to_path_buf()
+}
+
+/// Under the install's lock: follows a bundle that was moved on its volume (M8-D17) by pointing
+/// `R/bundle` at the running tree. `Ok(true)` when the install is this tree's (nothing to follow,
+/// or followed now); `Ok(false)` when the move is not one to follow any more: the pointer's
+/// target is back, the tree is not the one `R/bundle.id` records, the record's current version
+/// is not this tree's, or the tree's path is not a bundle path. Every condition discovery used
+/// is checked again here, now that the lock is held. The desktop integration is refreshed to the
+/// new place, best effort (the entry the next start or apply writes is the same).
+fn follow_move_locked(
+    inst: &Installation,
+    layout: &UserLayout,
+    record: &InstallState,
+) -> Result<bool, Error> {
+    if !inst.moved() {
+        return Ok(true);
+    }
+    let p = &inst.platform;
+    let fs = &*p.fs;
+    let tree = inst.tree_root();
+    let own = inst.tree_version();
+    let layout_err = |e: LayoutError| Error::from(lunepack_core::Error::Layout(e));
+    let is_current = record
+        .current
+        .as_ref()
+        .is_some_and(|c| same_version(&c.version, own));
+    // The pointer's target must still be gone. A missing pointer counts as gone: an adoption cut
+    // off after its record commit and before its pointer (M8-D9) leaves exactly that.
+    let gone = match layout.bundle_path(fs).map_err(layout_err)? {
+        Some(target) => fs.symlink_metadata(&target)?.is_none(),
+        None => true,
+    };
+    let facts = fs.place(tree)?;
+    let same_bundle =
+        read_bundle_identity(fs, layout).map_err(layout_err)? == Some((facts.device, facts.inode));
+    if !(is_current && gone && same_bundle) {
+        return Ok(false);
+    }
+    match set_bundle_pointer(fs, layout, tree) {
+        Ok(()) => {}
+        // The new name is not a bundle path (renamed without `.app`): a stray copy.
+        Err(LayoutError::NotCanonical) => return Ok(false),
+        Err(e) => return Err(layout_err(e)),
+    }
+    let request = IntegrationRequest {
+        app_id: inst.app_id().clone(),
+        install_root: tree.to_path_buf(),
+        version: own.clone(),
+        meta: inst.meta().clone(),
+        previous: None,
+        stale_bins: Vec::new(),
+    };
+    let _ = p.integration.apply(Scope::User, &request);
+    Ok(true)
+}
+
+/// Follows a bundle the user moved (M8-D17) when `inst` was found moved ([`Installation::moved`]):
+/// under the install's lock, `R/bundle` is pointed at this bundle, so the install, its record and
+/// its previous versions follow the app to its new place. `Ok(true)` when the install is this
+/// tree's, `Ok(false)` when it is not (the move is not one to follow, see
+/// [`startup_for`](crate::startup_for)): then the app runs as a development run. A tree that was
+/// not moved is `Ok(true)` with nothing done. [`startup_for`](crate::startup_for) does this
+/// itself; the runtime's modes call it before they use the install.
+pub fn follow_move(inst: &Installation) -> Result<bool, Error> {
+    let Some(layout) = inst.layout() else {
+        return Ok(false);
+    };
+    if !inst.moved() {
+        return Ok(true);
+    }
+    let p = &inst.platform;
+    let store = store_of(inst, layout);
+    let guard = lock_state(p, &layout.state_dir())?;
+    let loaded = store.load(&*p.fs, &*p.hasher)?;
+    let followed = match &loaded.record {
+        Some(record) => follow_move_locked(inst, layout, record)?,
+        None => false,
+    };
+    drop(guard);
+    Ok(followed)
+}
+
 fn is_pending(record: &InstallState, own: &Version) -> bool {
     record
         .pending
@@ -219,6 +323,11 @@ pub fn startup_for(inst: &Installation, args: Vec<OsString>) -> Result<Startup, 
     if record.current.is_none() {
         return Ok(Startup::go_on(Vec::new(), false));
     }
+    // A bundle moved on its volume is followed first (M8-D17); one that cannot be followed is a
+    // stray copy, which runs as a development run.
+    if !follow_move_locked(inst, layout, &record)? {
+        return Ok(Startup::go_on(Vec::new(), false));
+    }
     reconcile(inst, layout, &record)?;
 
     let mut next = record.clone();
@@ -233,8 +342,13 @@ pub fn startup_for(inst: &Installation, args: Vec<OsString>) -> Result<Startup, 
                 drop(guard);
                 // The rollback is committed: a relaunch that fails cannot undo it, and this
                 // version must still exit. The next start of the previous version recovers.
+                // Under the bundle layout the previous version is now the live bundle, no longer
+                // the tree it was staged in.
+                let program = inst
+                    .live_entry(previous.entry_path(), &previous.meta().entry)
+                    .unwrap_or_else(|_| previous.entry_path());
                 let _ = p.process.spawn_detached(&SpawnSpec {
-                    program: previous.entry_path(),
+                    program,
                     args,
                     env_set: Vec::new(),
                     env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
@@ -290,7 +404,7 @@ fn roll_back(
     };
     let request = IntegrationRequest {
         app_id: inst.app_id().clone(),
-        install_root: layout.root().to_path_buf(),
+        install_root: integration_root(inst, layout),
         version: previous.tree_version().clone(),
         meta: previous.meta().clone(),
         previous: Some(inst.meta().clone()),
@@ -345,8 +459,9 @@ pub fn apply_and_restart(options: ApplyOptions) -> Result<ApplyScheduled, Error>
 
 /// Starts `inst`'s own runtime, detached, to apply the staged version once the waited-for process
 /// (by default this one) has exited:
-/// `lunepack-runtime apply --wait-pid <pid> --wait-start <ticks> --version <v> [--no-ui] --
-/// <restart args>` (`--no-ui` for [`UiChoice::Never`]), with no health token in its environment.
+/// `lunepack-runtime apply --wait-pid <pid> --wait-start <ticks> --version <v> [--no-ui]
+/// [--background] -- <restart args>` (`--no-ui` for [`UiChoice::Never`], `--background` for
+/// [`ApplyOptions::background`]), with no health token in its environment.
 /// The caller exits next.
 ///
 /// The staged version is read again (C9): none, one that is not usable (FORMAT.md 12.7), a tree
@@ -382,6 +497,9 @@ pub fn apply_and_restart_for(
     .collect();
     if options.ui == UiChoice::Never {
         args.push(OsString::from("--no-ui"));
+    }
+    if options.background {
+        args.push(OsString::from("--background"));
     }
     args.push(OsString::from("--"));
     args.extend(options.restart_args);
