@@ -1067,7 +1067,7 @@ pub fn card(name: &str, version: &str, from: Option<&str>) -> AppCard {
 mod tests {
     use super::*;
 
-    use lunepack_testkit::{ChildScript, FakeChildPipes, FakeProcess};
+    use lunepack_testkit::{ChildScript, FakeChildPipes, FakeProcess, abs_path};
 
     fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
         move |name| {
@@ -1363,7 +1363,7 @@ mod tests {
     fn parent_host(process: &FakeProcess, bounds: Bounds) -> (UiHost, FakeChildPipes) {
         let mut pipes = process
             .spawn_child(&SpawnSpec {
-                program: PathBuf::from("/fake/pipes"),
+                program: abs_path("/fake/pipes"),
                 args: Vec::new(),
                 env_set: Vec::new(),
                 env_remove: Vec::new(),
