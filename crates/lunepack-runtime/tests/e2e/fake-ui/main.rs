@@ -144,7 +144,7 @@ fn serve(input: &mut impl std::io::Read, out: &mut impl std::io::Write, die: boo
                 })
             }
             EngineMsg::Progress { .. } | EngineMsg::Step { .. } | EngineMsg::Outcome(_) if die => {
-                std::process::abort();
+                die_abruptly();
             }
             EngineMsg::Close => return ExitCode::SUCCESS,
             _ => None,
@@ -155,4 +155,21 @@ fn serve(input: &mut impl std::io::Read, out: &mut impl std::io::Write, die: boo
             return ExitCode::SUCCESS;
         }
     }
+}
+
+/// Ends this process the way a crashed UI looks to the runtime (its pipes close, no exit status of
+/// its own), without a crash report: on macOS an abort would raise the system's "quit unexpectedly"
+/// dialog on the screen of whoever runs the suite, so the process kills itself with SIGKILL, which
+/// writes no report. Elsewhere it aborts (SIGABRT), as the Linux rows have always done.
+fn die_abruptly() -> ! {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", &std::process::id().to_string()])
+            .status();
+        // `kill` could not run: leave with a plain exit status (no signal, no report).
+        std::process::exit(137);
+    }
+    #[cfg(not(target_os = "macos"))]
+    std::process::abort()
 }

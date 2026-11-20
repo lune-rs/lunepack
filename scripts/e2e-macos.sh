@@ -111,7 +111,7 @@ cleanup() {
       sed -e 's/^path:[[:space:]]*//' -e 's/ (0x[0-9a-f]*)$//' | sort -u |
       while IFS= read -r known; do
         limited 30 "$lsregister" -u "$known" >/dev/null 2>&1 || true
-      done
+      done || true
     # Volume and disk-image records of the images mounted under the root are the system's own
     # and name no bundle; only a line that names a `.app` counts.
     left=$(limited 120 "$lsregister" -dump 2>/dev/null | grep "$root" | grep -c '\.app' || true)

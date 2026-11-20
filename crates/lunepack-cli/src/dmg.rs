@@ -206,6 +206,9 @@ impl Hdiutil {
             "APFS".as_ref(),
             "-volname".as_ref(),
             volname.as_ref(),
+            // No Spotlight index of the scratch volume: `mds` opening it is what leaves the image
+            // attached (and `verify` "Resource temporarily unavailable") on a busy Mac.
+            "-nospotlight".as_ref(),
             "-srcfolder".as_ref(),
             src.as_os_str(),
             out.as_os_str(),
@@ -306,7 +309,7 @@ mod tests {
         assert_eq!(
             calls(tmp.path()),
             [format!(
-                "create -format ULMO -fs APFS -volname My Vol -srcfolder /src dir {}",
+                "create -format ULMO -fs APFS -volname My Vol -nospotlight -srcfolder /src dir {}",
                 out.display()
             )]
         );
@@ -363,7 +366,7 @@ mod tests {
             format!("{err}").contains("temporarily unavailable"),
             "{err}"
         );
-        assert_eq!(calls(tmp2.path()).len(), 3);
+        assert_eq!(calls(tmp2.path()).len(), VERIFY_ATTEMPTS as usize);
     }
 
     #[test]
