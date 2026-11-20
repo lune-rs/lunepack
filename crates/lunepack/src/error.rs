@@ -3,6 +3,7 @@
 //! No variant's `Display` holds a URL query, a full user path or key bytes: core errors name only
 //! file names and origins, and the facade adds fixed text.
 
+use lunepack_core::codesign::PublisherOutcome;
 use lunepack_core::{
     FsError, IntegrationError, LayoutError, LifecycleError, LocationReason, ProcessError,
     ProcessErrorKind, RangeError, RelPath, StateError, TransportError, UpdateConfigError,
@@ -120,6 +121,17 @@ pub enum Error {
     UnsupportedLocation {
         /// Why the place is refused.
         reason: LocationReason,
+    },
+    /// The installed version's publisher policy (`enforce`, M9-D6, M9-D9) refused the staged
+    /// update: its operating-system code-signing publisher is not the installed version's, or it
+    /// could not be established. The reason is one of a closed set and never carries a path or
+    /// certificate text. Nothing is staged. On `different`, `candidate_unsigned` and
+    /// `candidate_invalid` the version is marked bad in the same state commit, so no check offers
+    /// it again; on `installed_invalid` and `os` nothing is marked and a later call checks again.
+    #[error("the update's code-signing publisher was refused: {}", .reason.code())]
+    PublisherMismatch {
+        /// Why the update was refused.
+        reason: PublisherOutcome,
     },
 }
 

@@ -12,7 +12,8 @@ use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
 use lunepack::{
-    Codec, Fs, Hasher, OsIntegration, Platform, Process, ProcessId, Rng, Verifier, Version,
+    Codec, Fs, Hasher, OsIntegration, Platform, Process, ProcessId, PublisherOutcome, Rng,
+    Verifier, Version,
 };
 
 /// The line a usage error prints on stderr. It names no argument value.
@@ -69,6 +70,17 @@ impl Place {
         })
     }
 }
+
+/// The reasons of exit 29 `publisher_mismatch`, in the order the docs list them: every outcome a
+/// refusal can carry (`installed_unsigned` proceeds under every policy, so it is never one).
+#[allow(dead_code)]
+pub const PUBLISHER_REASONS: [PublisherOutcome; 5] = [
+    PublisherOutcome::Different,
+    PublisherOutcome::InstalledInvalid,
+    PublisherOutcome::CandidateUnsigned,
+    PublisherOutcome::CandidateInvalid,
+    PublisherOutcome::Os,
+];
 
 /// The outcome classes of the runtime, each with a stable exit code and a stable `kind` name
 /// (C4: one per error class of the facade's error enum, plus the runtime's own outcomes).
@@ -135,6 +147,10 @@ pub enum Kind {
     /// The running app or the install's bundle is somewhere lunepack does not update (macOS,
     /// M8-D4); the output names the reason, a closed code.
     UnsupportedLocation(Place),
+    /// The installed version's publisher policy refused the update (M9-D9); the output names the
+    /// reason, a closed code (`different`, `installed_invalid`, `candidate_unsigned`,
+    /// `candidate_invalid`, `os`). Nothing was staged.
+    PublisherMismatch(PublisherOutcome),
     /// Anything else (a worker panic, a facade error this build does not know).
     Internal,
 }
@@ -142,7 +158,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind, in code order (for the golden of step 12).
     #[allow(dead_code)]
-    pub const ALL: [Kind; 29] = [
+    pub const ALL: [Kind; 30] = [
         Kind::Ok,
         Kind::Usage,
         Kind::NotInstalled,
@@ -172,6 +188,8 @@ impl Kind {
         Kind::NoRelease,
         // One representative: the five reasons share the code and the name (`Place::ALL`).
         Kind::UnsupportedLocation(Place::Translocated),
+        // One representative: every reason shares the code and the name (`PUBLISHER_REASONS`).
+        Kind::PublisherMismatch(PublisherOutcome::Different),
         Kind::Internal,
     ];
 
@@ -206,6 +224,7 @@ impl Kind {
             Kind::InstallMismatch => 26,
             Kind::NoRelease => 27,
             Kind::UnsupportedLocation(_) => 28,
+            Kind::PublisherMismatch(_) => 29,
             Kind::Internal => 70,
         }
     }
@@ -241,6 +260,7 @@ impl Kind {
             Kind::InstallMismatch => "install_mismatch",
             Kind::NoRelease => "no_release",
             Kind::UnsupportedLocation(_) => "unsupported_location",
+            Kind::PublisherMismatch(_) => "publisher_mismatch",
             Kind::Internal => "internal",
         }
     }
@@ -249,6 +269,7 @@ impl Kind {
     pub const fn reason(self) -> Option<&'static str> {
         match self {
             Kind::UnsupportedLocation(place) => Some(place.name()),
+            Kind::PublisherMismatch(reason) => Some(reason.code()),
             _ => None,
         }
     }
@@ -286,6 +307,7 @@ impl Kind {
             E::UnsupportedLocation { reason } => {
                 Place::of(*reason).map_or(Kind::Internal, Kind::UnsupportedLocation)
             }
+            E::PublisherMismatch { reason } => Kind::PublisherMismatch(*reason),
             // WorkerPanicked, and any variant a later facade adds (the enum is non-exhaustive).
             _ => Kind::Internal,
         }
@@ -1019,6 +1041,53 @@ mod tests {
                 Kind::UnsupportedLocation(place)
             );
         }
+    }
+
+    /// Every reason of exit 29 is a closed code, maps from the facade's error, and has a golden
+    /// object; the reasons are exactly the refusals the core's policy table can make.
+    #[test]
+    fn every_publisher_reason_has_a_closed_code_and_a_golden_object() {
+        use lunepack::{PublisherError, PublisherPolicy};
+        let golden = include_str!("../tests/golden/objects.jsonl");
+        for reason in PUBLISHER_REASONS {
+            let want = format!(
+                "\"kind\":\"publisher_mismatch\",\"exit_code\":29,\"reason\":\"{}\"}}",
+                reason.code()
+            );
+            assert!(
+                golden.lines().any(|l| l.ends_with(&want)),
+                "{}",
+                reason.code()
+            );
+            assert_eq!(
+                Kind::of(&lunepack::Error::PublisherMismatch { reason }),
+                Kind::PublisherMismatch(reason)
+            );
+            assert_eq!(Kind::PublisherMismatch(reason).code(), 29);
+        }
+        // The refusals `enforce` makes over every check result are exactly these reasons.
+        let mut refused: Vec<&str> = [
+            Ok(true),
+            Ok(false),
+            Err(PublisherError::InstalledUnsigned),
+            Err(PublisherError::InstalledInvalid),
+            Err(PublisherError::CandidateUnsigned),
+            Err(PublisherError::CandidateInvalid),
+            Err(PublisherError::NotApplicable),
+            Err(PublisherError::Os),
+        ]
+        .into_iter()
+        .filter_map(
+            |r| match lunepack_core::codesign::decide(PublisherPolicy::Enforce, r) {
+                lunepack_core::codesign::Decision::Refuse { reason, .. } => Some(reason.code()),
+                lunepack_core::codesign::Decision::Proceed(_) => None,
+            },
+        )
+        .collect();
+        let mut listed: Vec<&str> = PUBLISHER_REASONS.iter().map(|r| r.code()).collect();
+        refused.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(refused, listed);
     }
 
     #[test]
