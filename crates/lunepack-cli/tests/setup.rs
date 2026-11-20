@@ -465,7 +465,8 @@ fn mac_bundle(root: &Path) {
         0o644,
     );
     std::os::unix::fs::symlink("A", root.join(format!("{fw}/Versions/Current"))).unwrap();
-    // FORMAT 10.2: a link's target never passes through another link.
+    // The direct form. FORMAT 10.2 (M8-D20) also accepts the standard `Foo` -> `Versions/Current/Foo`
+    // through the link `Versions/Current` -> `A`; the pack test covers that form.
     std::os::unix::fs::symlink("Versions/A/Foo", root.join(format!("{fw}/Foo"))).unwrap();
     write_file(
         root,

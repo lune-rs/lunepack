@@ -1025,7 +1025,9 @@ impl Updater {
     ///
     /// An updater of a macOS bundle that is not installed but adoptable
     /// ([`crate::Installation::adoptable`], M8-D9) adopts it first, when the app has no live
-    /// install for the user: the bundle's own release (exactly its config's version and target)
+    /// install for the user and the bundle is directly in `~/Applications` or `/Applications`
+    /// (anywhere else it is a development run: no request, nothing written; adoption happens here
+    /// and in no other call, never in `startup`): the bundle's own release (exactly its config's version and target)
     /// is verified from the bundle's own root as above, the bundle is proved equal to that
     /// release's signed manifest file by file ([`lunepack_core::verify_tree`]: nothing missing,
     /// nothing extra, sizes, hashes, executable bits and link targets; the bundle is never

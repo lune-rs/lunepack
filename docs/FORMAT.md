@@ -949,8 +949,12 @@ step 3 completed.
   every file is fetched. A machine install's tree is only read.
 - The directory names above (`versions`, `state`, `cache`, `logs`, the `current` link) are those of the
   Linux per-user layout. A Windows per-user install uses the names of section 16 (`app`, `.lunepack\state`,
-  `.lunepack\cache`, `.lunepack\logs`, no `current` link); a reader recognises an installed tree by its
-  parent directory being the versions directory of one of the two schemes.
+  `.lunepack\cache`, `.lunepack\logs`, no `current` link). A macOS per-user install keeps the Linux names
+  under another data home, has no `current` link, and holds its live version in a bundle outside the
+  versions directory (section 17); its current tree is that bundle, the explicit current tree above, and
+  every other kept version's tree is in the versions directory as before. A reader recognises an installed
+  tree by its parent directory being the versions directory of one of the three schemes, or, on macOS, by
+  it being the bundle the install's pointer names (section 17).
 - A `staged` entry is usable only when `staged.version` is newer than `current.version` by
   precedence, is not in `bad`, `staged.target` equals the record's `target`, and the tree directory
   `<versions dir>/<staged.tree>` exists as a real directory. Otherwise it is ignored and the next
@@ -1018,7 +1022,8 @@ reader over the bytes it is about to write and writes only what passes.
 
 - On Linux and Windows targets the file is `lunepack-update.json` at the version tree's root
   (`<tree>/lunepack-update.json`). On macOS targets it is `Contents/Resources/lunepack-update.json`
-  inside the bundle tree (assumed until M8 settles the bundle layout).
+  inside the bundle tree (M8-D1; section 17), in the bundle's resources folder, so a code signature seals it
+  with the rest of the bundle.
 - The location is fixed for format 1 and never moves within it, so any version's runtime reads
   another version's configuration at the same place (M5-D17). An executable finds its tree by
   walking up from its own directory to the nearest configuration; the packager refuses an input
@@ -1194,6 +1199,22 @@ The rule validates and never rewrites a name. It is not applied to other targets
 For a `windows-*` target the file name `lunepack-stub.exe` (any ASCII case, at any depth of the input tree) is
 reserved for the launcher stub the packager places beside the entry (section 15) and is an error in the input.
 
+**macOS (M8).** For a `macos-*` target `entry` is `Contents/MacOS/<file>` (an executable regular file), so the
+runtime lands in `Contents/MacOS` beside it, and the bundle's file name is chosen from `name` at the first
+install (section 17). `name` can be that file name when `macos_name_ok` accepts it: 1 to 200 UTF-8 bytes, no
+`/`, `:` or control character, and no leading `.`. The rule validates and never rewrites a name. Unlike the
+Windows rule it does not refuse a release: a `name` that fails it makes the bundle's name the app id, and the
+packager says so on stderr, naming the rule and never the name. The declarations are not all applied:
+`autostart` writes a LaunchAgent property list (`~/Library/LaunchAgents/<app id>.lunepack.plist`, whose `Label`
+is the same text and whose program is the entry inside the live bundle; it is never loaded, so it takes effect
+at the next sign-in); `file_types` and `url_schemes` are not applied, because macOS takes them from the app's
+own `Info.plist`; `bin` and the freedesktop members have no meaning there, and no shortcut is made. A file is
+lunepack's only when it is a regular file whose `Label` is this app's; anything else at that path is a conflict
+and is never overwritten or removed. The names `lunepack-runtime` and `lunepack-ui` in `Contents/MacOS`, the
+file name `lunepack-update.json` at any depth, `Contents/Helpers/lunepack-update.app` with everything under it
+and `Contents/Resources/lunepack-setup.payload` are reserved for what the packager places (`docs/CLI.md`,
+"macOS targets") and are errors in the input.
+
 ### 13.5 Desktop-entry paths
 
 A path the Linux integration writes into a desktop entry's `Exec` or `Icon` value (the absolute path
@@ -1244,7 +1265,8 @@ follow the last part), so the file's length is a multiple of 8: Authenticode pad
 certificate table, and a signed file then keeps the trailer as the last bytes before the table. The writer is `lunepack setup` and its output is a
 function of the release directory (and, for a Windows file, of its output file name, which the stamped
 runtime carries); it is named `<app_id>-<ver>-<target>-setup`, with `.exe` appended
-for a `windows-*` target. Linux and Windows targets have setup files in this revision.
+for a `windows-*` target. Linux and Windows targets have setup files in this revision; a macOS target has
+an installer app that carries the same payload as a file of its own (14.4).
 
 On Windows the runtime part is the release's `lunepack-runtime.exe`, taken from the pack through its signed
 frame, with any certificate table removed and the app's icon and version information stamped in (the
@@ -1335,6 +1357,31 @@ by the magic (14.1):
 A refusal is the runtime's exit 7 `verify`, never a run as an ordinary runtime. The trailer and every
 part lie inside the bytes an Authenticode signature covers, so a signature protects them; a signature is
 not what makes a setup file trusted (14.2: the trailer's root is).
+
+### 14.4 The macOS installer's payload file
+
+A `macos-*` release has no setup file. Its installer is an app, `Install <name>.app`, written by
+`lunepack setup` into an LZMA-compressed disk image (M8-D7):
+
+| Path inside the app | Holds |
+|---|---|
+| `Contents/MacOS/lunepack-ui` | the release's UI, the app's main executable, taken from the pack through its signed frame |
+| `Contents/MacOS/lunepack-runtime` | the release's runtime, taken from the pack through its signed frame |
+| `Contents/Resources/lunepack-setup.payload` | the payload file below |
+| `Contents/Info.plist` | generated; `CFBundleIdentifier` is the app id with `_` written as `-`, then `.lunepack-installer` |
+| `Contents/Resources/lunepack-installer.icns` | the release's `[macos] icon`, when it has one |
+
+The payload file is a setup file without the runtime part: `keys.json`, the manifest and the pack, each
+starting at a multiple of 8 and the first at offset 0, then the trailer of 14.1, so the file's length is a
+multiple of 8. The runtime in `Contents/MacOS` is in setup mode when its resolved path is that one and the
+payload file next to it is a regular file (not a link). A file at that place is meant to be a payload, so
+a file that does not parse is refused as in 14.2 (exit 7), never read as "no payload". The payload is then
+verified exactly as a setup file's (14.2: the trailer's root is the trust anchor, no feed, first-install
+floors). The runtime goes in `Contents/MacOS` and not in `Contents/Resources`, so that signing treats it
+as the nested executable it is (M8-D7, refining D35's wording). The UI is the main executable, and it
+starts the runtime beside it as the engine, so a double-click opens the window.
+
+The image is built by `lunepack setup`; the installer app carries no signature in this revision.
 
 ## 15. Windows stub launch contract, version 1
 
@@ -1436,3 +1483,178 @@ and reported. The uninstall entry is
 `Publisher` (when present), `DisplayIcon`, `InstallLocation`, `UninstallString` (`"<stub>" --lunepack-uninstall`),
 `QuietUninstallString` (the same with `/S`), `NoModify`, `NoRepair` and the marker. `InstallLocation` is
 written for Windows' sake and never read by lunepack.
+
+## 17. macOS per-user layout
+
+A per-user install on macOS has an install root `R`, outside the app, and a live app bundle `B`, which is
+what the user sees and starts. The names below are a cross-version contract once an app ships (D28): the
+runtime of one version reads the install another version wrote. Section 13.1 puts the update configuration
+at `Contents/Resources/lunepack-update.json` inside every bundle tree.
+
+| Path | Holds |
+|---|---|
+| `R` = `<data home>/<app id>` | the install root. The data home is the canonical `$HOME/Library/Application Support` (`HOME` absolute and UTF-8, canonicalised once) |
+| `R/versions/<version>/` | the tree of every kept version other than the live one: a whole bundle tree named by the version's text (12.7), without `.app`, so no system service takes it for an app |
+| `R/versions/.swap`, `R/versions/.out` | the two slots a tree passes through on its way into or out of `B` (17.3). Neither is a version's text, which starts with a digit |
+| `R/state/`, `R/cache/`, `R/logs/` | as on Linux (12, 12.7) |
+| `R/bundle` | an absolute symlink to `B` (17.1) |
+| `R/bundle.id`, `R/bundle.id.tmp` | the identity of `B` (17.1); the second exists only while the first is being written |
+| `B` = `<apps dir>/<bundle name>.app` | the live bundle: always the install's current version once a reconcile has finished |
+
+There is no `current` link. The record (12) is the truth: which version is current, previous, pending or
+staged. `B` and the trees are made to match it by renames only (17.3), and nothing else ever moves the
+live app.
+
+### 17.1 The pointer, the identity and the name of `B`
+
+- **The apps folder** of a per-user install is `~/Applications`, canonicalised before `B` is chosen, and
+  created with owner-only permissions when it is missing (M8-D2). A bundle the user later moves is
+  followed (17.2).
+- **`B`'s name** is chosen once, at the first install, and kept for the life of the install (as M7-D16): the
+  display name `install.name` when `macos_name_ok` accepts it (13.4), else the app id, then `.app`. A name
+  that is taken (any existing entry, which is never touched) falls back to `<name> (<app id>).app`, and when
+  that is taken too the install is refused (`install_mismatch`, nothing written; as M7-D17).
+- **`R/bundle`** holds `B`'s path as text: absolute, UTF-8, in normal form (no `.` or `..`, no doubled or
+  trailing separator), the last name ending in `.app` with something before it, and every existing
+  component of its folder a real directory and not a link. A pointer that is anything else, or `R/bundle`
+  being anything but a symlink, is refused and never repaired. A runtime accepts a tree as the install's
+  live bundle only when its canonical path equals the pointer's text byte for byte.
+- **`R/bundle.id`** holds the device and inode of `B`'s directory as decimal text, `<device> <inode>`, at
+  most 64 bytes, written through `R/bundle.id.tmp` and a rename. It is written after every placement and
+  at the end of every reconcile that changed `B`, and rewritten by any reconcile that finds it not matching
+  `B`, so a crash between a swap and the write heals at the next reconcile. It is how a bundle that the
+  user moved is recognised (17.2); it is never used to decide which version `B` holds.
+
+### 17.2 Where a running tree stands
+
+A runtime that starts inside a bundle tree decides what it is in this order, before it reads the record's
+state for any other purpose, and writes nothing while it does:
+
+1. **Its location.** A tree on a `nullfs` mount, or under a path component `AppTranslocation`, is
+   *translocated*; one on a read-only volume (a mounted disk image) is *read only*. Both are refused with the
+   error `unsupported_location` (exit 28, `docs/RUNTIME.md`) in every mode, `check` included, so a
+   translocated app always learns to move rather than being told it is not installed.
+2. **A tree in `R/versions/` named by its own version text:** an old instance of this install (a process the
+   previous version started before a swap keeps running from the path the swap gave its tree). It is
+   installed.
+3. **`R/bundle` names the tree.** The tree is the live bundle: installed, unless the record is *replaced*
+   (17.4). When it names another existing bundle, the tree is a second copy of a live install and is not
+   installed: one install per app id per user.
+4. **The pointer is missing or its target is gone** and the tree is not under `$HOME/.Trash`: the install
+   follows the move when the tree's device and inode are exactly those in `R/bundle.id` and the record is
+   this app's, per user, with the tree's version as its current one. The follow happens under the install
+   lock, which re-checks all of that, and re-points `R/bundle`. A copy, a re-extracted archive, a move to
+   another volume or a tree in the Trash has another inode and is not installed.
+5. **Adoptable** (17.5): the tree's canonical parent is exactly `~/Applications` or `/Applications` and `R`
+   holds no record, a record without a current version, or an orphaned or replaced one (17.4).
+6. Otherwise **not installed**, a development run.
+
+After the tree is accepted as `B`, a runtime that is about to change the install checks the place once
+(`check_place`): `B`'s folder and `R/versions` are on one device (else `other_volume`); `B` is owned by the
+caller (else `not_owned`; a root-owned `B` is refused, not read as a machine install); the caller can create
+entries in `B`'s folder (else `not_writable`). The folder itself need not be the caller's, so an
+administrator's app in `/Applications` keeps updating (M8-D4).
+
+### 17.3 Reconcile: making `B` hold the current version
+
+The record is committed first (12.5), and reconcile then moves the disk to match it. It makes `B` hold
+`current.version` using only the renames below, so the state after a crash at any point is one the next
+reconcile finishes. Trees are identified by the app id and version in their own configuration, never by
+their names, and a link or a file at `B`, a slot or a version path is never followed (it is an error).
+
+With `B` the live bundle, `S` the swap slot, `X` the out slot and `T` = `R/versions/<current>`:
+
+1. `B` is missing (the first placement, or a two-rename cut short): the tree among `X`, `S` and `T` that
+   holds the current version is renamed to `B`. None does: the install is *orphaned* (17.4), and nothing is
+   moved.
+2. `X` holds a tree: it is renamed to `R/versions/<its version>`.
+3. `S` holds a tree: it is parked the same way when `B` already holds the current version or `S` holds a
+   third version; when `S` holds the current version it is swapped with `B`.
+4. `B` holds another version: `T` must hold the current version and is renamed to `S` (else `B` cannot be
+   made current and nothing is changed).
+
+A swap is `renamex_np(RENAME_SWAP)` on the pair `S`, `B`: one atomic step in which both names change
+places. A volume that does not support it (HFS+ and exFAT answer `ENOTSUP`) gets the journaled two-rename
+instead, `B` to `X`, `S` to `B`, `X` to `S`, whose journal is the slot names and the record. Which is used
+is learned by trying, never by a prior query. Every rename is followed by a sync of the folders it changed.
+At most 16 moves are made in one reconcile; more means the disk keeps changing under it and is an error.
+
+End state, whichever the path: `B` holds the current version, `R/versions/<previous>` holds the previous
+version when it is kept, both slots are empty, and `R/bundle.id` names `B`. Reconcile only renames. It never
+copies, writes (but for the identity), or removes a tree: the only thing that deletes a version tree is
+garbage collection (M5-D9, on `R/versions` only), and the only other deletion is an uninstall (17.6). A
+tree that is in the way (a stray tree in a slot, a name already taken) is parked under its own version or
+reported, never replaced.
+
+The update is therefore: stage the new version's tree in `R/versions/<new>` (12.7, as everywhere), commit
+`pending` and `current` in the record, then reconcile (`T` to `S`, swap `S` with `B`, park the old tree).
+The running app's own files move with its tree, and the process keeps its open files; a start that finds
+the record ahead of the disk finishes the swap before it goes on. A rollback is the same moves with the
+previous version as the current one.
+
+**Extended attributes (M8-D10).** The manifest has none (8.1), so a staged tree carries none, and a copy of an
+unchanged file from the old tree copies its data and mode only: `com.apple.quarantine` is never carried into
+a new tree. lunepack never sets that attribute and never removes it from the live bundle in place. A tree
+swapped into `B` therefore has no quarantine attribute, as with any updater that does not quarantine what it
+downloads. The first-launch assessment of the original install is the system's and is not changed.
+
+### 17.4 Orphaned and replaced installs
+
+- **Orphaned.** The record has a current version, but `R/bundle`'s target is missing and no tree in
+  `R/versions`, the slots included, holds that version. This is what the user's drag of `B` to the Trash
+  leaves. Reconcile reports it and moves nothing; a start is then not installed. An installer run over an
+  orphaned install is a fresh install that keeps only the anti-rollback floors (the root, the key-set
+  version and the feed `seq`, 11.2): previous, pending, bad versions and events start anew, with a new
+  install id, and the run ends with `installed`, not `already_installed`.
+- **Replaced.** A bundle at `B`'s own path whose configuration is this app at another version than the
+  record's current, while none of `B`'s slots or `R/versions/<current>` holds the current version. The user
+  dragged a newer download over the old one, or used Finder's Replace. It is treated as orphaned for what
+  follows: never installed, adoptable in an apps folder (17.5), otherwise a development run (an installer
+  run over it still ends `already_installed`: move the copy to the Trash first, which makes it the
+  orphaned case). A same-version
+  copy at the same path is the live bundle (its inode is recorded again at the next reconcile). A bundle at
+  `B`'s path that differs from the record only because an update or rollback was cut after its commit is
+  not replaced: reconcile finishes that.
+
+### 17.5 Adoption
+
+A bundle that is adoptable (17.2 step 5) is adopted by the update check, and only there (`check` and
+`download`, `docs/RUNTIME.md`): never at startup, which has no network, and never for a copy anywhere
+else. It proves the bundle is byte for byte a release signed under the root its own configuration names,
+then records it as the install. The bundle is not written, moved or removed.
+
+1. The root, key set and feed are verified and the floors raised as any check does; the release selected is
+   exactly the bundle configuration's version for its target (none: `no_release`).
+2. The release's manifest is fetched and verified, and `B` must equal it exactly: the same set of relative
+   paths, compared as listed bytes and never through a lookup, file sizes, SHA-256, executable bits and
+   link targets, no extra entry (an empty directory included), nothing followed. Any difference is a
+   `verify` failure and nothing is committed.
+3. The commit order, each step durable before the next:
+   1. `R/bundle.id` (and `R/versions`, so the layout is whole);
+   2. the integration (the LaunchAgent for `autostart`), before the record, as at a first install;
+   3. the record: a first install transition for no record or one without a current version, the orphan
+      transition (17.4) for an orphaned or replaced one, so the floors are kept and a new install id is
+      written;
+   4. `R/bundle`;
+   5. a reconcile, which renames nothing because `B` already holds the current version.
+
+Every cut is safe. A crash before step 3 leaves a record without a current version (or the old one) and the
+bundle adoptable again; the next check starts over. A crash after step 3 leaves a current version, a
+pointer that is missing or dangling, an identity equal to `B`'s: 17.2 step 4 follows it at the next
+start, with no network. The one case that cannot be told from a Finder move is a same-version orphan cut
+between steps 1 and 3: the next start follows it as a move and the install keeps its record, losing only
+the new install id and the `installed` and `first_run` events.
+
+### 17.6 The helper app, the installer and uninstall
+
+- **The update window** is a helper app nested in every bundle packed with `--ui` (M8-D6):
+  `Contents/Helpers/lunepack-update.app/Contents/MacOS/lunepack-ui` with a generated `Info.plist`
+  (`docs/CLI.md`). Nothing but the runtime sits in `Contents/MacOS` beside the entry.
+- **The installer** is `Install <name>.app` (14.4). It installs into `~/Applications` by 17.1 and 17.3's
+  first placement, with the record committed after the pointer and the identity (17.5's order).
+- **Uninstall** takes `B` from the runtime's own path and requires it to be exactly what `R/bundle` names,
+  then removes, under the install lock and with nothing started or changed unless every check passed and no
+  process runs from `B` or from any tree in `R`: `B`, renamed to `.<app id>.removing-<16 hex>` in its
+  folder and then deleted; `R`, renamed to its tombstone in the data home (as 16) and then deleted; and the
+  LaunchAgent entry when its `Label` is the app's. Each leaves its path in one rename, so a cut-off uninstall
+  leaves `B` and `R` whole or gone, `B` first.

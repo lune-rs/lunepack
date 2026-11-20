@@ -82,7 +82,10 @@ pub struct ApplyOptions {
     /// changes nothing. With it, a version that crashes before it confirms its health is rolled
     /// back at the health deadline rather than at once (macOS gives an app's exit status only to
     /// its parent, and an app started this way is not the applier's child), and an app that
-    /// activates itself in code still comes to the front.
+    /// activates itself in code still comes to the front. The health token still reaches the app
+    /// through its environment only, and an app that cannot be identified as the one just started
+    /// is never signalled. When the bundle's `Info.plist` cannot be read, or names another
+    /// executable than the entry, the app is started as a child, as without the option.
     pub background: bool,
 }
 

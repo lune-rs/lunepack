@@ -540,11 +540,11 @@ size, exec, codec and frame length. It reads the config for the root only and ne
 ### `lunepack setup`
 
 ```
-lunepack setup <DIR> --version <VERSION> --target <TARGET> [--out <FILE>] [--at <AT>]
+lunepack setup <DIR> --version <VERSION> --target <TARGET> [--out <FILE>] [--zip] [--at <AT>]
     [--config <CONFIG>]
 ```
 
-Builds a Linux or Windows setup file (FORMAT.md 14): the release's own runtime, then `keys.json`, the manifest
+Builds a Linux or Windows setup file (FORMAT.md 14; a `macos-*` target gets an installer `.dmg` or a `.zip` instead, below): the release's own runtime, then `keys.json`, the manifest
 and the pack of `<VERSION>` for `<TARGET>`, then the trailer naming them and the root the release's
 update configuration trusts. Run, the file installs exactly that version with no network, with the
 window or `--silent` (RUNTIME.md, "Setup files").
@@ -556,13 +556,38 @@ pack through their signed frames. The release must have been packed with `[updat
 (and `--ui` for a window). The written bytes are then parsed back and verified as the runtime
 parses them, so `keys.json` must be signed under the root the update configuration names.
 
-`<VERSION>` is the text as written in the release (canonical). Only the `linux-*` and `windows-*`
+`<VERSION>` is the text as written in the release (canonical). The `linux-*`, `windows-*` and `macos-*`
 targets are accepted in this release. The file goes to `--out`, or to
 `<app_id>-<VERSION>-<TARGET>-setup` (with `.exe` for a `windows-*` target) in the current directory;
 an existing file is not replaced. On a Unix host it is made executable (mode 0755). The output depends on the release directory only: two runs give
 the same bytes. `--at` verifies at that Unix time instead of the system clock. A setup file stops
 installing when its key set expires or its release keys' windows end: build it from a current
 release.
+
+**macOS (M8-D7, M8-D9).** A `macos-*` release has no setup file. `setup` writes one of two things, by the
+same checks as above, taking every file out of the pack through its signed frame:
+
+- **The installer `.dmg`** (default; a macOS host only, because it runs the system's `hdiutil`): an
+  LZMA-compressed APFS disk image (`hdiutil create -format ULMO -fs APFS`, no Spotlight index, verified with
+  `hdiutil verify` before it is placed; the volume is named after `install.name`, cut to 27 characters)
+  that holds exactly one app, `Install <name>.app` (the bundle's own name rule, FORMAT.md 13.4, applies),
+  built from the release's `lunepack-ui` as its main executable, its `lunepack-runtime`, a generated
+  `Info.plist`, the release's `[macos] icon` when there is one, and the payload file
+  `Contents/Resources/lunepack-setup.payload` (FORMAT.md 14.4). The release must have been packed with `--ui`:
+  the installer's executable is the release's UI, so a release without one is refused, naming `--zip`.
+  Opening the app shows the install window; `lunepack-runtime` inside it also installs with `--silent`
+  (RUNTIME.md, "macOS"). The default name is `<app_id>-<VERSION>-<TARGET>.dmg`; `--out` must end in
+  `.dmg`. The image is not signed or notarized (M9). `hdiutil` decides its bytes, so two runs need not give
+  the same image.
+- **The `.zip`** (`--zip`; any host, no image tool): the bundle `<bundle name>.app` exactly as released, with
+  every file's data and exec bit and every symlink as the manifest has them. It is written by lunepack's own
+  writer over `flate2` (deflate, level 9 when that is smaller, else stored; names in UTF-8; times fixed at
+  1980-01-01; Unix modes in the attributes; no ZIP64, so at most 65,535 entries and 4 GiB), so two runs give
+  the same bytes, and `ditto -x -k`, `unzip` and Finder extract it to the same tree (a code-signed bundle
+  still verifies). The default name is `<app_id>-<VERSION>-<TARGET>.zip`. A bundle dragged out of it has no
+  install record: the first update check in `~/Applications` or `/Applications` adopts it after proving it
+  equal to its release (RUNTIME.md, "macOS"); anywhere else it is a development run. `--zip` is refused for
+  a Linux or Windows target.
 
 ## The release directory
 
