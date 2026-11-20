@@ -304,11 +304,20 @@ mod native {
     }
 
     /// The UI dies abnormally: an abort on Linux; a plain nonzero exit on Windows (an abort there
-    /// can raise the error-reporting dialog).
+    /// can raise the error-reporting dialog); SIGKILL on macOS (an abort there writes a crash
+    /// report and can show the system's crash dialog; a kill writes none).
     fn die() -> ! {
         #[cfg(windows)]
         std::process::exit(3);
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &std::process::id().to_string()])
+                .status();
+            // `kill` could not run: a plain failure, still no report.
+            std::process::exit(137);
+        }
+        #[cfg(target_os = "linux")]
         std::process::abort();
     }
 
@@ -316,7 +325,20 @@ mod native {
         at.as_deref() == Some(trigger)
     }
 
+    /// Stops doing anything, for as long as the process that started this UI runs: a UI left
+    /// behind by a host that ended without stopping it (a test run killed midway, say) ends
+    /// itself instead of sleeping on as an orphan.
     fn sleep_for_good() -> ! {
+        #[cfg(unix)]
+        {
+            let parent = std::os::unix::process::parent_id();
+            while std::os::unix::process::parent_id() == parent {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            note("ui orphaned");
+            std::process::exit(0);
+        }
+        #[cfg(not(unix))]
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
@@ -699,10 +721,6 @@ mod native {
                 }
             }
         };
-        // macOS: an uninstall's in-use scan fails closed on a process of the user it cannot read,
-        // and a process another case starts or ends at that moment can be unreadable for an
-        // instant, so the uninstall cases run alone, after the others.
-        let mut alone: Vec<(&'static str, Case)> = Vec::new();
         std::thread::scope(|scope| {
             for (name, test) in TESTS {
                 if filter.is_some_and(|f| !name.contains(f.as_str())) {
@@ -718,17 +736,10 @@ mod native {
                     println!("test {name} ... skipped on macOS ({why})");
                     continue;
                 }
-                if cfg!(target_os = "macos") && name.starts_with("uninstall_") {
-                    alone.push((name, *test));
-                    continue;
-                }
                 let run_case = &run_case;
                 scope.spawn(move || run_case(name, *test));
             }
         });
-        for (name, test) in alone {
-            run_case(name, test);
-        }
         let failed = failed.into_inner().expect("failed");
         if !failed.is_empty() {
             println!("failed: {failed:?}");
