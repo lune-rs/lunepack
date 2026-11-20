@@ -26,6 +26,12 @@ lunepack-core.workspace = true
 # libproc (process identity, the in-use scan), kqueue (waiting for a non-child), setsid(2) for a
 # detached spawn and kill(2) for SIGTERM to an own child; nothing else.
 libc = { workspace = true }
+# The publisher check (M9-D7, M9-D10): `SecStaticCode`, `SecRequirement` and `Flags` of
+# Security.framework, over CoreFoundation's wrappers. Both are exact pins of what the lock already
+# holds for the HTTP stack; `REACH_ONLY_THROUGH` confines `security-framework` to this crate and to
+# `lunepack-http`.
+security-framework = { workspace = true }
+core-foundation = { workspace = true }
 
 [dev-dependencies]
 lunepack-testkit.workspace = true

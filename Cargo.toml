@@ -53,6 +53,9 @@ tempfile = "3"
 # Windows) and the open(2) flag constants.
 fs4 = "1.1"
 libc = "0.2"
+# macOS publisher check (M9-D10): exact pins of the versions already in the lock.
+security-framework = "=3.7.0"
+core-foundation = "=0.10.1"
 
 # Command-line packager (M3 step 7).
 clap = { version = "4", features = ["derive"] }
