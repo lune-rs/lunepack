@@ -4,7 +4,7 @@ Status: **draft**, awaiting approval together with `docs/FORMAT.md`.
 
 What lunepack's update and install path defends against, and what it does not. The format rules
 referred to here are in `docs/FORMAT.md`; the decisions in `docs/DECISIONS.md` (D7, D17, D21, D24,
-D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12, M7-D1 to M7-D22).
+D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12, M7-D1 to M7-D22, M8-D1 to M8-D20).
 
 ## Assets
 
@@ -640,6 +640,167 @@ paths it derived itself or read from a signed tree, and fails toward keeping fil
 - **Renaming the install folder** is unsupported (`docs/FORMAT.md` 16): the launcher still works from the
   renamed folder, the shortcut no longer matches the install's marker and is left alone, and updates
   report it as a conflict. Nothing is overwritten or removed that is not lunepack's.
+
+## macOS per-user (M8)
+
+The macOS per-user install (`docs/FORMAT.md` 17, `docs/RUNTIME.md` "macOS") moves the live app: the update
+swaps a bundle in the user's Applications folder, an app dragged there is adopted, the installer is an app
+whose UI starts the engine, and the packager writes disk images and archives. Class 4 (a process of the same
+user) is out of scope as before: it can already edit `B`, the trees, the records and `R/bundle`. What the
+pieces below add is that lunepack acts only on paths it derived itself or read from a signed tree, moves
+rather than deletes, and fails toward keeping the app.
+
+- **Swap and reconcile (M8-D3, M8-D5, M8-D16, M8-D17).** The record is committed first and the disk is moved
+  to match it by renames only, so the worst a crash does is leave the next start a few renames to finish:
+  the crash tests cut after every mutating call, on both swap paths, and require the same end state, and a
+  state the reconcile cannot make sense of it refuses without moving anything. Every
+  tree is identified by the app id and version in its own configuration, read with a size cap after each
+  component was checked to be a real directory or file, and never by its name; a link or a file at `B`, a
+  slot or a version path is refused, never followed; a tree of another app there is refused and left; a
+  name already taken is never replaced. `R/bundle` must be absolute, plain, canonical and UTF-8, and is
+  refused, not repaired, when it is not. The running app keeps working through a swap (its open files keep
+  their inodes; the files it opens by path afterwards are the new tree's). A startup may finish a swap while
+  an old instance runs: the old instance's own tree moves, and it is judged by where the kernel now names
+  it (below). A tree that is `R/versions/<version>`, named by its own version, is an old instance of the
+  install; any other copy is not the install's. A bundle the user replaces at `B`'s own path with another
+  version is the replaced case (`docs/FORMAT.md` 17.4): never taken for the install, adopted only after the
+  proof below, and never swapped over, because reconcile finds the current version in no tree and refuses
+  rather than guessing.
+- **Location rules and translocation (M8-D4).** A runtime inside a translocated app (a `nullfs` mount or an
+  `AppTranslocation` path component) or on a read-only volume, and an install whose `B` is on another
+  volume than `R/versions`, is not owned by the user or whose folder the user cannot write, is refused with
+  exit 28 and a reason from a closed set before anything is read, written or fetched, so such a copy
+  can neither fail halfway nor be updated from an image. A root-owned `B` is `not_owned`, not a per-machine
+  install; a per-machine install is a later milestone. The facts come from `statfs`, `stat` and
+  `faccessat` through `Fs::place`; the translocation test is the mount type and the path component, which are
+  what the system uses and have not been exercised on a real translocated app (that needs a notarized one,
+  M9): the refusal is correct for the system's translocation and untested against it.
+- **Quarantine and extended attributes (M8-D10).** lunepack never sets `com.apple.quarantine`, never
+  removes it from the live bundle in place, and copies no extended attribute into a staged tree (std's copy
+  does carry it; the adapter's copy writes data and mode only), so a bundle swapped in by an update has
+  none, as with any updater that does not quarantine what it downloads. The assessment the system made of
+  the original install on its first launch is not touched, and an update is verified by lunepack's own
+  signatures (frame hashes, the manifest under the key set under the root), not by the system's. A quarantined
+  copy that the user has not yet opened never runs (that is Gatekeeper's); a quarantined ad-hoc-signed
+  installer app is expected to be refused until M9.
+- **Adoption (M8-D9).** A bundle dragged into an apps folder is read before it is verified, so only what is
+  needed to find its configuration is read with the existing, capped parser, and nothing is executed.
+  The root it trusts is the one in the bundle's own configuration: the same bootstrap model as the online
+  `install` from a bootstrap tree (D25), and it grants nothing beyond what running that bundle already
+  grants (the same user, the same files). It is not an authentication of who wrote the bundle: a bundle that
+  passes proves only that every file is byte for byte a release signed by the keys under the root it names;
+  a bundle built by an attacker with its own root passes under that root, exactly as running it would have
+  run it. The configuration is itself a manifest entry, so a bundle that passes carries the configuration
+  its release was signed with. Before the commit nothing is recorded as current, floors rise only from
+  documents that verified, and a failure leaves the bundle alone. Adoption is limited to a bundle directly in
+  `~/Applications` or `/Applications` with no live install, so a development build, a download or a copy in
+  the Trash never causes a request or a record, and one install per app id per user holds. Its check of the
+  tree is `verify_tree`: the set of relative paths, compared as the exact bytes the directory listing gives
+  and never through a lookup, file sizes, SHA-256, exec bits and link targets, with any extra entry (an empty
+  directory included) a difference and no link followed. **Case- and normalisation-insensitive volumes**
+  are the point of that comparison. APFS and HFS+ look names up ignoring case, and APFS also ignores
+  Unicode normalisation, so a lookup by the manifest's spelling would find a file that is not named that way;
+  by comparing the listed bytes a variant spelling is a missing entry and an extra one, which fails the
+  proof, and a manifest cannot hold two paths that differ only in case or normalisation (FORMAT 10.2). A file
+  name under the tree that normalises to another's, or differs from it in case only, is therefore never
+  verified by looking it up. This is a parser-differential focus for review. A cut anywhere in the commit
+  order leaves a state the next check or start finishes (`docs/FORMAT.md` 17.5), and the only record
+  that can remain is one without a current version.
+- **Background launch (M8-D13).** `--background` starts the app through `open -g -n -W`. The health token
+  travels in `open`'s environment, which `open` hands to the app, and never in an argument, because
+  arguments are visible to every process of the user through `ps`; a test reads the process list while the
+  app runs. If `open` ever stopped passing the environment, the token would not arrive, the version would
+  not confirm and it would be rolled back at the deadline: fail-safe, not silent. The app, not being the
+  applier's child, has no exit status the applier can read, so it is identified, never assumed: exactly one
+  new process of the user whose executable path is the entry's and whose start time is after the spawn,
+  within ten seconds. Zero or several (a user starting the app by hand in the window, a second instance)
+  is unidentified, and an unidentified app is **never signalled**: only `open` is ended, the log says so,
+  and the health deadline decides. A signal to an identified app is sent only after its pid and start
+  time are read again. When the bundle's `Info.plist` cannot be read (`plutil`, bounded, no shell) or names
+  another executable than the entry, the start falls back to a child start. What stays: an app that
+  activates itself in code still comes to the front.
+- **Links through links (M8-D20, `docs/FORMAT.md` 10.2).** A framework's `Foo` is a link to
+  `Versions/Current/Foo`, itself through the link `Versions/Current` to `A`. The rule is lexical: a stack of
+  case-folded names starts at the link's parent, a name that is another link in the manifest is a hop whose
+  own target is resolved from its own parent and whose end becomes the stack (so a later `..` pops where
+  the hop led, as the kernel's resolution would), a hop that is not last must end on a directory (the root,
+  a listed directory or an implied one), a `..` with nothing to pop escapes and is refused, a hop into a link
+  being resolved is a cycle, and more than eight links followed for one link (far below the kernels' 32
+  and 40) is refused, so no accepted link meets `ELOOP`. The model matches physical resolution because
+  stage creates only manifest entries, as real directories, files and links by their text, and no entry's
+  path passes through a link; so every name that is not a link is a directory, a file or nothing, and
+  every link is found by its fold key, which matches every spelling APFS accepts and is stricter than ext4. The
+  bounds are linear: each link is resolved once (memoised, depth-independent results only), 200,000 links
+  of eight hops took 0.36 s in a release build, measured. A test materialises 10,000 seeded trees and requires,
+  for every accepted tree, that each link resolves inside the root or ends in `ENOENT` or `ENOTDIR`, never
+  `ELOOP`, with two instruments checked by local mutations (no hops followed, and exact-spelling lookup)
+  that each find an escaping tree. The 10-minute libFuzzer runs of the `tree` and `manifest` targets have
+  not been run (`cargo-fuzz` was not installed); the committed seeds replay in the gate. Final links are now
+  followed too, which refuses a loop or a chain of more than eight that earlier releases of the rule
+  accepted: neither resolves, so no working app depends on one. A `windows-*` manifest still refuses every
+  link before any of this. Cases a reviewer should attack: `d/s` to `..` with `l` to `d/s/x` is accepted where the old rule
+  refused it (the hop ends on the root and `x` dangles inside), while `s` to `.` with `l` to `s/../x`, and
+  its upper-case spelling `S`, are refused (the hop leads to the root and `..` then leaves the tree).
+- **The in-use scan (M5-D9 amended by M8-D19).** On macOS the scan reads executable, working directory and
+  open files through libproc and fails closed on an unreadable process of the user, with two exceptions, each
+  with what it cannot see. (1) A system daemon the kernel protects shows its executable but refuses its
+  working directory or open files: it is judged by what is readable, so a protected daemon that runs outside
+  the tree and holds a file inside it is not seen. (2) A process whose executable file was deleted has no
+  executable path to be inside the tree, so it is judged by its working directory and open files alone, and
+  counts as in use only if one of them lies in the tree, or if the kernel refuses its working directory
+  as well (then nothing can be told). That is what a user can see: a deleted executable that maps a library
+  from the tree, with its working directory elsewhere and nothing open there, is not seen, and nor is any
+  library mapped from the tree by a process that has no file open there. A consequence for an interrupted
+  garbage collection or uninstall: when the removal took the main executable first, the app still running
+  from it, with working directory `/` and its frameworks only mapped, is judged not in use, so the resumed
+  removal goes on; before M8-D19 it failed closed. Q103 accepted that. A read that fails on a process that
+  is starting or ending is re-read up to three times, ten milliseconds apart, and a process that has
+  meanwhile ended is not in use; one still unreadable is in use. A process that forks while the scanning
+  process holds a descriptor open under the tree inherits it until its exec and is counted, rightly.
+- **The installer's reversed channel (M8-D7, M6-D1, M6-D5).** In the installer app the UI is the main
+  executable and the runtime is its child over the UI's own streams, the reverse of every other flow. The
+  runtime treats every message from its parent as untrusted exactly as it does a child UI's (the flow
+  reducer decides what is valid and what a choice may be), never signals its parent, and finishes headless
+  if it is lost: a parent lost before any change cancels, after the outcome the outcome stands (Q51). The
+  UI starts the runtime from its own resolved path only (the runtime must be a sibling regular file, not a
+  link) with the one argument `--ui-stdio`, so nothing the user types reaches the runtime's command line.
+  Its standard output carries frames only, so no result or event text can be taken for one. The payload is
+  verified before anything is shown or written, from the trailer's root, as a setup file's is (this app is
+  no more trusted than a setup file: an attacker who can replace it can already run code as the user). A
+  `.dmg` is read-only, so the installer cannot write itself and its own location is not judged; only the place
+  of the new bundle is. The installer app has no bundle seal in this milestone: it launches unquarantined
+  here, and M9 owns signing and notarizing it.
+- **Process spawning and generated text (M8-D6, M8-D11, M8-D12).** The runtime and packager start `open`,
+  `plutil`, `osascript` and `hdiutil` by absolute path, with an argument vector and no shell, and each run is
+  bounded in time (the alert gives up after 120 s and its process is killed shortly after). The alert's
+  script is fixed and the title, text and kind arrive only as arguments, so no string can change what it
+  does. The helper app's `Info.plist`, the installer's `Info.plist` and the LaunchAgent plist are written
+  from the app id, name and entry of the signed configuration with XML escaping of every string, no value
+  with a control character, and a deterministic byte layout; the LaunchAgent is only written (atomically,
+  mode 0644, never loaded, so it takes effect at the next sign-in), replaced or removed only when its
+  `Label` is the app's, and refused when `~/Library/LaunchAgents` is a link or the entry is a link or
+  another program's file.
+- **Deletion (M8-D5).** There are two deleters. Garbage collection removes only direct children of
+  `R/versions` named by a kept version's text and checked with `lstat` just before, never `B`, the slots or the
+  pointer, and only when no process runs from the tree. Uninstall removes `B`, then `R`, then the
+  LaunchAgent: each by one rename to a tombstone (`.<app id>.removing-<16 hex>`, in `B`'s folder and in the
+  data home) and then the tombstone; it requires `B` to be exactly what `R/bundle` names, `R` to be a
+  canonical real directory holding this app's record, no process to run from `B` or from any tree in `R`, and
+  every check to pass before the first removal. A tombstone of an earlier cut-off run is removed at the next
+  uninstall by exact name form and without following a link. A foreign file next to `B`, another app's
+  LaunchAgent and the rest of the apps folder are never touched.
+- **The packager's outputs (M8-D8, M8-D9).** `pack` never modifies a bundle that holds a code signature: it
+  packs it unchanged when every file it would place is already there byte for byte, and otherwise refuses,
+  naming the path. The installer app and the `.zip` are built from bytes read out of the pack through their
+  signed frames, so nothing unverified reaches them, and written only where nothing exists. The `.zip`'s
+  entry names are manifest paths (no `..`, nothing absolute, FORMAT 10.1) under the bundle's own name (no
+  `/`), and no entry's path passes through a link entry (FORMAT 10.2), so an extractor that writes entry
+  after entry has no link to write through. The writer has no ZIP64, no extra fields, no encryption and no
+  data descriptors, so a reader's parser has little to differ on, and it makes the same bytes each time.
+  The `.dmg` is made by the system's tool and is not signed in this milestone.
+- **Not covered here.** Gatekeeper's, App Management's and background-item prompts and the focus of a
+  relaunched app are what only a person can see (`scripts/macos-user-check.sh`); translocation, notarization
+  and a signed installer are M9; a per-machine install is M10 and M11.
 
 ## Denial-of-service bounds
 
