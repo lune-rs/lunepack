@@ -1,9 +1,8 @@
 //! `MacPublisherCheck` against real bundles signed with the host's `codesign` (M9-D7, M9-R1-D2).
 //!
 //! Always run: ad-hoc and unsigned trees (no identity is needed), which also pin the Security
-//! status values the check depends on. Run when a throwaway identity is given (the CI job of
-//! the macOS CI job of M9 step 9, or a developer who sets the variables): two identities in
-//! a temporary keychain that is never this machine's login keychain or search list, named by
+//! status values the check depends on. Run when a throwaway identity is given (the macOS CI job
+//! of M9 step 9, or a developer who sets the variables): two identities in a temporary keychain that is never this machine's login keychain or search list, named by
 //! `LUNEPACK_TEST_KEYCHAIN` (a path), `LUNEPACK_TEST_IDENTITY_A` and `LUNEPACK_TEST_IDENTITY_B`
 //! (certificate names or hashes: not secrets). Without them the identity rows are skipped with
 //! their names printed, never silently.
