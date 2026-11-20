@@ -5,13 +5,15 @@
 //! (argv, never a shell), bounded in time, with one retry after a pause when `hdiutil create` fails
 //! with "Resource busy" (GitHub's hosted Macs do that now and then), and verifies it.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+
+use crate::tool;
 
 /// The installer app's executable and runtime, as M8-D7 names them.
 pub const UI_NAME: &str = "lunepack-ui";
@@ -32,8 +34,6 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const VERIFY_ATTEMPTS: u32 = 6;
 /// The pause before the one retry after "Resource busy".
 const BUSY_PAUSE: Duration = Duration::from_secs(5);
-/// Most bytes of `hdiutil`'s output kept for an error message.
-const OUTPUT_CAP: u64 = 16 * 1024;
 /// Longest volume name, in characters (M8-D9).
 pub const MAX_VOLUME_CHARS: usize = 27;
 
@@ -110,7 +110,8 @@ pub fn volume_name(name: &str) -> String {
     name.chars().take(MAX_VOLUME_CHARS).collect()
 }
 
-/// A way to run `hdiutil`; the fields are public to the module's tests.
+/// A way to run `hdiutil`; the fields are public to the module's tests. (`create` and `verify` still
+/// take a scratch directory; since M9 step 2 the runner keeps the output in memory and ignores it.)
 pub struct Hdiutil {
     program: PathBuf,
     create_timeout: Duration,
@@ -121,7 +122,7 @@ pub struct Hdiutil {
 /// What a bounded run produced.
 struct Ran {
     success: bool,
-    /// The tail of its standard error, then its standard output, as text.
+    /// Its standard error, then its standard output, as text (each capped by the runner).
     output: String,
 }
 
@@ -136,57 +137,24 @@ impl Hdiutil {
         }
     }
 
-    /// Runs `hdiutil args...` with output kept in files under `scratch`, killing it after
-    /// `timeout`.
-    fn run(&self, args: &[&std::ffi::OsStr], scratch: &Path, timeout: Duration) -> Result<Ran> {
-        let out_path = scratch.join("hdiutil.out");
-        let err_path = scratch.join("hdiutil.err");
-        let open = |path: &Path| {
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(path)
-                .with_context(|| format!("cannot create {}", path.display()))
-        };
-        let mut child = Command::new(&self.program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(open(&out_path)?))
-            .stderr(Stdio::from(open(&err_path)?))
-            .spawn()
-            .with_context(|| format!("cannot start {}", self.program.display()))?;
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            if let Some(status) = child.try_wait().context("cannot wait for hdiutil")? {
-                break Some(status);
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        let read = |path: &Path| {
-            let mut text = String::new();
-            if let Ok(file) = File::open(path) {
-                let mut bytes = Vec::new();
-                let _ = file.take(OUTPUT_CAP).read_to_end(&mut bytes);
-                text = String::from_utf8_lossy(&bytes).into_owned();
-            }
-            text
-        };
-        let output = format!("{}{}", read(&err_path), read(&out_path));
-        match status {
-            Some(status) => Ok(Ran {
-                success: status.success(),
-                output,
+    /// Runs `hdiutil args...` through the bounded tool runner (M9-D3), killing it after `timeout`.
+    fn run(&self, args: &[&std::ffi::OsStr], timeout: Duration) -> Result<Ran> {
+        let mut argv: Vec<OsString> = vec![self.program.clone().into_os_string()];
+        argv.extend(args.iter().map(|a| (*a).to_owned()));
+        match tool::run_captured(&argv, timeout) {
+            Ok(c) => Ok(Ran {
+                success: c.status.success(),
+                output: format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&c.stderr),
+                    String::from_utf8_lossy(&c.stdout)
+                ),
             }),
-            None => bail!(
+            Err(e) if e.is_timeout() => bail!(
                 "hdiutil did not finish within {} seconds and was stopped",
                 timeout.as_secs()
             ),
+            Err(e) => Err(anyhow::Error::new(e).context("hdiutil could not be run")),
         }
     }
 
@@ -194,7 +162,7 @@ impl Hdiutil {
     /// retry after a pause when it fails with "Resource busy". `out` must end in `.dmg` (hdiutil
     /// would add the extension itself) and must not exist; a partial file a failed run left is
     /// removed before the retry (it is the file this call asked `hdiutil` to create).
-    pub fn create(&self, volname: &str, src: &Path, out: &Path, scratch: &Path) -> Result<()> {
+    pub fn create(&self, volname: &str, src: &Path, out: &Path, _scratch: &Path) -> Result<()> {
         if out.extension().and_then(|e| e.to_str()) != Some("dmg") {
             bail!("{}: the image's file name must end in .dmg", out.display());
         }
@@ -216,7 +184,7 @@ impl Hdiutil {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let ran = self.run(&args, scratch, self.create_timeout)?;
+            let ran = self.run(&args, self.create_timeout)?;
             if ran.success {
                 return Ok(());
             }
@@ -236,15 +204,11 @@ impl Hdiutil {
     /// `hdiutil verify <dmg>`, with the same one retry after a pause when the image is still busy
     /// (right after `create`, `hdiutil verify` sometimes answers "Resource temporarily
     /// unavailable").
-    pub fn verify(&self, dmg: &Path, scratch: &Path) -> Result<()> {
+    pub fn verify(&self, dmg: &Path, _scratch: &Path) -> Result<()> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let ran = self.run(
-                &["verify".as_ref(), dmg.as_os_str()],
-                scratch,
-                self.verify_timeout,
-            )?;
+            let ran = self.run(&["verify".as_ref(), dmg.as_os_str()], self.verify_timeout)?;
             if ran.success {
                 return Ok(());
             }
@@ -266,6 +230,8 @@ fn is_busy(output: &str) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+
+    use std::time::Instant;
 
     use super::*;
 

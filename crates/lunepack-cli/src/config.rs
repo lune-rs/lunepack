@@ -9,13 +9,15 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use lunepack_core::encoding::hex_decode_array;
 use lunepack_core::limits::MAX_JSON_INT;
 use lunepack_core::update_config::{DEFAULT_HEALTH_TIMEOUT_SECS, HEALTH_TIMEOUT_SECS};
 use lunepack_core::{
-    AppId, Channel, Clock, FileType, Hasher, InstallMeta, RelPath, Signer, TrustedRoot, Verifier,
+    AppId, ArgvTemplate, Channel, Clock, FileType, Hasher, InstallMeta, PublisherPolicy, RelPath,
+    Signer, Target, TemplateRole, TrustedRoot, Verifier,
 };
 use lunepack_crypto::{CommandSigner, Ed25519Signer};
 use serde::Deserialize;
@@ -42,6 +44,32 @@ struct RawConfig {
     windows: Option<RawWindows>,
     /// macOS-only packager inputs (M8, step 7).
     macos: Option<RawMacos>,
+    /// OS code signing, per operating system (M9-D2).
+    codesign: Option<RawCodeSign>,
+}
+
+/// `[codesign]`: one section per operating system that is signed (M9-D2); there is none for Linux.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCodeSign {
+    windows: Option<RawCodeSignSection>,
+    macos: Option<RawCodeSignSection>,
+}
+
+/// `[codesign.windows]` or `[codesign.macos]`: argv templates (M9-D1) for the developer's signing
+/// tools. The macOS-only keys are refused in the Windows section, naming the key.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCodeSignSection {
+    sign: Vec<String>,
+    sign_bundle: Option<Vec<String>>,
+    sign_outer: Option<Vec<String>>,
+    sign_installer: Option<Vec<String>>,
+    verify: Option<Vec<String>>,
+    notarize: Option<Vec<String>>,
+    staple: Option<Vec<String>>,
+    timeout_secs: Option<u64>,
+    notarize_timeout_secs: Option<u64>,
 }
 
 /// `[macos]`: inputs for the update window's helper app; not part of any signed document.
@@ -66,6 +94,8 @@ struct RawUpdate {
     feed: String,
     channel: Option<String>,
     health_timeout_secs: Option<u64>,
+    /// `off`, `warn` or `enforce` (M9-D6); absent takes the default for the target.
+    publisher_check: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -153,6 +183,40 @@ pub struct UpdateSettings {
     pub health_timeout_secs: u64,
     /// The install metadata.
     pub install: InstallMeta,
+    /// `[update] publisher_check` as written (M9-D6); `None` takes the default for the target,
+    /// see [`Config::publisher_policy`].
+    pub publisher_check: Option<PublisherPolicy>,
+}
+
+/// How long one sign or verify call may run when the section names no `timeout_secs` (M9-D2).
+pub const DEFAULT_CODESIGN_TIMEOUT_SECS: u64 = 300;
+/// How long one notarize call may run when the section names no `notarize_timeout_secs` (M9-D2).
+pub const DEFAULT_NOTARIZE_TIMEOUT_SECS: u64 = 3600;
+/// The longest timeout a section may name: a day (a larger value is a typo).
+pub const MAX_CODESIGN_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// One resolved `[codesign.<os>]` section (M9-D2): every template parsed, every default applied.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // read by the sign stage (M9 step 3)
+pub struct CodeSignSection {
+    /// `sign`: each unsigned PE (Windows) or loose Mach-O file (macOS).
+    pub sign: ArgvTemplate,
+    /// `sign_bundle`: nested bundles (macOS); defaults to `sign`.
+    pub sign_bundle: ArgvTemplate,
+    /// `sign_outer`: the app bundle (macOS); defaults to `sign_bundle`.
+    pub sign_outer: ArgvTemplate,
+    /// `sign_installer`: `Setup.exe`, the installer app's items and the `.dmg`; defaults to `sign`.
+    pub sign_installer: ArgvTemplate,
+    /// `verify`: run on the signed outer object.
+    pub verify: Option<ArgvTemplate>,
+    /// `notarize` (macOS); present exactly when `staple` is.
+    pub notarize: Option<ArgvTemplate>,
+    /// `staple` (macOS); present exactly when `notarize` is.
+    pub staple: Option<ArgvTemplate>,
+    /// How long one sign or verify call may run.
+    pub timeout: Duration,
+    /// How long one notarize call may run.
+    pub notarize_timeout: Duration,
 }
 
 /// A parsed, validated `lunepack.toml`.
@@ -177,6 +241,10 @@ pub struct Config {
     /// `[macos] icon`, resolved against the config's directory (M8-D6); checked as an `.icns` file
     /// when the packager builds the helper app of a `macos-*` pack with `--ui`.
     pub macos_icon: Option<PathBuf>,
+    /// `[codesign.windows]`, when the config has it (M9-D2).
+    pub codesign_windows: Option<CodeSignSection>,
+    /// `[codesign.macos]`, when the config has it (M9-D2).
+    pub codesign_macos: Option<CodeSignSection>,
     signers: BTreeMap<String, SignerSpec>,
 }
 
@@ -190,6 +258,15 @@ fn update_settings(file: &str, u: RawUpdate, i: RawInstall) -> Result<UpdateSett
     let rel = |value: &str, field: &str| {
         RelPath::parse(value).map_err(|_| anyhow!("{file}: install.{field} is not a tree path"))
     };
+    let publisher_check = u
+        .publisher_check
+        .as_deref()
+        .map(|text| {
+            PublisherPolicy::parse(text).ok_or_else(|| {
+                anyhow!("{file}: update.publisher_check is not \"off\", \"warn\" or \"enforce\"")
+            })
+        })
+        .transpose()?;
     let install = InstallMeta {
         entry: rel(&i.entry, "entry")?,
         name: i.name,
@@ -216,6 +293,90 @@ fn update_settings(file: &str, u: RawUpdate, i: RawInstall) -> Result<UpdateSett
         channel,
         health_timeout_secs,
         install,
+        publisher_check,
+    })
+}
+
+/// Parses one template of `[codesign.<os>]`; the error names the section, the key and (from the
+/// core) the element index, never an element's text.
+fn template(
+    file: &str,
+    os: &str,
+    key: &str,
+    role: TemplateRole,
+    elements: &[String],
+) -> Result<ArgvTemplate> {
+    ArgvTemplate::parse(role, elements).map_err(|e| anyhow!("{file}: codesign.{os}.{key}: {e}"))
+}
+
+/// A timeout key: 1 second to a day.
+fn timeout(file: &str, os: &str, key: &str, value: Option<u64>, default: u64) -> Result<Duration> {
+    let secs = value.unwrap_or(default);
+    if secs == 0 || secs > MAX_CODESIGN_TIMEOUT_SECS {
+        bail!("{file}: codesign.{os}.{key} is outside 1..={MAX_CODESIGN_TIMEOUT_SECS}");
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+fn codesign_section(file: &str, os: &str, raw: RawCodeSignSection) -> Result<CodeSignSection> {
+    let macos = os == "macos";
+    if !macos {
+        // The keys that belong to the macOS bundle flow are refused here, naming the key.
+        for (key, present) in [
+            ("sign_bundle", raw.sign_bundle.is_some()),
+            ("sign_outer", raw.sign_outer.is_some()),
+            ("notarize", raw.notarize.is_some()),
+            ("staple", raw.staple.is_some()),
+            ("notarize_timeout_secs", raw.notarize_timeout_secs.is_some()),
+        ] {
+            if present {
+                bail!("{file}: codesign.{os}.{key} applies to macOS only");
+            }
+        }
+    }
+    let sign = template(file, os, "sign", TemplateRole::Sign, &raw.sign)?;
+    let optional = |key: &str, role: TemplateRole, value: &Option<Vec<String>>| {
+        value
+            .as_deref()
+            .map(|elements| template(file, os, key, role, elements))
+            .transpose()
+    };
+    let sign_bundle = optional("sign_bundle", TemplateRole::Sign, &raw.sign_bundle)?;
+    let sign_outer = optional("sign_outer", TemplateRole::Sign, &raw.sign_outer)?;
+    let sign_installer = optional("sign_installer", TemplateRole::Sign, &raw.sign_installer)?;
+    let verify = optional("verify", TemplateRole::Verify, &raw.verify)?;
+    let notarize = optional("notarize", TemplateRole::Notarize, &raw.notarize)?;
+    let staple = optional("staple", TemplateRole::Staple, &raw.staple)?;
+    match (&notarize, &staple) {
+        (Some(_), None) => bail!("{file}: codesign.{os}.notarize needs staple"),
+        (None, Some(_)) => bail!("{file}: codesign.{os}.staple needs notarize"),
+        _ => {}
+    }
+    let sign_bundle = sign_bundle.unwrap_or_else(|| sign.clone());
+    let sign_outer = sign_outer.unwrap_or_else(|| sign_bundle.clone());
+    let sign_installer = sign_installer.unwrap_or_else(|| sign.clone());
+    Ok(CodeSignSection {
+        sign,
+        sign_bundle,
+        sign_outer,
+        sign_installer,
+        verify,
+        notarize,
+        staple,
+        timeout: timeout(
+            file,
+            os,
+            "timeout_secs",
+            raw.timeout_secs,
+            DEFAULT_CODESIGN_TIMEOUT_SECS,
+        )?,
+        notarize_timeout: timeout(
+            file,
+            os,
+            "notarize_timeout_secs",
+            raw.notarize_timeout_secs,
+            DEFAULT_NOTARIZE_TIMEOUT_SECS,
+        )?,
     })
 }
 
@@ -327,6 +488,18 @@ impl Config {
             Some(i) => Some(dir.join(i)),
             None => None,
         };
+        let codesign = raw.codesign.unwrap_or(RawCodeSign {
+            windows: None,
+            macos: None,
+        });
+        let codesign_windows = codesign
+            .windows
+            .map(|section| codesign_section(&ctx(), "windows", section))
+            .transpose()?;
+        let codesign_macos = codesign
+            .macos
+            .map(|section| codesign_section(&ctx(), "macos", section))
+            .transpose()?;
         let update = match (raw.update, raw.install) {
             (None, None) => None,
             (None, Some(_)) => bail!("{}: [install] needs [update]", ctx()),
@@ -342,8 +515,38 @@ impl Config {
             update,
             windows_icon,
             macos_icon,
+            codesign_windows,
+            codesign_macos,
             signers,
         })
+    }
+
+    /// The `[codesign.<os>]` section that applies to `target`: `windows` for a `windows-*` target,
+    /// `macos` for a `macos-*` one, none for Linux (M9-D2). A section for another OS is ignored.
+    #[allow(dead_code)] // read by the sign stage (M9 step 3)
+    pub fn codesign_for(&self, target: Target) -> Option<&CodeSignSection> {
+        if target.is_windows() {
+            self.codesign_windows.as_ref()
+        } else if target.is_macos() {
+            self.codesign_macos.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// The publisher-continuity policy to write into the config of a tree for `target` (M9-D6): an
+    /// explicit `[update] publisher_check` wins; otherwise `enforce` when the target's OS has a
+    /// `[codesign.<os>]` section, else `off`.
+    #[allow(dead_code)] // read by the sign stage (M9 step 3)
+    pub fn publisher_policy(&self, target: Target) -> PublisherPolicy {
+        if let Some(explicit) = self.update.as_ref().and_then(|u| u.publisher_check) {
+            return explicit;
+        }
+        if self.codesign_for(target).is_some() {
+            PublisherPolicy::Enforce
+        } else {
+            PublisherPolicy::Off
+        }
     }
 
     /// The compiled-in root; checks the version, threshold and keys like a root document's.
@@ -468,6 +671,193 @@ mod tests {
         let bad = unknown.replace("name = \"App file\"", "name = \"App file\"\nglob = \"*\"");
         let e = parse(&bad).unwrap_err();
         assert!(format!("{e:#}").contains("unknown field"), "{e:#}");
+    }
+
+    const INSTALL: &str = "[install]\nentry = \"bin/app\"\nname = \"App\"\n";
+
+    fn err(extra: &str) -> String {
+        format!("{:#}", parse(extra).unwrap_err())
+    }
+
+    #[test]
+    fn a_codesign_section_resolves_its_defaults() {
+        let c = parse(
+            "[codesign.macos]\nsign = [\"codesign\", \"--sign\", \"{env:ID}\", \"{path}\"]\n\
+             sign_outer = [\"codesign\", \"--options\", \"runtime\", \"{path}\"]\n\
+             verify = [\"codesign\", \"--verify\", \"{path}\"]\n\
+             notarize = [\"notarytool\", \"{zip}\"]\nstaple = [\"stapler\", \"{path}\"]\n\
+             timeout_secs = 60\n",
+        )
+        .unwrap();
+        let m = c.codesign_macos.as_ref().unwrap();
+        assert!(c.codesign_windows.is_none());
+        // `sign_bundle` defaults to `sign`, `sign_installer` to `sign`, `sign_outer` is its own.
+        assert_eq!(m.sign_bundle, m.sign);
+        assert_eq!(m.sign_installer, m.sign);
+        assert_ne!(m.sign_outer, m.sign);
+        assert!(m.verify.is_some() && m.notarize.is_some() && m.staple.is_some());
+        assert_eq!(m.timeout, Duration::from_secs(60));
+        assert_eq!(m.notarize_timeout, Duration::from_secs(3600));
+        // `sign_outer` defaults to `sign_bundle` when only that is given.
+        let c = parse(
+            "[codesign.macos]\nsign = [\"a\", \"{path}\"]\nsign_bundle = [\"b\", \"{path}\"]\n",
+        )
+        .unwrap();
+        let m = c.codesign_macos.unwrap();
+        assert_eq!(m.sign_outer, m.sign_bundle);
+        assert_ne!(m.sign_outer, m.sign);
+        assert_eq!(m.timeout, Duration::from_secs(300));
+        // The Windows section, and the section chosen by target.
+        let c = parse("[codesign.windows]\nsign = [\"signtool\", \"sign\", \"{path}\"]\n").unwrap();
+        assert!(c.codesign_for(Target::WindowsX86_64).is_some());
+        assert!(c.codesign_for(Target::WindowsAarch64).is_some());
+        assert!(c.codesign_for(Target::MacosUniversal).is_none());
+        assert!(c.codesign_for(Target::LinuxX86_64).is_none());
+    }
+
+    #[test]
+    fn a_codesign_section_refuses_what_it_does_not_define() {
+        // An unknown key and an unknown section, each named.
+        let e = err("[codesign.macos]\nsign = [\"a\"]\nsigned = true\n");
+        assert!(e.contains("unknown field") && e.contains("signed"), "{e}");
+        let e = err("[codesign.linux]\nsign = [\"a\"]\n");
+        assert!(e.contains("unknown field") && e.contains("linux"), "{e}");
+        let e = err("[codesign.macos]\nverify = [\"a\"]\n");
+        assert!(e.contains("missing field") && e.contains("sign"), "{e}");
+        // macOS-only keys in the Windows section.
+        for key in [
+            "sign_bundle",
+            "sign_outer",
+            "notarize",
+            "staple",
+            "notarize_timeout_secs",
+        ] {
+            let value = if key.ends_with("secs") {
+                "5"
+            } else {
+                "[\"a\"]"
+            };
+            let e = err(&format!(
+                "[codesign.windows]\nsign = [\"a\"]\n{key} = {value}\n"
+            ));
+            assert!(e.contains(key) && e.contains("macOS only"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_template_error_names_the_section_the_key_and_the_element() {
+        let e = err("[codesign.macos]\nsign = [\"codesign\", \"ok\", \"--f={path}\"]\n");
+        assert!(
+            e.contains("codesign.macos.sign") && e.contains("element 2"),
+            "{e}"
+        );
+        assert!(!e.contains("--f="), "{e}");
+        let e = err("[codesign.windows]\nsign = [\"x\"]\nverify = [\"{path}\"]\n");
+        assert!(
+            e.contains("codesign.windows.verify") && e.contains("element 0"),
+            "{e}"
+        );
+        // `{zip}` belongs to notarize only.
+        let e = err("[codesign.macos]\nsign = [\"a\", \"{zip}\"]\n");
+        assert!(
+            e.contains("codesign.macos.sign") && e.contains("{zip}"),
+            "{e}"
+        );
+        let e = err("[codesign.macos]\nsign = []\n");
+        assert!(
+            e.contains("codesign.macos.sign") && e.contains("empty"),
+            "{e}"
+        );
+        let e = err("[codesign.macos]\nsign = [\"a\", \"{env:lower}\"]\n");
+        assert!(e.contains("element 1") && !e.contains("lower"), "{e}");
+    }
+
+    #[test]
+    fn notarize_and_staple_come_together() {
+        let base = "[codesign.macos]\nsign = [\"a\", \"{path}\"]\n";
+        let e = err(&format!("{base}notarize = [\"n\", \"{{zip}}\"]\n"));
+        assert!(e.contains("notarize needs staple"), "{e}");
+        let e = err(&format!("{base}staple = [\"s\", \"{{path}}\"]\n"));
+        assert!(e.contains("staple needs notarize"), "{e}");
+        // `{bundle}` is fine in a notarize template, `{zip}` in a staple one is not.
+        parse(&format!(
+            "{base}notarize = [\"n\", \"{{bundle}}\"]\nstaple = [\"s\", \"{{path}}\"]\n"
+        ))
+        .unwrap();
+        let e = err(&format!(
+            "{base}notarize = [\"n\", \"{{zip}}\"]\nstaple = [\"s\", \"{{zip}}\"]\n"
+        ));
+        assert!(e.contains("codesign.macos.staple"), "{e}");
+    }
+
+    #[test]
+    fn codesign_timeouts_are_bounded() {
+        let base = "[codesign.macos]\nsign = [\"a\", \"{path}\"]\n";
+        for key in ["timeout_secs", "notarize_timeout_secs"] {
+            let e = err(&format!("{base}{key} = 0\n"));
+            assert!(e.contains(key) && e.contains("outside"), "{e}");
+            let e = err(&format!("{base}{key} = 99999999999\n"));
+            assert!(e.contains(key), "{e}");
+            let c = parse(&format!("{base}{key} = 5\n")).unwrap();
+            assert!(c.codesign_macos.is_some());
+        }
+    }
+
+    #[test]
+    fn publisher_check_parses_and_defaults_by_target() {
+        let with = |member: &str| {
+            format!("[update]\nfeed = \"https://updates.example.com/app\"\n{member}{INSTALL}")
+        };
+        let win = "[codesign.windows]\nsign = [\"s\", \"{path}\"]\n";
+        let u = |c: &Config| c.update.as_ref().unwrap().publisher_check;
+        let c = parse(&with("")).unwrap();
+        assert_eq!(u(&c), None);
+        for (text, policy) in [
+            ("off", PublisherPolicy::Off),
+            ("warn", PublisherPolicy::Warn),
+            ("enforce", PublisherPolicy::Enforce),
+        ] {
+            let c = parse(&with(&format!("publisher_check = \"{text}\"\n"))).unwrap();
+            assert_eq!(u(&c), Some(policy));
+            // An explicit value wins whatever sections exist.
+            let c = parse(&format!(
+                "{win}{}",
+                with(&format!("publisher_check = \"{text}\"\n"))
+            ))
+            .unwrap();
+            assert_eq!(c.publisher_policy(Target::WindowsX86_64), policy);
+        }
+        for bad in ["\"Enforce\"", "\"on\"", "\"\"", "1", "true"] {
+            let e = err(&with(&format!("publisher_check = {bad}\n")));
+            assert!(
+                e.contains("publisher_check") || e.contains("invalid"),
+                "{e}"
+            );
+        }
+        // The default: enforce where the target's OS has a section, off elsewhere.
+        let c = parse(&format!("{win}{}", with(""))).unwrap();
+        assert_eq!(
+            c.publisher_policy(Target::WindowsX86_64),
+            PublisherPolicy::Enforce
+        );
+        assert_eq!(
+            c.publisher_policy(Target::MacosUniversal),
+            PublisherPolicy::Off
+        );
+        assert_eq!(
+            c.publisher_policy(Target::LinuxAarch64),
+            PublisherPolicy::Off
+        );
+        let c = parse(&with("")).unwrap();
+        assert_eq!(
+            c.publisher_policy(Target::WindowsX86_64),
+            PublisherPolicy::Off
+        );
+        // Without [update] there is nothing to write.
+        assert_eq!(
+            parse("").unwrap().publisher_policy(Target::WindowsX86_64),
+            PublisherPolicy::Off
+        );
     }
 
     #[test]

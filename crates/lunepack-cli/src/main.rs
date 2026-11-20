@@ -17,6 +17,7 @@ mod plist;
 mod release_dir;
 mod stamp;
 mod state;
+mod tool;
 mod zip;
 
 use std::path::PathBuf;
