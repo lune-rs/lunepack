@@ -20,8 +20,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use lunepack_core::codesign::{Decision, PublisherOutcome, decide};
 use lunepack_core::fetch::FetchPolicy;
 use lunepack_core::layout::LOCK_FILE;
+use lunepack_core::state::MAX_BAD_VERSIONS;
 use lunepack_core::state::{CurrentRef, Scope, is_record_name};
 use lunepack_core::state::{
     Floors, InstallCounters, InstallState, Loaded, MachineScope as MachineStore, RootParts,
@@ -37,7 +39,9 @@ use lunepack_core::{
     advance_root, read_entry, select_candidate, verify_feed, verify_key_set, verify_manifest,
     verify_payload_manifest,
 };
-use lunepack_core::{LayoutError, LayoutScheme, LocationReason};
+use lunepack_core::{
+    LayoutError, LayoutScheme, LocationReason, PublisherCheck, PublisherPolicy, SignedTree,
+};
 
 use crate::cache::{Cache, CacheKind, PartTools};
 use crate::fetch::{self, FeedUrls, FetchCtx, FrameNeed, PackTarget, cancellable};
@@ -195,6 +199,7 @@ pub struct UpdaterBuilder {
     clock: Option<Arc<dyn lunepack_core::Clock>>,
     rng: Option<Arc<dyn Rng>>,
     integration: Option<Arc<dyn OsIntegration>>,
+    publisher: Option<Arc<dyn PublisherCheck>>,
     workers: Option<usize>,
     budget: u64,
     policy: FetchPolicy,
@@ -243,6 +248,7 @@ impl UpdaterBuilder {
             clock: None,
             rng: None,
             integration: None,
+            publisher: None,
             workers: None,
             budget: DEFAULT_BUDGET,
             policy: FetchPolicy::default(),
@@ -332,6 +338,14 @@ impl UpdaterBuilder {
         self
     }
 
+    /// The publisher-continuity check [`Updater::stage`] runs (M9-D9; default: WinVerifyTrust on
+    /// Windows, Security.framework on macOS, none elsewhere). Whether it runs and what it refuses
+    /// is the installed tree's own `publisher_check` policy (M9-D6); no builder option changes it.
+    pub fn publisher_check(mut self, publisher: Arc<dyn PublisherCheck>) -> Self {
+        self.publisher = Some(publisher);
+        self
+    }
+
     /// Worker threads for scan and stage (default `min(available_parallelism, 8)`).
     pub fn workers(mut self, workers: usize) -> Self {
         self.workers = Some(workers);
@@ -408,6 +422,9 @@ impl UpdaterBuilder {
                 integration: self
                     .integration
                     .unwrap_or_else(crate::installation::default_integration),
+                publisher: self
+                    .publisher
+                    .unwrap_or_else(crate::installation::default_publisher),
                 workers: workers.max(1),
                 budget: self.budget,
                 policy: self.policy,
@@ -607,6 +624,7 @@ pub struct StagedVersion {
     version: Version,
     target: Target,
     tree: PathBuf,
+    publisher: Option<PublisherOutcome>,
 }
 
 impl StagedVersion {
@@ -623,6 +641,15 @@ impl StagedVersion {
     /// The tree's directory.
     pub fn tree(&self) -> &Path {
         &self.tree
+    }
+
+    /// What the publisher check (M9-D9) reported when it let this version through: `Some` under
+    /// a `warn` policy for any finding other than "same publisher" or "not applicable", and under
+    /// `enforce` for an installed version with no code signature (no baseline yet). `None` when
+    /// the check found the same publisher, did not apply, or did not run, and always for a version
+    /// re-opened by [`Updater::staged`] (the finding is not recorded).
+    pub fn publisher(&self) -> Option<PublisherOutcome> {
+        self.publisher
     }
 }
 
@@ -778,6 +805,7 @@ struct Inner {
     clock: Arc<dyn lunepack_core::Clock>,
     rng: Arc<dyn Rng>,
     integration: Arc<dyn OsIntegration>,
+    publisher: Arc<dyn PublisherCheck>,
     workers: usize,
     budget: u64,
     policy: FetchPolicy,
@@ -1073,6 +1101,16 @@ impl Updater {
 
     /// Builds and verifies the version tree from a download (phase `Stage`), fetching what fails by
     /// Range and then by the full pack (D27, M4-D20), and records it as staged. User scope only.
+    ///
+    /// Before the record, when the install has a current version, the publisher check runs
+    /// (M9-D9) under the policy of the **installed** tree's update config (`publisher_check`,
+    /// M9-D6; no config, or no such member, is `off`; a config that cannot be read fails the
+    /// stage): `off` runs nothing; `warn` goes on and reports any finding in
+    /// [`StagedVersion::publisher`] and a `tracing` warning; `enforce` refuses with
+    /// [`Error::PublisherMismatch`], records nothing staged, and in the same state commit marks the
+    /// version bad when the finding is about the candidate (`different`, `candidate_unsigned`,
+    /// `candidate_invalid`). The candidate's own config never sets its own policy. A first install
+    /// (no current version) has no installed publisher and runs no check.
     pub fn stage(
         &self,
         downloaded: Downloaded,
@@ -1222,6 +1260,7 @@ impl Updater {
             version: staged.version.clone(),
             target: staged.target,
             tree,
+            publisher: None,
         }))
     }
 }
@@ -1763,6 +1802,65 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
             }
         };
 
+        // M9-D9: the publisher check, under the installed tree's policy, before anything is
+        // recorded. Only an install with a current version has an installed publisher to compare
+        // with (a first install has none).
+        let decision = match snap.record().current.as_ref() {
+            Some(current) => {
+                let current = current.version.clone();
+                let candidate = staged.tree.clone();
+                on_job(
+                    &inner,
+                    Some(&lock),
+                    &cancel,
+                    "publisher",
+                    move |inner, _| publisher_decision(inner, &current, candidate),
+                )
+                .await?
+            }
+            None => Decision::Proceed(None),
+        };
+        if let Decision::Refuse { reason, .. } | Decision::Proceed(Some(reason)) = decision {
+            // The code only: never a path, a subject name or an OS message.
+            tracing::warn!(publisher = reason.code(), "publisher check finding");
+        }
+        if let Decision::Refuse { reason, mark_bad } = decision {
+            // Nothing is staged; the tree is left to GC, and the cache to the next download
+            // (its frames serve a retry after a local fault).
+            if mark_bad {
+                let bad = staged.version.clone();
+                on_job(
+                    &inner,
+                    Some(&lock),
+                    &cancel,
+                    "state-commit",
+                    move |inner, _| {
+                        let Snapshot::User {
+                            store,
+                            loaded,
+                            record,
+                        } = &snap
+                        else {
+                            return Err(Error::MachineScope);
+                        };
+                        // A full list (only an older writer gets there) cannot take one more: the
+                        // refusal stands, unmarked.
+                        if !record.bad.contains(&bad) && record.bad.len() < MAX_BAD_VERSIONS {
+                            let next = record.mark_bad(bad);
+                            store.commit(&*inner.fs, loaded, &next, &*inner.hasher)?;
+                        }
+                        Ok(())
+                    },
+                )
+                .await?;
+            }
+            return Err(Error::PublisherMismatch { reason });
+        }
+        let publisher = match decision {
+            Decision::Proceed(found) => found,
+            Decision::Refuse { .. } => None,
+        };
+
         // Record the tree, then drop the version's cache entries (M4-D17).
         let staged_ref =
             StagedRef::new(staged.version.clone(), staged.target, info.manifest_sha256);
@@ -1802,9 +1900,71 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
             version: staged.version,
             target: staged.target,
             tree: staged.tree,
+            publisher,
         })
     })
     .await
+}
+
+/// The publisher decision (M9-D9) for staging `candidate` over the install's current version
+/// `current`. The policy is the installed tree's (M9-D6): no installed tree, or no update config
+/// in it, is `off`, as is a config without the member; a config that is there but cannot be read,
+/// or names another app, fails closed (the error, nothing marked). Unless the policy is `off`, the
+/// candidate's own config is read for its entry (failing closed the same way, and when it has
+/// none) and the check runs; its result goes through [`decide`].
+fn publisher_decision(
+    inner: &Inner,
+    current: &Version,
+    candidate: PathBuf,
+) -> Result<Decision, Error> {
+    let Some(installed_root) = inner.current_tree(Some(current))? else {
+        return Ok(Decision::Proceed(None));
+    };
+    let Some(installed) = any_tree_config(&*inner.fs, &inner.app_id, &installed_root)? else {
+        return Ok(Decision::Proceed(None));
+    };
+    let policy = installed.publisher_check;
+    if policy == PublisherPolicy::Off {
+        return Ok(Decision::Proceed(None));
+    }
+    let candidate_config =
+        any_tree_config(&*inner.fs, &inner.app_id, &candidate)?.ok_or(Error::NoUpdateConfig)?;
+    let result = inner.publisher.same_publisher(
+        &SignedTree {
+            root: installed_root,
+            entry: installed.install.entry,
+        },
+        &SignedTree {
+            root: candidate,
+            entry: candidate_config.install.entry,
+        },
+    );
+    Ok(decide(policy, result))
+}
+
+/// The update config of the tree at `tree` wherever a scheme puts it: the tree's root (Linux,
+/// Windows), else a bundle's resources folder (macOS; FORMAT.md 13.1), so the answer does not
+/// depend on how the updater's layout was given. `Ok(None)` when neither place holds one; one that
+/// names another app is a refusal. The packager never writes both (13.1).
+fn any_tree_config(
+    fs: &dyn Fs,
+    app_id: &AppId,
+    tree: &Path,
+) -> Result<Option<lunepack_core::UpdateConfig>, Error> {
+    let mut found = None;
+    for scheme in [LayoutScheme::XDG, LayoutScheme::MACOS] {
+        let at = crate::installation::scheme_config_path(tree, scheme);
+        found = crate::installation::read_config(fs, &at)?;
+        if found.is_some() {
+            break;
+        }
+    }
+    match found {
+        Some(config) if &config.app_id != app_id => Err(Error::UpdateConfig(
+            UpdateConfigError::RootMismatch("app_id"),
+        )),
+        other => Ok(other),
+    }
 }
 
 // ---- first install -------------------------------------------------------------------------------

@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use lunepack::{LifecycleEvent, Version};
+use lunepack::{LifecycleEvent, PublisherOutcome, Version};
 
 use crate::events::{head, json_str, json_version};
 use crate::modes::Kind;
@@ -34,8 +34,15 @@ pub enum Body {
         /// The check adopted the running bundle before it checked.
         adopted: bool,
     },
-    /// `download`: the version staged, or none when the channel offers nothing new.
-    Download(Option<Version>),
+    /// `download`: the version staged, or none when the channel offers nothing new, and what the
+    /// publisher check reported when it let the version through (M9-D9; the `publisher` member is
+    /// written only then, so the object is unchanged otherwise).
+    Download {
+        /// The staged version, or none.
+        version: Option<Version>,
+        /// The publisher check's finding (a closed code), when there was one.
+        publisher: Option<PublisherOutcome>,
+    },
     /// `startup`: the events delivered, whether the app goes on, whether its version is still
     /// pending its health check.
     Startup {
@@ -98,10 +105,14 @@ pub fn result_line(command: &str, tree_version: &Version, body: &Body) -> String
                 out.push_str(",\"adopted\":true");
             }
         }
-        Body::Download(version) => {
+        Body::Download { version, publisher } => {
             out.push_str(",\"version\":");
             json_version(&mut out, version.as_ref());
             let _ = write!(out, ",\"staged\":{}", version.is_some());
+            if let Some(found) = publisher {
+                out.push_str(",\"publisher\":");
+                json_str(&mut out, found.code());
+            }
         }
         Body::Startup {
             events,
@@ -170,8 +181,15 @@ pub fn human_result(command: &str, body: &Body) -> String {
                 found
             }
         }
-        Body::Download(None) => format!("{command}: no update"),
-        Body::Download(Some(v)) => format!("{command}: staged {v}"),
+        Body::Download { version: None, .. } => format!("{command}: no update"),
+        Body::Download {
+            version: Some(v),
+            publisher: None,
+        } => format!("{command}: staged {v}"),
+        Body::Download {
+            version: Some(v),
+            publisher: Some(found),
+        } => format!("{command}: staged {v} (publisher: {})", found.code()),
         Body::Startup {
             events,
             exit,
@@ -242,8 +260,22 @@ mod tests {
                     adopted: false,
                 },
             ),
-            result_line("download", &tree, &Body::Download(Some(v("1.1.0")))),
-            result_line("download", &tree, &Body::Download(None)),
+            result_line(
+                "download",
+                &tree,
+                &Body::Download {
+                    version: Some(v("1.1.0")),
+                    publisher: None,
+                },
+            ),
+            result_line(
+                "download",
+                &tree,
+                &Body::Download {
+                    version: None,
+                    publisher: None,
+                },
+            ),
             result_line(
                 "startup",
                 &tree,
@@ -334,6 +366,23 @@ mod tests {
                     time_checked: true,
                 }),
                 adopted: true,
+            },
+        ));
+        // The other reasons of exit 29 (the representative in the loop above carries the first),
+        // and a download the publisher check let through with a finding (M9-D9).
+        for reason in crate::modes::PUBLISHER_REASONS.into_iter().skip(1) {
+            lines.push(error_line(
+                Some("download"),
+                Some(&tree),
+                Kind::PublisherMismatch(reason),
+            ));
+        }
+        lines.push(result_line(
+            "download",
+            &tree,
+            &Body::Download {
+                version: Some(v("1.1.0")),
+                publisher: Some(PublisherOutcome::InstalledUnsigned),
             },
         ));
         let mut text = lines.join("\n");
@@ -463,6 +512,23 @@ mod tests {
             "download: error: unexpected_version (exit 15)"
         );
         assert_eq!(human_error(None, Kind::Usage), "error: usage (exit 2)");
+        assert_eq!(
+            human_error(
+                Some("download"),
+                Kind::PublisherMismatch(PublisherOutcome::Different)
+            ),
+            "download: error: publisher_mismatch (exit 29, different)"
+        );
+        assert_eq!(
+            human_result(
+                "download",
+                &Body::Download {
+                    version: Some(v("1.1.0")),
+                    publisher: Some(PublisherOutcome::CandidateUnsigned),
+                }
+            ),
+            "download: staged 1.1.0 (publisher: candidate_unsigned)"
+        );
         assert_eq!(
             human_error(
                 Some("check"),
