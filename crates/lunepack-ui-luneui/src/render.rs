@@ -41,6 +41,9 @@ pub enum RenderError {
 }
 
 /// One thing that happens at a script time.
+// A script is a short list built by tests and the demo; boxing the one large variant would touch
+// every scene for no gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Step {
     /// A message from the engine.

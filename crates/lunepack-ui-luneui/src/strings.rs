@@ -73,6 +73,16 @@ pub fn install_scope() -> &'static str {
     "Installs for your account only. No administrator rights needed."
 }
 
+/// The welcome screen's line under the title once "Install for all users" is ticked.
+pub fn install_scope_all_users() -> &'static str {
+    "Installs for everyone on this PC. Windows will ask for administrator approval."
+}
+
+/// The label of the welcome screen's all-users checkbox.
+pub fn install_all_users_label() -> &'static str {
+    "Install for all users"
+}
+
 /// The done screen's body.
 pub fn install_done(os: Os, name: &str, version: &str) -> String {
     format!(

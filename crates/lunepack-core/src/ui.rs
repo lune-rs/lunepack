@@ -158,6 +158,10 @@ pub struct Details {
     pub location: Option<String>,
     /// How much space the install takes, in bytes.
     pub size_bytes: Option<u64>,
+    /// Where the app would be installed for all users (at most [`MAX_LOCATION`] bytes). The
+    /// install welcome screen offers the choice exactly when this is present; only an install
+    /// hello may carry it.
+    pub all_users_location: Option<String>,
 }
 
 /// One item of work the engine reports as done. Which items belong to which flow is fixed by
@@ -227,6 +231,9 @@ pub enum PromptKind {
 pub enum ChoiceValue {
     /// Go ahead.
     Proceed,
+    /// Go ahead and install for all users; valid only on the install welcome prompt, and only
+    /// when the hello offered it ([`Details::all_users_location`]).
+    ProceedAllUsers,
     /// Do not.
     Cancel,
     /// Leave the done screen; `launch` starts the app.
@@ -383,9 +390,9 @@ fn validate_engine(msg: &EngineMsg) -> Result<(), ProtocolError> {
     match msg {
         EngineMsg::Hello {
             build_id,
+            flow,
             app,
             details,
-            ..
         } => {
             check_bytes(build_id, "build_id", MAX_BUILD_ID)?;
             check_scalars(&app.name, "app name", MAX_NAME)?;
@@ -405,6 +412,12 @@ fn validate_engine(msg: &EngineMsg) -> Result<(), ProtocolError> {
             }
             if let Some(l) = &details.location {
                 check_bytes(l, "location", MAX_LOCATION)?;
+            }
+            if let Some(l) = &details.all_users_location {
+                check_bytes(l, "all_users_location", MAX_LOCATION)?;
+                if *flow != Flow::Install {
+                    return out_of_order("an all-users location outside the install flow");
+                }
             }
             if let Some(n) = details.size_bytes {
                 check_int(n, "size_bytes")?;
@@ -720,6 +733,11 @@ impl Message for EngineMsg {
                 m.insert("app".into(), Value::Object(a));
                 let mut d = Map::new();
                 insert_opt(&mut d, "location", details.location.as_ref());
+                insert_opt(
+                    &mut d,
+                    "all_users_location",
+                    details.all_users_location.as_ref(),
+                );
                 if let Some(n) = details.size_bytes {
                     d.insert("size_bytes".into(), Value::from(n));
                 }
@@ -791,6 +809,7 @@ impl Message for EngineMsg {
                 a.done()?;
                 let mut d = Fields::of(f.take("details")?, "details")?;
                 let location = d.opt_string("location")?;
+                let all_users_location = d.opt_string("all_users_location")?;
                 let size_bytes = match d.0.remove("size_bytes") {
                     None => None,
                     Some(v) => Some(Fields::uint_of(v, "size_bytes", MAX_JSON_INT)?),
@@ -803,6 +822,7 @@ impl Message for EngineMsg {
                     details: Details {
                         location,
                         size_bytes,
+                        all_users_location,
                     },
                 }
             }
@@ -844,6 +864,7 @@ impl Message for UiMsg {
                 m.insert("id".into(), Value::from(*id));
                 let (name, extra): (&str, Option<(&str, Value)>) = match value {
                     ChoiceValue::Proceed => ("proceed", None),
+                    ChoiceValue::ProceedAllUsers => ("proceed_all_users", None),
                     ChoiceValue::Cancel => ("cancel", None),
                     ChoiceValue::Finish { launch } => {
                         ("finish", Some(("launch", Value::Bool(*launch))))
@@ -879,6 +900,7 @@ impl Message for UiMsg {
                 let id = f.u32("id")?;
                 let value = match f.string("value")?.as_str() {
                     "proceed" => ChoiceValue::Proceed,
+                    "proceed_all_users" => ChoiceValue::ProceedAllUsers,
                     "cancel" => ChoiceValue::Cancel,
                     "finish" => ChoiceValue::Finish {
                         launch: f.boolean("launch")?,
@@ -1010,7 +1032,8 @@ struct OpenPrompt {
 /// it receives. One reducer per flow, selected by the hello. The engine asks
 /// [`FlowState::accepts`] about every message from the UI and refuses what it does not accept.
 ///
-/// - Install: welcome prompt, then `proceed` or `cancel`; installing (progress and steps); then
+/// - Install: welcome prompt, then `proceed` or `cancel` (or `proceed_all_users`, when the hello
+///   offered it); installing (progress and steps); then
 ///   `Installed` and the done prompt (`finish`), or `Failed` and the failed prompt (`retry`, which
 ///   goes back to installing, or `close`).
 /// - Update: waiting, applying, starting; then `Updated` (the window closes), or `RolledBack` and
@@ -1034,6 +1057,7 @@ pub struct FlowState {
     ping: Option<u32>,
     outcome: Option<Outcome>,
     leftovers: usize,
+    all_users_offered: bool,
 }
 
 impl Default for FlowState {
@@ -1061,6 +1085,7 @@ impl FlowState {
             ping: None,
             outcome: None,
             leftovers: 0,
+            all_users_offered: false,
         }
     }
 
@@ -1090,6 +1115,12 @@ impl FlowState {
     /// Whether a `Cancel` is accepted now.
     pub fn cancellable(&self) -> bool {
         self.cancellable && self.outcome.is_none() && self.flow.is_some()
+    }
+
+    /// Whether the hello offered the all-users install (an install flow with a
+    /// [`Details::all_users_location`]).
+    pub fn all_users_offered(&self) -> bool {
+        self.all_users_offered
     }
 
     /// How the operation ended, once it did.
@@ -1127,7 +1158,7 @@ impl FlowState {
 
     /// Applies a message the engine sends (or the UI receives).
     pub fn apply(&mut self, msg: &EngineMsg) -> Result<(), ProtocolError> {
-        if let EngineMsg::Hello { flow, .. } = msg {
+        if let EngineMsg::Hello { flow, details, .. } = msg {
             if self.flow.is_some() {
                 return out_of_order("a second hello");
             }
@@ -1135,6 +1166,7 @@ impl FlowState {
                 return out_of_order("the hello names another flow");
             }
             self.flow = Some(*flow);
+            self.all_users_offered = *flow == Flow::Install && details.all_users_location.is_some();
             self.screen = match flow {
                 Flow::Install => Screen::InstallWelcome,
                 Flow::Update => Screen::UpdateWaiting,
@@ -1305,6 +1337,7 @@ impl FlowState {
         use ChoiceValue as C;
         match (flow, kind, value) {
             (Flow::Install, PromptKind::Welcome, C::Proceed | C::Cancel) => true,
+            (Flow::Install, PromptKind::Welcome, C::ProceedAllUsers) => self.all_users_offered,
             (Flow::Uninstall, PromptKind::Confirm, C::Proceed | C::Cancel) => true,
             (Flow::Install, PromptKind::Done, C::Finish { .. }) => true,
             (Flow::Install, PromptKind::Failed, C::Retry | C::Close) => true,
@@ -1337,7 +1370,7 @@ impl FlowState {
                     self.answered = true;
                     self.cancel_requested = true;
                 }
-                ChoiceValue::Proceed => {
+                ChoiceValue::Proceed | ChoiceValue::ProceedAllUsers => {
                     self.prompt = None;
                     let next = if self.flow == Some(Flow::Install) {
                         Screen::Installing

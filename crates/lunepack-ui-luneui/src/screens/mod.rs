@@ -43,6 +43,8 @@ pub(crate) struct Out {
     pub focused: bool,
     /// The "open now" checkbox changed.
     pub launch: Option<bool>,
+    /// The welcome screen's "Install for all users" checkbox changed.
+    pub all_users: Option<bool>,
 }
 
 impl Draw<'_> {

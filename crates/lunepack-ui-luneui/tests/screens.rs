@@ -861,3 +861,103 @@ fn a_hello_from_another_build_is_refused_and_a_message_out_of_order_is_a_protoco
         Err(ProtocolError::OutOfOrder(_))
     ));
 }
+
+// ---- the all-users choice on the welcome screen ----
+
+fn offering() -> Vec<Timed> {
+    scenario::install_welcome_offering_all_users(Os::Windows, scenario::APP_NAME, true)
+}
+
+fn only_value(answers: &[UiMsg], want: ChoiceValue) -> bool {
+    matches!(answers, [UiMsg::Choice { value, .. }] if *value == want)
+}
+
+#[test]
+fn the_all_users_checkbox_exists_only_when_offered_and_is_unchecked() {
+    let (_, _, tree, _) = run(&welcome(), 600, MotionTier::Full);
+    assert!(
+        find(&tree, Role::Checkbox, "Install for all users").is_none(),
+        "not offered: no checkbox"
+    );
+    let (_, _, tree, _) = run(&offering(), 600, MotionTier::Full);
+    let node = find(&tree, Role::Checkbox, "Install for all users").expect("offered: a checkbox");
+    assert!(!node.states.contains(lune_ui::access::State::Checked));
+    assert!(node.states.contains(lune_ui::access::State::Focusable));
+}
+
+#[test]
+fn ticking_the_checkbox_checks_it_and_install_then_answers_all_users() {
+    // The click at 700 ticks the box; the Install button then answers ProceedAllUsers.
+    let mut s = scenario::install_welcome_all_users_ticked(Os::Windows, 700);
+    let (player, _, tree, answers) = run(&s, 1400, MotionTier::Full);
+    assert!(answers.is_empty(), "ticking answers nothing: {answers:?}");
+    assert_eq!(player.model.screen(), Screen::InstallWelcome);
+    let node = find(&tree, Role::Checkbox, "Install for all users").expect("a checkbox");
+    assert!(node.states.contains(lune_ui::access::State::Checked));
+
+    s.push(at(1500, Step::Click(520.0, 324.0)));
+    let (player, _, _, answers) = run(&s, 1600, MotionTier::Full);
+    assert!(
+        only_value(&answers, ChoiceValue::ProceedAllUsers),
+        "{answers:?}"
+    );
+    assert_eq!(player.model.screen(), Screen::Installing);
+}
+
+#[test]
+fn an_unticked_install_answers_proceed_even_when_offered() {
+    let mut s = offering();
+    s.push(at(700, Step::Click(520.0, 324.0)));
+    let (_, _, _, answers) = run(&s, 800, MotionTier::Full);
+    assert!(only_value(&answers, ChoiceValue::Proceed), "{answers:?}");
+
+    let mut s = offering();
+    s.push(at(700, Step::Key(NamedKey::Enter)));
+    let (_, _, _, answers) = run(&s, 800, MotionTier::Full);
+    assert!(only_value(&answers, ChoiceValue::Proceed), "{answers:?}");
+}
+
+#[test]
+fn enter_while_the_ticked_box_has_the_focus_answers_nothing_like_the_done_screens() {
+    // Ticking needs the focus, and Enter on a focused checkbox is the widget's, not the primary
+    // button's (as on the done screen); Install answers by click, Space or Enter on the button.
+    let mut s = scenario::install_welcome_all_users_ticked(Os::Windows, 700);
+    s.push(at(1000, Step::Key(NamedKey::Enter)));
+    let (_, _, _, answers) = run(&s, 1100, MotionTier::Full);
+    assert!(answers.is_empty(), "{answers:?}");
+}
+
+#[test]
+fn the_checkbox_ticks_by_keyboard_and_install_follows() {
+    // Tab to the box, Space ticks it, Tab to Cancel, Tab to Install, Space presses it.
+    let mut s = offering();
+    for (i, key) in [
+        NamedKey::Tab,
+        NamedKey::Space,
+        NamedKey::Tab,
+        NamedKey::Tab,
+        NamedKey::Space,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        s.push(at(700 + 100 * i as u64, Step::Key(key)));
+    }
+    let (_, _, _, answers) = run(&s, 1300, MotionTier::Full);
+    assert!(
+        only_value(&answers, ChoiceValue::ProceedAllUsers),
+        "{answers:?}"
+    );
+}
+
+#[test]
+fn ticked_the_note_and_the_location_describe_an_install_for_everyone() {
+    let ticked = scenario::install_welcome_all_users_ticked(Os::Windows, 700);
+    let (_, scene, _, _) = run(&ticked, 1400, MotionTier::Full);
+    let (_, plain, _, _) = run(&offering(), 1400, MotionTier::Full);
+    assert_ne!(
+        format!("{scene:?}"),
+        format!("{plain:?}"),
+        "the ticked frame differs from the unticked one"
+    );
+}

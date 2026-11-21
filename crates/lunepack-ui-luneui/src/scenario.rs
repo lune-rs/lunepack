@@ -6,6 +6,7 @@ use lunepack_core::ui::{
     AppCard, ChoiceValue, Details, EngineMsg, Flow, Outcome, PromptKind, StepItem, build_id,
 };
 
+use crate::look;
 use crate::render::{Step, Timed, at};
 use crate::strings::Os;
 
@@ -140,8 +141,34 @@ pub fn install_hello(os: Os, name: &str, icon: bool) -> EngineMsg {
         details: Details {
             location: Some(location(os)),
             size_bytes: Some(TOTAL_BYTES),
+            all_users_location: None,
         },
     }
+}
+
+/// Where the demo installs for all users (the offer exists on Windows only, so the path is one
+/// whatever `os` the scene runs on).
+pub const ALL_USERS_LOCATION: &str = "C:\\Program Files\\Lunegit";
+
+/// The welcome screen with the all-users choice offered, open at 0 ms.
+pub fn install_welcome_offering_all_users(os: Os, name: &str, icon: bool) -> Vec<Timed> {
+    let mut s = install_welcome(os, name, icon);
+    if let Step::Engine(EngineMsg::Hello { details, .. }) = &mut s[0].step {
+        details.all_users_location = Some(ALL_USERS_LOCATION.to_owned());
+    }
+    s
+}
+
+/// The all-users welcome screen with the checkbox ticked by a click at `click_ms` (the pointer
+/// leaves at `click_ms + 50`, so no hover shows).
+pub fn install_welcome_all_users_ticked(os: Os, click_ms: u64) -> Vec<Timed> {
+    let mut s = install_welcome_offering_all_users(os, APP_NAME, true);
+    s.push(at(
+        click_ms,
+        Step::Click(look::CONTENT_X + 8.0, look::CONTENT_BOTTOM - 16.0),
+    ));
+    s.push(at(click_ms + 50, Step::PointerAway));
+    s
 }
 
 /// The welcome screen, open at 0 ms.
@@ -241,6 +268,7 @@ pub fn update_hello() -> EngineMsg {
         details: Details {
             location: None,
             size_bytes: None,
+            all_users_location: None,
         },
     }
 }
@@ -340,6 +368,7 @@ pub fn uninstall_hello(os: Os) -> EngineMsg {
         details: Details {
             location: Some(location(os)),
             size_bytes: None,
+            all_users_location: None,
         },
     }
 }

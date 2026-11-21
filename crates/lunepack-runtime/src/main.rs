@@ -557,6 +557,7 @@ fn ui_for(
             .and_then(|p| p.to_str().map(str::to_owned))
             .and_then(|t| ui_host::within(t, MAX_LOCATION)),
         size_bytes: None,
+        all_users_location: None,
     };
     UiHost::start(
         &ui_host::Start {

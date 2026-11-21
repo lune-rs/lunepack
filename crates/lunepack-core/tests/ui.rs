@@ -26,10 +26,7 @@ fn hello(flow: Flow) -> EngineMsg {
         build_id: build_id(),
         flow,
         app: card(),
-        details: Details {
-            location: None,
-            size_bytes: None,
-        },
+        details: no_details(),
     }
 }
 
@@ -78,9 +75,15 @@ fn every_engine_message_round_trips() {
         details: Details {
             location: Some("/home/u/.local/share/Lunegit".into()),
             size_bytes: Some(123_456_789),
+            all_users_location: None,
         },
     };
-    let mut msgs = vec![full_hello, hello(Flow::Install), hello(Flow::Uninstall)];
+    let mut msgs = vec![
+        full_hello,
+        hello(Flow::Install),
+        hello(Flow::Uninstall),
+        hello_with(card(), offered(Some("/usr/lib/Lunegit"))),
+    ];
     for phase in [
         Phase::Check,
         Phase::Scan,
@@ -163,6 +166,10 @@ fn every_ui_message_round_trips() {
         },
         UiMsg::Choice {
             id: 1,
+            value: ChoiceValue::ProceedAllUsers,
+        },
+        UiMsg::Choice {
+            id: 1,
             value: ChoiceValue::Cancel,
         },
         UiMsg::Choice {
@@ -220,6 +227,25 @@ fn hand_written_frames_decode() {
             ..
         }
     ));
+    let m = read_engine(&frame(
+        r#"{"v":1,"type":"hello","build_id":"b","flow":"install","app":{"name":"A","version":"1"},"details":{"all_users_location":"/opt/A"}}"#,
+    ))
+    .unwrap();
+    assert!(matches!(
+        m,
+        EngineMsg::Hello { details: Details { all_users_location: Some(ref l), .. }, .. } if l == "/opt/A"
+    ));
+    let m = read_ui(&frame(
+        r#"{"v":1,"type":"choice","id":4,"value":"proceed_all_users"}"#,
+    ))
+    .unwrap();
+    assert_eq!(
+        m,
+        UiMsg::Choice {
+            id: 4,
+            value: ChoiceValue::ProceedAllUsers
+        }
+    );
     let m = read_ui(&frame(
         r#"{"v":1,"type":"choice","id":4,"value":"reveal","index":2}"#,
     ))
@@ -481,6 +507,10 @@ fn a_missing_or_extra_field_is_refused() {
             ProtocolError::ExtraField,
         ),
         (
+            r#"{"v":1,"type":"choice","id":1,"value":"proceed_all_users","launch":true}"#,
+            ProtocolError::ExtraField,
+        ),
+        (
             r#"{"v":1,"type":"choice","id":1,"value":"finish"}"#,
             ProtocolError::MissingField("launch"),
         ),
@@ -562,6 +592,14 @@ fn wrong_types_names_and_ranges_are_refused() {
             ProtocolError::WrongType("app"),
         ),
         (
+            r#"{"v":1,"type":"hello","build_id":"b","flow":"install","app":{"name":"A","version":"1"},"details":{"all_users_location":null}}"#,
+            ProtocolError::WrongType("all_users_location"),
+        ),
+        (
+            r#"{"v":1,"type":"hello","build_id":"b","flow":"install","app":{"name":"A","version":"1"},"details":{"all_users_location":5}}"#,
+            ProtocolError::WrongType("all_users_location"),
+        ),
+        (
             r#"{"v":1,"type":"hello","build_id":"b","flow":"install","app":{"name":"A","version":"1"},"details":{"size_bytes":9007199254740992}}"#,
             ProtocolError::OutOfRange("size_bytes"),
         ),
@@ -601,6 +639,15 @@ fn no_details() -> Details {
     Details {
         location: None,
         size_bytes: None,
+        all_users_location: None,
+    }
+}
+
+fn offered(all_users: Option<&str>) -> Details {
+    Details {
+        location: Some("/home/u/Lunegit".into()),
+        size_bytes: None,
+        all_users_location: all_users.map(str::to_owned),
     }
 }
 
@@ -692,6 +739,7 @@ fn text_from_the_manifest_is_capped_at_encode_and_at_decode() {
         Details {
             location: Some("l".repeat(4096)),
             size_bytes: None,
+            all_users_location: Some("a".repeat(4096)),
         },
     );
     round_trip_engine(&msg);
@@ -700,6 +748,16 @@ fn text_from_the_manifest_is_capped_at_encode_and_at_decode() {
         Details {
             location: Some("l".repeat(4097)),
             size_bytes: None,
+            all_users_location: None,
+        },
+    );
+    assert!(matches!(msg.encode(), Err(ProtocolError::TooLong { .. })));
+    let msg = hello_with(
+        card(),
+        Details {
+            location: None,
+            size_bytes: None,
+            all_users_location: Some("a".repeat(4097)),
         },
     );
     assert!(matches!(msg.encode(), Err(ProtocolError::TooLong { .. })));
@@ -1094,6 +1152,92 @@ fn a_choice_needs_an_open_prompt_its_id_and_a_value_of_its_set() {
     st.answer(&choice(5, ChoiceValue::Proceed)).unwrap();
     assert!(!st.accepts(&choice(5, ChoiceValue::Proceed)));
     assert!(st.answer(&choice(5, ChoiceValue::Cancel)).is_err());
+}
+
+fn started_with(flow: Flow, details: Details) -> FlowState {
+    let mut st = FlowState::expecting(flow);
+    st.apply(&hello_with_flow(flow, details)).unwrap();
+    st
+}
+
+fn hello_with_flow(flow: Flow, details: Details) -> EngineMsg {
+    EngineMsg::Hello {
+        build_id: build_id(),
+        flow,
+        app: card(),
+        details,
+    }
+}
+
+#[test]
+fn the_all_users_choice_needs_the_offer_on_the_install_welcome_prompt() {
+    // Offered: accepted on the welcome prompt, runs the install like proceed.
+    let mut st = started_with(Flow::Install, offered(Some("/usr/lib/Lunegit")));
+    assert!(st.all_users_offered());
+    prompt(&mut st, 1, PromptKind::Welcome);
+    assert!(st.accepts(&choice(1, ChoiceValue::ProceedAllUsers)));
+    assert!(st.accepts(&choice(1, ChoiceValue::Proceed)));
+    assert!(!st.accepts(&choice(2, ChoiceValue::ProceedAllUsers)), "id");
+    st.answer(&choice(1, ChoiceValue::ProceedAllUsers)).unwrap();
+    assert_eq!(st.screen(), Screen::Installing);
+    assert!(!st.accepts(&choice(1, ChoiceValue::ProceedAllUsers)));
+    // Not on any other install prompt, even when offered.
+    st.apply(&EngineMsg::Outcome(Outcome::Failed { code: 22 }))
+        .unwrap();
+    prompt(&mut st, 2, PromptKind::Failed);
+    assert!(!st.accepts(&choice(2, ChoiceValue::ProceedAllUsers)));
+    st.answer(&choice(2, ChoiceValue::Retry)).unwrap();
+    st.apply(&EngineMsg::Outcome(Outcome::Failed { code: 22 }))
+        .unwrap();
+    prompt(&mut st, 3, PromptKind::Failed);
+    assert!(!st.accepts(&choice(3, ChoiceValue::ProceedAllUsers)));
+
+    // Not offered: refused, and a refused answer changes nothing.
+    let mut st = started_with(Flow::Install, offered(None));
+    assert!(!st.all_users_offered());
+    prompt(&mut st, 1, PromptKind::Welcome);
+    assert!(!st.accepts(&choice(1, ChoiceValue::ProceedAllUsers)));
+    let before = st.clone();
+    assert!(st.answer(&choice(1, ChoiceValue::ProceedAllUsers)).is_err());
+    assert_eq!(st, before);
+    assert!(st.accepts(&choice(1, ChoiceValue::Proceed)));
+
+    // Another flow: the hello may not carry the location, and nothing there accepts the choice.
+    for flow in [Flow::Update, Flow::Uninstall] {
+        let msg = hello_with_flow(flow, offered(Some("/usr/lib/Lunegit")));
+        assert!(
+            matches!(msg.encode(), Err(ProtocolError::OutOfOrder(_))),
+            "{flow:?} at encode"
+        );
+        let body = r#"{"v":1,"type":"hello","build_id":"b","flow":"FLOW","app":{"name":"A","version":"1"},"details":{"all_users_location":"/opt/A"}}"#
+            .replace(
+                "FLOW",
+                if flow == Flow::Update {
+                    "update"
+                } else {
+                    "uninstall"
+                },
+            );
+        assert!(
+            matches!(
+                read_engine(&frame(&body)),
+                Err(ProtocolError::OutOfOrder(_))
+            ),
+            "{flow:?} at decode"
+        );
+        let mut st = started_with(flow, offered(None));
+        assert!(!st.all_users_offered());
+        let kind = if flow == Flow::Uninstall {
+            PromptKind::Confirm
+        } else {
+            // An update has no prompt before an outcome; fail it to reach one.
+            st.apply(&EngineMsg::Outcome(Outcome::Failed { code: 22 }))
+                .unwrap();
+            PromptKind::Failed
+        };
+        prompt(&mut st, 1, kind);
+        assert!(!st.accepts(&choice(1, ChoiceValue::ProceedAllUsers)));
+    }
 }
 
 #[test]

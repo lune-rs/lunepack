@@ -372,6 +372,50 @@ fn the_done_screens_checkbox_is_named_and_checked() {
     );
 }
 
+#[test]
+fn the_all_users_checkbox_is_named_toggled_and_first_in_the_tab_order() {
+    let toggled = |tree: &Tree| {
+        let mut open = vec![tree.state().root()];
+        while let Some(n) = open.pop() {
+            if format!("{:?}", n.role()) == "CheckBox" {
+                return format!("{:?}", n.toggled());
+            }
+            open.extend(n.children());
+        }
+        "no checkbox".to_owned()
+    };
+    let offered = scenario::install_welcome_offering_all_users(OS, scenario::APP_NAME, true);
+    let (_, frames) = run(Flow::Install, &offered, 700, &[], 600);
+    let tree = consumer(frames.last().unwrap());
+    assert_eq!(
+        labels(&tree, "CheckBox"),
+        vec!["Install for all users".to_owned()]
+    );
+    assert_eq!(toggled(&tree), "Some(False)");
+
+    let ticked = scenario::install_welcome_all_users_ticked(OS, 700);
+    let (_, frames) = run(Flow::Install, &ticked, 3000, &[], 1400);
+    assert_eq!(toggled(&consumer(frames.last().unwrap())), "Some(True)");
+
+    // Tab order: the box, Cancel, Install, then back to the box.
+    let (_, frames) = run(Flow::Install, &offered, 700, &[NamedKey::Tab; 4], 1200);
+    let visited: Vec<Option<String>> = frames[..4]
+        .iter()
+        .map(|f| focused_label(&consumer(f)))
+        .collect();
+    let want: Vec<Option<String>> = ["Install for all users", "Cancel", "Install"]
+        .iter()
+        .chain(std::iter::once(&"Install for all users"))
+        .map(|l| Some((*l).to_owned()))
+        .collect();
+    assert_eq!(visited, want);
+
+    // Not offered: no checkbox.
+    let plain = scenario::install_welcome(OS, scenario::APP_NAME, true);
+    let (_, frames) = run(Flow::Install, &plain, 3000, &[], 600);
+    assert!(labels(&consumer(frames.last().unwrap()), "CheckBox").is_empty());
+}
+
 /// The Tab order of each screen that has controls, as the labels the focus visits, and that one more
 /// Tab wraps to the first.
 #[test]
@@ -527,6 +571,30 @@ fn the_keyboard_drives_every_prompt_to_every_choice() {
             600,
             &[Enter],
             choice(ChoiceValue::Proceed),
+        ),
+        drive(
+            "welcome (all users offered): Enter proceeds",
+            Flow::Install,
+            scenario::install_welcome_offering_all_users(OS, scenario::APP_NAME, true),
+            600,
+            &[Enter],
+            choice(ChoiceValue::Proceed),
+        ),
+        drive(
+            "welcome (all users offered): Esc cancels",
+            Flow::Install,
+            scenario::install_welcome_offering_all_users(OS, scenario::APP_NAME, true),
+            600,
+            &[Escape],
+            choice(ChoiceValue::Cancel),
+        ),
+        drive(
+            "welcome (all users offered): Tab, Space, Tab, Tab, Space installs for all users",
+            Flow::Install,
+            scenario::install_welcome_offering_all_users(OS, scenario::APP_NAME, true),
+            600,
+            &[Tab, Space, Tab, Tab, Space],
+            choice(ChoiceValue::ProceedAllUsers),
         ),
         drive(
             "welcome: Esc cancels",

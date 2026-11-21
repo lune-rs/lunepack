@@ -11,7 +11,9 @@
 //! - `LUNEPACK_E2E_UI_MODE`: `proceed` (the default) says hello, answers every `Ping` and takes
 //!   the choice that lets the operation go on (proceed at the welcome and confirm screens, finish
 //!   without launching, close, acknowledge); `die` does the same until the operation reports
-//!   progress, a finished step or its outcome, and then aborts the process (SIGABRT).
+//!   progress, a finished step or its outcome, and then aborts the process (SIGABRT);
+//!   `all-users` is `proceed`, except that at the welcome screen it answers `ProceedAllUsers`
+//!   when the hello offered the all-users install (and plain `Proceed` when it did not).
 //!
 //! On Windows it is a GUI-subsystem program with the build's hardening (the runtime's `build.rs`
 //! links examples too), because `pack --ui` holds a `windows-*` UI to the runtime's own image
@@ -42,8 +44,9 @@ fn note(name: &str, text: &str) {
 }
 
 /// The choice that lets the operation go on.
-fn choice(kind: PromptKind, flow: Option<Flow>) -> ChoiceValue {
+fn choice(kind: PromptKind, flow: Option<Flow>, all_users: bool) -> ChoiceValue {
     match kind {
+        PromptKind::Welcome if all_users => ChoiceValue::ProceedAllUsers,
         PromptKind::Welcome | PromptKind::Confirm => ChoiceValue::Proceed,
         PromptKind::Done if flow == Some(Flow::Uninstall) => ChoiceValue::Close,
         PromptKind::Done => ChoiceValue::Finish { launch: false },
@@ -71,12 +74,12 @@ fn main() -> ExitCode {
         eprintln!("usage: e2e_fake_ui --engine");
         return ExitCode::from(2);
     }
-    let die = std::env::var(MODE_VAR).is_ok_and(|mode| mode == "die");
+    let mode = Mode::from_env();
     note("ui-spawns", "start\n");
     serve(
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
-        die,
+        mode,
     )
 }
 
@@ -95,7 +98,7 @@ fn installer_runtime() -> Option<std::path::PathBuf> {
 #[cfg(unix)]
 fn as_installer_parent(runtime: &Path) -> ExitCode {
     use std::process::{Command, Stdio};
-    let die = std::env::var(MODE_VAR).is_ok_and(|mode| mode == "die");
+    let mode = Mode::from_env();
     note("ui-spawns", "start\n");
     let Ok(mut child) = Command::new(runtime)
         .arg("--ui-stdio")
@@ -109,7 +112,7 @@ fn as_installer_parent(runtime: &Path) -> ExitCode {
     else {
         return ExitCode::from(1);
     };
-    serve(&mut from_child, &mut to_child, die);
+    serve(&mut from_child, &mut to_child, mode);
     drop(to_child);
     match child.wait() {
         Ok(status) if status.success() => ExitCode::SUCCESS,
@@ -117,9 +120,30 @@ fn as_installer_parent(runtime: &Path) -> ExitCode {
     }
 }
 
+/// What the stand-in does, from `LUNEPACK_E2E_UI_MODE`.
+#[derive(Clone, Copy)]
+struct Mode {
+    /// Abort once the operation reports progress, a step or its outcome.
+    die: bool,
+    /// Answer the all-users choice at the welcome screen when it is offered.
+    all_users: bool,
+}
+
+impl Mode {
+    fn from_env() -> Mode {
+        let mode = std::env::var(MODE_VAR).ok();
+        Mode {
+            die: mode.as_deref() == Some("die"),
+            all_users: mode.as_deref() == Some("all-users"),
+        }
+    }
+}
+
 /// Answers the engine's frames from `input` on `out` until the engine closes.
-fn serve(input: &mut impl std::io::Read, out: &mut impl std::io::Write, die: bool) -> ExitCode {
+fn serve(input: &mut impl std::io::Read, out: &mut impl std::io::Write, mode: Mode) -> ExitCode {
+    let die = mode.die;
     let mut flow = None;
+    let mut offered = false;
     loop {
         let Ok(msg) = ui::read_frame::<_, EngineMsg>(input) else {
             return ExitCode::SUCCESS;
@@ -129,9 +153,10 @@ fn serve(input: &mut impl std::io::Read, out: &mut impl std::io::Write, die: boo
                 build_id,
                 flow: shown,
                 app,
-                ..
+                details,
             } => {
                 flow = Some(shown);
+                offered = shown == Flow::Install && details.all_users_location.is_some();
                 note("ui-hello", &format!("{shown:?} {}\n", app.name));
                 Some(UiMsg::Hello { build_id })
             }
@@ -140,7 +165,7 @@ fn serve(input: &mut impl std::io::Read, out: &mut impl std::io::Write, die: boo
                 note("ui-prompts", &format!("{kind:?}\n"));
                 Some(UiMsg::Choice {
                     id,
-                    value: choice(kind, flow),
+                    value: choice(kind, flow, mode.all_users && offered),
                 })
             }
             EngineMsg::Progress { .. } | EngineMsg::Step { .. } | EngineMsg::Outcome(_) if die => {

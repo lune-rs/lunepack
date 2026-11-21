@@ -1005,6 +1005,7 @@ mod native {
                 Details {
                     location: None,
                     size_bytes: None,
+                    all_users_location: None,
                 },
             )
         }

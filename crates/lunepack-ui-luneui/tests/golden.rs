@@ -155,6 +155,20 @@ fn scenes() -> Vec<Scene> {
         scenario::install_welcome(OS, LONG_NAME, false),
         600,
     );
+    // The all-users choice offered: unchecked, then ticked by a click (the pointer away, the
+    // selection animation long done).
+    still(
+        "install-welcome-scope",
+        Flow::Install,
+        scenario::install_welcome_offering_all_users(OS, scenario::APP_NAME, true),
+        600,
+    );
+    still(
+        "install-welcome-scope-all",
+        Flow::Install,
+        scenario::install_welcome_all_users_ticked(OS, 700),
+        1400,
+    );
     still(
         "install-installing",
         Flow::Install,

@@ -1115,6 +1115,7 @@ mod tests {
             Details {
                 location: None,
                 size_bytes: None,
+                all_users_location: None,
             },
         )
     }
@@ -1272,6 +1273,7 @@ mod tests {
             Details {
                 location: None,
                 size_bytes: None,
+                all_users_location: None,
             },
         );
         let id = host.child_id().expect("the UI was started");
@@ -1387,6 +1389,7 @@ mod tests {
             Details {
                 location: None,
                 size_bytes: None,
+                all_users_location: None,
             },
         );
         (host, ends)

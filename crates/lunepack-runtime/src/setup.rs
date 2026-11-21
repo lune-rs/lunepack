@@ -512,6 +512,7 @@ pub fn welcome(prepared: &Prepared) -> (lunepack_core::ui::AppCard, lunepack_cor
             .map(str::to_owned)
             .and_then(|t| ui_host::within(t, lunepack_core::ui::MAX_LOCATION)),
         size_bytes: Some(prepared.verified.installed_bytes()),
+        all_users_location: None,
     };
     (card, details)
 }

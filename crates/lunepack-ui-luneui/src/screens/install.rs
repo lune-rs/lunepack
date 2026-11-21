@@ -56,12 +56,26 @@ pub(crate) fn note(ui: &mut Ui<'_>, d: &Draw<'_>, text: &str) -> f32 {
 
 fn welcome(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
     let m = d.m;
+    // The all-users choice exists only when the engine offered it; ticked, the note and the
+    // location describe the install for everyone.
+    let offered = m.state().all_users_offered();
+    let mut all_users = offered && d.v.all_users;
     title(ui, d, &strings::install_title(&m.name));
-    let note_bottom = note(ui, d, strings::install_scope());
+    let scope_note = if all_users {
+        strings::install_scope_all_users()
+    } else {
+        strings::install_scope()
+    };
+    let note_bottom = note(ui, d, scope_note);
 
     // The card: location, size and, when the package names one, the verified publisher.
     let mut rows: Vec<(&str, String, bool)> = Vec::new();
-    if let Some(loc) = &m.location {
+    let location = if all_users {
+        m.all_users_location.as_ref()
+    } else {
+        m.location.as_ref()
+    };
+    if let Some(loc) = location {
         rows.push(("Location", loc.clone(), false));
     }
     if let Some(size) = m.size_bytes {
@@ -114,6 +128,23 @@ fn welcome(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
     }
 
     let open = d.v.prompt.is_some();
+    // Bottom-left, level with the buttons, as the done screen's checkbox; drawn before them so
+    // the Tab order is the box, Cancel, Install.
+    let before = all_users;
+    let box_focus = offered
+        && widgets::checkbox(
+            ui,
+            "all_users",
+            Rect::new(CONTENT_X, CONTENT_BOTTOM - 32.0, 200.0, 32.0),
+            strings::install_all_users_label(),
+            &mut all_users,
+            d.live && open,
+        );
+    let proceed = if all_users {
+        ChoiceValue::ProceedAllUsers
+    } else {
+        ChoiceValue::Proceed
+    };
     let (clicked, focused) = super::button_group(
         ui,
         d,
@@ -135,14 +166,15 @@ fn welcome(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
         ],
     );
     let mut out = Out {
-        focused,
-        primary: d.choice(ChoiceValue::Proceed),
+        focused: focused || box_focus,
+        primary: d.choice(proceed),
+        all_users: (all_users != before).then_some(all_users),
         ..Out::default()
     };
     if clicked[0] {
         out.msg = d.choice(ChoiceValue::Cancel);
     } else if clicked[1] {
-        out.msg = d.choice(ChoiceValue::Proceed);
+        out.msg = d.choice(proceed);
     }
     out
 }
@@ -298,6 +330,7 @@ fn done(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
         primary: finish(launch),
         focused: focused || box_focus,
         launch: (launch != d.v.launch).then_some(launch),
+        ..Out::default()
     }
 }
 

@@ -4,11 +4,13 @@ Every screen of the install, update and uninstall flows, and every transition be
 headless at scale 1.0 and at fixed times by `tests/golden.rs`. Opaque material, Linux wording, the
 generated sample icon (`scenario::sample_icon_png`). A name is `<scene>.png` for a settled screen and
 `<transition>-<tier>-t<ms>.png` for a frame of a strip, `<ms>` counted from the instant of the change.
+`install-welcome-scope` and `install-welcome-scope-all` show the welcome screen with the all-users
+choice offered (D38), unticked and ticked by a click.
 
 ## One set per OS
 
-Each OS compares against its own set of the same 88 frames, because the adapters do not agree: the
-frames of Metal differ from the ones of lavapipe by at most 3 per channel, but in 11 of the 88 frames
+Each OS compares against its own set of the same 90 frames, because the adapters do not agree: the
+frames of Metal differ from the ones of lavapipe by at most 3 per channel, but in 11 of the 88 earlier frames
 (the transition strips, where glow, blur and fades are on screen) on 10.35 to 23.94 % of the
 pixels, over the 10 % the cross-adapter bound allows. The bound was not loosened; the sets were split.
 
@@ -25,7 +27,7 @@ own machine class in every step that changes how a screen looks, and before ever
 it, and a mismatch is never answered with a looser tolerance.
 
 The Linux set is split by CPU because lavapipe renders arm64 and x86-64 slightly differently (a channel
-delta of 2 on 0.14 to 0.37 % of the pixels in 82 of the 88 frames; repeats on one CPU are
+delta of 2 on 0.14 to 0.37 % of the pixels in 82 of the first 88 frames; repeats on one CPU are
 byte-identical). Same-image Linux stays `exact` against the set of its own CPU. A Linux CPU with
 neither set fails closed like an OS with none.
 
@@ -54,7 +56,7 @@ Re-seed on the set's own machine class, then look at what changed:
    table with `LUNEPACK_WRITE_GOLDENS=1` added (the golden test then writes the set instead of
    comparing).
 2. `git status` and `git diff --stat crates/lunepack-ui-luneui/tests/golden`: only the frames of the
-   screen that changed on purpose may differ. A set holds exactly the 88 frames and nothing else.
+   screen that changed on purpose may differ. A set holds exactly the 90 frames and nothing else.
 3. Run `cargo test -p lunepack-ui-luneui --locked --test golden` (the plain test checks the names), look
    at the frames that changed, and commit the set.
 
