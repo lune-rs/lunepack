@@ -2125,3 +2125,141 @@ fn the_installer_app_in_the_dmg_verifies_when_signed_and_not_otherwise() {
         .unwrap();
     assert!(image.status.success(), "the image is not signed");
 }
+
+// ---- The setup anchor (M10-D4, M10 step 14) -------------------------------------------------
+
+/// The anchor of a built Windows setup file, read through its image's `RT_RCDATA` resource, and
+/// that resource's byte span.
+fn anchor_of(bytes: &[u8]) -> (lunepack_core::setup::SetupAnchor, std::ops::Range<usize>) {
+    use lunepack_core::setup::{ANCHOR_RESOURCE_ID, SetupAnchor};
+    let span = lunepack_core::pe::rcdata(bytes, ANCHOR_RESOURCE_ID)
+        .unwrap()
+        .expect("an anchor resource");
+    let range = span.file_offset as usize..span.file_offset as usize + span.len as usize;
+    (SetupAnchor::parse(&bytes[range.clone()]).unwrap(), range)
+}
+
+/// Verifies `bytes` against the anchor in its own image, as a started Setup.exe does.
+fn check_anchored(bytes: &[u8]) -> Result<u64, String> {
+    let (anchor, _) = anchor_of(bytes);
+    let end = bytes.len();
+    lunepack_core::setup::verify_setup_anchored(
+        &anchor,
+        &bytes[end - TRAILER_SIZE as usize..],
+        &Bytes(bytes.to_vec()),
+        end as u64,
+        &ClockReading::read(&At(AT), None),
+        &LzmaCodec,
+        &Sha256Hasher,
+        &Ed25519Verifier,
+    )
+    .map(|a| a.keyset_version)
+    .map_err(|e| e.to_string())
+}
+
+#[test]
+fn windows_setup_carries_its_own_anchor_and_only_the_anchor_was_patched() {
+    use lunepack_core::Hasher as _;
+    use lunepack_core::setup::{ANCHOR_SIZE, SetupAnchor};
+    let w = World::windows(plain_windows());
+    let a = w.dir.path().join("a.exe");
+    assert_ok(&w.setup(&a, &[]), "windows setup");
+    let bytes = fs::read(&a).unwrap();
+    // Deterministic: a second run to the same file name gives the same bytes.
+    let again = w.dir.path().join("again").join("a.exe");
+    fs::create_dir_all(again.parent().unwrap()).unwrap();
+    assert_ok(&w.setup(&again, &[]), "windows setup again");
+    assert_eq!(fs::read(&again).unwrap(), bytes, "two runs differ");
+
+    // The anchor equals the digests of the file's own trailer block, key set and manifest.
+    let t = trailer_of(&bytes);
+    let part = |p: lunepack_core::setup::SetupPart| {
+        bytes[p.offset as usize..(p.offset + p.length) as usize].to_vec()
+    };
+    let (anchor, span) = anchor_of(&bytes);
+    assert_eq!(span.len(), ANCHOR_SIZE);
+    assert!(
+        span.end <= t.keys.offset as usize,
+        "inside the runtime image"
+    );
+    let h = Sha256Hasher;
+    assert_eq!(
+        anchor.trailer,
+        h.sha256(&bytes[bytes.len() - TRAILER_SIZE as usize..])
+    );
+    assert_eq!(anchor.keys, h.sha256(&part(t.keys)));
+    assert_eq!(anchor.manifest, h.sha256(&part(t.manifest)));
+    assert!(!anchor.is_placeholder());
+    assert_eq!(check_anchored(&bytes), Ok(1));
+
+    // With the placeholder put back, the runtime image is the stamped one: its RT_RCDATA 1 is the
+    // placeholder, it still passes the runtime check, and nothing else differs.
+    let mut placeholder = bytes.clone();
+    placeholder[span.clone()].copy_from_slice(&SetupAnchor::PLACEHOLDER);
+    let differing: Vec<usize> = (0..bytes.len())
+        .filter(|&i| bytes[i] != placeholder[i])
+        .collect();
+    assert!(!differing.is_empty());
+    assert!(differing.iter().all(|i| span.contains(i)));
+    let runtime = &placeholder[..t.keys.offset as usize];
+    lunepack_core::check_runtime_image(runtime, lunepack_core::Target::WindowsX86_64)
+        .expect("a hardened Windows runtime");
+    let image = editpe::Image::parse(runtime.to_vec()).unwrap();
+    let rcdata = image
+        .resource_directory()
+        .unwrap()
+        .root()
+        .get(editpe::ResourceEntryName::ID(10))
+        .and_then(|e| e.as_table())
+        .and_then(|t| t.get(editpe::ResourceEntryName::ID(1)))
+        .and_then(|e| e.as_table())
+        .expect("RT_RCDATA 1");
+    let langs = rcdata.entries();
+    assert_eq!(langs.len(), 1);
+    let data = rcdata.get(langs[0]).and_then(|e| e.as_data()).unwrap();
+    assert_eq!(data.data(), &SetupAnchor::PLACEHOLDER[..]);
+    // The placeholder file is refused.
+    assert!(check_anchored(&placeholder).is_err());
+}
+
+#[test]
+fn a_flipped_byte_in_the_trailer_keys_or_manifest_fails_the_anchored_read_back() {
+    let w = World::windows(plain_windows());
+    let a = w.dir.path().join("a.exe");
+    assert_ok(&w.setup(&a, &[]), "windows setup");
+    let bytes = fs::read(&a).unwrap();
+    let t = trailer_of(&bytes);
+    for (name, at) in [
+        ("trailer", bytes.len() - TRAILER_SIZE as usize + 3),
+        ("key set", (t.keys.offset + t.keys.length / 2) as usize),
+        (
+            "manifest",
+            (t.manifest.offset + t.manifest.length / 2) as usize,
+        ),
+    ] {
+        let mut b = bytes.clone();
+        b[at] ^= 0x01;
+        let err = check_anchored(&b).unwrap_err();
+        assert!(err.contains(name), "{name}: {err}");
+    }
+    // A flipped anchor byte fails too.
+    let (_, span) = anchor_of(&bytes);
+    let mut b = bytes.clone();
+    b[span.start + 20] ^= 0x01;
+    assert!(check_anchored(&b).is_err());
+}
+
+#[test]
+fn a_linux_setup_file_has_no_anchor() {
+    let w = World::new();
+    let a = w.dir.path().join("a-setup");
+    assert_ok(&w.setup(&a, &[]), "setup");
+    let bytes = fs::read(&a).unwrap();
+    let t = trailer_of(&bytes);
+    assert_eq!(&bytes[..w.runtime.len()], &w.runtime[..]);
+    assert!(
+        bytes[w.runtime.len()..t.keys.offset as usize]
+            .iter()
+            .all(|&b| b == 0)
+    );
+}

@@ -11,8 +11,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use editpe::types::{FixedFileInfo, VersionU16, VersionU32};
-use editpe::{Image, VersionInfo, VersionStringTable};
-use lunepack_core::pe::{PeHeaders, PeImage};
+use editpe::{
+    Image, ResourceData, ResourceEntry, ResourceEntryName, ResourceTable, VersionInfo,
+    VersionStringTable,
+};
+use lunepack_core::pe::{PeHeaders, PeImage, RT_RCDATA};
 use lunepack_core::{RelPath, Version};
 
 use crate::release_dir::read_capped;
@@ -225,8 +228,14 @@ fn version_info(fields: &Fields<'_>) -> VersionInfo {
     }
 }
 
-/// Writes the icon and the version info into `image` with `editpe` and returns the new bytes.
-fn write_resources(image: &[u8], fields: &Fields<'_>) -> Result<Vec<u8>> {
+/// Writes the icon, the version info and, when given, one `RT_RCDATA` resource `(id, bytes)` into
+/// `image` with `editpe`, all in one rewrite, and returns the new bytes. An `RT_RCDATA` entry the
+/// image already has under that id is refused, never replaced.
+fn write_resources(
+    image: &[u8],
+    fields: &Fields<'_>,
+    rcdata: Option<(u16, &[u8])>,
+) -> Result<Vec<u8>> {
     let mut image =
         Image::parse(image.to_vec()).context("the image cannot be read for stamping")?;
     let mut resources = image.resource_directory().cloned().unwrap_or_default();
@@ -238,6 +247,27 @@ fn write_resources(image: &[u8], fields: &Fields<'_>) -> Result<Vec<u8>> {
     resources
         .set_version_info(&version_info(fields))
         .context("the version info cannot be stamped")?;
+    if let Some((id, bytes)) = rcdata {
+        let kind = ResourceEntryName::ID(RT_RCDATA);
+        let mut names = match resources.root().get(&kind) {
+            Some(ResourceEntry::Table(t)) => t.clone(),
+            Some(ResourceEntry::Data(_)) => bail!("the image's RT_RCDATA resources are malformed"),
+            None => ResourceTable::default(),
+        };
+        let name = ResourceEntryName::ID(u32::from(id));
+        if names.get(&name).is_some() {
+            bail!("the image already has an RT_RCDATA resource {id}");
+        }
+        let mut data = ResourceData::default();
+        data.set_data(bytes.to_vec());
+        let mut languages = ResourceTable::default();
+        // LANG_NEUTRAL: the first language the loader's resource lookup tries.
+        languages.insert(ResourceEntryName::ID(0), ResourceEntry::Data(data));
+        names.insert(name, ResourceEntry::Table(languages));
+        resources
+            .root_mut()
+            .insert(kind, ResourceEntry::Table(names));
+    }
     image
         .set_resource_directory(resources)
         .context("the resources cannot be written")?;
@@ -270,11 +300,11 @@ pub fn first_changed_field(before: &PeImage, after: &PeImage) -> Option<&'static
 }
 
 /// A function that stamps image bytes; [`write_resources`] outside tests.
-type Stamper = dyn Fn(&[u8], &Fields<'_>) -> Result<Vec<u8>>;
+type Stamper<'s> = dyn Fn(&[u8], &Fields<'_>) -> Result<Vec<u8>> + 's;
 
 /// Stamps `image` with `fields` through `stamper` and refuses the result when a hardening field
 /// changed (P3). `stamper` is [`write_resources`] outside tests.
-fn stamp_with(image: &[u8], fields: &Fields<'_>, stamper: &Stamper) -> Result<Vec<u8>> {
+fn stamp_with(image: &[u8], fields: &Fields<'_>, stamper: &Stamper<'_>) -> Result<Vec<u8>> {
     let before = PeImage::parse(image).map_err(|_| anyhow!("the image is not a readable PE"))?;
     let stamped = stamper(image, fields)?;
     let after = PeImage::parse(&stamped)
@@ -290,7 +320,22 @@ fn stamp_with(image: &[u8], fields: &Fields<'_>, stamper: &Stamper) -> Result<Ve
 /// bytes are what they were. The caller checks the result again with `check_pe_stub` or
 /// `check_runtime_image`.
 pub fn stamp(image: &[u8], fields: &Fields<'_>) -> Result<Vec<u8>> {
-    stamp_with(image, fields, &write_resources)
+    stamp_with(image, fields, &|image, fields| {
+        write_resources(image, fields, None)
+    })
+}
+
+/// [`stamp`], and in the same rewrite the `RT_RCDATA` resource `id` holding `bytes` (the setup
+/// file's anchor placeholder, M10-D4). The hardening check is the same.
+pub fn stamp_with_rcdata(
+    image: &[u8],
+    fields: &Fields<'_>,
+    id: u16,
+    bytes: &[u8],
+) -> Result<Vec<u8>> {
+    stamp_with(image, fields, &move |image, fields| {
+        write_resources(image, fields, Some((id, bytes)))
+    })
 }
 
 /// Removes the Authenticode certificate table of a signed PE, which a stamp would invalidate and

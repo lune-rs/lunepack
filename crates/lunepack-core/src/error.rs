@@ -1037,6 +1037,11 @@ pub enum Error {
     /// An artifact's SHA-256 differs from its reference's.
     #[error("artifact hash does not match its reference")]
     ArtifactHash,
+    /// A setup file does not match the anchor in its runtime image (M10-D4): the anchor is the
+    /// unwritten placeholder or malformed, or a digest of the trailer, the key set or the manifest
+    /// differs. Names which, never a byte of the file.
+    #[error("the setup file does not match its anchor: {0}")]
+    SetupAnchor(&'static str),
     /// A field rule of a feed or manifest (FORMAT.md 7, 8) is broken.
     #[error("invalid field: {0}")]
     Field(&'static str),

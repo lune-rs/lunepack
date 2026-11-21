@@ -1,6 +1,7 @@
 //! A small fail-closed reader of Windows PE images (M7-D10, M7-D11): the machine, the subsystem,
 //! the import and delay-import DLL names, the load config's `DependentLoadFlags`, the security
-//! (certificate table) directory and the bytes of the first `RT_MANIFEST` resource.
+//! (certificate table) directory, the bytes of the first `RT_MANIFEST` resource and the file span
+//! of an `RT_RCDATA` resource ([`rcdata`]).
 //!
 //! Every offset is bound-checked: a truncated or inconsistent image is a [`PeError`], never a
 //! panic. The reader accepts the shapes a linker writes and refuses the rest, so it can refuse an
@@ -21,6 +22,8 @@ pub const SUBSYSTEM_CONSOLE: u16 = 3;
 pub const LOAD_LIBRARY_SEARCH_SYSTEM32: u16 = 0x800;
 /// `RT_MANIFEST`.
 pub const RT_MANIFEST: u32 = 24;
+/// `RT_RCDATA`.
+pub const RT_RCDATA: u32 = 10;
 
 /// The optional header magic of a PE32 image.
 pub const PE32_MAGIC: u16 = 0x10b;
@@ -280,8 +283,8 @@ impl PeHeaders {
             .fold(u64::from(self.size_of_headers), u64::max)
     }
 
-    /// `len` bytes at `rva` of `bytes` (the whole file), inside one section's raw data.
-    fn at_rva<'b>(&self, bytes: &'b [u8], rva: u32, len: usize) -> Result<&'b [u8]> {
+    /// The file offset of `len` bytes at `rva`, which must lie inside one section's raw data.
+    fn file_offset(&self, rva: u32, len: usize) -> Result<u64> {
         let s = self
             .sections
             .iter()
@@ -294,7 +297,13 @@ impl PeHeaders {
         {
             return bad("RVA range outside the section's data");
         }
-        slice(bytes, s.raw_ptr as usize + inner, len).ok_or(PeError::Malformed("RVA range"))
+        Ok(u64::from(s.raw_ptr) + inner as u64)
+    }
+
+    /// `len` bytes at `rva` of `bytes` (the whole file), inside one section's raw data.
+    fn at_rva<'b>(&self, bytes: &'b [u8], rva: u32, len: usize) -> Result<&'b [u8]> {
+        let at = self.file_offset(rva, len)?;
+        slice(bytes, at as usize, len).ok_or(PeError::Malformed("RVA range"))
     }
 
     /// The rest of the section's data from `rva`, at most `cap` bytes.
@@ -522,6 +531,66 @@ fn manifest(h: &PeHeaders, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         return bad("manifest size");
     }
     Ok(Some(h.at_rva(bytes, rva, size as usize)?.to_vec()))
+}
+
+/// Where an `RT_RCDATA` resource's data lies in the file (M10-D4): `len` bytes from `file_offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RcdataSpan {
+    /// The file offset of the resource's first byte.
+    pub file_offset: u64,
+    /// The resource's size in bytes.
+    pub len: u32,
+}
+
+/// The span of the `RT_RCDATA` resource with the integer id `id` in the image `bytes` (the whole
+/// file, or the image part of it), read like [`PeImage`]'s manifest: type, then name, then
+/// language. `Ok(None)` when the image has no resource directory, no `RT_RCDATA` type or no entry
+/// `id` under it. The id's entry must be a directory holding exactly one language entry, a data
+/// entry whose bytes lie inside one section's raw data (so the loader maps exactly those bytes at
+/// the resource's RVA); anything else, or a truncated directory, is a [`PeError`].
+pub fn rcdata(bytes: &[u8], id: u16) -> Result<Option<RcdataSpan>> {
+    let h = PeHeaders::parse(bytes, bytes.len() as u64)?;
+    let base = h.dir(DIR_RESOURCE).address;
+    if base == 0 {
+        return Ok(None);
+    }
+    let Some(&(_, names, is_dir)) = resource_entries(&h, bytes, base, base)?
+        .iter()
+        .find(|e| e.0 == RT_RCDATA)
+    else {
+        return Ok(None);
+    };
+    if !is_dir {
+        return bad("resource tree");
+    }
+    // An integer id has the high bit clear; a string name's entry has it set, so it never equals.
+    let Some(&(_, languages, is_dir)) = resource_entries(&h, bytes, base, names)?
+        .iter()
+        .find(|e| e.0 == u32::from(id))
+    else {
+        return Ok(None);
+    };
+    if !is_dir {
+        return bad("resource tree");
+    }
+    let languages = resource_entries(&h, bytes, base, languages)?;
+    let [(_, data, false)] = languages.as_slice() else {
+        return bad("RT_RCDATA resource: not exactly one language data entry");
+    };
+    let entry = h.at_rva(bytes, *data, 16)?;
+    let rva = u32_at(entry, 0).unwrap_or(0);
+    let size = u32_at(entry, 4).unwrap_or(0);
+    if size == 0 {
+        return bad("RT_RCDATA resource size");
+    }
+    let file_offset = h.file_offset(rva, size as usize)?;
+    if slice(bytes, file_offset as usize, size as usize).is_none() {
+        return bad("RT_RCDATA resource outside the file");
+    }
+    Ok(Some(RcdataSpan {
+        file_offset,
+        len: size,
+    }))
 }
 
 /// Whether manifest bytes request `asInvoker` and set `longPathAware` to `true` (M7-D10). A text
