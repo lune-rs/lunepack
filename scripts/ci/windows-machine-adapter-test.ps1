@@ -62,6 +62,7 @@ $user = $null
 $exe = $null
 $userExe = $null
 $shortcut = $null
+$launchMethods = @{}
 
 # ---- helpers -----------------------------------------------------------------------------------
 
@@ -92,7 +93,8 @@ function Probe([string[]]$a) {
 
 function AsUser([string]$tag, [string[]]$lines, [int]$timeout = 120) {
     $r = Invoke-AsUser -User $user -Lines $lines -WorkDir $workDir -OutDir $outDir -Tag $tag -TimeoutSec $timeout
-    if ($r.TimedOut) { throw "the standard user's command '$tag' did not finish" }
+    $script:launchMethods[$r.Method] = 1 + [int]$script:launchMethods[$r.Method]
+    if ($r.TimedOut) { throw "the standard user's command '$tag' did not finish (launch method: $($r.Method))" }
     [pscustomobject]$r
 }
 
@@ -161,6 +163,8 @@ function Remove-Everything {
     foreach ($dir in @($root, $rootB, $rootI, $base)) {
         if (Test-Path -LiteralPath $dir) { Remove-Item -Recurse -Force -LiteralPath $dir -ErrorAction SilentlyContinue }
     }
+    Get-ScheduledTask -TaskName 'lpadapter-run-*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue }
     Remove-StandardUser $user
 }
 
@@ -176,6 +180,7 @@ function Find-Leftovers {
     }
     if ((Native 'reg.exe' @('query', $runKey, '/v', $appInt)).Code -eq 0) { $left += 'the Run value' }
     if ($shortcut -and (Test-Path -LiteralPath $shortcut)) { $left += 'the shortcut' }
+    if (Get-ScheduledTask -TaskName 'lpadapter-run-*' -ErrorAction SilentlyContinue) { $left += 'a scheduled task' }
     if ($user) {
         if (Get-LocalUser -Name $user.Name -ErrorAction SilentlyContinue) { $left += 'the standard user' }
         if (Test-Path -LiteralPath (Join-Path $env:SystemDrive "Users\$($user.Name)")) { $left += 'the user profile folder' }
@@ -426,6 +431,7 @@ finally {
     try { Remove-Everything } catch { Write-Output "cleanup error: $($_.Exception.Message)" }
 }
 
+foreach ($m in $launchMethods.Keys) { Write-Output "the standard user's commands ran through: $m ($($launchMethods[$m]) commands)" }
 $left = @(Find-Leftovers)
 if ($left.Count -gt 0) {
     $failures.Add('leftovers')
