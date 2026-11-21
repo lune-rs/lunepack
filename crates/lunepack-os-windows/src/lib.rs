@@ -16,6 +16,9 @@
 //! known folders ([`program_files`], [`common_start_menu_programs`], [`local_app_data`]).
 //! [`PipeServer`] and [`PipeClient`] (M10 step 8) are the named pipe's two ends, each a
 //! `service::Duplex` with read deadlines; the client checks the pipe's owner before it sends.
+//! [`WindowsRegistrar`], [`WindowsConnector`] and [`run_service`] (M10 step 9) are the Service
+//! Control Manager side: the service's registration with its descriptor, the client's start of the
+//! service and connection to its pipe, and the service's dispatcher.
 //! The public API is safe and builds on every OS; off Windows the helpers are no-ops or
 //! `Unsupported`.
 
@@ -33,6 +36,8 @@ mod process;
 mod publisher;
 #[cfg(windows)]
 mod registry;
+#[cfg(any(windows, test))]
+mod scm;
 #[cfg(any(windows, test))]
 mod security;
 mod shell;
@@ -58,6 +63,13 @@ pub use pipe::{PipeCanceller, PipeClient, PipeServer, pipe_descriptor};
 pub use process::WindowsProcess;
 #[cfg(windows)]
 pub use publisher::WinPublisherCheck;
+#[cfg(windows)]
+pub use scm::{HostError, ServiceControl, WindowsConnector, WindowsRegistrar, run_service};
+#[cfg(any(windows, test))]
+pub use scm::{
+    NON_ADMIN_ALLOWED, USERS_ENTRY, USERS_MASK, display_name, judge_service_descriptor, pipe_name,
+    quote_image, service_name, unquote_image, with_users_entry,
+};
 #[cfg(any(windows, test))]
 pub use security::{
     ACE_ALLOWED, ACE_ALLOWED_CALLBACK, ACE_DENIED, ACE_DENIED_CALLBACK, Ace, CheckError,

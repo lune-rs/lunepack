@@ -41,3 +41,10 @@ windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_Co
 [[test]]
 name = "process"
 harness = false
+
+# Own main: the test binary is also the program the self-test starts (its first argument is
+# `--self-test`, its behaviour comes from the file name it was copied to), and the cases run one
+# after another.
+[[test]]
+name = "scm"
+harness = false
