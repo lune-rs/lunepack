@@ -18,14 +18,14 @@
 #![allow(unsafe_code)]
 
 use std::fs::{self, File};
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use lunepack_core::codesign::PLAN_HEAD_BYTES;
 use lunepack_core::path::MAX_PATH_DEPTH;
-use lunepack_core::pe::{PeError, PeHeaders};
+use lunepack_core::pe::{PeError, PeHeaders, has_pe_signature};
 use lunepack_core::{PublisherCheck, PublisherError, SignedTree};
 use windows_sys::Win32::Foundation::{GetLastError, HWND, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::WinTrust::{
@@ -175,32 +175,30 @@ fn subject_of(data: &WINTRUST_DATA) -> Option<Vec<u8>> {
     }
 }
 
-/// `MZ` with `PE\0\0` where `e_lfanew` points, inside `head` (the core's `sign_plan` rule for a
-/// file whose headers do not parse).
-fn has_pe_signature(head: &[u8]) -> bool {
-    let Some(raw) = head.get(0x3C..0x40) else {
-        return false;
-    };
-    let lfanew = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-    head.starts_with(b"MZ")
-        && lfanew
-            .checked_add(4)
-            .and_then(|end| head.get(lfanew..end))
-            .is_some_and(|sig| sig == b"PE\0\0")
-}
-
 /// Whether `file` is a PE image (the core reader decides, never the name: a DLL renamed `.dat` is
-/// still loadable). `Err` is a local fault.
+/// still loadable). A file the headers reader refuses is still one when `MZ` is followed by `PE\0\0`
+/// where `e_lfanew` points, wherever that is (the packager's rule, [`has_pe_signature`]): the
+/// loader maps an image whose `e_lfanew` lies far past any prefix, so the answer is read from the
+/// file and never from a bounded head alone. `Err` is a local fault.
 fn is_pe(file: &Path, len: u64) -> Result<bool, PublisherError> {
+    let os = |_: std::io::Error| PublisherError::Os;
+    let mut f = File::open(file).map_err(os)?;
     let mut head = Vec::new();
-    File::open(file)
-        .and_then(|f| f.take(PLAN_HEAD_BYTES as u64).read_to_end(&mut head))
-        .map_err(|_| PublisherError::Os)?;
-    Ok(match PeHeaders::parse(&head, len) {
-        Ok(_) => true,
-        Err(PeError::NotPe) => false,
-        Err(_) => has_pe_signature(&head),
-    })
+    (&mut f)
+        .take(PLAN_HEAD_BYTES as u64)
+        .read_to_end(&mut head)
+        .map_err(os)?;
+    match PeHeaders::parse(&head, len) {
+        Ok(_) => Ok(true),
+        Err(PeError::NotPe) => Ok(false),
+        Err(_) => has_pe_signature(&head, len, |at| {
+            let mut sig = [0u8; 4];
+            f.seek(SeekFrom::Start(at))?;
+            f.read_exact(&mut sig)?;
+            Ok(sig)
+        })
+        .map_err(os),
+    }
 }
 
 /// The files of the tree at `root`, sorted by path: regular files only. A reparse point, a
@@ -263,13 +261,20 @@ impl PublisherCheck for WinPublisherCheck {
         candidate: &SignedTree,
     ) -> Result<bool, PublisherError> {
         let baseline = installed_subject(installed)?;
-        // Every PE of the candidate first: an unsigned DLL refuses even when the entry matches.
-        for (_, path, len) in files_of(&candidate.root)? {
+        // Every PE of the candidate first: an unsigned DLL refuses even when the entry matches. The
+        // entry's own subject is kept from this walk, so it is verified once.
+        let entry_rel = candidate.entry.as_str();
+        let mut entry_subject = None;
+        for (rel, path, len) in files_of(&candidate.root)? {
             if !is_pe(&path, len)? {
                 continue;
             }
             match verify_file(&path) {
-                FileSig::Trusted(_) => {}
+                FileSig::Trusted(subject) => {
+                    if rel == entry_rel {
+                        entry_subject = Some(subject);
+                    }
+                }
                 FileSig::Unsigned => return Err(PublisherError::CandidateUnsigned),
                 // An expired candidate (no timestamp) is a packaging mistake (M9-R1-D3).
                 FileSig::Invalid | FileSig::Expired(_) => {
@@ -278,12 +283,20 @@ impl PublisherCheck for WinPublisherCheck {
                 FileSig::Os => return Err(PublisherError::Os),
             }
         }
-        match verify_file(&entry_path(candidate)) {
-            FileSig::Trusted(subject) => Ok(subject == baseline),
-            FileSig::Unsigned => Err(PublisherError::CandidateUnsigned),
-            FileSig::Invalid | FileSig::Expired(_) => Err(PublisherError::CandidateInvalid),
-            FileSig::Os => Err(PublisherError::Os),
-        }
+        let subject = match entry_subject {
+            Some(subject) => subject,
+            // The entry was not among the walk's PE files (its name differs in case, or it is not
+            // a PE): judge it on its own, as the file the update will start.
+            None => match verify_file(&entry_path(candidate)) {
+                FileSig::Trusted(subject) => subject,
+                FileSig::Unsigned => return Err(PublisherError::CandidateUnsigned),
+                FileSig::Invalid | FileSig::Expired(_) => {
+                    return Err(PublisherError::CandidateInvalid);
+                }
+                FileSig::Os => return Err(PublisherError::Os),
+            },
+        };
+        Ok(subject == baseline)
     }
 }
 

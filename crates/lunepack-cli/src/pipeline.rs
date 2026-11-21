@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write as _};
+use std::io::{self, Read, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
@@ -18,6 +18,7 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use anyhow::{Context, Result, anyhow, bail};
 use lunepack_core::codesign::PLAN_HEAD_BYTES;
 use lunepack_core::path::MAX_PATH_DEPTH;
+use lunepack_core::pe::has_pe_signature;
 use lunepack_core::update_config::{
     MACOS_CODE_SIGNATURE_DIR, MACOS_HELPER_APP, MACOS_HELPER_ICON, MACOS_HELPER_INFO_PLIST,
     MACOS_HELPER_UI, MACOS_INFO_PLIST, MACOS_INSTALLER_PAYLOAD, RUNTIME_FILE, RUNTIME_FILE_WINDOWS,
@@ -564,13 +565,27 @@ pub fn plan_signing(
             Found::Dir => PlanEntryKind::Dir,
             Found::Symlink => PlanEntryKind::Symlink,
             Found::File => {
+                let read = |e: io::Error| {
+                    anyhow::Error::new(e).context(format!("cannot read {}", full.display()))
+                };
+                let mut file = File::open(&full).map_err(read)?;
                 let mut head = Vec::new();
-                File::open(&full)
-                    .and_then(|f| f.take(PLAN_HEAD_BYTES as u64).read_to_end(&mut head))
-                    .with_context(|| format!("cannot read {}", full.display()))?;
+                (&mut file)
+                    .take(PLAN_HEAD_BYTES as u64)
+                    .read_to_end(&mut head)
+                    .map_err(read)?;
+                // A PE whose `e_lfanew` lies past the head is still one: ask the file.
+                let pe_signature = has_pe_signature(&head, meta.len(), |at| {
+                    let mut sig = [0u8; 4];
+                    file.seek(SeekFrom::Start(at))?;
+                    file.read_exact(&mut sig)?;
+                    Ok(sig)
+                })
+                .map_err(read)?;
                 PlanEntryKind::File {
                     head,
                     len: meta.len(),
+                    pe_signature,
                 }
             }
         };
@@ -1094,6 +1109,28 @@ mod tests {
                 .is_empty()
         );
         assert!(plan_signing(tree.path(), Target::MacosUniversal, None).is_err());
+    }
+
+    /// S1: a PE whose `e_lfanew` lies past the 64 KiB head is read from the file, so the plan sees
+    /// it (and refuses: its headers cannot be read from the head) instead of leaving it unsigned.
+    #[test]
+    fn a_pe_signature_past_the_head_is_found_in_the_file() {
+        let tree = tempfile::tempdir().unwrap();
+        let mut far = vec![0u8; 0x30000];
+        far[..2].copy_from_slice(b"MZ");
+        far[0x3C..0x40].copy_from_slice(&0x10000u32.to_le_bytes());
+        far[0x10000..0x10004].copy_from_slice(b"PE\0\0");
+        fs::write(tree.path().join("far.dll"), &far).unwrap();
+        let err = plan_signing(tree.path(), Target::WindowsX86_64, None).unwrap_err();
+        assert!(format!("{err:#}").contains("far.dll"), "{err:#}");
+        // The same file without the signature is not a PE.
+        far[0x10000] = b'X';
+        fs::write(tree.path().join("far.dll"), &far).unwrap();
+        assert!(
+            plan_signing(tree.path(), Target::WindowsX86_64, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
