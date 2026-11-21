@@ -89,6 +89,9 @@ png = "0.18"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # Security descriptors by SDDL and by handle (`GetSecurityInfo`, `ConvertSidToStringSidW`) for
+    # the protected directories (M10 step 7).
+    "Win32_Security_Authorization",
     # WinVerifyTrust for the publisher check (M9-D8); the provider-data types it hands back sit
     # behind the cryptography features.
     "Win32_Security_Cryptography",
@@ -100,8 +103,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Environment",
+    # Overlapped I/O (the named pipe, M10 step 8).
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
+    # Named pipes (M10 step 8).
+    "Win32_System_Pipes",
     "Win32_System_Registry",
+    # The Service Control Manager (M10 step 9).
+    "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

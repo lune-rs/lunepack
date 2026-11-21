@@ -11,6 +11,9 @@
 //! declares) with [`remove_stub_leftovers`] for the GC; and the launcher stub's two helpers
 //! ([`raw_command_line`], [`ignore_console_interrupts`]).
 //! [`WinPublisherCheck`] (M9 step 6) is the core's `PublisherCheck` over `WinVerifyTrust`.
+//! [`WindowsProtect`] (M10 step 7) is the core's `Protect` over explicit security descriptors, with
+//! the descriptor reader, the token queries ([`standing`], [`current_user_sid`]) and the per-machine
+//! known folders ([`program_files`], [`common_start_menu_programs`], [`local_app_data`]).
 //! The public API is safe and builds on every OS; off Windows the helpers are no-ops or
 //! `Unsupported`.
 
@@ -26,6 +29,8 @@ mod process;
 mod publisher;
 #[cfg(windows)]
 mod registry;
+#[cfg(any(windows, test))]
+mod security;
 mod shell;
 #[cfg(windows)]
 mod shortcut;
@@ -42,9 +47,18 @@ pub use launcher::{ignore_console_interrupts, raw_command_line};
 pub use process::WindowsProcess;
 #[cfg(windows)]
 pub use publisher::WinPublisherCheck;
+#[cfg(any(windows, test))]
+pub use security::{
+    ACE_ALLOWED, ACE_ALLOWED_CALLBACK, ACE_DENIED, ACE_DENIED_CALLBACK, Ace, CheckError,
+    Descriptor, INHERIT_ONLY_ACE, READ_CLASS, SID_ADMINISTRATORS, SID_ALL_APP_PACKAGES,
+    SID_CREATOR_GROUP, SID_CREATOR_OWNER, SID_EVERYONE, SID_SYSTEM, SID_TRUSTED_INSTALLER,
+    SID_USERS, judge,
+};
+#[cfg(windows)]
+pub use security::{WindowsProtect, check_dir, current_user_sid, read_descriptor, standing};
 pub use shell::{
-    MessageKind, allow_set_foreground, message_box, process_aumid, set_process_aumid,
-    start_menu_programs, user_program_files,
+    MessageKind, allow_set_foreground, common_start_menu_programs, local_app_data, message_box,
+    process_aumid, program_files, set_process_aumid, start_menu_programs, user_program_files,
 };
 #[cfg(windows)]
 pub use stub_place::remove_stub_leftovers;
