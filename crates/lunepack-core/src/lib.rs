@@ -28,6 +28,7 @@ pub mod policy;
 pub mod process;
 pub mod progress;
 pub mod root;
+pub mod service;
 pub mod setup;
 pub mod stage;
 pub mod state;
@@ -54,7 +55,7 @@ pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
 pub use error::{
     DesktopPathError, Error, FeedRule, LayoutError, LifecycleError, PublisherError, Result,
-    StageError, StateError, UpdateConfigError,
+    ServiceError, StageError, StateError, UpdateConfigError,
 };
 pub use feed::{
     ArtifactRef, CheckedRef, FeedDocument, FeedTargetEntry, ReleaseDoc, Rollout, RolloutDoc,
@@ -105,6 +106,7 @@ pub use process::{
 };
 pub use progress::{FileProgress, Phase, Progress, Source};
 pub use root::{RootDocument, TrustedRoot, advance_root};
+pub use service::{ClientSession, Duplex, ServerSession};
 pub use stage::{
     SourceFor, StageEnv, StageInput, StagedVersion, TreeDifference, TreeMismatch, scan, stage,
     verify_tree,

@@ -10,6 +10,7 @@ use crate::fs::FsError;
 use crate::integration::IntegrationError;
 use crate::path::{PathError, TreeError};
 use crate::process::ProcessError;
+use crate::service::{ErrorCode as ServiceErrorCode, VerifyClass};
 use crate::target::TargetError;
 use crate::traits::CodecId;
 use crate::transport::TransportError;
@@ -705,6 +706,70 @@ pub enum UpdateConfigError {
     /// The app id or root parts differ from the trusted root the writer was given.
     #[error("update config {0} does not match the trusted root")]
     RootMismatch(&'static str),
+}
+
+/// Why a service-protocol session (`service`, M10-D1) ended or a request failed. Carries no peer
+/// text: a malformed reason is a fixed description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ServiceError {
+    /// The peer closed the channel where a hello or an answer belonged.
+    #[error("the peer closed the connection")]
+    Closed,
+    /// The peer sent something the protocol refuses; the session ended.
+    #[error("malformed: {0}")]
+    Malformed(&'static str),
+    /// A read did not complete before its deadline; the session ended.
+    #[error("a read timed out")]
+    Timeout,
+    /// Reading or writing the channel failed; the session ended.
+    #[error("channel i/o failed: {0:?}")]
+    Io(std::io::ErrorKind),
+    /// The server answered `error{code}` (and `class` for `verify_failed`).
+    #[error("the service answered {code}")]
+    Answered {
+        /// The code.
+        code: ServiceErrorCode,
+        /// The verification class, for `verify_failed`.
+        class: Option<VerifyClass>,
+    },
+    /// The request named another app; the server answered `wrong_app` and ended the session.
+    #[error("the request is for another app")]
+    WrongApp,
+    /// No common protocol version: on the client the server's range, on the server the client's.
+    #[error("no common protocol version (the other side speaks {min} to {max})")]
+    Unsupported {
+        /// The other side's lowest version.
+        min: u32,
+        /// The other side's highest version.
+        max: u32,
+    },
+    /// The session has already ended.
+    #[error("the session has ended")]
+    Ended,
+    /// A message or frame this side tried to send has no valid encoding; nothing was written.
+    #[error("cannot encode {0}")]
+    Unencodable(&'static str),
+    /// The sink of [`crate::service::ServerSession::read_data`] failed; the session reads no more.
+    #[error("the data sink failed: {0:?}")]
+    Sink(std::io::ErrorKind),
+    /// The client's data source failed or ended early; the session ended.
+    #[error("the data source failed: {0:?}")]
+    Source(std::io::ErrorKind),
+}
+
+impl ServiceError {
+    /// The protocol error code this failure corresponds to: `malformed`, `timeout`, `wrong_app`,
+    /// the answered code, or `internal` for local failures.
+    pub fn code(&self) -> ServiceErrorCode {
+        match self {
+            ServiceError::Malformed(_) => ServiceErrorCode::Malformed,
+            ServiceError::Timeout => ServiceErrorCode::Timeout,
+            ServiceError::WrongApp => ServiceErrorCode::WrongApp,
+            ServiceError::Answered { code, .. } => *code,
+            _ => ServiceErrorCode::Internal,
+        }
+    }
 }
 
 /// Every way the core rejects input or fails.

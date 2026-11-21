@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use lunepack_core::fuzz::{
     FRAME_HEADER_LEN, FUZZ_APP_ID, FUZZ_TARGET, FUZZ_VERSION, HTTP_HEADER_LEN, STATE_NAME_SEQ,
 };
+use lunepack_core::service;
 use lunepack_core::state::{self, MAX_RECORD_BYTES};
 use lunepack_core::trust::PublicKey;
 use lunepack_core::{
@@ -85,6 +86,7 @@ pub fn fuzz_seeds() -> Vec<Seed> {
     state_seeds(&mut out);
     update_config_seeds(&mut out);
     setup_seeds(&fx, &mut out);
+    service_seeds(&mut out);
     out.0
 }
 
@@ -1303,4 +1305,316 @@ fn setup_seeds(fx: &ChainFixture<'_>, out: &mut Out) {
     let mut gap = signed(setup_over(fx, pe(false)), false, 64);
     gap.push(0);
     out.bad("setup", "byte-after-table", gap);
+}
+
+// ---- service protocol (M10-D1) -------------------------------------------------------------------
+
+fn service_frame(kind: u8, body: &[u8]) -> Vec<u8> {
+    service::encode_frame(kind, body).expect("a frame within its caps")
+}
+
+fn service_msg(body: &[u8]) -> Vec<u8> {
+    service_frame(service::KIND_MESSAGE, body)
+}
+
+/// A server-side input (byte 0 even): the client's hello, then `frames`.
+fn server_stream(frames: &[Vec<u8>]) -> Vec<u8> {
+    let hello = service::ClientHello { min: 1, max: 1 }
+        .encode()
+        .expect("hello");
+    let mut out = vec![0u8];
+    out.extend(service_msg(&hello));
+    for f in frames {
+        out.extend_from_slice(f);
+    }
+    out
+}
+
+/// A client-side input (byte 0 odd): the server's hello, then `frames`.
+fn client_stream(frames: &[Vec<u8>]) -> Vec<u8> {
+    let hello = service::ServerHello::Version(1).encode().expect("hello");
+    let mut out = vec![1u8];
+    out.extend(service_msg(&hello));
+    for f in frames {
+        out.extend_from_slice(f);
+    }
+    out
+}
+
+fn service_seeds(out: &mut Out) {
+    use lunepack_core::service::{
+        AttemptAnswer, DocumentDecl, DocumentKind, ErrorCode, KIND_DATA, ObjectKind, PendingStatus,
+        Request, RequestMsg, Response, ServerHello, StatusReport, Token, VerifyClass,
+    };
+    let app = AppId::parse(FUZZ_APP_ID).expect("app id");
+    let ver = |t: &str| Version::parse(t).expect("version");
+    let token = Token::from_bytes([0x42; 32]);
+    let request = |r: Request| {
+        service_msg(
+            &RequestMsg {
+                app: app.clone(),
+                request: r,
+            }
+            .encode()
+            .expect("request"),
+        )
+    };
+    let answer = |r: Response| service_msg(&r.encode().expect("answer"));
+    let data = |len: usize, fill: u8| service_frame(KIND_DATA, &vec![fill; len]);
+    let docs = vec![
+        DocumentDecl {
+            kind: DocumentKind::Root,
+            bytes: 3,
+        },
+        DocumentDecl {
+            kind: DocumentKind::Keys,
+            bytes: 4,
+        },
+        DocumentDecl {
+            kind: DocumentKind::Feed,
+            bytes: 5,
+        },
+        DocumentDecl {
+            kind: DocumentKind::Manifest,
+            bytes: 6,
+        },
+    ];
+    let stable = Channel::parse("stable").expect("channel");
+    let digest = Sha256Digest::from_bytes([0x5a; 32]);
+
+    // Server side: one accepted stream per request type.
+    out.ok("service", "server-hello-only", server_stream(&[]));
+    out.ok(
+        "service",
+        "server-status",
+        server_stream(&[request(Request::Status)]),
+    );
+    out.ok(
+        "service",
+        "server-stage-begin",
+        server_stream(&[
+            request(Request::StageBegin {
+                channel: stable.clone(),
+                documents: docs,
+            }),
+            data(10, b'a'),
+            data(8, b'b'),
+        ]),
+    );
+    out.ok(
+        "service",
+        "server-put",
+        server_stream(&[
+            request(Request::Put {
+                kind: ObjectKind::Pack,
+                sha256: digest,
+                size: 6,
+            }),
+            data(2, 1),
+            data(4, 2),
+        ]),
+    );
+    out.ok(
+        "service",
+        "server-stage-commit",
+        server_stream(&[request(Request::StageCommit)]),
+    );
+    out.ok(
+        "service",
+        "server-apply",
+        server_stream(&[request(Request::Apply {
+            version: ver("1.1.0"),
+        })]),
+    );
+    out.ok(
+        "service",
+        "server-attempt",
+        server_stream(&[request(Request::Attempt {
+            version: ver("1.1.0"),
+        })]),
+    );
+    out.ok(
+        "service",
+        "server-confirm",
+        server_stream(&[request(Request::Confirm {
+            version: ver("1.1.0"),
+            token: token.clone(),
+        })]),
+    );
+    out.ok(
+        "service",
+        "server-rollback",
+        server_stream(&[request(Request::Rollback {
+            version: ver("1.1.0"),
+            token: token.clone(),
+        })]),
+    );
+    let mut unsupported = vec![0u8];
+    unsupported.extend(service_msg(
+        &service::ClientHello { min: 2, max: 3 }
+            .encode()
+            .expect("hello"),
+    ));
+    out.ok("service", "server-unsupported", unsupported);
+
+    // Client side: one accepted stream per answer type.
+    let answers: Vec<(&str, Response)> = vec![
+        (
+            "status",
+            Response::Status(StatusReport {
+                current: ver("1.1.0"),
+                previous: Some(ver("1.0.0")),
+                pending: Some(PendingStatus {
+                    version: ver("1.1.0"),
+                    attempts: 1,
+                }),
+                staged: None,
+                service: ver("1.0.0"),
+                self_update_disabled: false,
+            }),
+        ),
+        (
+            "stage-ready",
+            Response::StageReady {
+                version: ver("1.1.0"),
+            },
+        ),
+        ("no-update", Response::NoUpdate),
+        ("put-ok", Response::PutOk),
+        ("progress", Response::Progress { done: 1, total: 2 }),
+        (
+            "staged",
+            Response::Staged {
+                version: ver("1.1.0"),
+            },
+        ),
+        (
+            "need-fetch",
+            Response::NeedFetch {
+                paths: vec![RelPath::parse("bin/hello").expect("path")],
+                more: true,
+            },
+        ),
+        (
+            "applied",
+            Response::Applied {
+                version: ver("1.1.0"),
+                token: token.clone(),
+            },
+        ),
+        (
+            "attempt-supervised",
+            Response::Attempt(AttemptAnswer::Supervised),
+        ),
+        (
+            "attempt-counted",
+            Response::Attempt(AttemptAnswer::Counted {
+                attempts: 2,
+                token: token.clone(),
+            }),
+        ),
+        (
+            "attempt-rolled-back",
+            Response::Attempt(AttemptAnswer::RolledBack {
+                current: ver("1.0.0"),
+            }),
+        ),
+        (
+            "attempt-not-pending",
+            Response::Attempt(AttemptAnswer::NotPending),
+        ),
+        ("confirmed", Response::Confirmed),
+        ("nothing-pending", Response::NothingPending),
+        (
+            "rolled-back",
+            Response::RolledBack {
+                current: ver("1.0.0"),
+            },
+        ),
+        ("error", Response::error(ErrorCode::Busy)),
+        (
+            "error-verify-failed",
+            Response::Error {
+                code: ErrorCode::VerifyFailed,
+                class: Some(VerifyClass::Signature),
+            },
+        ),
+    ];
+    for (name, r) in answers {
+        out.ok(
+            "service",
+            &format!("client-{name}"),
+            client_stream(&[answer(r)]),
+        );
+    }
+    let mut unsupported = vec![1u8];
+    unsupported.extend(service_msg(
+        &ServerHello::Unsupported { min: 1, max: 1 }
+            .encode()
+            .expect("hello"),
+    ));
+    out.ok("service", "client-unsupported", unsupported);
+
+    // Rejected.
+    let status = request(Request::Status);
+    let mut oversized = server_stream(&[]);
+    oversized.extend_from_slice(&u32::MAX.to_le_bytes());
+    oversized.push(service::KIND_MESSAGE);
+    out.bad("service", "oversized-length", oversized);
+    let raw_kind = |kind: u8| {
+        let mut s = server_stream(&[]);
+        s.extend_from_slice(&3u32.to_le_bytes());
+        s.extend_from_slice(&[kind, b'{', b'}']);
+        s
+    };
+    out.bad("service", "kind-0", raw_kind(0));
+    out.bad("service", "kind-3", raw_kind(3));
+    out.bad(
+        "service",
+        "duplicate-key",
+        server_stream(&[service_msg(
+            br#"{"type":"status","app":"org.example.hello","app":"org.example.hello"}"#,
+        )]),
+    );
+    out.bad(
+        "service",
+        "unknown-member",
+        server_stream(&[service_msg(
+            br#"{"type":"status","app":"org.example.hello","extra":1}"#,
+        )]),
+    );
+    let mut truncated = server_stream(std::slice::from_ref(&status));
+    truncated.pop();
+    out.bad("service", "truncated-frame", truncated);
+    let mut early = vec![0u8];
+    early.extend(data(4, 0));
+    early.extend(status);
+    out.bad("service", "data-before-hello", early);
+    let mut roots = vec![r#"{"kind":"root","bytes":1}"#; 17];
+    roots.extend([
+        r#"{"kind":"keys","bytes":1}"#,
+        r#"{"kind":"feed","bytes":1}"#,
+        r#"{"kind":"manifest","bytes":1}"#,
+    ]);
+    let body = format!(
+        r#"{{"type":"stage_begin","app":"{FUZZ_APP_ID}","channel":"stable","documents":[{}]}}"#,
+        roots.join(",")
+    );
+    out.bad(
+        "service",
+        "stage-begin-17-roots",
+        // The data the declaration names follows, so only the count rule refuses it.
+        server_stream(&[service_msg(body.as_bytes()), data(20, 0)]),
+    );
+    let short = &token.to_hex()[..63];
+    let body = format!(
+        r#"{{"type":"confirm","app":"{FUZZ_APP_ID}","version":"1.1.0","token":"{short}"}}"#
+    );
+    out.bad(
+        "service",
+        "token-63-characters",
+        server_stream(&[service_msg(body.as_bytes())]),
+    );
+    out.bad("service", "client-data-frame", client_stream(&[data(1, 0)]));
+    out.bad("service", "empty", Vec::new());
 }
