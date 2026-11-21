@@ -298,6 +298,11 @@ pub enum PlanEntryKind {
         head: Vec<u8>,
         /// Its length.
         len: u64,
+        /// [`pe::has_pe_signature`](crate::pe::has_pe_signature) for this file, answered by the
+        /// caller (which may read past `head`): a file whose headers do not parse is a PE the plan
+        /// cannot sign when this is true, and is not a PE otherwise. Setting it false for a file
+        /// that is a PE leaves that file unsigned.
+        pe_signature: bool,
     },
 }
 
@@ -399,7 +404,12 @@ fn deepest_first(a: &RelPath, b: &RelPath) -> std::cmp::Ordering {
 fn windows_plan(entries: &[PlanEntry]) -> Result<Vec<SignItem>, SignPlanError> {
     let mut files = Vec::new();
     for entry in entries {
-        let PlanEntryKind::File { head, len } = &entry.kind else {
+        let PlanEntryKind::File {
+            head,
+            len,
+            pe_signature,
+        } = &entry.kind
+        else {
             continue;
         };
         match PeHeaders::parse(head, *len) {
@@ -410,7 +420,7 @@ fn windows_plan(entries: &[PlanEntry]) -> Result<Vec<SignItem>, SignPlanError> {
             }
             Err(PeError::NotPe) => {}
             Err(PeError::Malformed(what)) => {
-                if has_pe_signature(head) {
+                if *pe_signature {
                     return Err(SignPlanError::MalformedPe {
                         path: entry.path.clone(),
                         what,
@@ -428,19 +438,6 @@ fn windows_plan(entries: &[PlanEntry]) -> Result<Vec<SignItem>, SignPlanError> {
             kind: SignKind::PeFile,
         })
         .collect())
-}
-
-/// `MZ` with `PE\0\0` where `e_lfanew` points, inside `head`.
-fn has_pe_signature(head: &[u8]) -> bool {
-    let Some(raw) = head.get(0x3C..0x40) else {
-        return false;
-    };
-    let lfanew = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-    head.starts_with(b"MZ")
-        && lfanew
-            .checked_add(4)
-            .and_then(|end| head.get(lfanew..end))
-            .is_some_and(|sig| sig == b"PE\0\0")
 }
 
 fn is_nested_bundle(path: &RelPath) -> bool {

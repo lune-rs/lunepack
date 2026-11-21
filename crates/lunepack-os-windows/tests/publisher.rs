@@ -152,6 +152,19 @@ impl Lab {
         }
     }
 
+    /// Writes an extra PE whose `e_lfanew` lies past 64 KiB (unsigned, or signed by `cert`) at `rel`.
+    fn add_far_pe(&self, tree: &SignedTree, rel: &str, cert: Option<&Cert>) {
+        let path = tree.root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let image = with_far_headers(&pe_image(0x8664, &PeSpec::hardened(2)), 0x10000);
+        let lfanew = u32::from_le_bytes(image[0x3C..0x40].try_into().unwrap());
+        assert!(lfanew >= 0x10000, "the headers are past the 64 KiB head");
+        fs::write(&path, image).unwrap();
+        if let Some(cert) = cert {
+            self.sign(cert, &path);
+        }
+    }
+
     /// Writes an extra PE (unsigned, or signed by `cert`) at `rel` in `tree`.
     fn add_pe(&self, tree: &SignedTree, rel: &str, cert: Option<&Cert>) {
         let path = tree.root.join(rel);
@@ -167,6 +180,37 @@ impl Drop for Lab {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.scratch);
     }
+}
+
+/// `image` (a PE the core reader accepts) with its NT headers moved `delta` bytes up: `e_lfanew`,
+/// `SizeOfHeaders` and every section's `PointerToRawData` grow by `delta` (a multiple of the file
+/// alignment) and the gap is zeros. The result is the shape a linker writes for a large `/STUB`, and
+/// a DLL the loader maps (checked on Windows 11 with a real linked DLL, `e_lfanew` 0x11870), but
+/// whose signature a 64 KiB prefix of the file does not show.
+fn with_far_headers(image: &[u8], delta: usize) -> Vec<u8> {
+    assert_eq!(delta % 0x200, 0);
+    let lfanew = u32::from_le_bytes(image[0x3C..0x40].try_into().unwrap()) as usize;
+    let coff = lfanew + 4;
+    let nsections = u16::from_le_bytes(image[coff + 2..coff + 4].try_into().unwrap()) as usize;
+    let opt_size = u16::from_le_bytes(image[coff + 16..coff + 18].try_into().unwrap()) as usize;
+    let opt = coff + 20;
+    let table = opt + opt_size;
+    let mut out = image[..lfanew].to_vec();
+    out.resize(lfanew + delta, 0);
+    out.extend_from_slice(&image[lfanew..]);
+    let put = |out: &mut Vec<u8>, at: usize, add: usize| {
+        let old = u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+        out[at..at + 4].copy_from_slice(&(old + add as u32).to_le_bytes());
+    };
+    put(&mut out, 0x3C, delta);
+    put(&mut out, opt + delta + 60, delta);
+    for i in 0..nsections {
+        let pointer = table + delta + 40 * i + 20;
+        if u32::from_le_bytes(out[pointer..pointer + 4].try_into().unwrap()) != 0 {
+            put(&mut out, pointer, delta);
+        }
+    }
+    out
 }
 
 /// Flips one byte of the first section's raw data of the PE at `path`.
@@ -278,7 +322,7 @@ fn real_signed_files_give_the_closed_outcomes() {
     if !is_admin() {
         eprintln!(
             "skipped: rows needing a trusted test root (the session is not elevated): \
-             renewal, different subject, unsigned candidate, unsigned DLL, tampered, unsigned installed, \
+             renewal, different subject, unsigned candidate, unsigned DLL, far-header DLL, tampered, unsigned installed, \
              untrusted root, held open, reparse point, renamed DLL, suite"
         );
         return;
@@ -334,6 +378,30 @@ fn real_signed_files_give_the_closed_outcomes() {
             assert_eq!(ask(&i, &c), Ok(true), "a non-PE file is not checked");
             lab.add_pe(&c, "data/library.dat", None);
             assert_eq!(ask(&i, &c), Err(PublisherError::CandidateUnsigned));
+        },
+    );
+    // S1: the loader maps an image whose `e_lfanew` lies far past the first 64 KiB, so an unsigned
+    // one is as dangerous as any other DLL, whatever a bounded prefix of the file shows.
+    rows.row(
+        "an unsigned DLL whose e_lfanew is past 64 KiB beside a correctly signed entry",
+        || {
+            let (i, c) = (
+                lab.tree("i", Some(&cert_a1), 0x400),
+                lab.tree("c", Some(&cert_a2), 0x400),
+            );
+            lab.add_far_pe(&c, "bin/far.dll", None);
+            assert_eq!(ask(&i, &c), Err(PublisherError::CandidateUnsigned));
+            // Signed by any trusted publisher it passes, and a far file with no `PE\0\0` where
+            // `e_lfanew` points is not a PE at all.
+            let c2 = lab.tree("c2", Some(&cert_a2), 0x400);
+            lab.add_far_pe(&c2, "bin/far.dll", Some(&cert_b));
+            assert_eq!(ask(&i, &c2), Ok(true));
+            let c3 = lab.tree("c3", Some(&cert_a2), 0x400);
+            let mut text = vec![0u8; 0x30000];
+            text[..2].copy_from_slice(b"MZ");
+            text[0x3C..0x40].copy_from_slice(&0x10000u32.to_le_bytes());
+            fs::write(c3.root.join("bin").join("far.dat"), text).unwrap();
+            assert_eq!(ask(&i, &c3), Ok(true));
         },
     );
     rows.row("one byte flipped in a signed candidate", || {

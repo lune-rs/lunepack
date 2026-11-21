@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use lunepack_core::codesign::PLAN_HEAD_BYTES;
-use lunepack_core::pe::MACHINE_X86_64;
+use lunepack_core::pe::{MACHINE_X86_64, MAX_E_LFANEW, has_pe_signature};
 use lunepack_core::{
     ArgvTemplate, ExpandCtx, PlanEntry, PlanEntryKind, PublisherPolicy, RelPath, SignItem,
     SignKind, SignPlanError, Target, TemplateError, TemplateRole, UpdateConfig, UpdateConfigError,
@@ -514,6 +514,8 @@ fn the_checks_and_the_plan_are_total_on_arbitrary_bytes() {
             kind: PlanEntryKind::File {
                 head: bytes.clone(),
                 len: claimed,
+                pe_signature: has_pe_signature(&bytes, claimed, |_| Ok::<_, ()>([0; 4]))
+                    .unwrap_or(false),
             },
         };
         let main = RelPath::parse("Contents/MacOS/main").unwrap();
@@ -547,6 +549,13 @@ fn file(path: &str, bytes: &[u8]) -> PlanEntry {
         kind: PlanEntryKind::File {
             head: bytes[..bytes.len().min(PLAN_HEAD_BYTES)].to_vec(),
             len: bytes.len() as u64,
+            // What the packager does: the file itself answers where the head cannot.
+            pe_signature: has_pe_signature(
+                &bytes[..bytes.len().min(PLAN_HEAD_BYTES)],
+                bytes.len() as u64,
+                |at| Ok::<_, ()>(bytes[at as usize..at as usize + 4].try_into().unwrap()),
+            )
+            .unwrap(),
         },
     }
 }
@@ -602,6 +611,84 @@ fn a_pe_with_a_signature_but_bad_headers_is_an_error() {
     let err = sign_plan(Target::WindowsX86_64, &[file("bad.dll", &bad)], None).unwrap_err();
     assert!(
         matches!(err, SignPlanError::MalformedPe { ref path, .. } if path.as_str() == "bad.dll")
+    );
+}
+
+/// A 0x30000-byte file whose DOS header points at `lfanew`, with `PE\0\0` there and nothing a PE
+/// reader accepts after it: a DLL the 64 KiB head cannot show.
+fn mz_with_far_signature(lfanew: usize, signature: &[u8; 4]) -> Vec<u8> {
+    let mut bytes = vec![0u8; 0x30000];
+    bytes[..2].copy_from_slice(b"MZ");
+    bytes[0x3C..0x40].copy_from_slice(&(lfanew as u32).to_le_bytes());
+    bytes[lfanew..lfanew + 4].copy_from_slice(signature);
+    bytes
+}
+
+/// S1: a PE whose `e_lfanew` lies past the head is a PE the plan cannot sign, an error and not a
+/// quiet "not a PE" (the file would stay unsigned in the release).
+#[test]
+fn a_pe_whose_signature_lies_past_the_head_is_an_error_not_skipped() {
+    for lfanew in [0x10000usize, 0x2FFF0, 0xFFFC] {
+        let bytes = mz_with_far_signature(lfanew, b"PE\0\0");
+        let err = sign_plan(Target::WindowsX86_64, &[file("far.dll", &bytes)], None).unwrap_err();
+        assert!(
+            matches!(err, SignPlanError::MalformedPe { ref path, .. } if path.as_str() == "far.dll"),
+            "e_lfanew {lfanew:#x}"
+        );
+    }
+    // The control: no signature where `e_lfanew` points is not a PE.
+    let bytes = mz_with_far_signature(0x10000, b"XXXX");
+    let plan = sign_plan(Target::WindowsX86_64, &[file("far.dll", &bytes)], None);
+    assert_eq!(plan, Ok(Vec::new()));
+}
+
+#[test]
+fn has_pe_signature_follows_the_loaders_rules() {
+    let read = |bytes: &[u8]| {
+        let bytes = bytes.to_vec();
+        move |at: u64| Ok::<_, ()>(bytes[at as usize..at as usize + 4].try_into().unwrap())
+    };
+    let far = mz_with_far_signature(0x10000, b"PE\0\0");
+    let head = &far[..PLAN_HEAD_BYTES];
+    // Past the head: read from the file.
+    assert_eq!(
+        has_pe_signature(head, far.len() as u64, read(&far)),
+        Ok(true)
+    );
+    // Inside the head: no read at all.
+    let near = mz_with_far_signature(0x80, b"PE\0\0");
+    assert_eq!(
+        has_pe_signature(&near[..PLAN_HEAD_BYTES], near.len() as u64, |_| Err::<
+            [u8; 4],
+            _,
+        >(
+            ()
+        )),
+        Ok(true)
+    );
+    // Not `MZ`, a short head, a signature that is not one, past the end of the file, at or above
+    // the loader's cap: all false, none reads.
+    let no_read = |_: u64| Err::<[u8; 4], _>(());
+    let mut not_mz = near.clone();
+    not_mz[0] = b'Z';
+    assert_eq!(has_pe_signature(&not_mz[..64], 0x30000, no_read), Ok(false));
+    assert_eq!(has_pe_signature(b"MZ", 2, no_read), Ok(false));
+    assert_eq!(has_pe_signature(&[], 0, no_read), Ok(false));
+    let past_end = mz_with_far_signature(0x2FFFC, b"PE\0\0");
+    assert_eq!(
+        has_pe_signature(&past_end[..PLAN_HEAD_BYTES], 0x2FFFE, no_read),
+        Ok(false)
+    );
+    let mut capped = far.clone();
+    capped[0x3C..0x40].copy_from_slice(&(MAX_E_LFANEW as u32).to_le_bytes());
+    assert_eq!(
+        has_pe_signature(&capped[..PLAN_HEAD_BYTES], u64::from(u32::MAX), no_read),
+        Ok(false)
+    );
+    // A failed read is the caller's error, never "not a PE".
+    assert_eq!(
+        has_pe_signature(head, far.len() as u64, |_| Err::<[u8; 4], _>("io")),
+        Err("io")
     );
 }
 
