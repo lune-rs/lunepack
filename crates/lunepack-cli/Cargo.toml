@@ -39,3 +39,9 @@ base64 = { workspace = true }
 tempfile = { workspace = true }
 # Tests read the documents the binary wrote back through the real verifiers.
 ed25519-dalek = { workspace = true, features = ["pkcs8", "pem"] }
+
+# Own main: the test binary is also the helper program the runner tests start (`--helper <mode>`),
+# and the cases run one after another. It compiles `src/tool.rs` itself (a bin crate has no lib).
+[[test]]
+name = "tool"
+harness = false

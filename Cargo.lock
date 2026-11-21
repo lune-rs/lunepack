@@ -2132,6 +2132,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "url",
 ]
 
@@ -2234,9 +2235,11 @@ dependencies = [
 name = "lunepack-os-macos"
 version = "0.0.0"
 dependencies = [
+ "core-foundation 0.10.1",
  "libc",
  "lunepack-core",
  "lunepack-testkit",
+ "security-framework",
 ]
 
 [[package]]

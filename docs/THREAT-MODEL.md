@@ -75,6 +75,11 @@ Stopped:
   documents signed by that key, and the key-set floor stops the old key set from coming back. No
   app update is needed.
 - The key is only accepted inside its `not_before`/`not_after` window for feeds.
+- A release signed with the leaked key alone cannot also carry the publisher's OS code-signing identity,
+  which the key does not hold. Under `enforce`, an installed app whose update configuration sets the
+  publisher-continuity policy refuses a release signed by another identity, unsigned or ad hoc, and marks it
+  bad (section "OS code signing and publisher continuity (M9)" below). This is a second barrier for apps
+  packed with OS signing, not a substitute for revoking the key.
 
 Not stopped:
 - Until clients fetch the revoking key set, the attacker can sign a feed and manifests and ship
@@ -563,7 +568,8 @@ paths it derived itself or read from a signed tree, and fails toward keeping fil
   `signtool verify` and the setup. The end-to-end suite signs a setup file with a throwaway certificate on a
   disposable runner and checks all three claims (it installs when signed; a flipped trailer byte and an
   appended byte each exit 7). A timestamped signature is a longer certificate table at the end, which the
-  locator accepts unchanged; a real timestamp authority is not exercised before code signing (M9).
+  locator accepts unchanged (M9 signs the setup file through the packager's `sign_installer` template; the
+  timestamp service is whatever the developer's template names, and CI's throwaway signatures carry none).
 - **The stub reads untrusted local state (M7-D7).** The stub runs with the user's rights and starts what the
   install record and the configuration name, so it takes `R` from its own resolved path only (no argument,
   environment variable or registry value), reads the record read only with its checksum and the
@@ -636,7 +642,8 @@ paths it derived itself or read from a signed tree, and fails toward keeping fil
   setup's UI) resembles what droppers do. Whether Windows Defender flags any lunepack binary is not yet
   measured; the CI job `e2e-windows-defender` runs the whole suite with Defender on, proves Defender
   works with a control that must be detected, and records any detection by threat name. The answer to a
-  flagged binary is code signing (M9), not an exclusion.
+  flagged binary is code signing (M9), not an exclusion; whether Defender still flags anything once the
+  binaries are signed is recorded by the same CI job.
 - **Renaming the install folder** is unsupported (`docs/FORMAT.md` 16): the launcher still works from the
   renamed folder, the shortcut no longer matches the install's marker and is left alone, and updates
   report it as a conflict. Nothing is overwritten or removed that is not lunepack's.
@@ -673,8 +680,9 @@ rather than deletes, and fails toward keeping the app.
   can neither fail halfway nor be updated from an image. A root-owned `B` is a machine install by ownership
   (D10) and is refused `machine_scope`, exit 17; a per-machine install is a later milestone. The facts come from `statfs`, `stat` and
   `faccessat` through `Fs::place`; the translocation test is the mount type and the path component, which are
-  what the system uses and have not been exercised on a real translocated app (that needs a notarized one,
-  M9): the refusal is correct for the system's translocation and untested against it.
+  what the system uses. A real translocated app needs a notarized one; `scripts/macos-sign-check.sh` runs
+  that row with the developer's own identity (it is not part of the gate or of CI), so until it has been
+  run the refusal is correct for the system's translocation and untested against it.
 - **Quarantine and extended attributes (M8-D10).** lunepack never sets `com.apple.quarantine`, never
   removes it from the live bundle in place, and copies no extended attribute into a staged tree (std's copy
   does carry it; the adapter's copy writes data and mode only), so a bundle swapped in by an update has
@@ -682,7 +690,8 @@ rather than deletes, and fails toward keeping the app.
   the original install on its first launch is not touched, and an update is verified by lunepack's own
   signatures (frame hashes, the manifest under the key set under the root), not by the system's. A quarantined
   copy that the user has not yet opened never runs (that is Gatekeeper's); a quarantined ad-hoc-signed
-  installer app is expected to be refused until M9.
+  installer app is refused, and an installer signed and notarized through `[codesign.macos]` is what passes
+  (`scripts/macos-sign-check.sh` checks the assessment).
 - **Adoption (M8-D9).** A bundle dragged into an apps folder is read before it is verified, so only what is
   needed to find its configuration is read with the existing, capped parser, and nothing is executed.
   The root it trusts is the one in the bundle's own configuration: the same bootstrap model as the online
@@ -768,8 +777,9 @@ rather than deletes, and fails toward keeping the app.
   verified before anything is shown or written, from the trailer's root, as a setup file's is (this app is
   no more trusted than a setup file: an attacker who can replace it can already run code as the user). A
   `.dmg` is read-only, so the installer cannot write itself and its own location is not judged; only the place
-  of the new bundle is. The installer app has no bundle seal in this milestone: it launches unquarantined
-  here, and M9 owns signing and notarizing it.
+  of the new bundle is. The installer app carries the bundle seal and the notarization ticket only when the
+  packager signs it (`[codesign.macos]`, M9); without that section it is unsealed and launches
+  unquarantined here.
 - **Process spawning and generated text (M8-D6, M8-D11, M8-D12).** The runtime and packager start `open`,
   `plutil`, `osascript` and `hdiutil` by absolute path, with an argument vector and no shell, and each run is
   bounded in time (the alert gives up after 120 s and its process is killed shortly after). The alert's
@@ -797,10 +807,84 @@ rather than deletes, and fails toward keeping the app.
   `/`), and no entry's path passes through a link entry (FORMAT 10.2), so an extractor that writes entry
   after entry has no link to write through. The writer has no ZIP64, no extra fields, no encryption and no
   data descriptors, so a reader's parser has little to differ on, and it makes the same bytes each time.
-  The `.dmg` is made by the system's tool and is not signed in this milestone.
+  The `.dmg` is made by the system's tool and signed, notarized and stapled by the packager's templates
+  when `[codesign.macos]` is configured (M9).
 - **Not covered here.** Gatekeeper's, App Management's and background-item prompts and the focus of a
-  relaunched app are what only a person can see (`scripts/macos-user-check.sh`); translocation, notarization
-  and a signed installer are M9; a per-machine install is M10 and M11.
+  relaunched app are what only a person can see (`scripts/macos-user-check.sh`); notarization, stapling and
+  translocation of a notarized app are what `scripts/macos-sign-check.sh` shows with the developer's own
+  identity; a per-machine install is M10 and M11.
+
+## OS code signing and publisher continuity (M9)
+
+Two things were added in M9: the packager signs releases and installers with the developer's own tools,
+and a client can refuse an update signed by a different OS code-signing publisher than the installed one.
+Neither replaces the release signatures of the format; OS signing is what the platform (Gatekeeper,
+SmartScreen) judges and what lunepack compares between versions.
+
+**Publisher continuity.** The installed version's update configuration sets a policy (`off`, `warn`,
+`enforce`, FORMAT.md 13.2, RUNTIME.md "Publisher continuity"). It stops an attacker who holds the release
+keys (class 2) but not the publisher's OS signing identity from shipping a build under another identity or
+none. It does not stop:
+- a DLL signed by another trusted publisher, added to a Windows release by a release-key holder: every
+  other PE file of the candidate only has to pass `WinVerifyTrust` under *any* trusted publisher, because
+  lunepack's prebuilt runtime and third-party DLLs keep their own signatures (M9-D8);
+- non-PE files on Windows (scripts, data, a `.bat` an entry later starts), and anything on macOS that the
+  bundle's signature does not seal, or on Linux (no OS check, `not_applicable`);
+- an app that is unsigned or ad-hoc signed, or an install made before it was signed: with no baseline
+  (`installed_unsigned`) `enforce` proceeds and reports, so enforcement starts at the first signed install;
+- a first install, an offline install from a setup file, an adoption, and rollbacks: there is no installed
+  and candidate pair;
+- an attacker who holds the publisher's OS signing identity as well as the release keys: the build is then
+  genuinely signed by the same publisher, and only revoking both helps.
+
+*Verdicts are an allowlist.* An adapter answers `same`, `different` or an `unsigned`/`invalid` code only for
+the operating-system statuses the design lists; every other status, and every file error while the tree
+is walked or opened (a sharing violation, a scanner's lock, access denied, an I/O error), is `os`. `os`
+refuses under `enforce` and marks nothing, so a local fault can never blacklist a genuine release for
+good; only a definitive statement about the candidate's own bytes or signature marks a version bad
+(M9-R1-D2). The check does no network access: no revocation lookup on Windows, no network validation on
+macOS, so a user cannot be made to wait on, or be steered by, a certificate authority's server.
+
+*Expired signatures.* A candidate PE whose signing certificate has expired (and carries no timestamp) is
+`candidate_invalid`: a packaging mistake. An *installed* entry whose certificate has since expired is not
+`installed_invalid`: its subject is read from the same trust state and serves as the baseline, and when
+that is not available the outcome is `installed_unsigned`, so an install does not block its own updates
+because its certificate aged (M9-R1-D3). Timestamping every signature (every example template in CLI.md
+does) avoids the case. An installed tree whose files were changed locally after install fails with
+`installed_invalid`, which `enforce` refuses without marking anything; the recovery is a reinstall. The
+tree's integrity is not what this check establishes (the release-signed manifest did that when it was
+staged); it only asks who published it.
+
+*Policy and default.* The policy is the installed version's, never the candidate's, and no option lowers
+it; an attacker who can edit the installed tree can already replace the runtime. The packager writes
+`enforce` by default when the target's OS has a `[codesign.<os>]` section (M9-D6). Its cost is that a
+publisher who changes certificate subject (a renewal under another organisation name, OV to EV) must first
+ship one release with `warn` (CLI.md, "Moving to another publisher"), or users are stuck on the old
+publisher's last release.
+
+**Signer processes (M9-D3).** The developer's templates run as direct child processes: never through a
+shell, a `.bat` or `.cmd` program refused on Windows, standard input closed, standard output and error
+capped at 64 KiB each, the child killed and reaped after its timeout. Placeholders are whole arguments and
+expand to absolute paths, so an expansion cannot be read as an option. `lunepack` prints the item's relative
+path and, on failure, the template's key, the program's file name, the exit status (or "timed out") and
+the last 4 KiB of standard error with every `{env:}` value of that call replaced by its name; it never
+prints or logs the expanded arguments or any environment variable. `{env:NAME}` values are on the child's
+command line, which other local users can read: they are for paths, key ids and identity names, never for a
+secret value (docs say so). A signing tool inherits the packager's environment, so a credential reaches it
+there or in a file the tool reads, and a tool that echoes it into its own standard error would show it in
+this tail; use a tool and options that do not. The signing tool is the developer's own trusted code: a
+malicious one signs what it wants; the stage only checks that the item really is in a signed form after the
+call (a template that exits 0 and changes nothing, or signs another file, fails the pack).
+
+**The staple ticket.** Stapling writes `Contents/CodeResources` into the bundle; the stage runs before
+hashing, so the ticket is a file of the release, covered by the manifest, and a pack that holds no ticket
+after `staple` fails. The ticket proves nothing about the release signature; it lets Gatekeeper accept the
+app offline.
+
+**Not proven by the gate or CI.** The real Developer ID path (the notary accepting lunepack's zip, hardened
+runtime on the runtime and UI, stapling, translocation of a notarized app, Gatekeeper's verdicts) is shown
+only by a person running `scripts/macos-sign-check.sh` with their own identity; CI proves the mechanics with
+ad-hoc and throwaway self-signed identities. Windows install rows with real signatures run on CI runners.
 
 ## Denial-of-service bounds
 

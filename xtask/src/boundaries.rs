@@ -109,10 +109,16 @@ pub const DEPENDS_ONLY_ON: &[(&str, &[&str])] = &[(
 /// it. The `windows` crate (M7-D4) is the COM binding of the Windows integration (D17); its other
 /// dependents are third-party crates of the UI stack, so it cannot be confined by a `CONFINED`
 /// line, and it is matched by exact package name (`windows-sys`, `windows-core` and
-/// `windows-targets` are other packages and are not held by this row).
+/// `windows-targets` are other packages and are not held by this row). `security-framework`
+/// (M9-D10) is the macOS publisher check's binding of Security.framework; `lunepack-http` reaches
+/// it already, through the platform certificate verifier of its TLS stack.
 pub const REACH_ONLY_THROUGH: &[(&str, &[&str])] = &[
     ("ring", &["lunepack-http"]),
     ("windows", &["lunepack-os-windows", "lunepack-ui-luneui"]),
+    (
+        "security-framework",
+        &["lunepack-http", "lunepack-os-macos"],
+    ),
 ];
 
 /// Like [`REACH_ONLY_THROUGH`], for whole crate families (M6): `(family, via)`. A package belongs

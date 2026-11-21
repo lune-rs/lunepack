@@ -26,6 +26,8 @@ use lunepack_core::{
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
+use crate::cmd_setup::bundle_stem;
+use crate::codesign::OsCodeSign;
 use crate::config::{Config, resolve_signer, writer_clock};
 use crate::pipeline::{self, Settings, UpdatePlan};
 use crate::place;
@@ -474,7 +476,7 @@ fn prepare_update(
         check_macos_install(&settings.install)?;
     }
     let root = config.trusted_root(&Sha256Hasher, &Ed25519Verifier)?;
-    let document = UpdateConfig::new(
+    let mut document = UpdateConfig::new(
         &root,
         version.clone(),
         target,
@@ -484,6 +486,9 @@ fn prepare_update(
         settings.install.clone(),
     )
     .map_err(config_error)?;
+    // M9-D6: what the installed tree enforces about the next update's publisher; `Off` is not
+    // written (M9-R1-D1), so a config without OS signing keeps its bytes.
+    document.publisher_check = config.publisher_policy(target);
     // The authoritative check, the one the facade runs before any request: the URL parser agrees.
     lunepack::check_config_feed(&document.feed).map_err(config_error)?;
     let bytes = read_capped(runtime, "--runtime", MAX_RUNTIME_BYTES)?;
@@ -578,6 +583,24 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         helper_plist: p.helper_plist.as_deref(),
         helper_icon: p.helper_icon.as_deref(),
     });
+    // The OS signing hook (M9): the config's `[codesign.<os>]` for this target, else the caller's.
+    let os_sign = config.codesign_for(target).map(|section| {
+        let stem = match (&config.update, target.is_macos()) {
+            (Some(u), true) => bundle_stem(&u.install.name, &config.app_id).to_owned(),
+            _ => config.app_id.as_str().to_owned(),
+        };
+        OsCodeSign::new(section.clone(), format!("{stem}.app"))
+    });
+    if os_sign.is_some() && target.is_macos() && update_plan.is_none() {
+        bail!(
+            "[codesign.macos] needs [update] and [install] in the config: the bundle's main \
+             executable is install.entry"
+        );
+    }
+    let code_sign: &dyn CodeSign = match &os_sign {
+        Some(os) => os,
+        None => code_sign,
+    };
     if let Some(dest) = &args.assemble {
         // M8-D8: write the tree to sign, and stop. Nothing is signed, read from or written to a
         // release. `[update]` was checked above, so there is a plan.
@@ -632,6 +655,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         workers,
         budget: args.memory_budget_mib.saturating_mul(1024 * 1024),
         code_sign,
+        os_signing: os_sign.is_some(),
         encoder: &LzmaCodec,
         codec: &LzmaCodec,
         hasher: &hasher,

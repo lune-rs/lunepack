@@ -75,6 +75,43 @@ fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(slice(bytes, at, 8)?.try_into().ok()?))
 }
 
+/// The largest `e_lfanew` the Windows loader accepts: `RtlImageNtHeaderEx` refuses an image whose
+/// `e_lfanew` is 256 MiB or more.
+pub const MAX_E_LFANEW: u64 = 0x1000_0000;
+
+/// Whether a file of `len` bytes whose first bytes are `head` is a PE image as far as the Windows
+/// loader is concerned: it starts with `MZ` and has `PE\0\0` where `e_lfanew` points, whatever
+/// else is wrong with the headers. The signature is looked for in `head` when it lies inside, and
+/// otherwise read from the file through `read_at(offset)` (the four bytes at `offset`; only called
+/// for an offset the loader would accept and the file holds), so a file whose `e_lfanew` lies past
+/// any bounded prefix is still found. A failed read is the caller's error: the answer is never
+/// guessed "not a PE".
+///
+/// This is the one rule the packager's sign plan and the client's publisher check share; it needs no
+/// valid headers, so it is the right question for a file [`PeHeaders::parse`] refuses.
+pub fn has_pe_signature<E>(
+    head: &[u8],
+    len: u64,
+    read_at: impl FnOnce(u64) -> std::result::Result<[u8; 4], E>,
+) -> std::result::Result<bool, E> {
+    let Some(lfanew) = head
+        .starts_with(b"MZ")
+        .then(|| u32_at(head, 0x3C))
+        .flatten()
+    else {
+        return Ok(false);
+    };
+    let at = u64::from(lfanew);
+    if at >= MAX_E_LFANEW || at + 4 > len {
+        return Ok(false);
+    }
+    // `at` is below 256 MiB, so it fits `usize` on every target.
+    match slice(head, at as usize, 4) {
+        Some(sig) => Ok(sig == b"PE\0\0"),
+        None => Ok(read_at(at)? == *b"PE\0\0"),
+    }
+}
+
 /// One data directory entry: an RVA (a file offset for the security directory) and a size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DataDir {

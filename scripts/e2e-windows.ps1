@@ -24,7 +24,12 @@
 # stub stdio and exit code), 7 (long path), 8 (uninstall by QuietUninstallString), 10 (no console
 # of the runtime's own), 11 (display-name change, Setup rerun, a user's rename), 12 (taken folder),
 # the console Ctrl+C / Ctrl+Break proof (scripts/ci/console-ctrl-test.ps1) and, on CI, the signed
-# Setup.exe (scripts/ci/windows-sign-test.ps1).
+# Setup.exe and the publisher-continuity rows (scripts/ci/windows-sign-test.ps1, M9 step 9): the
+# release is signed by the packager's own [codesign.windows] templates (signtool, a throwaway
+# certificate the job trusts), the signed Setup.exe installs, an update by the same certificate
+# goes through, another certificate is refused with exit 29 `different`, and a release with an
+# unsigned DLL with `candidate_unsigned`. Without -Install a dry-run row packs a signed release
+# with a certificate nothing trusts and checks that the templates ran.
 #
 # The harness never prints environment or registry dumps; a failure names a differing field, and
 # prints only versions, outcome words and exit codes.
@@ -297,10 +302,13 @@ function Reset-Ui { foreach ($n in 'ui-spawns', 'ui-hello', 'ui-prompts') { Remo
 # ---- the publisher ------------------------------------------------------------------------------------
 
 # Native stderr is not an error here (`keys gen` reports on it), so the preference is relaxed per call.
+# `$cli` is read through the call stack, never as `$script:cli`: the signed-setup row calls this from
+# a script block that scripts/ci/windows-sign-test.ps1 runs, where `script:` is that script's scope.
+# (`$script:cliExit` is written and read in the same call, so it agrees with itself either way.)
 function Invoke-Lunepack([string]$config, [string[]]$cliArgs) {
     $old = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    try { $out = @(& $script:cli --config $config @cliArgs 2>&1 | ForEach-Object { "$_" }) } finally { $ErrorActionPreference = $old }
+    try { $out = @(& $cli --config $config @cliArgs 2>&1 | ForEach-Object { "$_" }) } finally { $ErrorActionPreference = $old }
     $script:cliExit = $LASTEXITCODE
     return $out
 }
@@ -346,8 +354,20 @@ function New-App([string]$tag, [string]$idSuffix, [string]$nameSuffix, [string]$
     return $app
 }
 
+# The `[codesign.windows]` table of M9-D2 for signtool and a throwaway certificate: the signtool
+# path and the certificate's thumbprint reach the packager through the environment variables
+# LUNEPACK_E2E_SIGNTOOL and `$certVar` (names and hashes, not secrets). `$verify` adds the
+# `verify` template, which needs the certificate trusted on this machine.
+function CodeSign-Toml([string]$certVar, [bool]$verify) {
+    $t = "`n[codesign.windows]`nsign = ['{env:LUNEPACK_E2E_SIGNTOOL}', 'sign', '/fd', 'sha256', '/sha1', '{env:$certVar}', '/s', 'My', '{path}']`n"
+    if ($verify) { $t += "verify = ['{env:LUNEPACK_E2E_SIGNTOOL}', 'verify', '/pa', '{path}']`n" }
+    return $t
+}
+
 # Packs and publishes one version of an app. Options: Flags (lines of e2e-flags), Timeout
-# (health_timeout_secs), Name (a new display name from this version on).
+# (health_timeout_secs), Name (a new display name from this version on), CodeSign (TOML appended
+# to the config: a [codesign.windows] table), Runtime, Stub, Ui and Entry (other files than the
+# build's, e.g. copies signed beforehand), Files (relative path -> source file, put into the input).
 function Publish-Version($app, [string]$version, [hashtable]$options = @{}) {
     $flags = @()
     if ($options.ContainsKey('Flags')) { $flags = $options.Flags }
@@ -357,7 +377,16 @@ function Publish-Version($app, [string]$version, [hashtable]$options = @{}) {
     $in = Join-Path $app.Dir "in-$version"
     $dest = Join-Path $in ($app.EntryRel -replace '/', '\')
     [void][IO.Directory]::CreateDirectory((Long (Split-Path $dest -Parent)))
-    [IO.File]::Copy($app.EntrySource, (Long $dest), $true)
+    $entrySource = $app.EntrySource
+    if ($options.ContainsKey('Entry')) { $entrySource = $options.Entry }
+    [IO.File]::Copy($entrySource, (Long $dest), $true)
+    if ($options.ContainsKey('Files')) {
+        foreach ($name in $options.Files.Keys) {
+            $to = Join-Path $in $name
+            [void][IO.Directory]::CreateDirectory((Split-Path $to -Parent))
+            [IO.File]::Copy($options.Files[$name], $to, $true)
+        }
+    }
     if ($flags.Count -gt 0) { [IO.File]::WriteAllText((Join-Path $in 'e2e-flags'), (($flags -join "`n") + "`n"), $utf8) }
     $toml = "`n[update]`nfeed = `"$($app.Feed)`"`nchannel = `"stable`"`nhealth_timeout_secs = $timeout`n`n[install]`nentry = `"$($app.EntryRel)`"`nname = `"$($app.Name)`"`npublisher = `"Lunepack E2E`"`n"
     if ($app.Terminal) { $toml += "terminal = true`n" }
@@ -365,11 +394,17 @@ function Publish-Version($app, [string]$version, [hashtable]$options = @{}) {
         # M7-D3: a file type ("Open with"), a URL scheme and autostart; each name is unique to this run.
         $toml += "url_schemes = [`"$($app.Ext)`"]`nautostart = true`n`n[[install.file_types]]`next = `"$($app.Ext)`"`nmime = `"application/x-$($app.Ext)`"`nname = `"Lunepack E2E file`"`n"
     }
+    if ($options.ContainsKey('CodeSign')) { $toml += $options.CodeSign }
     [IO.File]::WriteAllText($app.Cfg, $app.Base + $toml, $utf8)
     $stubFile = $stub
     if ($app.Terminal) { $stubFile = $stubConsole }
-    $packArgs = @('pack', '--input', $in, '--version', $version, '--target', 'windows-x86_64', '--release-dir', $app.Rel, '--sign', "file:$($app.RelKey)", '--runtime', $runtime, '--stub', $stubFile)
-    if ($app.Ui) { $packArgs += @('--ui', $app.Ui) }
+    if ($options.ContainsKey('Stub')) { $stubFile = $options.Stub }
+    $runtimeFile = $runtime
+    if ($options.ContainsKey('Runtime')) { $runtimeFile = $options.Runtime }
+    $packArgs = @('pack', '--input', $in, '--version', $version, '--target', 'windows-x86_64', '--release-dir', $app.Rel, '--sign', "file:$($app.RelKey)", '--runtime', $runtimeFile, '--stub', $stubFile)
+    $uiFile = $app.Ui
+    if ($options.ContainsKey('Ui')) { $uiFile = $options.Ui }
+    if ($uiFile) { $packArgs += @('--ui', $uiFile) }
     Invoke-LunepackOk $app.Cfg $packArgs | Out-Null
     Invoke-LunepackOk $app.Cfg @('feed', 'add', '--release-dir', $app.Rel, '--channel', 'stable', '--version', $version, '--sign', "file:$($app.RelKey)") | Out-Null
 }
@@ -568,7 +603,7 @@ function Cleanup {
             Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    Remove-Item Env:LUNEPACK_E2E_OUT, Env:LUNEPACK_E2E_UI_DIR, Env:LUNEPACK_E2E_UI_MODE -ErrorAction SilentlyContinue
+    Remove-Item Env:LUNEPACK_E2E_OUT, Env:LUNEPACK_E2E_UI_DIR, Env:LUNEPACK_E2E_UI_MODE, Env:LUNEPACK_E2E_SIGNTOOL, Env:LUNEPACK_E2E_CERT_A, Env:LUNEPACK_E2E_CERT_B -ErrorAction SilentlyContinue
     Stop-Under $work
     Remove-Tree $work
 }
@@ -709,6 +744,26 @@ try {
             Require (Test-Path -LiteralPath (Long $longInput)) 'the long-path input exists'
             $vi = (Get-Item $setupB).VersionInfo
             Same 'console app Setup FileDescription' $vi.FileDescription "$($B.BaseName) Setup"
+        }
+        # M9 step 9: the packager signs through [codesign.windows]. The certificate is in the user's
+        # personal store only, trusted by nothing, so no `verify` template; what is checked is that
+        # signtool ran for the Setup.exe (and, by the packager's own signed-form check, for every PE).
+        Row 'codesign templates pack (dry run, an untrusted throwaway certificate)' {
+            $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+            if (-not $st) { Write-Output '     skipped: no signtool'; return }
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=lunepack-e2e-dry-$hex" -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1)
+            try {
+                $env:LUNEPACK_E2E_SIGNTOOL = $st.FullName
+                $env:LUNEPACK_E2E_CERT_A = $cert.Thumbprint
+                Publish-Version $A '1.7.0' @{ CodeSign = (CodeSign-Toml 'LUNEPACK_E2E_CERT_A' $false) }
+                $signedSetup = Build-Setup $A '1.7.0'
+                $sig = Get-AuthenticodeSignature -LiteralPath $signedSetup
+                Require ($null -ne $sig.SignerCertificate) 'the Setup.exe carries a signature'
+                Same 'Setup.exe signer' $sig.SignerCertificate.Thumbprint $cert.Thumbprint
+            } finally {
+                Remove-Item Env:\LUNEPACK_E2E_SIGNTOOL, Env:\LUNEPACK_E2E_CERT_A -ErrorAction SilentlyContinue
+                Remove-Item -Path "Cert:\CurrentUser\My\$($cert.Thumbprint)" -Force -ErrorAction SilentlyContinue
+            }
         }
         Write-Output 'skipped: the install rows (1 to 8, 11, 12, the console-event proof; they install into the real per-user locations, so they run on CI; pass -Install or set LUNEPACK_E2E_INSTALL=1 elsewhere)'
     } else {
@@ -1027,17 +1082,88 @@ try {
             Invoke-Uninstall $C
         } -Undo { Reset-App $C }
 
-        # The certificate is trusted machine-wide, so only a CI runner (a throwaway machine) runs this.
+        # The certificates are trusted machine-wide, so only a CI runner (a throwaway machine) runs
+        # this. The packager signs through [codesign.windows] (signtool is called by lunepack, with
+        # the signtool path and the certificate's thumbprint in the environment), and the rows
+        # after the signed Setup.exe are the publisher-continuity ones (M9-D8, M9-D9): each negative
+        # has its positive control in the same run (the same certificate updates first).
         if ($env:CI -eq 'true') {
-            Row 'signed Setup.exe' {
+            Row 'signed Setup.exe and publisher continuity' {
                 # The signed copy installs app A with /S: no install of A may be left from a row before.
                 Require (-not (Test-Path -LiteralPath $key)) 'app A is not installed before the signed-setup row'
-                $out = & (Join-Path $PSScriptRoot 'ci\windows-sign-test.ps1') -Setup $setup
+                $publish = {
+                    param($ctx)
+                    $env:LUNEPACK_E2E_SIGNTOOL = $ctx.Signtool
+                    $env:LUNEPACK_E2E_CERT_A = $ctx.ThumbA
+                    if ($ctx.ThumbB) { $env:LUNEPACK_E2E_CERT_B = $ctx.ThumbB }
+                    Publish-Version $A '2.0.0' @{ Name = $A.BaseName; CodeSign = (CodeSign-Toml 'LUNEPACK_E2E_CERT_A' $true) }
+                    return (Build-Setup $A '2.0.0')
+                }
+                $continue = {
+                    param($ctx)
+                    $A.Root = Join-Path $programs $A.BaseName
+                    $signCopy = {
+                        param([string]$source, [string]$name)
+                        $copy = Join-Path $work "presigned-$name"
+                        Copy-Item -LiteralPath $source -Destination $copy
+                        $null = & $ctx.Signtool sign /fd sha256 /sha1 $ctx.ThumbA /s My $copy
+                        if ($LASTEXITCODE -ne 0) { throw "signtool could not sign the copy of $name" }
+                        return $copy
+                    }
+                    Row 'continuity: the installed release is signed (A) and recorded' {
+                        Assert-Record $A '2.0.0' $null @()
+                        $sigs = @(Get-ChildItem -LiteralPath (Join-Path $A.Root 'app\2.0.0') -Recurse -File -Include *.exe, *.dll | ForEach-Object { Get-AuthenticodeSignature -LiteralPath $_.FullName })
+                        Require ($sigs.Count -ge 2) 'the installed tree holds PE files'
+                        foreach ($sig in $sigs) { SameV 'signer of an installed PE' $sig.SignerCertificate.Thumbprint $ctx.ThumbA }
+                    }
+                    Row 'continuity: the same certificate updates (the control)' {
+                        Publish-Version $A '2.1.0' @{ CodeSign = (CodeSign-Toml 'LUNEPACK_E2E_CERT_A' $true) }
+                        $rt = Join-Path $A.Root 'app\2.0.0\lunepack-runtime.exe'
+                        $d = Run-Tool $rt @('download', '--json', '--expect-version', '2.1.0')
+                        if ($d.Code -ne 0) { throw "INVALID: the control failed: download exited $($d.Code): $(@($d.Out)[-1])" }
+                        Require (@($d.Out)[-1] -match '"staged":true') 'the control stages 2.1.0'
+                        Require (@($d.Out)[-1] -notmatch '"publisher"') 'the same certificate gives no finding'
+                        Update-ViaRuntime $A '2.0.0' '2.1.0' -NoUi
+                        Wait-Updated $A '2.1.0'
+                        Assert-Record $A '2.1.0' '2.0.0' @()
+                    }
+                    Row 'continuity: another certificate is refused (exit 29 different) and marked bad' {
+                        Publish-Version $A '2.2.0' @{ CodeSign = (CodeSign-Toml 'LUNEPACK_E2E_CERT_B' $true) }
+                        $rt = Join-Path $A.Root 'app\2.1.0\lunepack-runtime.exe'
+                        $d = Run-Tool $rt @('download', '--json', '--expect-version', '2.2.0')
+                        SameV 'download exit code (another certificate)' $d.Code 29
+                        $last = @($d.Out)[-1]
+                        Require ($last -match '"kind":"publisher_mismatch"' -and $last -match '"reason":"different"') "the error names publisher_mismatch and different: $last"
+                        Assert-Record $A '2.1.0' '2.0.0' @('2.2.0')
+                        $d = Run-Tool $rt @('check', '--json')
+                        SameV 'check exit code after the refusal' $d.Code 0
+                        Require (@($d.Out)[-1] -match '"update":null') 'a refused version is never offered again'
+                    }
+                    Row 'continuity: a release with an unsigned DLL is refused (exit 29 candidate_unsigned)' {
+                        # Everything the packager places is signed by A beforehand, no [codesign.windows]
+                        # section runs, and one more PE (a copy of the app, as extra.dll) is not.
+                        $files = @{
+                            Entry = (& $signCopy $A.EntrySource 'entry.exe')
+                            Runtime = (& $signCopy $runtime 'lunepack-runtime.exe')
+                            Stub = (& $signCopy $stub 'lunepack-stub.exe')
+                            Ui = (& $signCopy $fakeUi 'ui.exe')
+                        }
+                        $files.Files = @{ 'extra.dll' = $appExe }
+                        Publish-Version $A '2.3.0' $files
+                        $rt = Join-Path $A.Root 'app\2.1.0\lunepack-runtime.exe'
+                        $d = Run-Tool $rt @('download', '--json', '--expect-version', '2.3.0')
+                        SameV 'download exit code (unsigned DLL)' $d.Code 29
+                        $last = @($d.Out)[-1]
+                        Require ($last -match '"reason":"candidate_unsigned"') "the error names candidate_unsigned: $last"
+                        Assert-Record $A '2.1.0' '2.0.0' @('2.2.0', '2.3.0')
+                    }
+                }
+                $out = & (Join-Path $PSScriptRoot 'ci\windows-sign-test.ps1') -Publish $publish -Continue $continue
                 $out | ForEach-Object { Write-Output "     $_" }
                 Require ($LASTEXITCODE -eq 0) 'the signed-setup checks pass'
             }
         } else {
-            Write-Output 'skipped: the signed Setup.exe row (CI only: it trusts a certificate machine-wide)'
+            Write-Output 'skipped: the signed Setup.exe and publisher-continuity rows (CI only: they trust certificates machine-wide)'
         }
     }
 } catch {

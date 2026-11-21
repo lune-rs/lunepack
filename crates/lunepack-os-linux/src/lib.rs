@@ -12,11 +12,13 @@ pub mod motion;
 mod process;
 #[cfg(target_os = "linux")]
 mod procfs;
+mod publisher;
 #[cfg(target_os = "linux")]
 mod xdg;
 
 #[cfg(target_os = "linux")]
 pub use process::LinuxProcess;
+pub use publisher::NoPublisherCheck;
 #[cfg(target_os = "linux")]
 pub use xdg::{XdgDirs, XdgEnv, XdgIntegration, xdg_dirs};
 

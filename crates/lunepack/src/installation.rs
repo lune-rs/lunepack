@@ -19,9 +19,9 @@ use lunepack_core::state::UserScope;
 use lunepack_core::update_config::{MAX_UPDATE_CONFIG_BYTES, runtime_file};
 use lunepack_core::{
     AppId, BundleDiscovery, BundleProbe, Discovery, FeedKind, FileKind, Fs, FsErrorKind, Hasher,
-    InstallMeta, LayoutError, LayoutScheme, LockGuard, OsIntegration, Process, Projection, RelPath,
-    Rng, UPDATE_CONFIG_FILE, UpdateConfig, UpdateConfigError, UserLayout, Verifier, Version,
-    discover, discover_bundle, resolve_root, tree_candidates,
+    InstallMeta, LayoutError, LayoutScheme, LockGuard, OsIntegration, Process, Projection,
+    PublisherCheck, RelPath, Rng, UPDATE_CONFIG_FILE, UpdateConfig, UpdateConfigError, UserLayout,
+    Verifier, Version, discover, discover_bundle, resolve_root, tree_candidates,
 };
 
 use crate::{Error, Layout, UpdaterBuilder, check_config_feed};
@@ -48,6 +48,7 @@ pub struct Platform {
     pub(crate) process: Arc<dyn Process>,
     pub(crate) integration: Arc<dyn OsIntegration>,
     pub(crate) rng: Arc<dyn Rng>,
+    pub(crate) publisher: Arc<dyn PublisherCheck>,
     pub(crate) health_token: Option<OsString>,
     pub(crate) data_home: Option<PathBuf>,
     pub(crate) home: Option<PathBuf>,
@@ -81,6 +82,7 @@ impl Platform {
             process: default_process(),
             integration: default_integration(),
             rng: Arc::new(lunepack_crypto::OsRng),
+            publisher: default_publisher(),
             health_token: std::env::var_os(HEALTH_TOKEN_VAR),
             data_home: None,
             home: None,
@@ -124,6 +126,14 @@ impl Platform {
     /// The random source.
     pub fn with_rng(mut self, rng: Arc<dyn Rng>) -> Platform {
         self.rng = rng;
+        self
+    }
+
+    /// The publisher-continuity check a staged update goes through (M9-D9; default: WinVerifyTrust
+    /// on Windows, Security.framework on macOS, none elsewhere). Whether and how strictly it runs
+    /// is the installed tree's own policy (M9-D6), which nothing here changes.
+    pub fn with_publisher_check(mut self, publisher: Arc<dyn PublisherCheck>) -> Platform {
+        self.publisher = publisher;
         self
     }
 
@@ -209,6 +219,17 @@ fn canonical_home(raw: Option<&std::ffi::OsStr>) -> Result<PathBuf, Error> {
     } else {
         Err(home())
     }
+}
+
+/// The publisher-continuity check of this platform (M9, C7).
+pub(crate) fn default_publisher() -> Arc<dyn PublisherCheck> {
+    #[cfg(windows)]
+    let check: Arc<dyn PublisherCheck> = Arc::new(lunepack_os_windows::WinPublisherCheck);
+    #[cfg(target_os = "macos")]
+    let check: Arc<dyn PublisherCheck> = Arc::new(lunepack_os_macos::MacPublisherCheck);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let check: Arc<dyn PublisherCheck> = Arc::new(lunepack_os_linux::NoPublisherCheck);
+    check
 }
 
 /// The native layout scheme: [`LayoutScheme::WINDOWS`] on Windows (M7-D2), [`LayoutScheme::MACOS`]
@@ -804,7 +825,8 @@ impl Installation {
         .hasher(Arc::clone(&p.hasher))
         .verifier(Arc::clone(&p.verifier))
         .rng(Arc::clone(&p.rng))
-        .integration(Arc::clone(&p.integration));
+        .integration(Arc::clone(&p.integration))
+        .publisher_check(Arc::clone(&p.publisher));
         // macOS (M8-D2): a first install puts the live bundle in the user's `~/Applications`.
         if p.layout_scheme.projection == Projection::Bundle {
             builder = builder.bundle_layout(p.home()?.join("Applications"));

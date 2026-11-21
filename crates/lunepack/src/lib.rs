@@ -138,6 +138,7 @@ pub use worker_transport::WorkerTransport;
 // that replace a default adapter.
 /// The core's error, the cause inside [`Error::Verify`].
 pub use lunepack_core::Error as CoreError;
+pub use lunepack_core::codesign::PublisherOutcome;
 pub use lunepack_core::fetch::FetchPolicy;
 pub use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, Body, BoxFuture, ByteRange, CancelToken, Channel,
@@ -145,9 +146,10 @@ pub use lunepack_core::{
     FileKind, FileProgress, FileWrite, Fs, FsError, FsErrorKind, Hasher, Head, InstallMeta,
     IntegrationError, IntegrationItem, IntegrationReport, IntegrationRequest, LifecycleEvent,
     LockGuard, Meta, OsIntegration, Phase, Process, ProcessError, ProcessErrorKind, ProcessId,
-    Progress, RangeError, ReadAt, RelPath, Request, Response, Rng, Sha256Digest, Source, SpawnSpec,
-    StateError, Target, Transport, TransportError, TransportErrorKind, TrustedRoot, UpdateConfig,
-    UpdateConfigError, UserLayout, Validator, Verifier, Version, WaitOutcome,
+    Progress, PublisherCheck, PublisherError, PublisherPolicy, RangeError, ReadAt, RelPath,
+    Request, Response, Rng, Sha256Digest, SignedTree, Source, SpawnSpec, StateError, Target,
+    Transport, TransportError, TransportErrorKind, TrustedRoot, UpdateConfig, UpdateConfigError,
+    UserLayout, Validator, Verifier, Version, WaitOutcome,
 };
 
 /// Plumbing that tests and sibling crates use; not part of the supported API and free to change in

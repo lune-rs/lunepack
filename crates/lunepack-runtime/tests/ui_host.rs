@@ -116,6 +116,8 @@ mod native {
     const INSTALL_ID: [u8; 16] = [3; 16];
     /// A bound on any one runtime run.
     const RUN_LIMIT: Duration = Duration::from_secs(90);
+    /// How long a wait target waits for a note of the fake UI (see `sleep`), within `RUN_LIMIT`.
+    const UNTIL_LIMIT: Duration = Duration::from_secs(60);
     /// What a bound measured from a run's own events may exceed the channel's bound by, for a
     /// runner under load. The cases measure the channel's waits, never a run's whole time: how
     /// long an install or an apply takes on a shared runner is not what they check.
@@ -553,10 +555,19 @@ mod native {
 
     // ---- the app for `apply` ---------------------------------------------------------------
 
-    /// A process that sleeps `<seconds>` (the wait target of a case).
+    /// A process that sleeps `<seconds>` (the wait target of a case); given `<file> <text>` too,
+    /// it then goes on until `file` holds `text`, for at most [`UNTIL_LIMIT`].
     pub fn sleep(rest: &[String]) {
         let secs: f64 = rest.first().and_then(|s| s.parse().ok()).expect("seconds");
         std::thread::sleep(Duration::from_secs_f64(secs));
+        if let [_, file, text] = rest {
+            let until = Instant::now() + UNTIL_LIMIT;
+            while Instant::now() < until
+                && !std::fs::read_to_string(file).is_ok_and(|t| t.contains(text.as_str()))
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     /// The app `apply` starts: notes its start and its fds, then confirms or crashes as its
@@ -840,8 +851,11 @@ mod native {
 
     /// macOS: a pipe has one inode per end, so the UI's own two ends say nothing about the
     /// runtime's ends of the same pipes. The app is started with no stdio, so it must hold no pipe
-    /// at all; the instrument is that the UI noted two pipes (its stdin and stdout) and that the
-    /// listing finds a pipe this process holds.
+    /// but those every child of this test inherits anyway (descriptors this process was handed
+    /// without close-on-exec: GitHub's macOS runner hands down two, at the same numbers in every
+    /// process of the chain; a pipe the runtime opened cannot share a number with one it holds).
+    /// The instruments: the UI noted two pipes (its stdin and stdout), the listing finds a pipe
+    /// this process holds, and the control listing finds a pipe its shell was given.
     #[cfg(target_os = "macos")]
     fn assert_app_holds_no_ui_pipe(out: &Path, app_fds: &str) {
         let pipes = ui_pipes(out);
@@ -850,7 +864,51 @@ mod native {
         let (reader, _writer) = std::io::pipe().expect("a pipe");
         assert!(all_fds().contains("fifo:"), "the listing misses a pipe");
         drop(reader);
-        assert!(app_fds.trim().is_empty(), "the app holds a pipe: {app_fds}");
+        let control = inherited_pipes(out, true);
+        assert!(
+            control.iter().any(|p| p == "fifo:0"),
+            "the control misses its stdin pipe: {control:?}"
+        );
+        let inherited = inherited_pipes(out, false);
+        let own: Vec<&str> = app_fds
+            .split_whitespace()
+            .filter(|p| !inherited.iter().any(|i| i == p))
+            .collect();
+        assert!(
+            own.is_empty(),
+            "the app holds a pipe no other child inherits: {own:?} (every child: {inherited:?})"
+        );
+    }
+
+    /// The pipes a child of this test holds without the runtime in between: a shell started with
+    /// no stdio (with `stdin_pipe`, a pipe as its stdin) lists them the way the app does.
+    #[cfg(target_os = "macos")]
+    fn inherited_pipes(out: &Path, stdin_pipe: bool) -> Vec<String> {
+        let file = out.join(format!("control-fds-{stdin_pipe}"));
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "fds=''\nfor f in /dev/fd/*; do if [ -p \"$f\" ]; then fds=\"$fds fifo:${f#/dev/fd/}\"; fi; done\n\
+                 printf '%s' \"$fds\" > \"$1\"\n",
+            )
+            .arg("sh")
+            .arg(&file)
+            .stdin(if stdin_pipe {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the control shell");
+        drop(child.stdin.take());
+        assert!(child.wait().expect("the control shell").success());
+        std::fs::read_to_string(&file)
+            .expect("the control's listing")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
     }
 
     #[cfg(target_os = "linux")]
@@ -2058,7 +2116,14 @@ mod native {
         }
 
         fn command(&self, extra: &[&str]) -> Command {
-            let target = wait_target();
+            self.command_until(extra, None)
+        }
+
+        /// [`ApplyLab::command`] whose wait target (the app that "exits" for the apply) runs on
+        /// until the fake UI noted `note` (bounded): the apply cannot move past its wait before
+        /// the UI got there.
+        fn command_until(&self, extra: &[&str], note: Option<&str>) -> Command {
+            let target = wait_target(note.map(|n| (self.out.join("notes"), n)));
             let runtime = common::tree_of(&self.layout(), V100)
                 .join(ENTRY_DIR)
                 .join(RUNTIME_FILE);
@@ -2132,12 +2197,15 @@ mod native {
         }
     }
 
-    /// A short-lived process to wait for (reaped by a thread), and its id.
-    fn wait_target() -> ProcessId {
-        let mut child = Command::new(std::env::current_exe().expect("exe"))
-            .args([SLEEP_ARG, "0.3"])
-            .spawn()
-            .expect("sleep");
+    /// A short-lived process to wait for (reaped by a thread), and its id; with `until`, it runs
+    /// on until that file holds that text (bounded, see `sleep`).
+    fn wait_target(until: Option<(PathBuf, &str)>) -> ProcessId {
+        let mut cmd = Command::new(std::env::current_exe().expect("exe"));
+        cmd.args([SLEEP_ARG, "0.3"]);
+        if let Some((file, text)) = until {
+            cmd.arg(file).arg(text);
+        }
+        let mut child = cmd.spawn().expect("sleep");
         let id = NativeProcess::new()
             .process_id(child.id())
             .expect("probe")
@@ -2148,9 +2216,13 @@ mod native {
         id
     }
 
+    /// The cases whose fake UI is started from the live bundle wait for its first note before
+    /// the apply moves past its wait (see `apply_ui_killed_mid_apply_still_confirms`).
+    const UI_STARTED: Option<&str> = Some("ui start ");
+
     fn apply_well_behaved_closes_and_the_app_holds_no_ui_pipe() {
         let lab = ApplyLab::new("confirm", "");
-        let run = lab.run(lab.command(&[]));
+        let run = lab.run(lab.command_until(&[], UI_STARTED));
         assert_eq!(run.code, 0, "{run:?}");
         assert_eq!(lab.current(), version(V110));
         let notes = lab.notes();
@@ -2168,12 +2240,22 @@ mod native {
         assert!(!notes.contains(HEALTH_TOKEN_VAR));
     }
 
+    /// The UI dies at the first progress frame: the wait phase's, sent before the apply waits
+    /// for the app. The wait target runs until the UI noted its death, so the apply's commit
+    /// comes after it: a UI started from the live bundle by path (macOS: the fake UI is a shell
+    /// script, which `/bin/sh` opens by that path once started) would otherwise, under load, be
+    /// read after the commit swapped the bundle, from the new version's tree, and never run.
     fn apply_ui_killed_mid_apply_still_confirms() {
         let lab = ApplyLab::new("confirm", "die@progress");
-        let run = lab.run(lab.command(&[]));
+        let run = lab.run(lab.command_until(&[], Some("ui dies at progress")));
         assert_eq!(run.code, 0, "{run:?}");
         assert_eq!(lab.current(), version(V110));
-        assert!(lab.notes().contains("ui dies at progress"));
+        assert!(
+            lab.notes().contains("ui dies at progress"),
+            "notes:\n{}\nlog:\n{}",
+            lab.notes(),
+            lab.log()
+        );
         assert!(
             lab.log().contains("\"code\":\"ui_stopped\""),
             "{}",
@@ -2183,9 +2265,14 @@ mod native {
 
     fn apply_ui_stops_reading_mid_apply_still_confirms() {
         let lab = ApplyLab::new("confirm", "stop@progress");
-        let run = lab.run(lab.command(&[]));
+        let run = lab.run(lab.command_until(&[], Some("ui stops at progress")));
         assert_eq!(run.code, 0, "{run:?}");
         assert_eq!(lab.current(), version(V110));
+        assert!(
+            lab.notes().contains("ui stops at progress"),
+            "{}",
+            lab.notes()
+        );
         // The close bound, then the kill, after the outcome was committed.
         let after = run.since_final_event(&lab.log());
         assert!(
@@ -2196,7 +2283,7 @@ mod native {
 
     fn apply_rollback_with_a_hung_ui_relaunches_first_and_ends() {
         let lab = ApplyLab::new("crash", "expect=@expect@,stop@prompt:RolledBack");
-        let run = lab.run(lab.command(&[]));
+        let run = lab.run(lab.command_until(&[], UI_STARTED));
         assert_eq!(run.code, 20, "{run:?}");
         assert_eq!(lab.current(), version(V100));
         let notes = lab.notes();
@@ -2234,7 +2321,7 @@ mod native {
         let lab = ApplyLab::with_ui("confirm", "", UiAt::Helper);
         let beside = lab.bundle_default().join(ENTRY_DIR).join(ui_host::UI_FILE);
         assert!(!beside.exists(), "a UI stands beside the runtime");
-        let run = lab.run(lab.command(&[]));
+        let run = lab.run(lab.command_until(&[], UI_STARTED));
         assert_eq!(run.code, 0, "{run:?}");
         assert_eq!(lab.current(), version(V110));
         let notes = lab.notes();
