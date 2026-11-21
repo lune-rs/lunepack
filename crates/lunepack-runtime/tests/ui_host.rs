@@ -2169,9 +2169,13 @@ mod native {
         id
     }
 
+    /// The cases whose fake UI is started from the live bundle wait for its first note before
+    /// the apply moves past its wait (see `apply_ui_killed_mid_apply_still_confirms`).
+    const UI_STARTED: Option<&str> = Some("ui start ");
+
     fn apply_well_behaved_closes_and_the_app_holds_no_ui_pipe() {
         let lab = ApplyLab::new("confirm", "");
-        let run = lab.run(lab.command(&[]));
+        let run = lab.run(lab.command_until(&[], UI_STARTED));
         assert_eq!(run.code, 0, "{run:?}");
         assert_eq!(lab.current(), version(V110));
         let notes = lab.notes();
@@ -2214,9 +2218,14 @@ mod native {
 
     fn apply_ui_stops_reading_mid_apply_still_confirms() {
         let lab = ApplyLab::new("confirm", "stop@progress");
-        let run = lab.run(lab.command(&[]));
+        let run = lab.run(lab.command_until(&[], Some("ui stops at progress")));
         assert_eq!(run.code, 0, "{run:?}");
         assert_eq!(lab.current(), version(V110));
+        assert!(
+            lab.notes().contains("ui stops at progress"),
+            "{}",
+            lab.notes()
+        );
         // The close bound, then the kill, after the outcome was committed.
         let after = run.since_final_event(&lab.log());
         assert!(
@@ -2227,7 +2236,7 @@ mod native {
 
     fn apply_rollback_with_a_hung_ui_relaunches_first_and_ends() {
         let lab = ApplyLab::new("crash", "expect=@expect@,stop@prompt:RolledBack");
-        let run = lab.run(lab.command(&[]));
+        let run = lab.run(lab.command_until(&[], UI_STARTED));
         assert_eq!(run.code, 20, "{run:?}");
         assert_eq!(lab.current(), version(V100));
         let notes = lab.notes();
@@ -2265,7 +2274,7 @@ mod native {
         let lab = ApplyLab::with_ui("confirm", "", UiAt::Helper);
         let beside = lab.bundle_default().join(ENTRY_DIR).join(ui_host::UI_FILE);
         assert!(!beside.exists(), "a UI stands beside the runtime");
-        let run = lab.run(lab.command(&[]));
+        let run = lab.run(lab.command_until(&[], UI_STARTED));
         assert_eq!(run.code, 0, "{run:?}");
         assert_eq!(lab.current(), version(V110));
         let notes = lab.notes();
