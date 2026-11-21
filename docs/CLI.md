@@ -64,6 +64,7 @@ public = "<64 lowercase hex characters>"   # the key the command signs for
 feed = "https://updates.example.com/hello/"   # the release directory, as a client reaches it
 channel = "stable"                            # default "stable"
 health_timeout_secs = 60                      # default 60, 5..=3600
+publisher_check = "enforce"                   # optional (M9): "off", "warn" or "enforce"; see "Code signing"
 
 [install]
 entry = "bin/hello"          # the executable, relative to the tree (required, must be exec)
@@ -87,6 +88,14 @@ icon = "assets/hello.ico"    # an .ico file, relative to this file
 
 [macos]                      # optional: inputs of the macOS update window's helper app, not signed
 icon = "assets/hello.icns"   # an .icns file, relative to this file; read only with --ui on a macos-* target
+
+[codesign.windows]           # optional (M9): how a release is signed with the OS's code signing, as argv
+                             # templates with no shell, always timestamped; see "Code signing"
+sign = ["signtool", "sign", "/fd", "sha256", "/tr", "https://timestamp.example.com", "/td", "sha256",
+        "{path}"]
+[codesign.macos]             # optional (M9): the same for a macos-* target
+sign = ["/usr/bin/codesign", "--force", "--options", "runtime", "--timestamp",
+        "--sign", "{env:LUNEPACK_SIGN_IDENTITY}", "{path}"]
 ```
 
 ## The publisher state file (M3-R2-D1)
@@ -309,8 +318,9 @@ inside its window; the signers reach the threshold; the manifest and pack do not
 is valid for this host (below).
 
 The stages, in order (C2): (1) assemble: copy the input into a temporary directory (removed on success
-and on every error); (2) code-sign: a hook for OS code signing, the identity for now; (3) hash every
-file; (4) pack: choose the smallest codec per file, round-trip it through the decoder a client uses,
+and on every error); (2) code-sign: the OS sign stage, the developer's argv templates run over the items of the sign plan,
+inner to outer, when the config has a `[codesign.<os>]` section for the target's OS ("Code signing"),
+nothing otherwise; (3) hash every file; (4) pack: choose the smallest codec per file, round-trip it through the decoder a client uses,
 and lay the frames out; (5) sign the manifest. `pack` then verifies its own output the way a client
 does (a throwaway feed signed by the same signers, `verify_manifest`, the pack against the manifest's
 size and SHA-256, every frame decoded) and only then writes the pack and, last, the manifest. Neither is
@@ -418,9 +428,10 @@ fields only, so two packs of the same input give the same bytes (C2).
 **Windows setup files.** `lunepack setup` for a `windows-*` target takes the runtime out of the pack through
 its signed frame, removes any certificate table, stamps it as above (its `OriginalFilename` is the file's
 name) and appends the payload and the trailer, with nothing after it (FORMAT.md 14). The output is
-`<app_id>-<VERSION>-<TARGET>-setup.exe` by default. Sign it with Authenticode after it is built (M9); the
-runtime finds the trailer in a signed file (FORMAT.md 14.3), and a byte added after the signature makes it
-refuse to run.
+`<app_id>-<VERSION>-<TARGET>-setup.exe` by default. With `[codesign.windows]` in the config, `setup` signs it
+with the `sign_installer` template after it is built ("Code signing"); without it, sign the file yourself
+with Authenticode. The runtime finds the trailer in a signed file (FORMAT.md 14.3), and a byte added after
+the signature makes it refuse to run.
 
 ### macOS targets (M8)
 
@@ -467,6 +478,159 @@ that tree (inner code first); pack it with the same options, passing the signed 
 UI from the assembled tree as `--runtime` and `--ui` (signing rewrites a Mach-O file). `--assemble`
 refuses a `<dir>` that exists, an input that is already signed, a target that is not `macos-*` and a
 config without `[update]`; a failure removes the `<dir>` it created.
+
+### Code signing: `[codesign.windows]` and `[codesign.macos]` (M9)
+
+`pack` signs a release with the developer's own tools before it hashes the tree, and `setup` signs the
+installers after they are built. lunepack runs the tool; the tool, the identity and the account are the
+developer's. The sections apply only to targets of their own OS (a `[codesign.windows]` section is ignored
+for a `macos-*` target); there is no Linux section, because the release signatures already cover a Linux
+tree. Without the section for the target's OS nothing is signed and nothing about the pack changes.
+
+```toml
+[codesign.macos]
+sign = ["/usr/bin/codesign", "--force", "--options", "runtime", "--timestamp",
+        "--sign", "{env:LUNEPACK_SIGN_IDENTITY}", "{path}"]
+verify = ["/usr/bin/codesign", "--verify", "--deep", "--strict", "{path}"]
+notarize = ["/usr/bin/xcrun", "notarytool", "submit", "{zip}",
+            "--key", "{env:LUNEPACK_NOTARY_KEY}", "--key-id", "{env:LUNEPACK_NOTARY_KEY_ID}",
+            "--issuer", "{env:LUNEPACK_NOTARY_ISSUER}", "--wait"]
+staple = ["/usr/bin/xcrun", "stapler", "staple", "{path}"]
+```
+
+**Keys** (every template is a non-empty array of strings; unknown keys are errors):
+
+| Key | Meaning |
+|---|---|
+| `sign` | required: signs a Windows PE file or a loose macOS Mach-O file |
+| `sign_bundle` | macOS, optional, default `sign`: nested bundles and, by default, the outer bundle |
+| `sign_outer` | macOS, optional, default `sign_bundle`: the app bundle only, where its entitlements go |
+| `sign_installer` | optional, default `sign`: what `setup` signs (`Setup.exe`, the installer app's items and the app, the `.dmg`) |
+| `verify` | optional: run after a signature. Windows: on every PE file just signed; macOS: once, on the signed outer bundle |
+| `notarize`, `staple` | macOS, both or neither: after `sign_outer` and `verify`, `notarize` (with `{zip}` or `{bundle}`), then `staple` on the bundle |
+| `timeout_secs` | sign and verify, default 300, `1..=86400` |
+| `notarize_timeout_secs` | macOS, default 3600, `1..=86400` |
+
+**Templates (M9-D1).** An element is either literal text with no `{` or `}` at all, or exactly one
+placeholder as the whole element: `{path}` (the absolute path of the item being processed), `{bundle}` and
+`{zip}` (in `notarize` only: the bundle directory, or a zip of it that lunepack writes for the call and
+removes after it, holding the bundle as `<bundle name>.app`), and `{env:NAME}` (`NAME` matches
+`[A-Z_][A-Z0-9_]*`; the variable must be set and non-empty, else the pack fails before any tool runs).
+`--file={path}` or `x{env:A}` is refused when the config loads, as is any other brace. `{path}`, `{bundle}`
+and `{zip}` are never the program (`argv[0]`); `{env:NAME}` may be (a tool path from the environment).
+Every path placeholder expands to an absolute path, so no expansion can be read as an option. There is no
+shell and no quoting language: a template is an argument vector.
+
+**No secret values in templates.** `{env:NAME}` puts the value on the tool's command line, which other
+local users can read. It is for paths, key ids and identity names, never for a password, token or key
+material. A secret reaches the tool through the tool's own environment or a file it reads (a keychain, a
+password file, an API-key file kept outside every checkout). The key file of a notarization is a path in
+`{env:}`; lunepack never reads it.
+
+**How a template runs (M9-D3).** Every template, and `hdiutil`, goes through one runner: the program is
+started directly (on Windows a `.bat` or `.cmd` program is refused, because `cmd.exe` would re-parse the
+arguments), standard input is closed, standard output and error keep at most 64 KiB each, and the child is
+killed after its timeout. Its environment is the packager's own, unchanged (tools need `PATH`, `HOME`,
+`SystemRoot` and their own credentials). `pack` and `setup` print `code-sign: <relative path>` per item and,
+on a failure, the template's key (`sign`, `notarize`, ...), the program's file name, the exit status or
+"timed out" and at most the last 4 KiB of the tool's standard error with every `{env:}` value of that call
+replaced by `<NAME>`. They never print the expanded arguments or any environment variable. After every call
+lunepack checks that the item really changed into a signed form; a tool that exits 0 and changes nothing, or
+signs another file, fails the pack with `code-sign: <relative path> is not signed after <key>` and nothing
+is written to the release.
+
+**What is signed (M9-D4).** On a `windows-*` target, every file of the tree whose header is a PE (the
+header decides, not the extension) and that has no certificate table, deepest first; PE files that are
+already signed (a third party's runtime DLL, the developer's own) are left as they are. A file that starts with
+`MZ` and has `PE\0\0` where its `e_lfanew` points is a PE wherever that is, even past the first 64 KiB; one whose
+headers lunepack cannot read (such a far-header image included) fails the pack instead of being left unsigned. On a `macos-*` bundle
+with no `Contents/_CodeSignature`: for each nested bundle (`*.app`, `*.framework`, `*.appex`, `*.xpc`,
+`*.bundle` and `*.plugin` directories under `Contents/`), deepest first, its loose Mach-O files and then the
+bundle with `sign_bundle`; then the outer bundle's own loose Mach-O files (the main executable excluded);
+then the outer bundle with `sign_outer`. The runtime, the helper update app and the UI binary are in that
+order by construction. A bundle that already holds a signature (the signed-bundle flow above) is left
+unchanged by the whole stage: the developer signed it, and notarizes it themselves if they want. A framework
+with several `Versions/` directories signs only `Current`. The outer bundle's `{path}` and `{bundle}` name a
+directory whose name ends in `.app`, so tools that dispatch on the suffix see a normal bundle; the
+directory's name is internal and no output records it.
+
+**Notarization and the staple ticket (M9-D5).** For a `macos-*` bundle, after the outer bundle is signed
+and verified, `notarize` runs with `{zip}` or `{bundle}`, then `staple` on the bundle, then lunepack checks
+that `Contents/CodeResources`, the ticket stapler writes, is a regular file in the tree. All of it happens
+before hashing, so the ticket is a file of the signed release (a `staple` that writes none fails the pack).
+`setup` signs the installer app's items and the app, notarizes and staples the app, builds the image, then
+signs, notarizes and staples the `.dmg`: two notarizations. The `.zip` installer holds the bundle as
+released.
+
+**Publisher continuity (M9-D6).** The pack also writes the update configuration's `publisher_check` member
+(FORMAT.md 13.2): the policy the *installed* version applies when it stages a later one (RUNTIME.md,
+"Publisher continuity"). The default is `enforce` when the config has a `[codesign.<os>]` section for the
+target's OS and `off` otherwise; an explicit `[update] publisher_check = "off" | "warn" | "enforce"` wins.
+`off` is not written (the member is left out, so the bytes are those of a config without it). Under
+`enforce` an update must be signed by the same OS code-signing publisher as the installed version, and the
+installed app must really be signed: an unsigned or ad-hoc install has no baseline, and a tree whose files
+carry no signature of the platform's kind is refused. Use `warn` while you are not sure your signing is in
+place.
+
+**Moving to another publisher.** If you change the certificate's subject (a renewal under another
+organisation name, a move between certificate types, a new Developer ID team), installed apps under
+`enforce` refuse the first release under the new identity and stay on the old one. Ship one release first
+with `publisher_check = "warn"`, signed by the old identity; once your users run it, the next release can be
+signed by the new identity, and their client reports the finding (`different`) and updates. A release signed
+ad hoc, or by a tool that left it unsigned, is refused the same way (`candidate_unsigned`).
+
+**Timestamps and expiry.** A signature made without a timestamp stops verifying when the certificate
+expires (`CERT_E_EXPIRED` on Windows). Use a timestamp in every template: `--timestamp` for `codesign`
+(notarization requires it anyway), `/tr <service> /td sha256` for `signtool`, `--tsaurl` for `jsign`. A
+candidate signed with an expired, untimestamped certificate is refused as `candidate_invalid`; an *installed*
+entry whose certificate has since expired does not block its own updates (THREAT-MODEL.md, "OS code signing
+and publisher continuity (M9)"). The throwaway signatures of lunepack's own CI carry no timestamp, because
+the tests have no network to a timestamp service.
+
+**Example templates.** These use placeholder names. Each tool's own arguments are its own: check them against
+the tool's documentation and your version. lunepack's tests run `codesign`, `xcrun notarytool` and `stapler`
+(on a Mac, with ad-hoc and throwaway identities in CI and the developer's own in
+`scripts/macos-sign-check.sh`) and `signtool` with a throwaway certificate; the others come from the tools'
+documentation and are not run by lunepack's tests.
+
+```toml
+# macOS: codesign + notarytool + stapler (the section above); entitlements on the app bundle only:
+sign_outer = ["/usr/bin/codesign", "--force", "--options", "runtime", "--timestamp",
+              "--entitlements", "{env:LUNEPACK_ENTITLEMENTS}",
+              "--sign", "{env:LUNEPACK_SIGN_IDENTITY}", "{path}"]
+# (an identity looks like "Developer ID Application: Example Corp (TEAMID)", or is its hash)
+
+# macOS: rcodesign (apple-codesign), a p12 file reference and the App Store Connect API key file.
+# Untested since 2024 in this project; `{bundle}` lets the tool submit the bundle itself.
+sign = ["rcodesign", "sign", "--p12-file", "{env:LUNEPACK_P12_FILE}",
+        "--p12-password-file", "{env:LUNEPACK_P12_PASSWORD_FILE}",
+        "--code-signature-flags", "runtime", "{path}"]
+notarize = ["rcodesign", "notary-submit", "--api-key-file", "{env:LUNEPACK_NOTARY_API_KEY_FILE}",
+            "--wait", "{bundle}"]
+staple = ["rcodesign", "staple", "{path}"]
+```
+
+```toml
+# Windows: signtool with a certificate in the user's store, identified by its SHA-1 thumbprint.
+[codesign.windows]
+sign = ["signtool", "sign", "/fd", "sha256", "/tr", "https://timestamp.example.com", "/td", "sha256",
+        "/sha1", "{env:LUNEPACK_SIGN_CERT_SHA1}", "{path}"]
+verify = ["signtool", "verify", "/pa", "{path}"]
+
+# Windows: Azure Trusted Signing through signtool's dlib; the account's credentials live in the dlib's
+# own environment, the metadata file names the account.
+sign = ["signtool", "sign", "/fd", "sha256", "/tr", "https://timestamp.example.com", "/td", "sha256",
+        "/dlib", "{env:LUNEPACK_AZURE_DLIB}", "/dmdf", "{env:LUNEPACK_AZURE_METADATA}", "{path}"]
+
+# jsign with a PKCS#12 file: the password is read from the environment by jsign (`env:NAME` is jsign's
+# own reference syntax, plain text to lunepack), never passed as an argument value.
+sign = ["jsign", "--keystore", "{env:LUNEPACK_P12_FILE}", "--storepass", "env:LUNEPACK_P12_PASSWORD",
+        "--tsaurl", "https://timestamp.example.com", "--alg", "SHA-256", "{path}"]
+```
+
+On a Mac, `scripts/macos-sign-check.sh` walks the whole real path with your own identity and notary
+account: signing, notarization, stapling, Gatekeeper, translocation and continuity (credentials are named
+by environment variable; `--dry-run` shows what it would do without them).
 
 ### `lunepack feed add`
 
@@ -577,8 +741,10 @@ same checks as above, taking every file out of the pack through its signed frame
   the installer's executable is the release's UI, so a release without one is refused, naming `--zip`.
   Opening the app shows the install window; `lunepack-runtime` inside it also installs with `--silent`
   (RUNTIME.md, "macOS"). The default name is `<app_id>-<VERSION>-<TARGET>.dmg`; `--out` must end in
-  `.dmg`. The image is not signed or notarized (M9). `hdiutil` decides its bytes, so two runs need not give
-  the same image.
+  `.dmg`. With `[codesign.macos]` in the config the installer app is signed (its items inner to outer,
+  then the app), notarized and stapled when the section has `notarize` and `staple`, and only then is the
+  image built, signed, notarized and stapled ("Code signing"); without the section neither is signed.
+  `hdiutil` decides the image's bytes, so two runs need not give the same image.
 - **The `.zip`** (`--zip`; any host, no image tool): the bundle `<bundle name>.app` exactly as released, with
   every file's data and exec bit and every symlink as the manifest has them. It is written by lunepack's own
   writer over `flate2` (deflate, level 9 when that is smaller, else stored; names in UTF-8; times fixed at
@@ -658,6 +824,9 @@ length) and the layout are fixed, and Ed25519 signatures are deterministic. Not 
 - a command signer may not sign deterministically (that is the command's property);
 - the `exec` bit and symlinks come from the file system, so a Windows and a Unix checkout of the same
   files differ;
+- a release signed through `[codesign.<os>]` is as deterministic as the signing tool: a timestamped
+  signature or a notarization ticket differs from run to run. A pack with no `[codesign.*]` section for its
+  OS is byte-identical to one from before M9;
 - identical bytes on different CPU architectures (arm64 against x86-64) are asserted by known-answer
   tests, which first run on all three operating systems at the first push.
 

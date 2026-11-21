@@ -1034,8 +1034,8 @@ reader over the bytes it is about to write and writes only what passes.
 ### 13.2 Payload
 
 The file follows 3.1 with one difference: `null` is the value of a member the tables mark "or
-null", and every member in the tables is required (a nullable member is written as `null`, never
-omitted). It is at most 64 KiB (65536 bytes).
+null", and every member in the tables is required unless the table says "optional" (a nullable member is
+written as `null`, never omitted; an optional member is left out when it has no value). It is at most 64 KiB (65536 bytes).
 
 | Member | Type | Rule |
 |---|---|---|
@@ -1050,6 +1050,13 @@ omitted). It is at most 64 KiB (65536 bytes).
 | `channel` | string | the channel the tree follows (10.5) |
 | `health_timeout_secs` | integer | `5 ..= 3600`: how long a supervised start may take to confirm its health (the packager's default is 60) |
 | `install` | object | the install metadata (13.4) |
+| `publisher_check` | string, optional | the publisher-continuity policy of the tree (M9-D6, M9-D9): `off`, `warn` or `enforce` (exact, lowercase text; anything else, or a value that is not a string, is invalid). It tells the tree's own runtime what to do when it stages a later version whose OS code signature is not the installed one's (RUNTIME.md, "Publisher continuity"). Absent means `off`, so every configuration from before the member reads as `off`. The writer leaves the member out when the policy is `off` (never writes `"off"` or `null`), so the bytes of a configuration with no policy are the bytes from before the member existed |
+
+The member governs the check of the **next** update only, and only the installed tree's own value counts: a
+candidate's `publisher_check` takes effect once it is installed, never on its own staging (M9-D6). The
+packager writes `enforce` when the config has a `[codesign.<os>]` section for the target's OS and no
+`[update] publisher_check`, `off` otherwise, and an explicit `[update] publisher_check` wins (CLI.md, "Code
+signing").
 
 The lunepack writer emits the members of every object in byte order of their names, pretty-printed
 with two-space indentation and a final newline. A reader does not depend on member order or
@@ -1244,6 +1251,9 @@ reads them through the verified manifest:
   a writer that rewrites the document writes it back unchanged). An unknown member inside `root` or
   `install` makes the document invalid, so new data is added as new top-level members, or as new
   optional members of `install` in a revision that names them.
+- `publisher_check` (M9) is such a top-level member: a reader from before it keeps it as an unknown member and
+  ignores it, so an older runtime never enforces a policy it does not know. A reader that knows the member
+  refuses a value outside `off`, `warn` and `enforce`.
 - A writer that adds a member older readers must not ignore names it in `critical`. A reader that
   finds any name in `critical` stops with "newer format"; v1 implements no critical name.
 - `format` above 1 is a newer format: the reader stops and nothing is written. `format` 0 is invalid.

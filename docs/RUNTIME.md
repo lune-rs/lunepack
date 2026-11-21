@@ -95,7 +95,7 @@ line a second on stderr and the final line is one human line on stdout (an error
 | Command | Members |
 |---|---|
 | `check` | `update`: `null`, or `{version, download_size_max, time_checked}` (`time_checked` is false when the clock was implausible and expiry checks were skipped); `adopted`: `true`, present only in the run that adopted the running bundle (macOS, "Adoption" below) |
-| `download` | `version` and `staged`: the staged version and `true`; or `null` and `false` when the channel offers nothing new |
+| `download` | `version` and `staged`: the staged version and `true`; or `null` and `false` when the channel offers nothing new; `publisher`: present only when the update was staged with a finding to report, one of `different`, `installed_unsigned`, `installed_invalid`, `candidate_unsigned`, `candidate_invalid`, `os` ("Publisher continuity" below) |
 | `startup` | `events`: `[{kind: "installed", version}, {kind: "updated", from, to}, {kind: "first_run", version}, ...]`, oldest first; `action`: `"continue"` or `"exit"`; `pending` |
 | `confirm` | `outcome`: `"confirmed"` or `"nothing_pending"` |
 | `apply-and-restart` | `version`: the staged version the applier will apply; `scheduled`: `true` |
@@ -140,10 +140,57 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 26 | `install_mismatch` | (install, uninstall) the install is not the one this environment derives; for install also an existing `R` that is not lunepack's (not a real directory, or holding files it did not make) |
 | 27 | `no_release` | (install) the channel offers no release for this install yet (none, none whose rollout admits it, or none at or above the bootstrap's own version); nothing was installed, retry later. (macOS adoption) the feed lists no release of the version and target the bundle's own configuration names; nothing was adopted |
 | 28 | `unsupported_location` | (macOS, every mode) the running app or the install's bundle is somewhere lunepack does not update: the error object carries `reason`, one of `translocated`, `read_only`, `other_volume`, `not_owned`, `not_writable`; move the app to the Applications folder of the user and open it from there |
+| 29 | `publisher_mismatch` | (download) the installed version's publisher policy (`enforce`) refused the update: the error object carries `reason`, one of `different`, `installed_invalid`, `candidate_unsigned`, `candidate_invalid`, `os`; nothing was staged. On `different`, `candidate_unsigned` and `candidate_invalid` the version is marked bad and never offered again; on `installed_invalid` and `os` nothing is marked and a later `download` checks again |
 | 70 | `internal` | anything else (a worker panic, a library error this build does not know) |
 
 The table lives in one place in the runtime (`crates/lunepack-runtime/src/modes.rs`) and is pinned
 by `crates/lunepack-runtime/tests/golden/objects.jsonl`, one error object per kind.
+
+## Publisher continuity
+
+An app packed with OS code signing (CLI.md, "Code signing") can refuse an update that a different publisher
+signed than the one it is running, so a leaked release key alone does not let an attacker push a build
+under another certificate. The check runs when a version is staged (`check` only looks at the feed;
+`download` and the facade's `Updater::stage` stage), between staging and recording the staged version, so
+every path that turns a candidate into something `apply` can use goes through it. First installs, offline
+installs from a setup file, adoption and rollbacks have no installed-and-candidate pair and run no check.
+
+The **policy is the installed version's** `publisher_check` member of its update configuration (FORMAT.md
+13.2): `off`, `warn` or `enforce`, absent meaning `off`. The candidate's own member never governs its own
+check, and nothing on the command line or in the builder lowers it. A tree with no update configuration
+reads as `off`; one that cannot be read fails the staging without marking anything.
+
+What the operating system answers, and what the policy does with it (every pair is covered):
+
+| Answer | `off` | `warn` | `enforce` |
+|---|---|---|---|
+| same publisher; not applicable (Linux) | proceed | proceed | proceed |
+| `installed_unsigned`: the installed version is unsigned or ad-hoc signed, so there is no baseline | proceed | proceed, reported | proceed, reported |
+| `different`, `candidate_unsigned`, `candidate_invalid` | proceed | proceed, reported | exit 29, the version is marked bad |
+| `installed_invalid`, `os` | proceed | proceed, reported | exit 29, nothing is marked |
+
+`off` runs no check. A refusal that names the candidate's own bytes or signature (`different`,
+`candidate_unsigned`, `candidate_invalid`) marks the version bad in the same state commit that skips the
+staging: `check` never offers it again (D27) and nothing is staged. `installed_invalid` and `os` are local
+faults (a locked file, a broken install, an API failure): nothing is marked, and a later `download` checks
+again. `enforce` therefore needs a really signed app: a tree whose files carry no signature of the
+platform's kind answers `os` or `candidate_unsigned` and is refused. The packager writes `enforce` only
+when the config has a `[codesign.<os>]` section for the target.
+
+A finding that does not stop the update is a `tracing` warning that names the code only, and the optional
+`publisher` member of `download`'s result. Neither carries a path, a certificate subject or any text from
+the operating system.
+
+The rules, in short (M9-D7, M9-D8): on Windows the installed and the candidate entry executables must both
+pass `WinVerifyTrust` (no user interface, no revocation lookup, no network) and their leaf signers' subject
+names must be byte-equal, and every other PE file of the candidate must pass under any trusted publisher;
+on macOS the candidate bundle must pass a strict, nested static validation and satisfy the installed
+bundle's designated requirement (an ad-hoc signature counts as unsigned on either side); Linux has no
+check. Only a definitive statement about the candidate's own bytes or signature can mark a version bad: any
+other operating-system status, and every file error while reading the tree, is `os`.
+
+A per-machine install keeps returning `machine_scope` (17); the check is added to the per-machine engine
+with M10.
 
 ## Apply and restart
 

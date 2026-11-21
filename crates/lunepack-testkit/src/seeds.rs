@@ -1064,6 +1064,7 @@ pub fn sample_update_config() -> UpdateConfig {
             url_schemes: Vec::new(),
             autostart: false,
         },
+        publisher_check: Default::default(),
         extra: Default::default(),
     }
 }

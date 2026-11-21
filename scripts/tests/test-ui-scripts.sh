@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tests for scripts/ui-golden.sh (argument handling only: nothing here starts Docker or a render),
 # scripts/macos-user-check.sh (its arguments and refusals only: nothing here builds or opens anything)
-# and scripts/ci/ui-size.sh (its arguments, and its fail-closed reading of the packager's output,
+# scripts/macos-sign-check.sh (its arguments and its credential refusals only: nothing here builds,
+# signs or contacts a service) and scripts/ci/ui-size.sh (its arguments, and its fail-closed reading of the packager's output,
 # with a stub in place of the `lunepack` command).
 set -euo pipefail
 
@@ -14,6 +15,7 @@ here=$(cd "$here" && pwd)
 GOLDEN=$here/../ui-golden.sh
 SIZE=$here/../ci/ui-size.sh
 USER_CHECK=$here/../macos-user-check.sh
+SIGN_CHECK=$here/../macos-sign-check.sh
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=lib.sh
 . "$here/lib.sh"
@@ -128,6 +130,110 @@ else
   t_check "user check: the refusal made no temporary root" test "$before" = "$after"
   run_cmd bash "$USER_CHECK" --real-applications
   t_check "user check: --real-applications without a terminal is refused too" rc_is 1
+fi
+
+# --- macos-sign-check.sh --------------------------------------------------------------------
+run_cmd bash "$SIGN_CHECK" --bogus
+t_check "sign check: an unknown option is a usage error" rc_is 2
+t_check "sign check: usage is printed" out_has "usage:"
+
+run_cmd bash "$SIGN_CHECK" extra
+t_check "sign check: a stray argument is a usage error" rc_is 2
+
+run_cmd bash "$SIGN_CHECK" --windows-note --dry-run
+t_check "sign check: --windows-note with --dry-run is a usage error" rc_is 2
+
+run_cmd bash "$SIGN_CHECK" --help
+t_check "sign check: --help exits 0" rc_is 0
+t_check "sign check: --help prints usage" out_has "usage:"
+
+run_cmd bash "$SIGN_CHECK" --windows-note
+t_check "sign check: --windows-note exits 0 on any OS" rc_is 0
+t_check "sign check: --windows-note says it is not run here" out_has "not here"
+
+if [ "$(uname -s)" != Darwin ]; then
+  run_cmd bash "$SIGN_CHECK" --dry-run
+  t_check "sign check: a run off macOS is refused" rc_is 1
+  t_check "sign check: the refusal says macOS only" out_has "macOS only"
+else
+  # The planted values must never appear in any output: they stand for an identity name, a key id,
+  # an issuer and a key path.
+  planted_identity=PLANTED-IDENTITY-0xD3ADB33F
+  planted_key_id=PLANTEDKEYID7Q
+  planted_issuer=PLANTED-ISSUER-5b7e
+  keys=$T_TMP/planted-keys-dir
+  mkdir -p "$keys"
+  printf 'not a key\n' >"$keys/planted-key-file"
+  chmod 600 "$keys/planted-key-file"
+  roots_before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'lunepack-signcheck.*' 2>/dev/null | wc -l | tr -d ' ')
+  # shellcheck disable=SC2329 # named as a command to run_cmd
+  sign_env() { # <identity> <key> <key id> <issuer>: every credential variable, set or not
+    env -u LUNEPACK_SIGN_IDENTITY -u LUNEPACK_NOTARY_KEY -u LUNEPACK_NOTARY_KEY_ID -u LUNEPACK_NOTARY_ISSUER \
+      ${1:+LUNEPACK_SIGN_IDENTITY="$1"} ${2:+LUNEPACK_NOTARY_KEY="$2"} \
+      ${3:+LUNEPACK_NOTARY_KEY_ID="$3"} ${4:+LUNEPACK_NOTARY_ISSUER="$4"} \
+      bash "$SIGN_CHECK"
+  }
+  # shellcheck disable=SC2329 # named as a command to t_check
+  planted_absent() {
+    ! grep -qF -e "$planted_identity" -e "$planted_key_id" -e "$planted_issuer" -e "planted-key" "$OUT"
+  }
+
+  run_cmd sign_env "" "" "" ""
+  t_check "sign check: no variable set is refused" rc_is 1
+  t_check "sign check: it names LUNEPACK_SIGN_IDENTITY" out_has "LUNEPACK_SIGN_IDENTITY is not set"
+  t_check "sign check: it names LUNEPACK_NOTARY_KEY" out_has "LUNEPACK_NOTARY_KEY is not set"
+  t_check "sign check: it names LUNEPACK_NOTARY_KEY_ID" out_has "LUNEPACK_NOTARY_KEY_ID is not set"
+  t_check "sign check: it names LUNEPACK_NOTARY_ISSUER" out_has "LUNEPACK_NOTARY_ISSUER is not set"
+
+  run_cmd sign_env "$planted_identity" "$keys/planted-key-file" "" "$planted_issuer"
+  t_check "sign check: one missing variable is refused" rc_is 1
+  t_check "sign check: it names the one that is missing" out_has "LUNEPACK_NOTARY_KEY_ID is not set"
+  t_check "sign check: it does not name the ones that are set" out_lacks "LUNEPACK_SIGN_IDENTITY is not set"
+  t_check "sign check: no planted value in the output (one missing)" planted_absent
+
+  chmod 644 "$keys/planted-key-file"
+  run_cmd sign_env "$planted_identity" "$keys/planted-key-file" "$planted_key_id" "$planted_issuer"
+  t_check "sign check: a key file of mode 0644 is refused" rc_is 1
+  t_check "sign check: the refusal names the mode and the variable" out_has "LUNEPACK_NOTARY_KEY is not mode 0600"
+  t_check "sign check: no planted value in the output (mode 0644)" planted_absent
+  chmod 600 "$keys/planted-key-file"
+
+  run_cmd sign_env "$planted_identity" "$keys/planted-no-such-file" "$planted_key_id" "$planted_issuer"
+  t_check "sign check: a key path that names nothing is refused" rc_is 1
+  t_check "sign check: no planted value in the output (no such file)" planted_absent
+
+  mkdir -p "$keys/planted-dir-as-key"
+  run_cmd sign_env "$planted_identity" "$keys/planted-dir-as-key" "$planted_key_id" "$planted_issuer"
+  t_check "sign check: a directory as the key path is refused" rc_is 1
+  t_check "sign check: it says not a regular file" out_has "not a regular file"
+
+  ln -s "$keys/planted-key-file" "$keys/planted-link"
+  run_cmd sign_env "$planted_identity" "$keys/planted-link" "$planted_key_id" "$planted_issuer"
+  t_check "sign check: a link as the key path is refused" rc_is 1
+  t_check "sign check: no planted value in the output (link)" planted_absent
+
+  # A key inside a git checkout (a repository made here, with the repo's own refusal rule).
+  g init -q "$T_TMP/planted-repo"
+  mkdir -p "$T_TMP/planted-repo/sub"
+  printf 'not a key\n' >"$T_TMP/planted-repo/sub/planted-key-file"
+  chmod 600 "$T_TMP/planted-repo/sub/planted-key-file"
+  run_cmd sign_env "$planted_identity" "$T_TMP/planted-repo/sub/planted-key-file" "$planted_key_id" "$planted_issuer"
+  t_check "sign check: a key inside a git checkout is refused" rc_is 1
+  t_check "sign check: the refusal says so" out_has "inside a git checkout"
+  t_check "sign check: no planted value in the output (inside a checkout)" planted_absent
+
+  # A key inside this repository (the worktree the script runs from).
+  repo_probe=$(mktemp -d "$here/../../.signcheck-test.XXXXXX")
+  printf 'not a key\n' >"$repo_probe/planted-key-file"
+  chmod 600 "$repo_probe/planted-key-file"
+  run_cmd sign_env "$planted_identity" "$repo_probe/planted-key-file" "$planted_key_id" "$planted_issuer"
+  rm -rf "$repo_probe"
+  t_check "sign check: a key inside this repository is refused" rc_is 1
+  t_check "sign check: the refusal says so (repository)" out_has "inside"
+  t_check "sign check: no planted value in the output (inside this repository)" planted_absent
+
+  roots_after=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'lunepack-signcheck.*' 2>/dev/null | wc -l | tr -d ' ')
+  t_check "sign check: every refusal came before the temporary root was made" test "$roots_before" = "$roots_after"
 fi
 
 t_finish

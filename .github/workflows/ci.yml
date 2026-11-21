@@ -172,10 +172,14 @@ jobs:
   e2e-windows:
     # the end-to-end suite of the Windows runtime (M7 step 13, scripts/e2e-windows.ps1): per-user
     # install from a `Setup.exe`, the stub launcher, updates, rollbacks, uninstall, a planted-DLL
-    # check of every shipped binary, and (CI only) the signed `Setup.exe` test, which trusts a
-    # throwaway certificate on this disposable runner. It installs for real under the runner's
-    # profile. Defender is as the runner image has it; `e2e-windows-defender` is the same with
-    # Defender on. A skip is not a pass: the script exits non-zero on a failed row.
+    # check of every shipped binary, and (CI only) the signed `Setup.exe` and publisher-continuity
+    # rows (M9 step 9): the packager signs through its own [codesign.windows] templates, and the
+    # rows trust two throwaway certificates on this disposable runner (removed again, whatever
+    # happens; no secret). The next step runs the adapter's own publisher tests with throwaway
+    # certificates too (scripts/ci/windows-publisher-test.ps1), and a skipped row fails it. The
+    # suite installs for real under the runner's profile. Defender is as the runner image has it;
+    # `e2e-windows-defender` is the same with Defender on. A skip is not a pass: the script exits
+    # non-zero on a failed row.
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -185,6 +189,9 @@ jobs:
       - name: Windows end-to-end suite
         shell: pwsh
         run: ./scripts/e2e-windows.ps1
+      - name: Publisher continuity (WinVerifyTrust adapter rows, throwaway certificates)
+        shell: pwsh
+        run: ./scripts/ci/windows-publisher-test.ps1
 
   e2e-windows-defender:
     # the same suite with Windows Defender on (M7 step 14; probe P-W4 showed the runner can run
@@ -221,10 +228,14 @@ jobs:
     # the end-to-end suite of the macOS runtime (M8 step 11, scripts/e2e-macos.sh --ci, rows 1-12):
     # per-user install from a `.dmg`, updates by a bundle swap, rollbacks, adoption of a bundle
     # dragged out of a `.zip`, uninstall, and the row that starts the installed bundle through
-    # LaunchServices. It runs under a throwaway HOME inside one temp root on the runner; no signing
-    # identity (ad-hoc only), no sudo. The instrument records (spctl, syspolicy_check, xattr:
-    # names and verdicts only) are uploaded as an artifact whatever the suite did. A skip is not a
-    # pass: the script sets LUNEPACK_E2E_REQUIRE and exits non-zero on a failed row.
+    # LaunchServices, the packager's own signing through [codesign.macos] (ad hoc), and the
+    # publisher-continuity rows (M9 step 9): scripts/ci/macos-selfsigned.sh makes two throwaway
+    # self-signed identities in a temporary keychain under the temp root (never in the search
+    # list, deleted by the script's trap; no secret). It runs under a throwaway HOME inside one
+    # temp root on the runner; no sudo unless the runner refuses an untrusted identity (then
+    # trust is added for the job and removed again). The instrument records (spctl,
+    # syspolicy_check, xattr, the signing and continuity verdicts: names and verdicts only) are
+    # uploaded as an artifact whatever the suite did. A skip is not a pass: the script sets LUNEPACK_E2E_REQUIRE and exits non-zero on a failed row.
     runs-on: macos-latest
     timeout-minutes: 90
     steps:
@@ -239,7 +250,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          grep -E '^  (instrument |signed: )' "$RUNNER_TEMP/e2e-macos.log" > "$RUNNER_TEMP/e2e-macos-instruments.txt" || true
+          grep -E '^  (instrument |signed: |codesign: |continuity: )' "$RUNNER_TEMP/e2e-macos.log" > "$RUNNER_TEMP/e2e-macos-instruments.txt" || true
       # actions/upload-artifact v7.0.2, as in runtime-musl
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()

@@ -1653,3 +1653,475 @@ fn macos_dmg_refusals_leave_nothing_behind() {
     assert!(err.contains("does not match the manifest"), "{err}");
     assert!(!other.exists());
 }
+
+// ---- OS signing of the installers (M9 step 4) ---------------------------------------------------
+
+/// The helper programs of one signing test: `sh` scripts in `tools/` that log what they were asked
+/// to sign (to `log`) and rewrite it into a form the signed-form checks accept.
+struct Tools {
+    dir: PathBuf,
+    log: PathBuf,
+}
+
+impl Tools {
+    fn new(w: &World) -> Tools {
+        let dir = w.dir.path().join("tools");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("signed.macho"), signed_macho()).unwrap();
+        Tools {
+            log: dir.join("log"),
+            dir,
+        }
+    }
+
+    /// A TOML template running script `name` (body `body`) with the arguments `args`.
+    fn template(&self, name: &str, body: &str, args: &[&str]) -> String {
+        let path = self.dir.join(format!("{name}.sh"));
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nLOG='{}'\nTOOLS='{}'\n{body}\n",
+                self.log.display(),
+                self.dir.display()
+            ),
+        )
+        .unwrap();
+        let mut parts = vec!["/bin/sh".to_owned(), path.display().to_string()];
+        parts.extend(args.iter().map(|a| (*a).to_owned()));
+        let items: Vec<String> = parts.iter().map(|p| format!("'{p}'")).collect();
+        format!("[{}]", items.join(", "))
+    }
+
+    fn log(&self) -> Vec<String> {
+        fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `[codesign.macos]` with fake tools; `over` replaces the body of the tool named by its key
+    /// (`sign_installer`, `verify`, `notarize`, `staple`). `sign` always fails: the installer
+    /// never uses it.
+    fn macos_section(&self, over: &[(&str, &str)]) -> String {
+        let body = |key: &str, default: &'static str| -> String {
+            over.iter()
+                .find(|(k, _)| *k == key)
+                .map_or_else(|| default.to_owned(), |(_, b)| (*b).to_owned())
+        };
+        let sign = self.template("sign", "echo \"sign|$1\" >> \"$LOG\"; exit 9", &["{path}"]);
+        let installer = self.template(
+            "sign_installer",
+            &body(
+                "sign_installer",
+                "echo \"sign_installer|$(basename \"$1\")\" >> \"$LOG\"\n\
+                 case \"$1\" in\n\
+                 *.dmg) /usr/bin/codesign --force --sign - \"$1\" ;;\n\
+                 *.app) mkdir -p \"$1/Contents/_CodeSignature\"; echo seal > \"$1/Contents/_CodeSignature/CodeResources\" ;;\n\
+                 *) cp \"$TOOLS/signed.macho\" \"$1\" ;;\n\
+                 esac",
+            ),
+            &["{path}"],
+        );
+        let verify = self.template(
+            "verify",
+            &body("verify", "echo \"verify|$(basename \"$1\")\" >> \"$LOG\""),
+            &["{path}"],
+        );
+        let notarize = self.template(
+            "notarize",
+            &body(
+                "notarize",
+                "echo \"notarize|$(basename \"$1\")|$(basename \"$2\")\" >> \"$LOG\"\n\
+                 case \"$2\" in *.zip) cp \"$2\" \"$TOOLS/notarized-app.zip\" ;; esac",
+            ),
+            &["{bundle}", "{zip}"],
+        );
+        let staple = self.template(
+            "staple",
+            &body(
+                "staple",
+                "echo \"staple|$(basename \"$1\")\" >> \"$LOG\"\n\
+                 case \"$1\" in\n\
+                 *.dmg) ;;\n\
+                 *) if [ -e \"$(dirname \"$(dirname \"$1\")\")/installer.dmg\" ]; then echo dmg-existed-before-app-staple >> \"$LOG\"; fi\n\
+                    echo ticket > \"$1/Contents/CodeResources\" ;;\n\
+                 esac",
+            ),
+            &["{path}"],
+        );
+        format!(
+            "\n[codesign.macos]\nsign = {sign}\nsign_installer = {installer}\nverify = {verify}\n\
+             notarize = {notarize}\nstaple = {staple}\n"
+        )
+    }
+}
+
+fn append_config(w: &World, text: &str) {
+    use std::io::Write as _;
+    let mut f = fs::OpenOptions::new().append(true).open(&w.config).unwrap();
+    f.write_all(text.as_bytes()).unwrap();
+}
+
+/// A thin arm64 Mach-O with a code signature the signed-form check accepts.
+fn signed_macho() -> Vec<u8> {
+    let mut b = Vec::new();
+    for word in [0xFEED_FACFu32, ARM64, 0, 2, 1, 16, 0, 0] {
+        b.extend_from_slice(&word.to_le_bytes());
+    }
+    for word in [0x1du32, 16, 64, 16] {
+        b.extend_from_slice(&word.to_le_bytes());
+    }
+    b.resize(80, 0xAA);
+    b
+}
+
+/// What a signing tool does to a finished PE: a certificate table of 32 bytes at its end.
+fn with_certificate_table(bytes: &[u8]) -> Vec<u8> {
+    assert_eq!(
+        bytes.len() % 8,
+        0,
+        "a setup file's length is a multiple of 8"
+    );
+    let at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+    let pe = at(bytes, 0x3C);
+    let magic = u16::from_le_bytes(bytes[pe + 24..pe + 26].try_into().unwrap());
+    let dir = pe + 24 + if magic == 0x20b { 112 } else { 96 } + 4 * 8;
+    let mut out = bytes.to_vec();
+    out[dir..dir + 4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out[dir + 4..dir + 8].copy_from_slice(&32u32.to_le_bytes());
+    out.extend_from_slice(&[0x5A; 32]);
+    out
+}
+
+/// The entries of `dir`: nothing is left in the output directory but what the test put there.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A Windows setup file is signed with `sign_installer` after it is complete, then read back as
+/// signed: the locator finds the trailer before the certificate table (M7-D11). A tool that signs
+/// nothing, one that damages the trailer and one that appends past the table each stop `setup`
+/// with no output file.
+#[test]
+fn windows_setup_is_signed_and_read_back_as_signed() {
+    let w = World::windows(plain_windows());
+    let tools = Tools::new(&w);
+    let unsigned_dir = w.dir.path().join("unsigned");
+    fs::create_dir(&unsigned_dir).unwrap();
+    let unsigned_path = unsigned_dir.join("Hello-Setup.exe");
+    assert_ok(&w.setup(&unsigned_path, &[]), "unsigned setup");
+    let unsigned = fs::read(&unsigned_path).unwrap();
+    let signed = with_certificate_table(&unsigned);
+    fs::write(tools.dir.join("signed.exe"), &signed).unwrap();
+
+    let config = |sign_body: &str| {
+        let sign = tools.template("sign", "echo \"sign|$1\" >> \"$LOG\"; exit 9", &["{path}"]);
+        let installer = tools.template("sign_installer", sign_body, &["{path}"]);
+        let verify = tools.template(
+            "verify",
+            "echo \"verify|$(basename \"$1\")\" >> \"$LOG\"",
+            &["{path}"],
+        );
+        format!(
+            "\n[codesign.windows]\nsign = {sign}\nsign_installer = {installer}\nverify = {verify}\n"
+        )
+    };
+    let good =
+        "echo \"sign_installer|$(basename \"$1\")\" >> \"$LOG\"; cp \"$TOOLS/signed.exe\" \"$1\"";
+    let base = fs::read_to_string(&w.config).unwrap();
+    let run = |name: &str, body: &str| {
+        fs::write(&w.config, format!("{base}{}", config(body))).unwrap();
+        let dir = w.dir.path().join(name);
+        fs::create_dir(&dir).unwrap();
+        let out = dir.join("Hello-Setup.exe");
+        let result = w.setup(&out, &[]);
+        (dir, out, result)
+    };
+
+    let (dir, out, result) = run("signed", good);
+    assert_ok(&result, "signed setup");
+    assert_eq!(fs::read(&out).unwrap(), signed);
+    assert_eq!(
+        tools.log(),
+        ["sign_installer|Hello-Setup.exe", "verify|Hello-Setup.exe"],
+        "the installer's template, not `sign`, then verify"
+    );
+    // The runtime's own reader finds the trailer before the certificate table.
+    let bytes = fs::read(&out).unwrap();
+    let located = locate_file(&Bytes(bytes.clone())).unwrap();
+    assert_eq!(
+        located,
+        Located::Setup {
+            end: unsigned.len() as u64
+        }
+    );
+    let tail = &bytes[unsigned.len() - TRAILER_SIZE as usize..unsigned.len()];
+    let trailer =
+        SetupTrailer::parse(tail, unsigned.len() as u64, &Sha256Hasher, &Ed25519Verifier).unwrap();
+    assert_eq!(trailer, trailer_of(&unsigned));
+    assert_eq!(names_in(&dir), ["Hello-Setup.exe"]);
+    assert!(
+        stdout(&result).contains("code-sign: Hello-Setup.exe"),
+        "{}",
+        stdout(&result)
+    );
+
+    // Each failure stops `setup` and leaves no file.
+    let mut flipped = signed.clone();
+    flipped[unsigned.len() - 100] ^= 1;
+    fs::write(tools.dir.join("flipped.exe"), &flipped).unwrap();
+    let mut grown = signed.clone();
+    grown.push(0);
+    fs::write(tools.dir.join("grown.exe"), &grown).unwrap();
+    for (name, body, expect) in [
+        ("nochange", "exit 0", "is not signed after sign_installer"),
+        (
+            "failing",
+            "echo 'the certificate is expired' >&2; exit 7",
+            "sign_installer failed",
+        ),
+        ("damaged", "cp \"$TOOLS/flipped.exe\" \"$1\"", "setup"),
+        (
+            "grown",
+            "cp \"$TOOLS/grown.exe\" \"$1\"",
+            "not read back as a setup file",
+        ),
+    ] {
+        let (dir, out, result) = run(name, body);
+        let err = assert_fails(&result, 1, name);
+        assert!(err.contains(expect), "{name}: {err}");
+        assert!(!out.exists(), "{name}: an output file was left");
+        assert!(names_in(&dir).is_empty(), "{name}: {:?}", names_in(&dir));
+    }
+}
+
+/// A Linux setup file and a macOS `.zip` are not signed: no template runs for them.
+#[test]
+fn linux_setup_and_the_zip_run_no_signing_tool() {
+    let w = World::new();
+    let tools = Tools::new(&w);
+    let windows = tools.template("sign", "echo \"sign|$1\" >> \"$LOG\"", &["{path}"]);
+    append_config(&w, &format!("\n[codesign.windows]\nsign = {windows}\n"));
+    assert_ok(
+        &w.setup(&w.dir.path().join("linux-setup"), &[]),
+        "linux setup",
+    );
+    assert!(tools.log().is_empty(), "{:?}", tools.log());
+
+    let m = World::mac(PLAIN_MAC);
+    let tools = Tools::new(&m);
+    append_config(&m, &tools.macos_section(&[]));
+    assert_ok(&mac_zip(&m, &m.dir.path().join("a.zip")), "setup --zip");
+    assert!(
+        tools.log().is_empty(),
+        "the zip holds the released bundle: {:?}",
+        tools.log()
+    );
+}
+
+/// The installer app is signed (its runtime, then the app), verified, notarized and stapled before
+/// the image is built; then the image is signed, notarized and stapled (M9-D5). The recording shows
+/// the order, and the zip handed to the notary holds the installer app.
+#[test]
+fn macos_dmg_signing_runs_in_the_fixed_order() {
+    if !macos_host("the installer .dmg") {
+        return;
+    }
+    let w = World::mac(PLAIN_MAC);
+    let tools = Tools::new(&w);
+    append_config(&w, &tools.macos_section(&[]));
+    let dir = w.dir.path().join("out");
+    fs::create_dir(&dir).unwrap();
+    let dmg = dir.join("hello.dmg");
+    let out = mac_dmg(&w, &dmg);
+    assert_ok(&out, "setup with signing");
+    assert_eq!(
+        tools.log(),
+        [
+            "sign_installer|lunepack-runtime",
+            "sign_installer|Install Hello.app",
+            "verify|Install Hello.app",
+            "notarize|Install Hello.app|lunepack-notarize.zip",
+            "staple|Install Hello.app",
+            "sign_installer|installer.dmg",
+            "notarize|installer.dmg|installer.dmg",
+            "staple|installer.dmg",
+        ]
+    );
+    let zip = fs::read(tools.dir.join("notarized-app.zip")).unwrap();
+    for name in [
+        "Install Hello.app/Contents/MacOS/lunepack-ui",
+        "Install Hello.app/Contents/_CodeSignature/CodeResources",
+    ] {
+        assert!(
+            zip.windows(name.len()).any(|w| w == name.as_bytes()),
+            "{name}"
+        );
+    }
+    // The image is signed (the dispatching tool ran the real `codesign`, ad hoc) and holds the
+    // stapled, sealed app.
+    let signed = std::process::Command::new("/usr/bin/codesign")
+        .args(["--verify"])
+        .arg(&dmg)
+        .output()
+        .unwrap();
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+    let mount = attach(&dmg, &w.dir.path().join("mnt"));
+    let app = mount.0.join("Install Hello.app");
+    assert_eq!(
+        fs::read(app.join("Contents/CodeResources")).unwrap(),
+        b"ticket\n"
+    );
+    assert!(app.join("Contents/_CodeSignature/CodeResources").is_file());
+    assert_eq!(
+        fs::read(app.join("Contents/MacOS/lunepack-runtime")).unwrap(),
+        signed_macho()
+    );
+    assert_eq!(names_in(&dir), ["hello.dmg"]);
+}
+
+/// Every step of the installer signing that fails stops `setup`, with the message shape of M9-D3,
+/// and leaves no file at the final name and nothing beside it.
+#[test]
+fn a_failing_signing_step_leaves_no_dmg() {
+    if !macos_host("the installer .dmg") {
+        return;
+    }
+    let dispatch = |app: &str, dmg: &str, runtime: &str| {
+        format!(
+            "echo \"sign_installer|$(basename \"$1\")\" >> \"$LOG\"\n\
+             case \"$1\" in\n\
+             *.dmg) {dmg} ;;\n\
+             *.app) {app} ;;\n\
+             *) {runtime} ;;\n\
+             esac"
+        )
+    };
+    let seal = "mkdir -p \"$1/Contents/_CodeSignature\"; echo seal > \"$1/Contents/_CodeSignature/CodeResources\"";
+    let real = "/usr/bin/codesign --force --sign - \"$1\"";
+    let cp = "cp \"$TOOLS/signed.macho\" \"$1\"";
+    type Case<'a> = (&'a str, Vec<(&'a str, String)>, &'a str);
+    let cases: Vec<Case> = vec![
+        (
+            "the runtime is not signed",
+            vec![("sign_installer", dispatch(seal, real, "echo 'bad key' >&2; exit 3"))],
+            "sign_installer failed",
+        ),
+        (
+            "the app is left unsigned",
+            vec![("sign_installer", dispatch("exit 0", real, cp))],
+            "Install Hello.app is not signed after sign_installer",
+        ),
+        (
+            "verify fails",
+            vec![("verify", "exit 4".to_owned())],
+            "verify failed",
+        ),
+        (
+            "the app's notarization fails",
+            vec![("notarize", "echo 'rejected' >&2; exit 5".to_owned())],
+            "notarize failed",
+        ),
+        (
+            "the app's staple leaves no ticket",
+            vec![("staple", "exit 0".to_owned())],
+            "staple left no ticket",
+        ),
+        (
+            "the image is left unsigned",
+            vec![("sign_installer", dispatch(seal, "exit 0", cp))],
+            "hello.dmg is not signed after sign_installer",
+        ),
+        (
+            "the image's notarization fails",
+            vec![("notarize", "case \"$1\" in *.dmg) exit 5;; esac".to_owned())],
+            "notarize failed",
+        ),
+        (
+            "the image's staple fails",
+            vec![(
+                "staple",
+                "case \"$1\" in *.dmg) exit 6;; *) echo ticket > \"$1/Contents/CodeResources\";; esac"
+                    .to_owned(),
+            )],
+            "staple failed",
+        ),
+    ];
+    for (what, over, expect) in cases {
+        let w = World::mac(PLAIN_MAC);
+        let tools = Tools::new(&w);
+        let over: Vec<(&str, &str)> = over.iter().map(|(k, b)| (*k, b.as_str())).collect();
+        append_config(&w, &tools.macos_section(&over));
+        let dir = w.dir.path().join("out");
+        fs::create_dir(&dir).unwrap();
+        let dmg = dir.join("hello.dmg");
+        let err = assert_fails(&mac_dmg(&w, &dmg), 1, what);
+        assert!(err.contains(expect), "{what}: {err}");
+        assert!(err.contains("code-sign:"), "{what}: {err}");
+        assert!(!dmg.exists(), "{what}: an image was left");
+        assert!(names_in(&dir).is_empty(), "{what}: {:?}", names_in(&dir));
+    }
+}
+
+/// Real `codesign`, ad hoc: the installer app inside the image passes `codesign --verify --deep
+/// --strict` after mounting, and so does the image; without `[codesign.macos]` the same app does
+/// not (the instrument).
+#[test]
+fn the_installer_app_in_the_dmg_verifies_when_signed_and_not_otherwise() {
+    if !macos_host("the signed installer .dmg") {
+        return;
+    }
+    let w = World::mac(Mac {
+        ui: true,
+        icon: true,
+        signed: true,
+    });
+    let verify = |dmg: &Path, mnt: &str| {
+        let mount = attach(dmg, &w.dir.path().join(mnt));
+        let app = mount.0.join("Install Hello.app");
+        let out = std::process::Command::new("/usr/bin/codesign")
+            .args(["--verify", "--deep", "--strict"])
+            .arg(&app)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let plain = w.dir.path().join("plain.dmg");
+    assert_ok(&mac_dmg(&w, &plain), "setup without signing");
+    assert!(
+        !verify(&plain, "mnt-plain").0,
+        "the instrument: an unsigned installer app must not verify"
+    );
+
+    append_config(
+        &w,
+        "\n[codesign.macos]\n\
+         sign = ['/usr/bin/codesign', '--force', '--sign', '-', '{path}']\n\
+         sign_installer = ['/usr/bin/codesign', '--force', '--sign', '-', '{path}']\n\
+         verify = ['/usr/bin/codesign', '--verify', '--deep', '--strict', '{path}']\n",
+    );
+    let signed = w.dir.path().join("signed.dmg");
+    let out = mac_dmg(&w, &signed);
+    assert_ok(&out, "setup with ad-hoc signing");
+    let (ok, why) = verify(&signed, "mnt-signed");
+    assert!(ok, "the installer app does not verify: {why}");
+    let image = std::process::Command::new("/usr/bin/codesign")
+        .arg("--verify")
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(image.status.success(), "the image is not signed");
+}

@@ -10,13 +10,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write as _};
+use std::io::{self, Read, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 
 use anyhow::{Context, Result, anyhow, bail};
+use lunepack_core::codesign::PLAN_HEAD_BYTES;
 use lunepack_core::path::MAX_PATH_DEPTH;
+use lunepack_core::pe::has_pe_signature;
 use lunepack_core::update_config::{
     MACOS_CODE_SIGNATURE_DIR, MACOS_HELPER_APP, MACOS_HELPER_ICON, MACOS_HELPER_INFO_PLIST,
     MACOS_HELPER_UI, MACOS_INFO_PLIST, MACOS_INSTALLER_PAYLOAD, RUNTIME_FILE, RUNTIME_FILE_WINDOWS,
@@ -24,8 +26,8 @@ use lunepack_core::update_config::{
 };
 use lunepack_core::{
     CodeSign, Codec, CodecId, Encoder, EntryKind, Hasher, InstallMeta, ManifestDocument,
-    PackedFile, RelPath, ReleaseLayout, STUB_FILE, Sha256Digest, Target, UPDATE_CONFIG_FILE,
-    pack_file, validate_tree,
+    PackedFile, PlanEntry, PlanEntryKind, RelPath, ReleaseLayout, STUB_FILE, Sha256Digest,
+    SignItem, Target, UPDATE_CONFIG_FILE, pack_file, sign_plan, validate_tree,
 };
 
 /// Fixed per-job allowance on top of the input, output and encoder estimates: 16 MiB of slack for
@@ -71,7 +73,7 @@ pub struct Item {
 }
 
 /// The kind of a directory entry, without following symlinks; specials are an error.
-enum Found {
+pub(crate) enum Found {
     Dir,
     File,
     Symlink,
@@ -516,7 +518,7 @@ fn copy_dir(from: &Path, to: &Path, depth: usize) -> Result<()> {
 }
 
 /// Every path under `root`, sorted by path bytes, with what it is.
-fn walk(root: &Path) -> Result<Vec<(RelPath, PathBuf, Found, fs::Metadata)>> {
+pub(crate) fn walk(root: &Path) -> Result<Vec<(RelPath, PathBuf, Found, fs::Metadata)>> {
     let mut out = Vec::new();
     walk_into(root, "", &mut out, 0)?;
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -549,20 +551,47 @@ fn walk_into(
     Ok(())
 }
 
-/// The code-signing order (C2 stage 2): the files under `root`, deepest first, then by path bytes.
-pub fn sign_order(root: &Path) -> Result<Vec<RelPath>> {
-    let mut files: Vec<RelPath> = walk(root)?
-        .into_iter()
-        .filter(|(_, _, kind, _)| matches!(kind, Found::File))
-        .map(|(path, ..)| path)
-        .collect();
-    files.sort_by(|a, b| {
-        b.components()
-            .count()
-            .cmp(&a.components().count())
-            .then_with(|| a.cmp(b))
-    });
-    Ok(files)
+/// The sign plan of the assembled tree at `root` (C2 stage 2, M9-D4): every entry read once, each
+/// file's first bytes included, then [`lunepack_core::sign_plan`]. `main_exe` is the bundle's main
+/// executable, required for a `macos-*` target.
+pub fn plan_signing(
+    root: &Path,
+    target: Target,
+    main_exe: Option<&RelPath>,
+) -> Result<Vec<SignItem>> {
+    let mut entries = Vec::new();
+    for (path, full, kind, meta) in walk(root)? {
+        let kind = match kind {
+            Found::Dir => PlanEntryKind::Dir,
+            Found::Symlink => PlanEntryKind::Symlink,
+            Found::File => {
+                let read = |e: io::Error| {
+                    anyhow::Error::new(e).context(format!("cannot read {}", full.display()))
+                };
+                let mut file = File::open(&full).map_err(read)?;
+                let mut head = Vec::new();
+                (&mut file)
+                    .take(PLAN_HEAD_BYTES as u64)
+                    .read_to_end(&mut head)
+                    .map_err(read)?;
+                // A PE whose `e_lfanew` lies past the head is still one: ask the file.
+                let pe_signature = has_pe_signature(&head, meta.len(), |at| {
+                    let mut sig = [0u8; 4];
+                    file.seek(SeekFrom::Start(at))?;
+                    file.read_exact(&mut sig)?;
+                    Ok(sig)
+                })
+                .map_err(read)?;
+                PlanEntryKind::File {
+                    head,
+                    len: meta.len(),
+                    pe_signature,
+                }
+            }
+        };
+        entries.push(PlanEntry { path, kind });
+    }
+    sign_plan(target, &entries, main_exe).context("the tree cannot be code-signed")
 }
 
 #[cfg(unix)]
@@ -797,6 +826,9 @@ pub struct Settings<'a> {
     pub budget: u64,
     /// The code-signing hook.
     pub code_sign: &'a dyn CodeSign,
+    /// Whether `code_sign` signs for the OS (M9): the stage then builds the sign plan of the tree
+    /// (and skips a bundle that is already signed); otherwise the hook gets an empty plan.
+    pub os_signing: bool,
     /// The encoder.
     pub encoder: &'a dyn Encoder,
     /// The decoder of the round trip.
@@ -829,7 +861,13 @@ pub fn build(
     set: &Settings<'_>,
     say: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<Built> {
-    let tree = work.join("tree");
+    // A `macos-*` tree is built in a directory named `*.app` (M9-R1-D4), so a signing tool that
+    // goes by the suffix sees a bundle. The name is internal: only relative paths are recorded.
+    let tree = work.join(if target.is_macos() {
+        "tree.app"
+    } else {
+        "tree"
+    });
     if let Some(plan) = &set.update
         && input.is_dir()
     {
@@ -842,11 +880,19 @@ pub fn build(
         say("update: placed the runtime and the update config")?;
     }
 
-    let order = sign_order(&tree)?;
-    set.code_sign
-        .sign_tree(&tree, &order)
-        .context("code signing failed")?;
-    say(&format!("code-sign: {} file(s)", order.len()))?;
+    if set.os_signing && is_signed_bundle(input, target) {
+        // M8-D8: the developer signed this bundle, and any change would break the seal.
+        say("code-sign: the input bundle is already signed; left unchanged")?;
+    } else {
+        let order = if set.os_signing {
+            let main_exe = set.update.as_ref().map(|p| &p.install.entry);
+            plan_signing(&tree, target, main_exe)?
+        } else {
+            Vec::new()
+        };
+        set.code_sign.sign_tree(&tree, &order)?;
+        say(&format!("code-sign: {} item(s)", order.len()))?;
+    }
 
     let items = hash_tree(&tree, target, set.hasher)?;
     let mut report = Report::default();
@@ -970,8 +1016,8 @@ mod tests {
     }
 
     impl CodeSign for Rewrite {
-        fn sign_tree(&self, root: &Path, order: &[RelPath]) -> Result<(), Error> {
-            *self.seen.lock().unwrap() = order.iter().map(|p| p.as_str().to_owned()).collect();
+        fn sign_tree(&self, root: &Path, order: &[SignItem]) -> Result<(), Error> {
+            *self.seen.lock().unwrap() = order.iter().map(|i| i.rel().to_owned()).collect();
             fs::write(root.join(self.path), self.bytes).expect("rewrite");
             Ok(())
         }
@@ -1003,6 +1049,7 @@ mod tests {
             workers: 2,
             budget: 1 << 30,
             code_sign: &sign,
+            os_signing: false,
             encoder: &LzmaCodec,
             codec: &LzmaCodec,
             hasher: &Sha256Hasher,
@@ -1032,15 +1079,57 @@ mod tests {
             file_sha(&built.manifest, "sub/lib.bin"),
             Sha256Hasher.sha256(b"a library")
         );
-        // Deepest first, then by path.
-        assert_eq!(
-            *sign.seen.lock().unwrap(),
-            ["sub/deeper/x.bin", "sub/lib.bin", "app.bin"]
-        );
+        // Not an OS signer: the hook runs, with an empty plan.
+        assert!(sign.seen.lock().unwrap().is_empty());
         // The input itself is never touched.
         assert_eq!(
             fs::read(input.path().join("app.bin")).unwrap(),
             b"original bytes of the app"
+        );
+    }
+
+    #[test]
+    fn the_plan_is_read_from_the_tree() {
+        use lunepack_testkit::exe_headers;
+        let tree = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tree.path().join("bin/deep")).unwrap();
+        let pe = exe_headers::pe_image(0x8664, &exe_headers::PeSpec::hardened(2));
+        fs::write(tree.path().join("app.exe"), &pe).unwrap();
+        fs::write(tree.path().join("bin/deep/lib.dll"), &pe).unwrap();
+        fs::write(tree.path().join("readme.txt"), b"not a PE").unwrap();
+        fs::write(tree.path().join("fake.exe"), b"MZ but not a PE").unwrap();
+        let plan = plan_signing(tree.path(), Target::WindowsX86_64, None).unwrap();
+        let shown: Vec<&str> = plan.iter().map(SignItem::rel).collect();
+        // Deepest first; a non-PE `.exe` and a text file are not items.
+        assert_eq!(shown, ["bin/deep/lib.dll", "app.exe"]);
+        // Linux signs nothing; a macOS plan needs the main executable.
+        assert!(
+            plan_signing(tree.path(), Target::LinuxX86_64, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(plan_signing(tree.path(), Target::MacosUniversal, None).is_err());
+    }
+
+    /// S1: a PE whose `e_lfanew` lies past the 64 KiB head is read from the file, so the plan sees
+    /// it (and refuses: its headers cannot be read from the head) instead of leaving it unsigned.
+    #[test]
+    fn a_pe_signature_past_the_head_is_found_in_the_file() {
+        let tree = tempfile::tempdir().unwrap();
+        let mut far = vec![0u8; 0x30000];
+        far[..2].copy_from_slice(b"MZ");
+        far[0x3C..0x40].copy_from_slice(&0x10000u32.to_le_bytes());
+        far[0x10000..0x10004].copy_from_slice(b"PE\0\0");
+        fs::write(tree.path().join("far.dll"), &far).unwrap();
+        let err = plan_signing(tree.path(), Target::WindowsX86_64, None).unwrap_err();
+        assert!(format!("{err:#}").contains("far.dll"), "{err:#}");
+        // The same file without the signature is not a PE.
+        far[0x10000] = b'X';
+        fs::write(tree.path().join("far.dll"), &far).unwrap();
+        assert!(
+            plan_signing(tree.path(), Target::WindowsX86_64, None)
+                .unwrap()
+                .is_empty()
         );
     }
 

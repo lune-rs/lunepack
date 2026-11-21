@@ -118,7 +118,10 @@ fn download(
 ) -> Result<Body, Kind> {
     let updater = updater(inst, parsed)?;
     let Some(info) = checked(&updater, output, cancel)?.update else {
-        return Ok(Body::Download(None));
+        return Ok(Body::Download {
+            version: None,
+            publisher: None,
+        });
     };
     if let Some(expected) = &parsed.expect_version
         && (expected != info.version() || expected.to_string() != info.version().to_string())
@@ -136,7 +139,10 @@ fn download(
     let staged = updater
         .stage(downloaded, cancel)
         .map_err(|e| Kind::of(&e))?;
-    Ok(Body::Download(Some(staged.version().clone())))
+    Ok(Body::Download {
+        version: Some(staged.version().clone()),
+        publisher: staged.publisher(),
+    })
 }
 
 fn startup(inst: &Installation, parsed: &Parsed) -> Result<Body, Kind> {

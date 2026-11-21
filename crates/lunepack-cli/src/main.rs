@@ -9,6 +9,7 @@ mod cmd_keys;
 mod cmd_pack;
 mod cmd_setup;
 mod cmd_verify;
+mod codesign;
 mod config;
 mod dmg;
 mod pipeline;
@@ -17,13 +18,14 @@ mod plist;
 mod release_dir;
 mod stamp;
 mod state;
+mod tool;
 mod zip;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use lunepack_core::{CodeSign, Error, RelPath};
+use lunepack_core::{CodeSign, Error, SignItem};
 
 #[derive(Parser)]
 #[command(
@@ -89,7 +91,7 @@ enum KeysCommand {
 struct NoCodeSign;
 
 impl CodeSign for NoCodeSign {
-    fn sign_tree(&self, _root: &std::path::Path, _order: &[RelPath]) -> Result<(), Error> {
+    fn sign_tree(&self, _root: &std::path::Path, _plan: &[SignItem]) -> Result<(), Error> {
         Ok(())
     }
 }

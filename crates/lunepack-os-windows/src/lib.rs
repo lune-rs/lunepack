@@ -10,6 +10,7 @@
 //! shortcut with its app user model id, and the file types, URL schemes and autostart the app
 //! declares) with [`remove_stub_leftovers`] for the GC; and the launcher stub's two helpers
 //! ([`raw_command_line`], [`ignore_console_interrupts`]).
+//! [`WinPublisherCheck`] (M9 step 6) is the core's `PublisherCheck` over `WinVerifyTrust`.
 //! The public API is safe and builds on every OS; off Windows the helpers are no-ops or
 //! `Unsupported`.
 
@@ -22,12 +23,16 @@ mod launcher;
 #[cfg(windows)]
 mod process;
 #[cfg(windows)]
+mod publisher;
+#[cfg(windows)]
 mod registry;
 mod shell;
 #[cfg(windows)]
 mod shortcut;
 #[cfg(windows)]
 mod stub_place;
+#[cfg(any(windows, test))]
+mod trust_status;
 
 pub use harden::harden_dll_search;
 #[cfg(windows)]
@@ -35,6 +40,8 @@ pub use integration::{MARKER_VALUE, UNINSTALL_KEY, WinScope, WindowsIntegration}
 pub use launcher::{ignore_console_interrupts, raw_command_line};
 #[cfg(windows)]
 pub use process::WindowsProcess;
+#[cfg(windows)]
+pub use publisher::WinPublisherCheck;
 pub use shell::{
     MessageKind, allow_set_foreground, message_box, process_aumid, set_process_aumid,
     start_menu_programs, user_program_files,

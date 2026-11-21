@@ -20,6 +20,8 @@ lunepack-http.workspace = true
 # Processes and the XDG desktop integration (the crate is empty outside Linux).
 lunepack-os-linux.workspace = true
 thiserror.workspace = true
+# The warning of a publisher finding (M9-D9); never a subscriber.
+tracing.workspace = true
 # The cache's part sidecars (strict JSON on read through the core) and feed URL resolution.
 serde = { workspace = true }
 serde_json = { workspace = true }

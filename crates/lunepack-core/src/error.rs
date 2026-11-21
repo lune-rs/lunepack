@@ -120,6 +120,48 @@ pub enum JsonError {
     Syntax(Untrusted),
 }
 
+/// Why a publisher-continuity check (M9-D9) has no yes or no. A closed set: no variant carries a
+/// path, an operating-system message or certificate text, so an error is safe to show as it is;
+/// an adapter's detail goes to its own debug log, without subject names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PublisherError {
+    /// The installed tree has no operating-system signature: there is no baseline to compare with.
+    #[error("the installed version is not code-signed")]
+    InstalledUnsigned,
+    /// The installed tree's signature does not verify (a locally modified install).
+    #[error("the installed version's code signature does not verify")]
+    InstalledInvalid,
+    /// The candidate tree has no operating-system signature.
+    #[error("the update is not code-signed")]
+    CandidateUnsigned,
+    /// The candidate tree's signature does not verify.
+    #[error("the update's code signature does not verify")]
+    CandidateInvalid,
+    /// This platform has no publisher check (Linux).
+    #[error("publisher checks do not apply on this platform")]
+    NotApplicable,
+    /// The operating system could not answer (an API failure, a locked or unreadable file). A
+    /// local fault says nothing about the candidate.
+    #[error("the operating system could not check the publisher")]
+    Os,
+}
+
+impl PublisherError {
+    /// The stable code text: `installed_unsigned`, `installed_invalid`, `candidate_unsigned`,
+    /// `candidate_invalid`, `not_applicable` or `os`.
+    pub const fn code(self) -> &'static str {
+        match self {
+            PublisherError::InstalledUnsigned => "installed_unsigned",
+            PublisherError::InstalledInvalid => "installed_invalid",
+            PublisherError::CandidateUnsigned => "candidate_unsigned",
+            PublisherError::CandidateInvalid => "candidate_invalid",
+            PublisherError::NotApplicable => "not_applicable",
+            PublisherError::Os => "os",
+        }
+    }
+}
+
 /// Why a hex string was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]

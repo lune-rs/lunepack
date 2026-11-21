@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use lunepack::{InstallMeta, RelPath, TrustedRoot, UpdateConfig, Version};
+use lunepack::{InstallMeta, PublisherPolicy, RelPath, TrustedRoot, UpdateConfig, Version};
 use lunepack_core::state::{InstallState, UserScope};
 use lunepack_core::{
     AppId, Channel, CodecId, EncodedFrame, Encoder, Hasher as _, PayloadKind, ReleaseLayout,
@@ -48,14 +48,14 @@ const APP_ARGS: &str = "app-args";
 const APP_SLEEP_SECS: u64 = 3;
 /// The golden lines of `apply-and-restart`: its result, `nothing_staged`, `unexpected_version`.
 #[cfg(unix)]
-const GOLDEN_SCHEDULED: usize = 39;
-const GOLDEN_NOTHING_STAGED: usize = 40;
-const GOLDEN_UNEXPECTED: usize = 41;
+const GOLDEN_SCHEDULED: usize = 40;
+const GOLDEN_NOTHING_STAGED: usize = 41;
+const GOLDEN_UNEXPECTED: usize = 42;
 
 const GOLDEN_OBJECTS: &str = include_str!("golden/objects.jsonl");
 /// The golden line of a check that adopted the running bundle and found no update (M8-D9).
 #[cfg(target_os = "macos")]
-const GOLDEN_ADOPTED: usize = 46;
+const GOLDEN_ADOPTED: usize = 47;
 
 fn app_id() -> AppId {
     AppId::parse(SUITE_APP_ID).expect("app id")
@@ -152,18 +152,31 @@ struct Lab {
     signers: Vec<Ed25519Signer>,
     t: u64,
     publishes: u64,
+    /// The `publisher_check` every published config carries (M9-D6).
+    publisher_check: PublisherPolicy,
 }
 
 impl Lab {
     /// Publishes 1.0.0 and installs it.
     fn installed() -> Lab {
-        let lab = Lab::published();
+        Lab::installed_with(PublisherPolicy::Off)
+    }
+
+    /// Publishes 1.0.0 with the publisher policy `policy` in its config, and installs it.
+    fn installed_with(policy: PublisherPolicy) -> Lab {
+        let lab = Lab::published_with(policy);
         lab.install_1_0_0();
         lab
     }
 
-    /// Publishes 1.0.0 (and writes its bootstrap tree); installs nothing.
+    /// Publishes 1.0.0 (and writes its bootstrap tree); installs nothing (the macOS adoption
+    /// cases).
+    #[cfg(target_os = "macos")]
     fn published() -> Lab {
+        Lab::published_with(PublisherPolicy::Off)
+    }
+
+    fn published_with(publisher_check: PublisherPolicy) -> Lab {
         let h = common::Home::new("cli-", SUITE_APP_ID, Some("CLI test"), false);
         let keys = tempfile::tempdir().expect("keys");
         let signers = (0..2)
@@ -181,6 +194,7 @@ impl Lab {
             signers,
             t: now(),
             publishes: 0,
+            publisher_check,
         };
         lab.publish(&["1.0.0"]);
         lab
@@ -283,7 +297,7 @@ impl Lab {
                 url_schemes: Vec::new(),
                 autostart: false,
             };
-            let config = UpdateConfig::new(
+            let mut config = UpdateConfig::new(
                 &root,
                 Version::parse(version).expect("version"),
                 TARGET,
@@ -292,9 +306,9 @@ impl Lab {
                 60,
                 meta,
             )
-            .expect("config")
-            .to_bytes()
-            .expect("config bytes");
+            .expect("config");
+            config.publisher_check = self.publisher_check;
+            let config = config.to_bytes().expect("config bytes");
             let files: Vec<(&str, Vec<u8>, bool)> = vec![
                 // Started by the applier, the app records its arguments, stays up a while (so an
                 // applier that kept a caller's stdio would hold a capture open), then confirms its
@@ -692,6 +706,78 @@ fn download_stages_the_update_and_is_repeatable() {
     let run = lab.cmd(&["download"]);
     assert_eq!(run.code, 0, "{run:?}");
     assert_eq!(run.stdout, "download: staged 1.1.0\n");
+}
+
+/// What the platform's native publisher check (M9-D9) says about the lab's trees, which carry no
+/// code signature: Linux has no check (no finding); on Windows the entry is no PE file and on
+/// macOS the bundle (no `Info.plist`, a script as its executable) is no code the OS judges, so the
+/// status is outside each adapter's verdict allowlist (M9-R1-D2) and the finding is `os`.
+#[cfg(target_os = "linux")]
+const NATIVE_FINDING: Option<&str> = None;
+#[cfg(not(target_os = "linux"))]
+const NATIVE_FINDING: Option<&str> = Some("os");
+
+/// `download` runs the publisher check under the installed tree's `warn` policy: the update is
+/// staged and the finding is the result's `publisher` member (and the human line's note).
+#[test]
+fn download_reports_the_publisher_finding_under_warn() {
+    let mut lab = Lab::installed_with(PublisherPolicy::Warn);
+    lab.publish(&["1.0.0", "1.1.0"]);
+    let run = lab.cmd(&["download", "--json"]);
+    assert_eq!(run.code, 0, "{run:?}");
+    let want = match NATIVE_FINDING {
+        None => golden(3).to_owned(),
+        Some(code) => golden(3).replace('}', &format!(",\"publisher\":\"{code}\"}}")),
+    };
+    assert_eq!(run.last_line(), want);
+    assert_eq!(run.stderr, "");
+    run.assert_clean(&lab, &[]);
+    let record = lab.record().expect("record");
+    assert_eq!(record.staged.expect("staged").version.to_string(), "1.1.0");
+    assert!(record.bad.is_empty());
+
+    let run = lab.cmd(&["download"]);
+    assert_eq!(run.code, 0, "{run:?}");
+    let want = match NATIVE_FINDING {
+        None => "download: staged 1.1.0\n".to_owned(),
+        Some(code) => format!("download: staged 1.1.0 (publisher: {code})\n"),
+    };
+    assert_eq!(run.stdout, want);
+}
+
+/// Under `enforce` a finding that is a local fault (`os`) is exit 29 with its reason: nothing is
+/// staged or marked bad. Linux has no check, so the update is staged.
+#[test]
+fn download_under_enforce_refuses_with_exit_29() {
+    let mut lab = Lab::installed_with(PublisherPolicy::Enforce);
+    lab.publish(&["1.0.0", "1.1.0"]);
+    let run = lab.cmd(&["download", "--json"]);
+    run.assert_clean(&lab, &[]);
+    let record = lab.record().expect("record");
+    assert!(record.bad.is_empty());
+    match NATIVE_FINDING {
+        None => {
+            assert_eq!(run.code, 0, "{run:?}");
+            assert_eq!(run.last_line(), golden(3));
+            assert!(record.staged.is_some());
+        }
+        Some(code) => {
+            assert_eq!(run.code, 29, "{run:?}");
+            let want = format!(
+                "{{\"schema\":1,\"type\":\"error\",\"command\":\"download\",\"tree_version\":\"1.0.0\",\"kind\":\"publisher_mismatch\",\"exit_code\":29,\"reason\":\"{code}\"}}"
+            );
+            assert_eq!(run.last_line(), want);
+            assert!(GOLDEN_OBJECTS.lines().any(|l| l == want), "a golden line");
+            assert!(record.staged.is_none());
+            let run = lab.cmd(&["download"]);
+            assert_eq!(run.code, 29, "{run:?}");
+            run.assert_clean(&lab, &[]);
+            assert_eq!(
+                run.stderr.lines().last(),
+                Some(format!("download: error: publisher_mismatch (exit 29, {code})").as_str())
+            );
+        }
+    }
 }
 
 #[test]
