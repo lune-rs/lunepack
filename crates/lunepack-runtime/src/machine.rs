@@ -2880,11 +2880,15 @@ mod tests {
             format!("{text}extra\n"),
             text.replace(ID, "short"),
             text.replace(SID, "not-a-sid"),
-            text.replace("root /", "root pf/"),
+            text.replace(
+                &format!("root {}", marker.root.display()),
+                "root relative/dir",
+            ),
             text.replace("name My Hello App", "name "),
             text.replace("name My Hello App", "name My\tHello"),
             text.replace("\nroot ", "\r\nroot "),
         ] {
+            assert_ne!(bad, text, "the edit changed nothing");
             assert_eq!(Marker::parse(&bad), None, "{bad:?}");
         }
         // A name with a control character is not written at all.
