@@ -23,6 +23,7 @@ use std::time::Duration;
 use lunepack_core::codesign::{Decision, PublisherOutcome, decide};
 use lunepack_core::fetch::FetchPolicy;
 use lunepack_core::layout::LOCK_FILE;
+use lunepack_core::service::CommitOutcome;
 use lunepack_core::state::MAX_BAD_VERSIONS;
 use lunepack_core::state::{CurrentRef, Scope, is_record_name};
 use lunepack_core::state::{
@@ -45,6 +46,7 @@ use lunepack_core::{
 
 use crate::cache::{Cache, CacheKind, PartTools};
 use crate::fetch::{self, FeedUrls, FetchCtx, FrameNeed, PackTarget, cancellable};
+use crate::machine::{self, Offer, SignedDocs, StageSession};
 use crate::progress::{ProgressPump, ProgressSink, progress};
 use crate::task::{OpLock, spawn_job};
 use crate::worker_transport::WorkerTransport;
@@ -198,6 +200,8 @@ pub struct UpdaterBuilder {
     rng: Option<Arc<dyn Rng>>,
     integration: Option<Arc<dyn OsIntegration>>,
     publisher: Option<Arc<dyn PublisherCheck>>,
+    service: Option<Arc<dyn lunepack_core::ServiceConnector>>,
+    policy_source: Option<Arc<dyn lunepack_core::PolicySource>>,
     workers: Option<usize>,
     budget: u64,
     policy: FetchPolicy,
@@ -247,6 +251,8 @@ impl UpdaterBuilder {
             rng: None,
             integration: None,
             publisher: None,
+            service: None,
+            policy_source: None,
             workers: None,
             budget: DEFAULT_BUDGET,
             policy: FetchPolicy::default(),
@@ -344,6 +350,27 @@ impl UpdaterBuilder {
         self
     }
 
+    /// How the update service of a per-machine install is reached (M10, C8): a [`Layout::Machine`]
+    /// updater stages through it. Without one, staging a machine layout is [`Error::MachineScope`]
+    /// (the library never writes a machine install itself). An updater of
+    /// [`crate::Installation::updater_builder`] has the platform's connector.
+    pub fn service_connector(
+        mut self,
+        connector: Arc<dyn lunepack_core::ServiceConnector>,
+    ) -> Self {
+        self.service = Some(connector);
+        self
+    }
+
+    /// Where the administrator's policy for a per-machine install is read (M10-D12): with
+    /// self-update disabled, `check`, `download` and `stage` of a [`Layout::Machine`] updater are
+    /// [`Error::DisabledByPolicy`] before any request. Without a source nothing is disabled. An
+    /// updater of [`crate::Installation::updater_builder`] has the platform's.
+    pub fn policy_source(mut self, source: Arc<dyn lunepack_core::PolicySource>) -> Self {
+        self.policy_source = Some(source);
+        self
+    }
+
     /// Worker threads for scan and stage (default `min(available_parallelism, 8)`).
     pub fn workers(mut self, workers: usize) -> Self {
         self.workers = Some(workers);
@@ -423,6 +450,8 @@ impl UpdaterBuilder {
                 publisher: self
                     .publisher
                     .unwrap_or_else(crate::installation::default_publisher),
+                service: self.service,
+                policy_source: self.policy_source,
                 workers: workers.max(1),
                 budget: self.budget,
                 policy: self.policy,
@@ -539,6 +568,8 @@ pub struct UpdateInfo {
     manifest: Arc<VerifiedManifest>,
     manifest_sha256: Sha256Digest,
     pack: PackTarget,
+    /// The documents the check verified, as it read them (a machine install's stage sends them).
+    docs: Arc<SignedDocs>,
 }
 
 impl fmt::Debug for UpdateInfo {
@@ -804,6 +835,9 @@ struct Inner {
     rng: Arc<dyn Rng>,
     integration: Arc<dyn OsIntegration>,
     publisher: Arc<dyn PublisherCheck>,
+    /// The update service of a per-machine install, when the updater has one.
+    service: Option<Arc<dyn lunepack_core::ServiceConnector>>,
+    policy_source: Option<Arc<dyn lunepack_core::PolicySource>>,
     workers: usize,
     budget: u64,
     policy: FetchPolicy,
@@ -937,6 +971,20 @@ impl Inner {
 
     fn cache(&self) -> Cache {
         Cache::new(Arc::clone(&self.fs), self.layout.cache_dir().to_path_buf())
+    }
+
+    /// M10-D12: an administrator's policy switched self-update off for this per-machine install.
+    /// Read before every operation that would reach for an update, so no request is made.
+    fn refuse_if_disabled(&self) -> Result<(), Error> {
+        let disabled = matches!(self.layout, Layout::Machine { .. })
+            && self
+                .policy_source
+                .as_ref()
+                .is_some_and(|source| source.read(&self.app_id).self_update_disabled);
+        if disabled {
+            return Err(Error::DisabledByPolicy);
+        }
+        Ok(())
     }
 }
 
@@ -1264,6 +1312,7 @@ impl Updater {
 }
 
 async fn check(inner: Arc<Inner>, options: CheckOptions) -> Result<CheckOutcome, Error> {
+    inner.refuse_if_disabled()?;
     if let Some(bundle) = inner.adopt.clone() {
         return check_adopting(inner, bundle, options).await;
     }
@@ -1323,7 +1372,7 @@ async fn check_from(
     let transport_arc = inner.transport.for_op(lock);
     let transport = &*transport_arc;
 
-    let Documents { root, keys, feed } =
+    let (Documents { root, keys, feed }, mut docs) =
         verify_documents(inner, transport, &floors, &clock).await?;
     let candidate = select_candidate(
         &feed,
@@ -1340,6 +1389,7 @@ async fn check_from(
             let url = inner.urls.reference(reference)?;
             let bytes = fetch::fetch_document(transport, &url, reference.size()).await?;
             let manifest = verify_manifest(&keys, &candidate.entry, &bytes, hasher, verifier)?;
+            docs.manifest = bytes.to_vec();
             let pack = manifest.pack();
             let pack = PackTarget {
                 url: inner.urls.reference(pack)?,
@@ -1356,6 +1406,7 @@ async fn check_from(
                 manifest_sha256: reference.sha256(),
                 manifest: Arc::new(manifest),
                 pack,
+                docs: Arc::new(docs),
             })
         }
     };
@@ -1374,26 +1425,37 @@ async fn check_from(
 /// The documents of a check, in FORMAT.md 11.1 order: the root walk (FORMAT.md 5.2) from the
 /// higher of the stored (`floors`) and the embedded root, then the key set and the feed against
 /// `floors` and `clock`. The core's [`RootWalk`] verifies; this only fetches. Nothing is committed.
+/// Also returns the bytes it read (the manifest is the caller's): a machine install's stage sends
+/// them to the service.
+///
+/// On a machine install the walk starts from the machine record's root whenever it has one, never
+/// from a higher embedded root: the service verifies from that root alone (M10-D17), so the
+/// rotation documents it is sent must follow it.
 async fn verify_documents(
     inner: &Inner,
     transport: &dyn Transport,
     floors: &Floors,
     clock: &ClockReading,
-) -> Result<Documents, Error> {
+) -> Result<(Documents, SignedDocs), Error> {
     let hasher = &*inner.hasher;
     let verifier = &*inner.verifier;
+    let machine = matches!(inner.layout, Layout::Machine { .. });
     let start = match &floors.root {
-        Some(parts) if parts.version > inner.root.version() => {
+        Some(parts) if machine || parts.version > inner.root.version() => {
             parts.to_trusted(inner.app_id.clone(), hasher, verifier)?
         }
         _ => inner.root.clone(),
     };
+    let mut docs = SignedDocs::default();
     let mut walk = RootWalk::new(start);
     while let Some(next) = walk.next_version() {
         let url = inner.urls.root(next)?;
         match fetch::fetch_root_doc(transport, &url, Limits::V1.root_doc_bytes).await? {
             None => break,
-            Some(bytes) => walk.advance(&bytes, hasher, verifier)?,
+            Some(bytes) => {
+                walk.advance(&bytes, hasher, verifier)?;
+                docs.roots.push(bytes);
+            }
         }
     }
     walk.check_app_id(&inner.app_id)?;
@@ -1402,7 +1464,11 @@ async fn verify_documents(
     let chain = walk.verify_keys(&inner.app_id, floors, &keys_bytes, clock, hasher, verifier)?;
     let feed_bytes =
         fetch::fetch_document(transport, &inner.feed_url, Limits::V1.feed_doc_bytes).await?;
-    Ok(chain.verify_feed(&inner.app_id, &inner.channel, &feed_bytes, clock, verifier)?)
+    let documents =
+        chain.verify_feed(&inner.app_id, &inner.channel, &feed_bytes, clock, verifier)?;
+    docs.keys = keys_bytes;
+    docs.feed = feed_bytes;
+    Ok((documents, docs))
 }
 
 /// Re-loads the state under the lock and refuses an update that is no longer newer, or bad.
@@ -1445,6 +1511,7 @@ async fn download(
     info: UpdateInfo,
     mut options: DownloadOptions,
 ) -> Result<Downloaded, Error> {
+    inner.refuse_if_disabled()?;
     let cancel = options.cancel.clone().unwrap_or_default();
     let (sink, mut pump) = progress(Phase::Scan, 0);
     let mut callback = options.progress.take();
@@ -1615,6 +1682,11 @@ async fn refuse_case_collision(
 }
 
 async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersion, Error> {
+    if matches!(inner.layout, Layout::Machine { .. }) {
+        // C8: the library never writes a machine install; the service does, from the same bytes.
+        inner.refuse_if_disabled()?;
+        return stage_machine(inner, downloaded).await;
+    }
     let Layout::User { versions_dir, .. } = &inner.layout else {
         return Err(Error::MachineScope);
     };
@@ -1867,6 +1939,244 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
         })
     })
     .await
+}
+
+/// What `stage` of a machine layout sends the service for `downloaded`: every frame the download
+/// holds and, when some file still has no frame, the pack it holds. (The service chooses its own
+/// sources: the unchanged files of its tree first.)
+fn offers(downloaded: &Downloaded) -> Vec<Offer> {
+    let manifest = &downloaded.info.manifest;
+    let mut out = Vec::new();
+    let mut needs_pack = false;
+    for (i, need) in frames_of(manifest) {
+        if downloaded.unchanged.get(i).is_some_and(Option::is_some) {
+            continue;
+        }
+        match downloaded.frames.get(&need.sha256) {
+            Some(path) => {
+                if !out.iter().any(|o: &Offer| o.sha256 == need.sha256) {
+                    out.push(Offer {
+                        kind: lunepack_core::service::ObjectKind::Frame,
+                        sha256: need.sha256,
+                        size: need.length,
+                        path: path.clone(),
+                    });
+                }
+            }
+            None => needs_pack = true,
+        }
+    }
+    if let (true, Some(pack)) = (needs_pack, downloaded.pack.as_ref()) {
+        out.push(Offer {
+            kind: lunepack_core::service::ObjectKind::Pack,
+            sha256: downloaded.info.pack.sha256,
+            size: downloaded.info.pack.size,
+            path: pack.clone(),
+        });
+    }
+    out
+}
+
+/// `stage` of a per-machine install (C8): the documents the check verified and the objects the
+/// download holds go to the service's stage session, which verifies them again and builds the
+/// tree. A `need_fetch` is answered by fetching what is missing (the failing frames by Range,
+/// then the whole pack, the D27 ladder) and committing again, within the session's three commits.
+/// Dropping the future, or a cancel, ends the session: the service discards what it holds.
+async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersion, Error> {
+    if !matches!(
+        inner.layout,
+        Layout::Machine {
+            versions_dir: Some(_),
+            ..
+        }
+    ) {
+        return Err(Error::MachineScope);
+    }
+    let Some(connector) = inner.service.clone() else {
+        // No way to reach a service was given: the library has no other way to stage (C8).
+        return Err(Error::MachineScope);
+    };
+    let Downloaded {
+        info,
+        unchanged,
+        mut frames,
+        mut pack,
+        mut options,
+    } = downloaded;
+    let cancel = options.cancel.clone().unwrap_or_default();
+    let (sink, mut pump) = progress(Phase::Stage, 0);
+    let mut callback = options.progress.take();
+    with_progress(&mut pump, &mut callback, async {
+        let lock = take_lock(&inner, &cancel).await?;
+        // The same freshness rule as the user stage, from the machine record.
+        load_fresh(&inner, &lock, &cancel, &info).await?;
+        let all_frames = frames_of(&info.manifest);
+        let mut held = Downloaded {
+            info: info.clone(),
+            unchanged: unchanged.clone(),
+            frames: frames.clone(),
+            pack: pack.clone(),
+            options: DownloadOptions::default(),
+        };
+        let first = offers(&held);
+        let docs = Arc::clone(&info.docs);
+        let channel = inner.channel.clone();
+        let app_id = inner.app_id.clone();
+        let progress_sink = sink.clone();
+        // One job opens the session, uploads and commits; the session lives on between jobs.
+        let (session, mut outcome) = on_job(
+            &inner,
+            Some(&lock),
+            &cancel,
+            "service-stage",
+            move |inner, cancel| {
+                let session = machine::open_session(&*connector, &app_id)?;
+                let (mut stage, version) = StageSession::begin(session, &channel, &docs)?;
+                let Some(version) = version else {
+                    // The service sees no update where the check found one: it is stale.
+                    return Err(Error::Stale);
+                };
+                if version != info.version {
+                    return Err(Error::Stale);
+                }
+                stage.upload(&*inner.fs, &first, cancel)?;
+                let outcome = commit(&mut stage, &progress_sink)?;
+                Ok((stage, outcome))
+            },
+        )
+        .await?;
+        let session = Arc::new(std::sync::Mutex::new(Some(session)));
+        let (mut range_tried, mut pack_tried) = (false, false);
+        let staged_version = loop {
+            let paths = match outcome {
+                CommitOutcome::Staged(v) => break v,
+                CommitOutcome::NeedFetch { paths, .. } => paths,
+            };
+            let failed: Vec<usize> = info
+                .manifest
+                .entries()
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| paths.contains(e.path()))
+                .map(|(i, _)| i)
+                .collect();
+            let failed_frames: Vec<FrameNeed> = all_frames
+                .iter()
+                .filter(|(i, _)| failed.contains(i))
+                .map(|(_, f)| f.clone())
+                .collect();
+            // The service's scan found these changed: whatever the user's scan said, they need
+            // an object now.
+            for &i in &failed {
+                if let Some(slot) = held.unchanged.get_mut(i) {
+                    *slot = None;
+                }
+            }
+            let ctx = fetch_ctx(&inner, &lock, &cancel, &sink);
+            if !range_tried {
+                range_tried = true;
+                sink.set_phase(Phase::Download, 0);
+                let fetched = fetch::download(&ctx, &info.pack, &failed_frames).await?;
+                for f in &failed_frames {
+                    if let Some(p) = fetched.frame(&f.sha256) {
+                        frames.insert(f.sha256, p.to_path_buf());
+                    }
+                }
+                if let Some(p) = fetched.pack() {
+                    pack = Some(p.to_path_buf());
+                }
+            } else if !pack_tried {
+                pack_tried = true;
+                let sha = info.pack.sha256;
+                on_job(
+                    &inner,
+                    Some(&lock),
+                    &cancel,
+                    "cache-drop",
+                    move |inner, _| Ok(inner.cache().remove_entry(CacheKind::Pack, &sha)?),
+                )
+                .await?;
+                sink.set_phase(Phase::Download, 0);
+                pack = Some(fetch::fetch_pack(&ctx, &info.pack, None).await?);
+            } else {
+                return Err(Error::NeedFetchExhausted(paths));
+            }
+            held.frames = frames.clone();
+            held.pack = pack.clone();
+            // Frames the service has taken are not sent again; the pack goes when files still
+            // lack a frame.
+            let more = offers(&held);
+            let session = Arc::clone(&session);
+            let progress_sink = sink.clone();
+            sink.set_phase(Phase::Stage, 0);
+            outcome = on_job(
+                &inner,
+                Some(&lock),
+                &cancel,
+                "service-stage",
+                move |inner, cancel| {
+                    let mut guard = session.lock().map_err(|_| Error::WorkerPanicked)?;
+                    let stage = guard.as_mut().ok_or(Error::Cancelled)?;
+                    stage.upload(&*inner.fs, &more, cancel)?;
+                    commit(stage, &progress_sink)
+                },
+            )
+            .await?;
+        };
+        // The session ends here: the service's folder for it goes with the connection.
+        drop(session);
+
+        // The service recorded the tree; read where, and drop the version's cache entries.
+        let drop_frames: Vec<Sha256Digest> = all_frames.iter().map(|(_, f)| f.sha256).collect();
+        let pack_sha = info.pack.sha256;
+        let version = staged_version.clone();
+        let staged = on_job(
+            &inner,
+            Some(&lock),
+            &cancel,
+            "service-staged",
+            move |inner, _| {
+                let snap = inner.load()?;
+                let record = snap.record();
+                let staged = record
+                    .staged
+                    .as_ref()
+                    .filter(|s| s.version == version && record.staged_issued_bound().is_some())
+                    .ok_or(Error::NothingStaged)?;
+                let tree = inner
+                    .layout
+                    .versions_dir()
+                    .ok_or(Error::NothingStaged)?
+                    .join(&staged.tree);
+                let cache = inner.cache();
+                for sha in &drop_frames {
+                    let _ = cache.remove_entry(CacheKind::Frame, sha);
+                }
+                let _ = cache.remove_entry(CacheKind::Pack, &pack_sha);
+                Ok(StagedVersion {
+                    version,
+                    target: staged.target,
+                    tree,
+                    publisher: None,
+                })
+            },
+        )
+        .await?;
+        Ok(staged)
+    })
+    .await
+}
+
+/// `stage_commit` with the service's progress forwarded as the stage phase's.
+fn commit(stage: &mut StageSession, sink: &ProgressSink) -> Result<CommitOutcome, Error> {
+    let last = AtomicU64::new(0);
+    stage.commit(&mut |done, total| {
+        if total > 0 {
+            sink.set_total(total);
+        }
+        let before = last.swap(done, Ordering::SeqCst);
+        sink.add_done(done.saturating_sub(before));
+    })
 }
 
 /// The publisher decision (M9-D9) for staging `candidate` over the install's current version
@@ -2310,7 +2620,9 @@ async fn check_adopting(
         root: trusted,
         keys,
         feed,
-    } = verify_documents(&inner, transport, &floors, &clock).await?;
+    } = verify_documents(&inner, transport, &floors, &clock)
+        .await?
+        .0;
     let version_text = config.version.to_string();
     let entry = feed
         .releases()
