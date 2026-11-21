@@ -151,6 +151,15 @@ pub enum Kind {
     /// reason, a closed code (`different`, `installed_invalid`, `candidate_unsigned`,
     /// `candidate_invalid`, `os`). Nothing was staged.
     PublisherMismatch(PublisherOutcome),
+    /// The install is for all users and needs administrator rights, and the run cannot ask for them
+    /// (`--all-users --silent` as a standard user; M10-D15).
+    ElevationRequired,
+    /// The user declined the administrator prompt (M10-D15).
+    ElevationDeclined,
+    /// The release carries no update service, so it installs per user only (M10-D7).
+    PerMachineUnavailable,
+    /// A directory of the machine install is not protected as it must be (M10-D9).
+    NotProtected,
     /// Anything else (a worker panic, a facade error this build does not know).
     Internal,
 }
@@ -158,7 +167,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind, in code order (for the golden of step 12).
     #[allow(dead_code)]
-    pub const ALL: [Kind; 30] = [
+    pub const ALL: [Kind; 34] = [
         Kind::Ok,
         Kind::Usage,
         Kind::NotInstalled,
@@ -190,6 +199,10 @@ impl Kind {
         Kind::UnsupportedLocation(Place::Translocated),
         // One representative: every reason shares the code and the name (`PUBLISHER_REASONS`).
         Kind::PublisherMismatch(PublisherOutcome::Different),
+        Kind::ElevationRequired,
+        Kind::ElevationDeclined,
+        Kind::PerMachineUnavailable,
+        Kind::NotProtected,
         Kind::Internal,
     ];
 
@@ -225,6 +238,10 @@ impl Kind {
             Kind::NoRelease => 27,
             Kind::UnsupportedLocation(_) => 28,
             Kind::PublisherMismatch(_) => 29,
+            Kind::ElevationRequired => 30,
+            Kind::ElevationDeclined => 31,
+            Kind::PerMachineUnavailable => 34,
+            Kind::NotProtected => 35,
             Kind::Internal => 70,
         }
     }
@@ -261,6 +278,10 @@ impl Kind {
             Kind::NoRelease => "no_release",
             Kind::UnsupportedLocation(_) => "unsupported_location",
             Kind::PublisherMismatch(_) => "publisher_mismatch",
+            Kind::ElevationRequired => "elevation_required",
+            Kind::ElevationDeclined => "elevation_declined",
+            Kind::PerMachineUnavailable => "per_machine_unavailable",
+            Kind::NotProtected => "not_protected",
             Kind::Internal => "internal",
         }
     }
@@ -272,6 +293,20 @@ impl Kind {
             Kind::PublisherMismatch(reason) => Some(reason.code()),
             _ => None,
         }
+    }
+
+    /// The kind a child's exit code names: success, one of this table's codes (the two kinds that
+    /// carry a reason are never a child's answer here), else `process`.
+    pub fn from_exit_code(code: i32) -> Kind {
+        let Ok(code) = u8::try_from(code) else {
+            return Kind::Process;
+        };
+        Kind::ALL
+            .iter()
+            .copied()
+            .find(|k| k.code() == code)
+            .filter(|k| !matches!(k, Kind::UnsupportedLocation(_) | Kind::PublisherMismatch(_)))
+            .unwrap_or(Kind::Process)
     }
 
     /// The class of a facade error. The facade's `Display` text is never used.
@@ -438,6 +473,135 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
 /// once; anything else is a usage error.
 pub fn parse_setup(args: &[OsString]) -> Result<bool, UsageError> {
     silent_or_s(args)
+}
+
+/// The option that asks a Windows setup to install for all users (M10-D15).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const ALL_USERS_FLAG: &str = "--all-users";
+/// The hidden mode of a Windows setup file's elevated copy (M10 step 16).
+pub const MACHINE_INSTALL: &str = "machine-install";
+
+/// The options of a setup file's run on a system with per-machine installs (Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetupArgs {
+    /// `--silent` or `/S`: no UI and no prompt (D41).
+    pub silent: bool,
+    /// `--all-users`: install for all users.
+    pub all_users: bool,
+}
+
+/// The arguments of the hidden `machine-install` mode. Both values are checked for their form
+/// only; the system parses the SID when the pipe is made.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MachineArgs {
+    /// `--events <32 lowercase hex>`: the id of the elevation pipe's name.
+    pub events: String,
+    /// `--for-sid <SID>`: the one account that may read the pipe (`S-1-…`).
+    pub for_sid: String,
+}
+
+impl std::fmt::Debug for MachineArgs {
+    /// Shows no value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MachineArgs").finish_non_exhaustive()
+    }
+}
+
+/// What a setup file's command line asks for on Windows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum SetupCommand {
+    /// An install run: nothing, or `--silent` / `/S` and `--all-users`, each at most once, in
+    /// any order.
+    Run(SetupArgs),
+    /// `machine-install --events <id> --for-sid <SID>`: the elevated copy's mode.
+    MachineInstall(MachineArgs),
+}
+
+/// [`parse_setup_command_with`] for this system: per-machine options exist on Windows only.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_setup_command(args: &[OsString]) -> Result<SetupCommand, UsageError> {
+    parse_setup_command_with(args, cfg!(windows))
+}
+
+/// Parses a setup file's command line. With `machine` false it is [`parse_setup`]; with it, the
+/// `--all-users` option and the `machine-install` mode are accepted too. An unknown, repeated or
+/// malformed option is a usage error that names nothing.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_setup_command_with(
+    args: &[OsString],
+    machine: bool,
+) -> Result<SetupCommand, UsageError> {
+    if !machine {
+        return silent_or_s(args).map(|silent| {
+            SetupCommand::Run(SetupArgs {
+                silent,
+                all_users: false,
+            })
+        });
+    }
+    if args.first().is_some_and(|a| a == MACHINE_INSTALL) {
+        return parse_machine_install(&args[1..]).map(SetupCommand::MachineInstall);
+    }
+    let mut run = SetupArgs {
+        silent: false,
+        all_users: false,
+    };
+    for arg in args {
+        if is_silent_flag(arg) && !run.silent {
+            run.silent = true;
+        } else if arg == ALL_USERS_FLAG && !run.all_users {
+            run.all_users = true;
+        } else {
+            return Err(UsageError);
+        }
+    }
+    Ok(SetupCommand::Run(run))
+}
+
+/// `--events <id> --for-sid <SID>`, in either order, each once.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_machine_install(args: &[OsString]) -> Result<MachineArgs, UsageError> {
+    let mut events: Option<String> = None;
+    let mut sid: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let name = args[i].to_str().ok_or(UsageError)?;
+        let value = args.get(i + 1).and_then(|v| v.to_str()).ok_or(UsageError)?;
+        match name {
+            "--events" if events.is_none() && is_events_id(value) => {
+                events = Some(value.to_owned());
+            }
+            "--for-sid" if sid.is_none() && is_sid_text(value) => sid = Some(value.to_owned()),
+            _ => return Err(UsageError),
+        }
+        i += 2;
+    }
+    match (events, sid) {
+        (Some(events), Some(for_sid)) => Ok(MachineArgs { events, for_sid }),
+        _ => Err(UsageError),
+    }
+}
+
+/// Exactly 32 lowercase hexadecimal characters.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_events_id(text: &str) -> bool {
+    text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The form of a SID's text: `S-1-<authority>` and one to fifteen sub-authorities, all decimal,
+/// at most 184 characters. The system parses it when it is used.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_sid_text(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("S-1-") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    text.len() <= 184
+        && (2..=16).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Whether `uninstall` has a phase 2 (`--install-root`): Windows only (M7-D5).
@@ -779,6 +943,171 @@ mod tests {
         }
     }
 
+    /// M10-D15: a Windows setup takes `--silent`/`/S` and `--all-users`, each once, in any order.
+    #[test]
+    fn a_machine_setup_run_takes_silent_and_all_users_once_each() {
+        let run = |a: &[&str]| parse_setup_command_with(&os(a), true);
+        let want = |silent, all_users| Ok(SetupCommand::Run(SetupArgs { silent, all_users }));
+        assert_eq!(run(&[]), want(false, false));
+        assert_eq!(run(&["--silent"]), want(true, false));
+        assert_eq!(run(&["--all-users"]), want(false, true));
+        assert_eq!(run(&["--all-users", "--silent"]), want(true, true));
+        assert_eq!(run(&["--silent", "--all-users"]), want(true, true));
+        // `/S` is silent on Windows only (is_silent_flag).
+        if cfg!(windows) {
+            assert_eq!(run(&["/S"]), want(true, false));
+            assert_eq!(run(&["/S", "--all-users"]), want(true, true));
+        }
+        for bad in [
+            &["--all-users", "--all-users"][..],
+            &["--silent", "--silent"],
+            &["--silent", "--silent"],
+            &["--all-users=1"],
+            &["--ALL-USERS"],
+            &["--all-user"],
+            &["--for-all-users"],
+            &["all-users"],
+            &["--no-ui"],
+        ] {
+            assert_eq!(run(bad), Err(UsageError), "{bad:?}");
+        }
+        // Without per-machine installs (Linux, macOS) the option does not exist.
+        let plain = |a: &[&str]| parse_setup_command_with(&os(a), false);
+        assert_eq!(plain(&["--all-users"]), Err(UsageError));
+        assert_eq!(plain(&["machine-install"]), Err(UsageError));
+        assert_eq!(
+            plain(&["--silent"]),
+            Ok(SetupCommand::Run(SetupArgs {
+                silent: true,
+                all_users: false
+            }))
+        );
+    }
+
+    #[test]
+    fn the_machine_install_mode_takes_a_32_hex_id_and_a_sid_once_each() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let sid = "S-1-5-21-1004336348-1177238915-682003330-1001";
+        let ok = |a: &[&str]| parse_setup_command_with(&os(a), true);
+        let want = Ok(SetupCommand::MachineInstall(MachineArgs {
+            events: id.to_owned(),
+            for_sid: sid.to_owned(),
+        }));
+        assert_eq!(
+            ok(&["machine-install", "--events", id, "--for-sid", sid]),
+            want
+        );
+        assert_eq!(
+            ok(&["machine-install", "--for-sid", sid, "--events", id]),
+            want
+        );
+        let long_id = format!("{id}0");
+        let upper = id.to_uppercase();
+        let short = &id[..31];
+        let non_hex = format!("{}g", &id[..31]);
+        for bad in [
+            vec!["machine-install"],
+            vec!["machine-install", "--events", id],
+            vec!["machine-install", "--for-sid", sid],
+            vec![
+                "machine-install",
+                "--events",
+                id,
+                "--events",
+                id,
+                "--for-sid",
+                sid,
+            ],
+            vec![
+                "machine-install",
+                "--events",
+                id,
+                "--for-sid",
+                sid,
+                "--silent",
+            ],
+            vec!["machine-install", "--events", short, "--for-sid", sid],
+            vec!["machine-install", "--events", &long_id, "--for-sid", sid],
+            vec!["machine-install", "--events", &upper, "--for-sid", sid],
+            vec!["machine-install", "--events", &non_hex, "--for-sid", sid],
+            vec!["machine-install", "--events", id, "--for-sid", "S-1-5"],
+            vec!["machine-install", "--events", id, "--for-sid", "S-1-5-x"],
+            vec!["machine-install", "--events", id, "--for-sid", "s-1-5-21-1"],
+            vec!["machine-install", "--events", id, "--for-sid", "S-2-5-21-1"],
+            vec![
+                "machine-install",
+                "--events",
+                id,
+                "--for-sid",
+                "S-1-5-21--1",
+            ],
+            vec!["machine-install", "--events", id, "--for-sid", ""],
+            vec![
+                "machine-install",
+                "--events",
+                id,
+                "--for-sid",
+                &format!("S-1-5-{}", "1-".repeat(100)),
+            ],
+            vec![
+                "machine-install",
+                &format!("--events={id}"),
+                "--for-sid",
+                sid,
+            ],
+            vec![
+                "--all-users",
+                "machine-install",
+                "--events",
+                id,
+                "--for-sid",
+                sid,
+            ],
+        ] {
+            assert_eq!(ok(&bad), Err(UsageError), "{bad:?}");
+        }
+        // The ordinary runtime has no such mode.
+        assert_eq!(
+            parse(&os(&["machine-install", "--events", id, "--for-sid", sid])),
+            Err(UsageError)
+        );
+    }
+
+    #[test]
+    fn a_child_exit_code_names_its_kind_and_an_unknown_one_is_a_process_error() {
+        assert_eq!(Kind::from_exit_code(0), Kind::Ok);
+        assert_eq!(Kind::from_exit_code(23), Kind::AlreadyInstalled);
+        assert_eq!(Kind::from_exit_code(30), Kind::ElevationRequired);
+        assert_eq!(Kind::from_exit_code(31), Kind::ElevationDeclined);
+        assert_eq!(Kind::from_exit_code(34), Kind::PerMachineUnavailable);
+        assert_eq!(Kind::from_exit_code(35), Kind::NotProtected);
+        assert_eq!(Kind::from_exit_code(70), Kind::Internal);
+        // Not a code of the table, a reason-carrying kind, a negative or a wide code.
+        for code in [
+            1,
+            28,
+            29,
+            32,
+            33,
+            36,
+            255,
+            -1,
+            256,
+            i32::MIN,
+            0xC000_0005_u32 as i32,
+        ] {
+            assert_eq!(Kind::from_exit_code(code), Kind::Process, "{code}");
+        }
+        for kind in Kind::ALL {
+            if !matches!(
+                kind,
+                Kind::UnsupportedLocation(_) | Kind::PublisherMismatch(_)
+            ) {
+                assert_eq!(Kind::from_exit_code(i32::from(kind.code())), kind);
+            }
+        }
+    }
+
     #[test]
     fn install_and_uninstall_take_only_silent() {
         assert_eq!(
@@ -949,6 +1278,10 @@ mod tests {
         assert_eq!(Kind::InUse.code(), 25);
         assert_eq!(Kind::InstallMismatch.code(), 26);
         assert_eq!(Kind::NoRelease.code(), 27);
+        assert_eq!(Kind::ElevationRequired.code(), 30);
+        assert_eq!(Kind::ElevationDeclined.code(), 31);
+        assert_eq!(Kind::PerMachineUnavailable.code(), 34);
+        assert_eq!(Kind::NotProtected.code(), 35);
         assert_eq!(Kind::of(&lunepack::Error::NoRelease), Kind::NoRelease);
         for place in Place::ALL {
             let kind = Kind::UnsupportedLocation(place);

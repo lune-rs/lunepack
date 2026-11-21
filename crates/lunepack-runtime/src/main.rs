@@ -21,7 +21,9 @@ mod cli;
 mod events;
 mod gc;
 mod install;
+mod machine;
 mod modes;
+mod relay;
 mod setup;
 mod tempdirs;
 mod ui_host;
@@ -590,15 +592,12 @@ fn fail(command: &'static str, kind: Kind) -> Kind {
 
 /// Setup mode (M6 step 7, M7): `None` when this executable carries no setup trailer (the ordinary
 /// runtime), else the run's exit kind. A trailer that is malformed is `verify`; a command line
-/// other than nothing or `--silent` (`/S` on Windows) is a usage error.
-#[cfg(any(target_os = "linux", windows))]
+/// other than nothing or `--silent` is a usage error.
+#[cfg(target_os = "linux")]
 fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
     use lunepack::Process as _;
 
-    #[cfg(target_os = "linux")]
     let process = lunepack_os_linux::LinuxProcess::new();
-    #[cfg(windows)]
-    let process = lunepack_os_windows::WindowsProcess::new();
     let exe = process.current_exe().ok()?;
     let found = match setup::detect(
         &lunepack_fs::StdFs::new(),
@@ -641,6 +640,7 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         let prepared = match setup::prepare(
             ad,
             found,
+            setup::Binding::TrailerRoot,
             &data_home,
             ui_home.as_deref(),
             want_ui,
@@ -658,7 +658,7 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
                 return kind;
             }
         };
-        let (app, details) = setup::welcome(&prepared);
+        let (app, details) = setup::welcome(&prepared, None);
         let ui = match prepared.ui_dir() {
             // The UI was read out of the verified pack into this run's own directory (M6-D7); the
             // host starts it from there as it starts the one beside an installed runtime.
@@ -678,7 +678,7 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         };
         let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
         ui.report(&events);
-        let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui);
+        let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui, None);
         let seen = ui.outcome_acknowledged();
         ui.close(&events);
         prepared.cleanup(&*ad.fs);
@@ -686,6 +686,304 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         notice(silent, seen, prepared.name(), Operation::Install, kind);
         kind
     }))
+}
+
+/// Setup mode on Windows (M10 step 16): the Linux flow plus the all-users install. `None` when this
+/// executable carries no setup trailer. The payload is verified against the anchor the image
+/// carries of its own payload, never against the trailer's root alone (M10-D4), before anything is
+/// shown or written; then the run follows [`machine::route`]: the window with the all-users
+/// choice, an all-users install in this process, the hidden elevated `machine-install` mode, or a
+/// refusal. A process that holds a full administrator token never starts the UI (M10-D15).
+#[cfg(windows)]
+fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
+    use lunepack::Process as _;
+    use lunepack_core::setup::{ANCHOR_RESOURCE_ID, SetupAnchor};
+
+    let process = lunepack_os_windows::WindowsProcess::new();
+    let exe = process.current_exe().ok()?;
+    let found = match setup::detect(
+        &lunepack_fs::StdFs::new(),
+        &exe,
+        &lunepack_crypto::Sha256Hasher,
+        &lunepack_crypto::Ed25519Verifier,
+    ) {
+        setup::Detect::None => return None,
+        setup::Detect::Malformed => {
+            conclude(stderr_events(), &setup::failed(Kind::Verify, None));
+            notice(
+                unparsed_setup_quiet(args),
+                false,
+                SETUP_TITLE,
+                Operation::Setup,
+                Kind::Verify,
+            );
+            return Some(Kind::Verify);
+        }
+        setup::Detect::Setup(found) => found,
+    };
+    let Ok(command) = modes::parse_setup_command(args) else {
+        eprintln!("{USAGE_LINE}");
+        return Some(Kind::Usage);
+    };
+    // Read from this process's own mapped image: what was started, whatever happens to the file.
+    let anchor = lunepack_os_windows::own_resource(ANCHOR_RESOURCE_ID)
+        .and_then(|bytes| SetupAnchor::parse(&bytes).ok());
+    let elevation = lunepack_os_windows::WindowsElevation;
+    match command {
+        // No `run`: its platform reads the environment (the health token it then drops), and the
+        // elevated copy reads none.
+        modes::SetupCommand::MachineInstall(machine_args) => Some(machine_install_mode(
+            &elevation,
+            found,
+            anchor.as_ref(),
+            &machine_args,
+        )),
+        modes::SetupCommand::Run(run_args) => Some(run(|ad| {
+            windows_setup(
+                ad,
+                &process,
+                &elevation,
+                &exe,
+                found,
+                anchor.as_ref(),
+                run_args,
+            )
+        })),
+    }
+}
+
+/// The hidden `machine-install` mode: the engine's first install in an elevated copy of the setup,
+/// its progress into the pipe the unelevated setup reads. Its exit code is its whole result. It
+/// builds its few adapters itself and reads no environment variable, no temporary directory and
+/// nothing of a user's profile.
+#[cfg(windows)]
+fn machine_install_mode(
+    elevation: &dyn lunepack_core::Elevation,
+    found: setup::Found,
+    anchor: Option<&lunepack_core::setup::SetupAnchor>,
+    args: &modes::MachineArgs,
+) -> Kind {
+    let Some(home) = machine::native::machine_home() else {
+        return Kind::Fs;
+    };
+    let (fs, codec, hasher, verifier, rng) = (
+        lunepack_fs::StdFs::new(),
+        lunepack_codec_lzma::LzmaCodec,
+        lunepack_crypto::Sha256Hasher,
+        lunepack_crypto::Ed25519Verifier,
+        lunepack_crypto::OsRng,
+    );
+    let protect = lunepack_os_windows::WindowsProtect;
+    let base = machine::Base {
+        fs: &fs,
+        codec: &codec,
+        hasher: &hasher,
+        verifier: &verifier,
+        clock: &lunepack::SystemClock,
+        rng: &rng,
+        protect: &protect,
+        home: &home,
+    };
+    machine::run_mode(
+        &base,
+        &machine::native::NativeInstaller,
+        &machine::native::NativePipes,
+        elevation.standing(),
+        args,
+        &found,
+        anchor,
+        machine::ACCEPT_WAIT,
+    )
+}
+
+/// The refusal a Windows setup run ends with before it installs anything: the result on stdout and
+/// stderr and, unless the process is elevated (which never shows a window), the native notice.
+#[cfg(windows)]
+fn setup_refused(kind: Kind, name: Option<&str>, silent: bool, elevated: bool) -> Kind {
+    let kind = headless_fail(setup::COMMAND, kind);
+    if !elevated {
+        match name {
+            Some(name) => notice(silent, false, name, Operation::Install, kind),
+            None => notice(silent, false, SETUP_TITLE, Operation::Setup, kind),
+        }
+    }
+    kind
+}
+
+/// The fixed text an elevated setup started without `--all-users` shows (nothing from the payload).
+#[cfg(windows)]
+const ELEVATED_SETUP_TEXT: &str = "This installer does not run with administrator rights. \
+Start it normally and choose \"Install for all users\", or start it with --all-users from an \
+administrator prompt.";
+
+/// A Windows setup run after its payload's anchor was read.
+#[cfg(windows)]
+fn windows_setup(
+    ad: &modes::Adapters,
+    process: &lunepack_os_windows::WindowsProcess,
+    elevation: &dyn lunepack_core::Elevation,
+    exe: &std::path::Path,
+    found: setup::Found,
+    anchor: Option<&lunepack_core::setup::SetupAnchor>,
+    run_args: modes::SetupArgs,
+) -> Kind {
+    let silent = run_args.silent;
+    let standing = elevation.standing();
+    let elevated = standing == lunepack_core::Standing::UacElevated;
+    // Before anything is shown, looked up or written: the payload against the anchor.
+    let verified = match setup::verify(ad, found, setup::Binding::Anchor(anchor)) {
+        Ok(verified) => verified,
+        Err(refused) => return setup_refused(refused.kind, None, silent, elevated),
+    };
+    let name = verified.name().to_owned();
+    let (offer, forced) = match machine::decide(standing, run_args, verified.has_service(), &|| {
+        let data_home = data_home()?;
+        Ok(setup::user_install_exists(
+            ad,
+            &data_home,
+            verified.app_id(),
+            &name,
+        ))
+    }) {
+        machine::Decision::Exit(kind) => return setup_refused(kind, Some(&name), silent, elevated),
+        machine::Decision::Notice => {
+            let _ = lunepack_os_windows::message_box(
+                SETUP_TITLE,
+                ELEVATED_SETUP_TEXT,
+                lunepack_os_windows::MessageKind::Error,
+            );
+            eprintln!("{USAGE_LINE}");
+            return Kind::Usage;
+        }
+        machine::Decision::InProcess => return install_all_users_here(ad, verified, anchor),
+        machine::Decision::Window { offer, forced } => (offer, forced),
+    };
+
+    // The window (when one may be shown), per user by default.
+    let data_home = match data_home() {
+        Ok(dir) => dir,
+        Err(kind) => return setup_refused(kind, Some(&name), silent, elevated),
+    };
+    let env = |name: &str| std::env::var_os(name);
+    let want_ui = ui_host::ui_wanted(silent, &env);
+    let own = process.process_id(std::process::id()).ok().flatten();
+    clear_temp_dirs(ad);
+    let ui_home = setup::ui_home(&env);
+    let prepared =
+        match verified.into_prepared(ad, &data_home, ui_home.as_deref(), want_ui, own, &alive) {
+            Ok(prepared) => prepared,
+            Err(refused) => {
+                let kind = headless_fail(setup::COMMAND, refused.kind);
+                notice(
+                    silent,
+                    false,
+                    refused.name.as_deref().unwrap_or(SETUP_TITLE),
+                    Operation::Install,
+                    kind,
+                );
+                return kind;
+            }
+        };
+    // The all-users install needs the machine home and this user's SID; without them the choice
+    // is not offered (and a run that asked for it fails).
+    let home = machine::native::machine_home();
+    let sid = lunepack_os_windows::current_user_sid().ok();
+    let connector = machine::native::NativeConnector;
+    let machine_ctx = match (&home, &sid) {
+        (Some(home), Some(sid)) => Some(setup::Machine {
+            home,
+            hand_off: machine::HandOff {
+                elevation,
+                connector: &connector,
+                rng: &*ad.rng,
+                own_exe: exe,
+                sid,
+            },
+            offered: offer,
+            forced,
+        }),
+        _ => None,
+    };
+    if machine_ctx.is_none() && forced {
+        prepared.cleanup(&*ad.fs);
+        return setup_refused(Kind::Process, Some(&name), silent, elevated);
+    }
+    let all_users_location = machine_ctx
+        .as_ref()
+        .filter(|m| m.offered)
+        .and_then(|m| shown_path(m.home.join(&name)).to_str().map(str::to_owned));
+    let (app, details) = setup::welcome(&prepared, all_users_location);
+    let ui = match prepared.ui_dir() {
+        Some(dir) => UiHost::start(
+            &ui_host::Start {
+                process: std::sync::Arc::clone(&ad.process),
+                fs: &*ad.fs,
+                runtime_exe: &dir.join("lunepack-runtime"),
+                env: &env,
+                quiet: silent,
+            },
+            Flow::Install,
+            app,
+            details,
+        ),
+        None => UiHost::headless(Flow::Install),
+    };
+    let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
+    ui.report(&events);
+    let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui, machine_ctx.as_ref());
+    let seen = ui.outcome_acknowledged();
+    ui.close(&events);
+    prepared.cleanup(&*ad.fs);
+    conclude(events, &last);
+    notice(silent, seen, prepared.name(), Operation::Install, kind);
+    kind
+}
+
+/// `--all-users` as an administrator: the payload copied, verified and installed in this process,
+/// with no window. The result is the one JSON line on stdout.
+#[cfg(windows)]
+fn install_all_users_here(
+    ad: &modes::Adapters,
+    verified: setup::Verified,
+    anchor: Option<&lunepack_core::setup::SetupAnchor>,
+) -> Kind {
+    let (Some(anchor), Some(home)) = (anchor, machine::native::machine_home()) else {
+        return headless_fail(setup::COMMAND, Kind::Fs);
+    };
+    let protect = lunepack_os_windows::WindowsProtect;
+    let base = machine::Base {
+        fs: &*ad.fs,
+        codec: &*ad.codec,
+        hasher: &*ad.hasher,
+        verifier: &*ad.verifier,
+        clock: &lunepack::SystemClock,
+        rng: &*ad.rng,
+        protect: &protect,
+        home: &home,
+    };
+    let events = stderr_events();
+    let result = machine::install_all(
+        &base,
+        &machine::native::NativeInstaller,
+        verified.found(),
+        anchor,
+        &events,
+    );
+    let version = verified.version().clone();
+    let (kind, last) = match result {
+        Ok(installed) => (
+            Kind::Ok,
+            Event::Result {
+                command: setup::COMMAND,
+                tree_version: Some(version),
+                outcome: setup::OUTCOME,
+                version: Some(installed.version),
+            },
+        ),
+        Err(kind) => (kind, setup::failed(kind, Some(version))),
+    };
+    conclude(events, &last);
+    kind
 }
 
 /// Whether a setup run that ends before its arguments were validated (a malformed setup file) is
@@ -759,11 +1057,13 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
             return fail(Kind::Fs, None);
         };
         // No UI is read out of the pack: the installer app carries it beside this runtime.
-        let prepared = match setup::prepare(ad, found, &data_home, None, false, None, &alive) {
-            Ok(prepared) => prepared.with_apps_dir(apps_dir),
-            Err(refused) => return fail(refused.kind, refused.name.as_deref()),
-        };
-        let (app, details) = setup::welcome(&prepared);
+        let binding = setup::Binding::TrailerRoot;
+        let prepared =
+            match setup::prepare(ad, found, binding, &data_home, None, false, None, &alive) {
+                Ok(prepared) => prepared.with_apps_dir(apps_dir),
+                Err(refused) => return fail(refused.kind, refused.name.as_deref()),
+            };
+        let (app, details) = setup::welcome(&prepared, None);
         let env = |name: &str| std::env::var_os(name);
         let ui = match how {
             InstallerRun::Silent => UiHost::headless(Flow::Install),
@@ -796,7 +1096,7 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         };
         let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
         ui.report(&events);
-        let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui);
+        let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui, None);
         let seen = ui.outcome_acknowledged();
         ui.close(&events);
         conclude_to(events, &last, !ui_stdio);

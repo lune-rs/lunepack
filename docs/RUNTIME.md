@@ -141,6 +141,10 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 27 | `no_release` | (install) the channel offers no release for this install yet (none, none whose rollout admits it, or none at or above the bootstrap's own version); nothing was installed, retry later. (macOS adoption) the feed lists no release of the version and target the bundle's own configuration names; nothing was adopted |
 | 28 | `unsupported_location` | (macOS, every mode) the running app or the install's bundle is somewhere lunepack does not update: the error object carries `reason`, one of `translocated`, `read_only`, `other_volume`, `not_owned`, `not_writable`; move the app to the Applications folder of the user and open it from there |
 | 29 | `publisher_mismatch` | (download) the installed version's publisher policy (`enforce`) refused the update: the error object carries `reason`, one of `different`, `installed_invalid`, `candidate_unsigned`, `candidate_invalid`, `os`; nothing was staged. On `different`, `candidate_unsigned` and `candidate_invalid` the version is marked bad and never offered again; on `installed_invalid` and `os` nothing is marked and a later `download` checks again |
+| 30 | `elevation_required` | (setup, Windows) the install is for all users and needs administrator rights, and the run cannot ask for them (`--all-users --silent` as a standard user); nothing was changed |
+| 31 | `elevation_declined` | (setup, Windows) the user declined the administrator prompt; nothing was changed |
+| 34 | `per_machine_unavailable` | (setup, Windows) the release carries no update service, so it installs per user only |
+| 35 | `not_protected` | (setup, Windows) a directory of the all-users install is not protected as it must be; nothing was changed |
 | 70 | `internal` | anything else (a worker panic, a library error this build does not know) |
 
 The table lives in one place in the runtime (`crates/lunepack-runtime/src/modes.rs`) and is pinned

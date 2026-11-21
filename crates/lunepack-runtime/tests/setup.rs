@@ -231,6 +231,92 @@ mod cases {
 
     // ---- the release and the setup file -----------------------------------------------------
 
+    /// Windows: `image` (the built runtime) with an `RT_RCDATA` resource `ANCHOR_RESOURCE_ID` of
+    /// [`ANCHOR_SIZE`] bytes holding the anchor placeholder, the way the packager stamps one. This
+    /// test crate cannot link the packager's PE editor (the boundary check confines it), and the
+    /// runtime image's only resource is its manifest, so the manifest's entry is retyped as
+    /// `RT_RCDATA` (the same name 1 and language) and resized to the placeholder: the loader finds
+    /// it as `FindResourceW` would find the real one. The test copy has no manifest; the real
+    /// stamped runtime keeps its own.
+    #[cfg(windows)]
+    fn with_anchor_slot(mut image: Vec<u8>) -> Vec<u8> {
+        use lunepack_core::setup::{ANCHOR_RESOURCE_ID, ANCHOR_SIZE, SetupAnchor};
+        let u16_at = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+        let u32_at = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        let pe = u32_at(&image, 0x3c) as usize;
+        assert_eq!(&image[pe..pe + 4], b"PE\0\0", "a PE image");
+        let sections = u16_at(&image, pe + 6) as usize;
+        let optional = pe + 24;
+        let table = optional + u16_at(&image, pe + 20) as usize;
+        let dirs = optional
+            + if u16_at(&image, optional) == 0x20b {
+                112
+            } else {
+                96
+            };
+        let rsrc_rva = u32_at(&image, dirs + 2 * 8);
+        assert_ne!(rsrc_rva, 0, "the runtime has a resource directory");
+        let to_file = |image: &[u8], rva: u32| -> usize {
+            (0..sections)
+                .find_map(|i| {
+                    let s = table + 40 * i;
+                    let (size, va, raw, at) = (
+                        u32_at(image, s + 8),
+                        u32_at(image, s + 12),
+                        u32_at(image, s + 16),
+                        u32_at(image, s + 20),
+                    );
+                    (rva >= va && rva < va + size.max(raw)).then(|| (rva - va + at) as usize)
+                })
+                .expect("the RVA lies in a section")
+        };
+        let root = to_file(&image, rsrc_rva);
+        let named = u16_at(&image, root + 12) as usize;
+        let ids = u16_at(&image, root + 14) as usize;
+        let entry = |i: usize| root + 16 + 8 * i;
+        let manifest_entry = (named..named + ids)
+            .find(|i| u32_at(&image, entry(*i)) == 24)
+            .expect("the runtime's only resource type is its manifest");
+        assert_eq!(ids, 1, "the runtime has no other resource type");
+        image[entry(manifest_entry)..entry(manifest_entry) + 4]
+            .copy_from_slice(&10u32.to_le_bytes());
+        // type -> name -> language -> data entry
+        let sub = |image: &[u8], at: usize| {
+            let offset = u32_at(image, at + 4);
+            assert_ne!(offset & 0x8000_0000, 0, "a subdirectory");
+            root + (offset & 0x7fff_ffff) as usize
+        };
+        let names = sub(&image, entry(manifest_entry));
+        let name_entry = names + 16;
+        assert_eq!(u32_at(&image, name_entry), u32::from(ANCHOR_RESOURCE_ID));
+        let langs = sub(&image, name_entry);
+        let data_entry = root + (u32_at(&image, langs + 16 + 4) & 0x7fff_ffff) as usize;
+        let (rva, size) = (u32_at(&image, data_entry), u32_at(&image, data_entry + 4));
+        assert!(size as usize >= ANCHOR_SIZE, "room for the placeholder");
+        image[data_entry + 4..data_entry + 8].copy_from_slice(&(ANCHOR_SIZE as u32).to_le_bytes());
+        let at = to_file(&image, rva);
+        image[at..at + ANCHOR_SIZE].copy_from_slice(&SetupAnchor::PLACEHOLDER);
+        let span = lunepack_core::pe::rcdata(&image, ANCHOR_RESOURCE_ID)
+            .expect("the resource directory reads")
+            .expect("the slot is found as RT_RCDATA");
+        assert_eq!(
+            (span.file_offset as usize, span.len as usize),
+            (at, ANCHOR_SIZE)
+        );
+        image
+    }
+
+    /// Windows: writes `anchor` over the placeholder of a built setup file.
+    #[cfg(windows)]
+    fn patch_anchor(bytes: &mut [u8], anchor: &[u8]) {
+        let span = lunepack_core::pe::rcdata(bytes, lunepack_core::setup::ANCHOR_RESOURCE_ID)
+            .expect("the resource directory reads")
+            .expect("the setup file carries the slot");
+        assert_eq!(span.len as usize, anchor.len());
+        let at = span.file_offset as usize;
+        bytes[at..at + anchor.len()].copy_from_slice(anchor);
+    }
+
     struct StoreOnly;
 
     impl Encoder for StoreOnly {
@@ -264,6 +350,24 @@ mod cases {
     struct Twist {
         /// The config names a root other than the one the trailer and the key set use.
         config_root_other: bool,
+        /// Windows: what the setup's runtime image carries of its payload's anchor (M10-D4).
+        #[cfg_attr(not(windows), allow(dead_code))]
+        anchor: AnchorTwist,
+    }
+
+    /// What the runtime image of a Windows setup file carries as its anchor.
+    #[derive(Default, Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(not(windows), allow(dead_code))]
+    enum AnchorTwist {
+        /// The digests of the file's own payload.
+        #[default]
+        Good,
+        /// The image has no anchor resource at all.
+        Missing,
+        /// The resource is there, still the placeholder the packager stamps before the payload.
+        Placeholder,
+        /// The digests of the trailer block with one bit flipped.
+        WrongTrailer,
     }
 
     struct Lab {
@@ -531,8 +635,15 @@ mod cases {
 
             // The setup file is the runtime with the payload after it; the macOS payload file is
             // the payload alone, its parts from offset 0.
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(all(not(target_os = "macos"), not(windows)))]
             let mut bytes = runtime;
+            // Windows: the runtime image, with the slot for the anchor unless the case has none.
+            #[cfg(windows)]
+            let mut bytes = if twist.anchor == AnchorTwist::Missing {
+                runtime
+            } else {
+                with_anchor_slot(runtime)
+            };
             #[cfg(target_os = "macos")]
             let mut bytes = {
                 drop(runtime);
@@ -565,6 +676,24 @@ mod cases {
                 pack: pack_part,
             };
             bytes.extend_from_slice(&trailer.encode().expect("trailer"));
+            #[cfg(windows)]
+            match twist.anchor {
+                AnchorTwist::Good | AnchorTwist::WrongTrailer => {
+                    let end = bytes.len();
+                    let mut block = bytes[end - TRAILER_SIZE as usize..].to_vec();
+                    if twist.anchor == AnchorTwist::WrongTrailer {
+                        block[3] ^= 1;
+                    }
+                    let anchor = lunepack_core::setup::SetupAnchor::of(
+                        &block,
+                        &ks_bytes,
+                        &manifest,
+                        &Sha256Hasher,
+                    );
+                    patch_anchor(&mut bytes, &anchor.encode());
+                }
+                AnchorTwist::Missing | AnchorTwist::Placeholder => {}
+            }
             bytes
         }
 
@@ -1156,9 +1285,81 @@ mod cases {
     fn a_trailer_root_other_than_the_configs_is_refused() {
         let lab = Lab::new(Twist {
             config_root_other: true,
+            ..Twist::default()
         });
         let run = lab.run(&["--silent"], None);
         assert_eq!(run.code, EXIT_VERIFY, "{run:?}");
+        lab.assert_nothing_installed();
+    }
+
+    /// M10-D4: on Windows every setup run is bound to the anchor its own image carries; an image
+    /// without one, with the placeholder the packager stamps first, or with a wrong digest is
+    /// refused (7) before anything is shown, looked up or written, whatever it was asked: also
+    /// `--all-users`, which a valid setup would answer with its own codes (30, 34, 23). The
+    /// hidden `machine-install` mode of such an image is a usage error, and starts nothing.
+    #[cfg(windows)]
+    fn a_setup_whose_anchor_is_missing_a_placeholder_or_wrong_is_refused() {
+        const ID: &str = "0123456789abcdef0123456789abcdef";
+        let sid = lunepack_os_windows::current_user_sid().expect("the user's SID");
+        for anchor in [
+            AnchorTwist::Missing,
+            AnchorTwist::Placeholder,
+            AnchorTwist::WrongTrailer,
+        ] {
+            let lab = Lab::new(Twist {
+                anchor,
+                ..Twist::default()
+            });
+            for args in [
+                &["--silent"][..],
+                &[],
+                &["--all-users", "--silent"],
+                &["--all-users"],
+                &["/S", "--all-users"],
+            ] {
+                let run = lab.run(args, None);
+                assert_eq!(run.code, EXIT_VERIFY, "{args:?}: {run:?}");
+                assert!(run.stdout.contains("\"kind\":\"verify\""), "{run:?}");
+                assert!(lab.noted("ui-dir").is_empty(), "a UI was started");
+                lab.assert_nothing_installed();
+                run.assert_no_path(&lab);
+            }
+            // The elevated mode: an image without a usable anchor is not an install to make. (One
+            // with a good anchor is the end-to-end suite's, run as a standard user and as an
+            // administrator: it would install for all users.)
+            if anchor != AnchorTwist::WrongTrailer {
+                let run = lab.run(
+                    &["machine-install", "--events", ID, "--for-sid", &sid],
+                    None,
+                );
+                assert_eq!(
+                    run.code,
+                    EXIT_USAGE,
+                    "{anchor_name}: {run:?}",
+                    anchor_name = anchor as u8
+                );
+                lab.assert_nothing_installed();
+            }
+        }
+    }
+
+    /// A good setup file's `--all-users` is accepted by the grammar (what it does is the
+    /// end-to-end suite's); the flags a setup does not have are still a usage error.
+    #[cfg(windows)]
+    fn all_users_is_an_option_of_a_setup_and_nothing_next_to_it_is() {
+        let lab = Lab::new(Twist::default());
+        for args in [
+            &["--all-users", "--all-users"][..],
+            &["--all-users=1"],
+            &["--all-users", "install"],
+            &["--for-all-users"],
+            &["machine-install"],
+            &["machine-install", "--events", "x"],
+        ] {
+            let run = lab.run(args, None);
+            assert_eq!(run.code, EXIT_USAGE, "{args:?}: {run:?}");
+            assert_eq!(run.stderr.trim(), "lunepack-runtime: usage error");
+        }
         lab.assert_nothing_installed();
     }
 
@@ -2041,6 +2242,16 @@ mod cases {
             (
                 "arguments_other_than_silent_are_a_usage_error",
                 arguments_other_than_silent_are_a_usage_error,
+            ),
+            #[cfg(windows)]
+            (
+                "a_setup_whose_anchor_is_missing_a_placeholder_or_wrong_is_refused",
+                a_setup_whose_anchor_is_missing_a_placeholder_or_wrong_is_refused,
+            ),
+            #[cfg(windows)]
+            (
+                "all_users_is_an_option_of_a_setup_and_nothing_next_to_it_is",
+                all_users_is_an_option_of_a_setup_and_nothing_next_to_it_is,
             ),
             #[cfg(windows)]
             (
