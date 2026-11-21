@@ -1,6 +1,7 @@
 //! Pure update-framework logic and the traits behind every external or replaceable capability; depends on no adapter or I/O crate.
 
 pub mod cancel;
+pub mod chain;
 pub mod codesign;
 pub mod digest;
 pub mod encoding;
@@ -41,6 +42,9 @@ pub mod version;
 pub mod write;
 
 pub use cancel::CancelToken;
+pub use chain::{
+    Documents, KeysChain, MAX_ROOT_STEPS, RootWalk, raised_floors, verify_first_install_keys,
+};
 pub use codesign::{
     ArgvTemplate, Decision, ExpandCtx, Expanded, PlanEntry, PlanEntryKind, PublisherOutcome,
     SignItem, SignKind, SignPlanError, TemplateError, TemplateRole, decide, macho_slices_signed,

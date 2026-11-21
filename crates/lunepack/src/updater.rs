@@ -32,11 +32,11 @@ use lunepack_core::state::{
 use lunepack_core::update_config::MAX_UPDATE_CONFIG_BYTES;
 use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, CancelToken, Channel, ClockReading, Codec,
-    FileKind, Fs, Hasher, IntegrationError, IntegrationRequest, Limits, OsIntegration, Phase,
-    Progress, ReadAt, RelPath, Request, Rng, RootNaming, Sha256Digest, SourceFor, StageEnv,
-    StageError, StageInput, Target, Transport, TransportError, TrustedRoot, UpdateConfig,
+    Documents, FileKind, Fs, Hasher, IntegrationError, IntegrationRequest, Limits, OsIntegration,
+    Phase, Progress, ReadAt, RelPath, Request, Rng, RootNaming, RootWalk, Sha256Digest, SourceFor,
+    StageEnv, StageError, StageInput, Target, Transport, TransportError, TrustedRoot, UpdateConfig,
     UpdateConfigError, UserLayout, VerifiedEntry, VerifiedManifest, Verifier, Version,
-    advance_root, read_entry, select_candidate, verify_feed, verify_key_set, verify_manifest,
+    raised_floors, read_entry, select_candidate, verify_first_install_keys, verify_manifest,
     verify_payload_manifest,
 };
 use lunepack_core::{
@@ -50,8 +50,6 @@ use crate::task::{OpLock, spawn_job};
 use crate::worker_transport::WorkerTransport;
 use crate::{Error, SystemClock};
 
-/// The most root rotations one check walks (a bound on a hostile mirror's root chain).
-const MAX_ROOT_STEPS: u64 = 1024;
 /// The default stage memory budget (M4-D11).
 const DEFAULT_BUDGET: u64 = 256 * 1024 * 1024;
 
@@ -1361,7 +1359,7 @@ async fn check_from(
             })
         }
     };
-    let raised = raised_floors(inner, &root, &keys, &feed);
+    let raised = raised_floors(&root, &keys, &feed, &inner.channel);
     on_job(
         inner,
         Some(lock),
@@ -1373,16 +1371,9 @@ async fn check_from(
     Ok(info)
 }
 
-/// The signed documents a check verified: the root it walked to, the key set and the feed.
-struct Documents {
-    root: TrustedRoot,
-    keys: lunepack_core::VerifiedKeySet,
-    feed: lunepack_core::VerifiedFeed,
-}
-
 /// The documents of a check, in FORMAT.md 11.1 order: the root walk (FORMAT.md 5.2) from the
 /// higher of the stored (`floors`) and the embedded root, then the key set and the feed against
-/// `floors` and `clock`. Nothing is committed.
+/// `floors` and `clock`. The core's [`RootWalk`] verifies; this only fetches. Nothing is committed.
 async fn verify_documents(
     inner: &Inner,
     transport: &dyn Transport,
@@ -1391,55 +1382,27 @@ async fn verify_documents(
 ) -> Result<Documents, Error> {
     let hasher = &*inner.hasher;
     let verifier = &*inner.verifier;
-    let mut root = match &floors.root {
+    let start = match &floors.root {
         Some(parts) if parts.version > inner.root.version() => {
             parts.to_trusted(inner.app_id.clone(), hasher, verifier)?
         }
         _ => inner.root.clone(),
     };
-    for _ in 0..MAX_ROOT_STEPS {
-        let url = inner.urls.root(root.version().saturating_add(1))?;
+    let mut walk = RootWalk::new(start);
+    while let Some(next) = walk.next_version() {
+        let url = inner.urls.root(next)?;
         match fetch::fetch_root_doc(transport, &url, Limits::V1.root_doc_bytes).await? {
             None => break,
-            Some(bytes) => root = advance_root(&root, &bytes, hasher, verifier)?,
+            Some(bytes) => walk.advance(&bytes, hasher, verifier)?,
         }
     }
-    if root.app_id() != &inner.app_id {
-        return Err(Error::Verify(lunepack_core::Error::AppIdMismatch));
-    }
-    let floor = floors.to_rollback_floor();
+    walk.check_app_id(&inner.app_id)?;
     let keys_bytes =
         fetch::fetch_document(transport, &inner.urls.keys()?, Limits::V1.keys_doc_bytes).await?;
-    let keys = verify_key_set(&root, &keys_bytes, &floor, clock, hasher, verifier)?;
+    let chain = walk.verify_keys(&inner.app_id, floors, &keys_bytes, clock, hasher, verifier)?;
     let feed_bytes =
         fetch::fetch_document(transport, &inner.feed_url, Limits::V1.feed_doc_bytes).await?;
-    let feed = verify_feed(
-        &keys,
-        &feed_bytes,
-        &inner.app_id,
-        &inner.channel,
-        &floor,
-        clock,
-        verifier,
-    )?;
-    Ok(Documents { root, keys, feed })
-}
-
-/// The floors verified documents raise: the root's parts, the key set's version and this
-/// channel's feed `seq`.
-fn raised_floors(
-    inner: &Inner,
-    root: &TrustedRoot,
-    keys: &lunepack_core::VerifiedKeySet,
-    feed: &lunepack_core::VerifiedFeed,
-) -> Floors {
-    let mut raised = Floors {
-        root: Some(RootParts::from_trusted(root)),
-        keyset_version: keys.version(),
-        ..Floors::default()
-    };
-    raised.feed_seq.insert(inner.channel.clone(), feed.seq());
-    raised
+    Ok(chain.verify_feed(&inner.app_id, &inner.channel, &feed_bytes, clock, verifier)?)
 }
 
 /// Re-loads the state under the lock and refuses an update that is no longer newer, or bad.
@@ -2360,7 +2323,7 @@ async fn check_adopting(
     let bytes = fetch::fetch_document(transport, &url, reference.size()).await?;
     let manifest = verify_manifest(&keys, &entry, &bytes, &*inner.hasher, &*inner.verifier)?;
     let issued = manifest.issued();
-    let raised = raised_floors(&inner, &trusted, &keys, &feed);
+    let raised = raised_floors(&trusted, &keys, &feed, &inner.channel);
     on_job(
         &inner,
         Some(&lock),
@@ -2762,14 +2725,7 @@ fn verify_payload(
     // A first install: no floor time (the clock is plausible) and no stored floors (P6).
     let clock = ClockReading::read(&*inner.clock, None);
     let keys_bytes = read_part(file, payload.keys, "keys", Limits::V1.keys_doc_bytes)?;
-    let keys = verify_key_set(
-        root,
-        &keys_bytes,
-        &lunepack_core::RollbackFloor::default(),
-        &clock,
-        hasher,
-        verifier,
-    )?;
+    let keys = verify_first_install_keys(root, &keys_bytes, &clock, hasher, verifier)?;
     let manifest_bytes = read_part(
         file,
         payload.manifest,
