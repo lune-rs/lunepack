@@ -34,6 +34,8 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const VERIFY_ATTEMPTS: u32 = 6;
 /// The pause before the one retry after "Resource busy".
 const BUSY_PAUSE: Duration = Duration::from_secs(5);
+/// How long `hdiutil info` and each `hdiutil detach` may run when an attachment is released.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longest volume name, in characters (M8-D9).
 pub const MAX_VOLUME_CHARS: usize = 27;
 
@@ -117,6 +119,7 @@ pub struct Hdiutil {
     create_timeout: Duration,
     verify_timeout: Duration,
     busy_pause: Duration,
+    release_timeout: Duration,
 }
 
 /// What a bounded run produced.
@@ -134,6 +137,7 @@ impl Hdiutil {
             create_timeout: CREATE_TIMEOUT,
             verify_timeout: VERIFY_TIMEOUT,
             busy_pause: BUSY_PAUSE,
+            release_timeout: RELEASE_TIMEOUT,
         }
     }
 
@@ -184,7 +188,12 @@ impl Hdiutil {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let ran = self.run(&args, self.create_timeout)?;
+            let ran = self.run(&args, self.create_timeout);
+            // `hdiutil create -srcfolder` attaches the image at `out` while it fills it; a run that
+            // was stopped, failed or ended with the detach still pending leaves it attached (and a
+            // later `verify` answers "Resource temporarily unavailable").
+            self.release(out);
+            let ran = ran?;
             if ran.success {
                 return Ok(());
             }
@@ -221,6 +230,58 @@ impl Hdiutil {
     }
 }
 
+impl Hdiutil {
+    /// Detaches every disk the system still has attached from the image file `image` (best effort:
+    /// a failure here leaves what `hdiutil` itself left, and the caller's own result stands).
+    pub fn release(&self, image: &Path) {
+        let mut wanted = vec![image.to_path_buf()];
+        if let (Some(parent), Some(name)) = (image.parent(), image.file_name())
+            && let Ok(real) = fs::canonicalize(if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            })
+        {
+            wanted.push(real.join(name));
+        }
+        let Ok(info) = self.run(&["info".as_ref()], self.release_timeout) else {
+            return;
+        };
+        if !info.success {
+            return;
+        }
+        for dev in attached_from(&info.output, &wanted) {
+            let _ = self.run(
+                &["detach".as_ref(), "-force".as_ref(), dev.as_ref()],
+                self.release_timeout,
+            );
+        }
+    }
+}
+
+/// The whole-disk devices (`/dev/diskN`) that `hdiutil info` lists for an image whose
+/// `image-path` is one of `images`.
+fn attached_from(info: &str, images: &[PathBuf]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut ours = false;
+    for line in info.lines() {
+        if line.starts_with("=====") {
+            ours = false;
+        } else if let Some(path) = line.strip_prefix("image-path") {
+            let path = path.trim_start().strip_prefix(':').unwrap_or("").trim();
+            ours = images.iter().any(|i| i.as_os_str() == path);
+        } else if ours && let Some(dev) = line.split_whitespace().next() {
+            let disk = dev.strip_prefix("/dev/disk");
+            if disk.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                && !found.iter().any(|f| f == dev)
+            {
+                found.push(dev.to_owned());
+            }
+        }
+    }
+    found
+}
+
 /// Whether `hdiutil` failed because the image or device is busy for the moment.
 fn is_busy(output: &str) -> bool {
     let text = output.to_ascii_lowercase();
@@ -243,8 +304,11 @@ mod tests {
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho \"$@\" >> '{calls}'\nn=$(wc -l < '{calls}' | tr -d ' ')\n{body}\n",
-                calls = calls.display()
+                "#!/bin/sh\ncase \"$1\" in info|detach) echo \"$@\" >> '{released}'; [ \"$1\" = detach ] || cat '{info}' 2>/dev/null; exit 0 ;; esac\n\
+                 echo \"$@\" >> '{calls}'\nn=$(wc -l < '{calls}' | tr -d ' ')\n{body}\n",
+                calls = calls.display(),
+                released = dir.join("released").display(),
+                info = dir.join("info").display()
             ),
         )
         .unwrap();
@@ -254,7 +318,89 @@ mod tests {
             create_timeout: Duration::from_secs(30),
             verify_timeout: Duration::from_secs(30),
             busy_pause: Duration::from_millis(10),
+            release_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// The `info` and `detach` calls the fake saw.
+    fn released(dir: &Path) -> Vec<String> {
+        fs::read_to_string(dir.join("released"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// An `hdiutil info` listing: one image of the system's and `image` attached as disk 12.
+    fn info_listing(image: &Path) -> String {
+        format!(
+            "framework       : 710\nimages          : 2\n\
+             ================================================\n\
+             image-path      : /Library/Other/system.dmg\n\
+             process ID      : 1\n\
+             /dev/disk6\tGUID_partition_scheme\t\n\
+             /dev/disk6s1\t7C3457EF-0000-11AA-AA11-00306543ECAC\t\n\
+             ================================================\n\
+             image-path      : {}\n\
+             image-alias     : {}\n\
+             /dev/disk12\tGUID_partition_scheme\t\n\
+             /dev/disk12s1\t7C3457EF-0000-11AA-AA11-00306543ECAC\t\n\
+             /dev/disk13\tEF57347C-0000-11AA-AA11-00306543ECAC\t\n\
+             /dev/disk13s1\t41504653-0000-11AA-AA11-00306543ECAC\t\n",
+            image.display(),
+            image.display()
+        )
+    }
+
+    #[test]
+    fn the_listing_names_only_the_disks_of_the_image() {
+        let image = PathBuf::from("/tmp/x y/installer.dmg");
+        let info = info_listing(&image);
+        assert_eq!(
+            attached_from(&info, std::slice::from_ref(&image)),
+            ["/dev/disk12", "/dev/disk13"]
+        );
+        assert!(attached_from(&info, &[PathBuf::from("/tmp/x y/other.dmg")]).is_empty());
+        assert!(attached_from("", std::slice::from_ref(&image)).is_empty());
+    }
+
+    #[test]
+    fn a_create_that_leaves_its_image_attached_is_detached_on_every_path() {
+        for (body, ok) in [
+            ("exit 0", true),
+            ("echo 'no space left' >&2; exit 1", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let out = tmp.path().join("x.dmg");
+            let real = fs::canonicalize(tmp.path()).unwrap().join("x.dmg");
+            fs::write(tmp.path().join("info"), info_listing(&real)).unwrap();
+            let h = fake(tmp.path(), body);
+            assert_eq!(h.create("v", tmp.path(), &out, tmp.path()).is_ok(), ok);
+            assert_eq!(
+                released(tmp.path()),
+                [
+                    "info",
+                    "detach -force /dev/disk12",
+                    "detach -force /dev/disk13"
+                ],
+                "{body}"
+            );
+        }
+        // Stopped at its bound: released too.
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("x.dmg");
+        let real = fs::canonicalize(tmp.path()).unwrap().join("x.dmg");
+        fs::write(tmp.path().join("info"), info_listing(&real)).unwrap();
+        let mut h = fake(tmp.path(), "exec sleep 30");
+        h.create_timeout = Duration::from_millis(200);
+        assert!(h.create("v", tmp.path(), &out, tmp.path()).is_err());
+        assert_eq!(released(tmp.path()).len(), 3);
+        // Nothing attached: only the listing.
+        let tmp = tempfile::tempdir().unwrap();
+        let h = fake(tmp.path(), "exit 0");
+        h.create("v", tmp.path(), &tmp.path().join("x.dmg"), tmp.path())
+            .unwrap();
+        assert_eq!(released(tmp.path()), ["info"]);
     }
 
     fn calls(dir: &Path) -> Vec<String> {
