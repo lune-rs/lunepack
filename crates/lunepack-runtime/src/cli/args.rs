@@ -31,6 +31,9 @@ pub enum Command {
     /// Hands the staged version to a detached applier, which applies it and restarts the app once
     /// the waited-for process has exited.
     ApplyAndRestart,
+    /// Re-creates the update service of a machine install (M10-D13); asks for administrator
+    /// rights when the process has none.
+    Repair,
 }
 
 impl Command {
@@ -42,6 +45,7 @@ impl Command {
             Command::Startup => "startup",
             Command::Confirm => "confirm",
             Command::ApplyAndRestart => "apply-and-restart",
+            Command::Repair => "repair",
         }
     }
 
@@ -53,6 +57,7 @@ impl Command {
             "startup" => Some(Command::Startup),
             "confirm" => Some(Command::Confirm),
             "apply-and-restart" => Some(Command::ApplyAndRestart),
+            "repair" => Some(Command::Repair),
             _ => None,
         }
     }
@@ -78,6 +83,8 @@ pub struct Parsed {
     /// `--background`: the applier starts the new version without bringing it to the front
     /// (M8-D13; macOS only).
     pub background: bool,
+    /// `--silent` (`repair`): never ask for administrator rights; without them, exit 30.
+    pub silent: bool,
     /// The arguments after `--`: the app's own arguments (`startup`, which a rolled-back start
     /// passes on), or the arguments the new version is started with (`apply-and-restart`).
     pub passed_args: Vec<OsString>,
@@ -98,6 +105,7 @@ impl std::fmt::Debug for Parsed {
             .field("wait_pid", &self.wait_pid)
             .field("no_ui", &self.no_ui)
             .field("background", &self.background)
+            .field("silent", &self.silent)
             .field("passed_args", &self.passed_args.len())
             .finish()
     }
@@ -121,6 +129,7 @@ pub fn parse(command: Command, rest: &[OsString]) -> Result<Parsed, UsageError> 
         wait_pid: None,
         no_ui: false,
         background: false,
+        silent: false,
         passed_args: Vec::new(),
     };
     let mut i = 0;
@@ -154,6 +163,14 @@ pub fn parse(command: Command, rest: &[OsString]) -> Result<Parsed, UsageError> 
                 return Err(UsageError);
             }
             parsed.background = true;
+            i += 1;
+            continue;
+        }
+        if name == "--silent" {
+            if parsed.silent || command != Command::Repair {
+                return Err(UsageError);
+            }
+            parsed.silent = true;
             i += 1;
             continue;
         }

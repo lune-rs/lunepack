@@ -13,9 +13,14 @@
 //! ```text
 //! phase <name>
 //! progress <name> <done> <total>
+//! end <code>
 //! ```
 //!
-//! where `<name>` is one of the closed phase names and the numbers are decimal.
+//! where `<name>` is one of the closed phase names and the numbers are decimal. `end` is the last
+//! line of a mode whose result no exit code reaches the reader (the machine uninstall, whose
+//! copy runs after the process the reader started has exited); `<code>` is the mode's exit code.
+//! It is advice for the failure the reader names, never proof of success: the reader decides
+//! success from the machine record.
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
@@ -91,6 +96,33 @@ fn number(text: &str) -> Option<u64> {
     if plain { text.parse().ok() } else { None }
 }
 
+/// One line of the relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Line {
+    /// An event (`phase`, `progress`).
+    Event(Event),
+    /// `end <code>`: the exit code of the writer's mode.
+    End(u8),
+}
+
+/// The relay line of the end of a mode that exited with `code`.
+pub fn encode_end(code: u8) -> String {
+    format!("end {code}")
+}
+
+/// One relay line, `None` for anything outside the grammar.
+pub fn decode_line(line: &str) -> Option<Line> {
+    if line.len() > MAX_LINE || !line.is_ascii() {
+        return None;
+    }
+    if let Some(code) = line.strip_prefix("end ") {
+        return number(code)
+            .and_then(|n| u8::try_from(n).ok())
+            .map(Line::End);
+    }
+    decode(line).map(Line::Event)
+}
+
 /// The event of one relay line, `None` for anything outside the grammar.
 pub fn decode(line: &str) -> Option<Event> {
     if line.len() > MAX_LINE || !line.is_ascii() {
@@ -128,6 +160,13 @@ impl RelaySink {
     pub fn new(out: Box<dyn Write + Send>) -> RelaySink {
         RelaySink { out }
     }
+}
+
+/// Writes the `end` line of a mode that exits with `code` into `out`; best effort.
+pub fn write_end(out: &mut dyn Write, code: u8) {
+    let mut line = encode_end(code);
+    line.push('\n');
+    let _ = out.write_all(line.as_bytes()).and_then(|()| out.flush());
 }
 
 impl Sink for RelaySink {
@@ -172,24 +211,35 @@ pub fn relay(
     events: &Events,
     done: &AtomicBool,
 ) -> usize {
+    relay_ending(connector, id, events, done).0
+}
+
+/// [`relay`], and the code of the `end` line when the stream ended with one (advice only).
+pub fn relay_ending(
+    connector: &dyn EventConnector,
+    id: &str,
+    events: &Events,
+    done: &AtomicBool,
+) -> (usize, Option<u8>) {
     let start = Instant::now();
     let mut channel = loop {
         match connector.connect(id, SLICE) {
             Ok(channel) => break channel,
-            Err(Attempt::Refused) => return 0,
+            Err(Attempt::Refused) => return (0, None),
             Err(Attempt::NotYet) => {
                 if done.load(Ordering::Acquire) || start.elapsed() > CONNECT_LIMIT {
-                    return 0;
+                    return (0, None);
                 }
             }
         }
     };
     if channel.set_read_deadline(Some(SLICE)).is_err() {
-        return 0;
+        return (0, None);
     }
     let mut carry: Vec<u8> = Vec::new();
     let mut total = 0usize;
     let mut relayed = 0usize;
+    let mut end: Option<u8> = None;
     let mut buf = [0u8; 512];
     loop {
         match channel.read(&mut buf) {
@@ -203,15 +253,20 @@ pub fn relay(
                 while let Some(at) = carry.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = carry.drain(..=at).collect();
                     let Ok(line) = std::str::from_utf8(&line[..line.len() - 1]) else {
-                        return relayed;
+                        return (relayed, end);
                     };
-                    match decode(line) {
-                        Some(event) => {
+                    // Nothing follows an `end`.
+                    if end.is_some() {
+                        return (relayed, end);
+                    }
+                    match decode_line(line) {
+                        Some(Line::Event(event)) => {
                             events.emit(&event);
                             relayed += 1;
                         }
+                        Some(Line::End(code)) => end = Some(code),
                         // Outside the grammar: the stream is not what it should be.
-                        None => return relayed,
+                        None => return (relayed, end),
                     }
                 }
                 if carry.len() > MAX_LINE {
@@ -228,7 +283,31 @@ pub fn relay(
             Err(_) => break,
         }
     }
-    relayed
+    (relayed, end)
+}
+
+/// [`relay_ending`] for a writer that may take a long time (a process that runs after the one the
+/// reader started has exited): follows the pipe until it ends, or until `limit` has passed.
+pub fn relay_to_the_end(
+    connector: &dyn EventConnector,
+    id: &str,
+    events: &Events,
+    limit: Duration,
+) -> (usize, Option<u8>) {
+    let done = AtomicBool::new(false);
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let start = Instant::now();
+            while !finished.load(Ordering::Acquire) && start.elapsed() < limit {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            done.store(true, Ordering::Release);
+        });
+        let out = relay_ending(connector, id, events, &done);
+        finished.store(true, Ordering::Release);
+        out
+    })
 }
 
 #[cfg(test)]
@@ -526,5 +605,71 @@ mod tests {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
         );
+    }
+
+    #[test]
+    fn the_end_line_carries_a_code_and_nothing_follows_it() {
+        assert_eq!(encode_end(25), "end 25");
+        assert_eq!(decode_line("end 25"), Some(Line::End(25)));
+        assert_eq!(decode_line("end 0"), Some(Line::End(0)));
+        assert_eq!(
+            decode_line("phase install"),
+            Some(Line::Event(Event::phase(Phase::Install, None)))
+        );
+        for bad in [
+            "end", "end ", "end 256", "end -1", "end 01", "end 1 2", "End 1", "end  1", "end +1",
+        ] {
+            assert_eq!(decode_line(bad), None, "{bad:?}");
+        }
+        // `decode` stays the events' own grammar.
+        assert_eq!(decode("end 0"), None);
+        // Over a pipe: events, then the end; the reader gets both. Lines after the end end the relay.
+        for (stream, want) in [
+            ("phase uninstall\nend 25\n", (1, Some(25))),
+            ("end 0\n", (0, Some(0))),
+            ("phase uninstall\n", (1, None)),
+            ("end 25\nphase install\n", (0, Some(25))),
+            ("end 25\nend 0\n", (0, Some(25))),
+            ("phase uninstall\nend 300\nphase install\n", (1, None)),
+        ] {
+            let (mut child, reader) = mem_duplex();
+            std::io::Write::write_all(&mut child, stream.as_bytes()).unwrap();
+            drop(child);
+            let connector = OneConnector(std::sync::Mutex::new(Some(reader)));
+            let sink = Collect::default();
+            let events = Events::new(None, Some(Box::new(sink.clone())));
+            let done = AtomicBool::new(false);
+            let got = relay_ending(&connector, "id", &events, &done);
+            events.finish(Duration::from_secs(1));
+            assert_eq!(got, want, "{stream:?}");
+            assert_eq!(sink.0.lock().unwrap().len(), want.0, "{stream:?}");
+        }
+    }
+
+    struct OneConnector(std::sync::Mutex<Option<MemDuplex>>);
+
+    impl EventConnector for OneConnector {
+        fn connect(&self, _: &str, _: Duration) -> Result<Box<dyn Duplex>, Attempt> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .map(|d| Box::new(d) as Box<dyn Duplex>)
+                .ok_or(Attempt::Refused)
+        }
+    }
+
+    #[test]
+    fn a_writer_that_never_ends_is_followed_only_until_the_limit() {
+        // The pipe stays open and silent: the relay stops at the limit, with nothing relayed.
+        let (child, reader) = mem_duplex();
+        let connector = OneConnector(std::sync::Mutex::new(Some(reader)));
+        let events = Events::new(None, None);
+        let started = Instant::now();
+        let got = relay_to_the_end(&connector, "id", &events, Duration::from_millis(300));
+        assert_eq!(got, (0, None));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(child);
     }
 }

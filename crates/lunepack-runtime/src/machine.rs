@@ -24,9 +24,10 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lunepack::{Phase, Progress, Version};
+use lunepack::{FileKind, Phase, Process, Progress, Version};
 use lunepack_core::engine::{InstallRequest, Installed, MachineOpError, Ports, install};
 use lunepack_core::limits::Limits;
 use lunepack_core::setup::{
@@ -35,12 +36,14 @@ use lunepack_core::setup::{
 use lunepack_core::state::MachineStore;
 use lunepack_core::{
     AppId, Clock, ClockReading, Codec, DirClass, Elevated, Elevation, Fs, FsError, FsErrorKind,
-    Hasher, LayoutScheme, MachineLayout, Protect, ReadAt, Rng, RootChoice, Scope, Standing,
-    Verifier, resolve_root_scoped,
+    Hasher, LayoutScheme, MachineLayout, PolicySource, Protect, ReadAt, Rng, RootChoice, Scope,
+    ServiceConnector, Standing, Verifier, resolve_root_scoped, root_valid_for_uninstall,
 };
 
 use crate::events::{Event, Events};
-use crate::modes::{Kind, MACHINE_INSTALL, MachineArgs, SetupArgs};
+use crate::modes::{
+    Kind, MACHINE_INSTALL, MACHINE_REPAIR, MACHINE_UNINSTALL, MachineArgs, SetupArgs,
+};
 use crate::relay::{EventConnector, RelaySink};
 use crate::setup::Found;
 
@@ -606,6 +609,573 @@ pub fn hand_off_unless(
     hand_off(h, events, installed)
 }
 
+// ---- repair and uninstall of an installed machine tree (M10 step 18) -------------------------
+
+/// How long phase 2 of the machine uninstall waits for phase 1 to exit before it goes on (the
+/// engine's removal guard then decides).
+pub const SECOND_WAIT: Duration = Duration::from_secs(10);
+/// How long the unelevated side follows phase 2 through its pipe before it judges the result by
+/// the machine record alone.
+pub const SECOND_LIMIT: Duration = Duration::from_secs(10 * 60);
+/// The prefix of the folder phase 1 copies the runtime into, before the 32 hex characters of its id.
+pub const UNINSTALL_PREFIX: &str = ".lunepack-uninstall-";
+/// The runtime's file name in that folder.
+pub const UNINSTALL_COPY: &str = "lunepack-runtime.exe";
+/// The marker's file name in that folder.
+pub const UNINSTALL_MARKER: &str = "marker";
+/// The most bytes of a marker read.
+const MARKER_MAX: u64 = 4096;
+/// The first line of a marker.
+const MARKER_HEAD: &str = "lunepack-uninstall 1";
+
+/// The one-shot operations of the engine and the process effects of the elevated modes: the
+/// Windows adapters on Windows, a fake in tests.
+pub trait Ops: Send + Sync {
+    /// The engine's `repair` of the install at `root`, whose service is registered under `name`.
+    fn repair(&self, root: &Path, name: &str) -> Result<Version, Kind>;
+    /// The engine's `uninstall` of the install at `root`.
+    fn uninstall(&self, root: &Path, name: &str) -> Result<(), Kind>;
+    /// Makes `dir` this process's working directory (so nothing of this process stays in `R`).
+    fn enter(&self, dir: &Path) -> bool;
+    /// Registers `path` (a file, or a folder that is empty by then) for deletion at the next
+    /// restart of the system.
+    fn delete_at_restart(&self, path: &Path) -> bool;
+}
+
+/// What an unelevated process hands the work of `repair` and `uninstall` to.
+pub struct Host<'a> {
+    /// The system's elevation.
+    pub elevation: &'a dyn Elevation,
+    /// The engine's one-shot operations, for a process that is an administrator's already.
+    pub ops: &'a dyn Ops,
+    /// Opens an elevated child's pipe.
+    pub pipes: &'a dyn EventConnector,
+    /// The install's update service.
+    pub service: &'a dyn ServiceConnector,
+    /// The administrator's policy.
+    pub policy: &'a dyn PolicySource,
+    /// The ids of pipes come from here.
+    pub rng: &'a dyn Rng,
+    /// The user's SID, as text: the one account that may read an elevated child's pipe.
+    pub sid: Option<&'a str>,
+}
+
+/// Whether an administrator's policy makes the runtime of the install of `app_id` headless
+/// (`NoUpdateUi`, M10-D12), as `LUNEPACK_NO_UI` does for every install: only a machine install is
+/// ruled by the policy of its machine.
+pub fn no_update_ui(is_machine: bool, policy: &dyn PolicySource, app_id: &AppId) -> bool {
+    is_machine && policy.read(app_id).no_update_ui
+}
+
+/// Whether `a` is the directory `b` (as paths; on Windows without regard to case).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+    } else {
+        a == b
+    }
+}
+
+/// The install root `R` and the version tree the runtime image at `exe` stands in:
+/// `<home>\<R>\app\<version>\…\<exe>`, `R` directly in the machine home. Pure path logic; nothing
+/// is read.
+pub fn tree_of(exe: &Path, home: &Path) -> Option<(PathBuf, PathBuf)> {
+    for tree in exe.ancestors().skip(1) {
+        let Some(app) = tree.parent() else {
+            continue;
+        };
+        let is_app = app
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("app"));
+        if !is_app {
+            continue;
+        }
+        let root = app.parent()?;
+        if root.parent().is_some_and(|p| same_dir(p, home))
+            && root
+                .file_name()
+                .is_some_and(|n| n.as_encoded_bytes().first() != Some(&b'.'))
+        {
+            return Some((root.to_path_buf(), tree.to_path_buf()));
+        }
+        return None;
+    }
+    None
+}
+
+/// The machine install an elevated runtime stands in, as its own files and the machine record say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Located {
+    /// The install root `R`.
+    pub root: PathBuf,
+    /// The app.
+    pub app_id: AppId,
+    /// The display name: the service is registered under it.
+    pub name: String,
+    /// The tree's own version.
+    pub version: Version,
+}
+
+/// Finds the install the runtime image at `exe` belongs to, from its own path, its tree's update
+/// configuration and the machine record (never from an argument or the environment): `exe` is in
+/// `<home>\<R>\app\<version>\`, `R` is a real directory directly in the machine home, and the
+/// record of the app named by the tree's configuration lives in `R`. Anything else is refused
+/// before any effect: `usage` for a place that is no machine tree, `install_mismatch` for one that
+/// is not the install the machine record knows.
+pub fn locate(fs: &dyn Fs, hasher: &dyn Hasher, home: &Path, exe: &Path) -> Result<Located, Kind> {
+    let (root, tree) = tree_of(exe, home).ok_or(Kind::Usage)?;
+    let version = tree
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| Version::parse(n).ok().filter(|v| v.to_string() == n))
+        .ok_or(Kind::Usage)?;
+    let mut config_path = tree.clone();
+    for part in LayoutScheme::WINDOWS.config.split('/') {
+        config_path.push(part);
+    }
+    let bytes = fs
+        .read_capped(
+            &config_path,
+            lunepack_core::update_config::MAX_UPDATE_CONFIG_BYTES,
+        )
+        .map_err(|_| Kind::UpdateConfig)?;
+    let config = lunepack::UpdateConfig::parse(&bytes).map_err(|_| Kind::UpdateConfig)?;
+    if config.version != version || config.version.to_string() != version.to_string() {
+        return Err(Kind::UpdateConfig);
+    }
+    let name = config.install.name.clone();
+    match find(fs, hasher, home, &config.app_id, &name) {
+        Machine::Present(found, _) if same_dir(&found, &root) => {}
+        _ => return Err(Kind::InstallMismatch),
+    }
+    if !root_valid_for_uninstall(fs, home, &root, &config.app_id, LayoutScheme::WINDOWS) {
+        return Err(Kind::InstallMismatch);
+    }
+    Ok(Located {
+        root,
+        app_id: config.app_id,
+        name,
+        version,
+    })
+}
+
+/// The hidden `machine-repair` mode: the engine's `repair` for the install the image stands in,
+/// in an elevated process (an unelevated one is a usage error). The arguments of the mode have the
+/// shape of `machine-install`'s and name nothing this mode uses: its result is its exit code.
+pub fn run_repair_mode(
+    ops: &dyn Ops,
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    home: &Path,
+    standing: Standing,
+    exe: &Path,
+) -> Kind {
+    if standing == Standing::Standard {
+        return Kind::Usage;
+    }
+    let located = match locate(fs, hasher, home, exe) {
+        Ok(located) => located,
+        Err(kind) => return kind,
+    };
+    match ops.repair(&located.root, &located.name) {
+        Ok(_) => Kind::Ok,
+        Err(kind) => kind,
+    }
+}
+
+/// What the unelevated side of `repair` and `uninstall` knows of the install.
+#[derive(Debug, Clone)]
+pub struct Site {
+    /// The install root `R`.
+    pub root: PathBuf,
+    /// The app.
+    pub app_id: AppId,
+    /// The display name.
+    pub name: String,
+    /// The runtime of the install's current version inside `R`: the elevated image.
+    pub runtime: PathBuf,
+}
+
+/// The unelevated side's view of the machine install `inst` is a version of: `None` when it is
+/// not one. The elevated image is the runtime of the record's current version inside `R`, which
+/// nobody but an administrator can have written; the running tree's own is the fallback.
+pub fn target_of(fs: &dyn Fs, hasher: &dyn Hasher, inst: &lunepack::Installation) -> Option<Site> {
+    let layout = inst.machine_layout()?;
+    let store = MachineStore {
+        dir: layout.state_dir(),
+        app_id: inst.app_id().clone(),
+    };
+    let current = store
+        .load(fs, hasher)
+        .ok()
+        .and_then(|loaded| loaded.record)
+        .and_then(|record| record.current)
+        .and_then(|c| inst.version_installation(&c.version).ok());
+    Some(Site {
+        root: layout.root().to_path_buf(),
+        app_id: inst.app_id().clone(),
+        name: inst.meta().name.clone(),
+        runtime: current
+            .as_ref()
+            .map_or_else(|| inst.runtime_path(), |c| c.runtime_path()),
+    })
+}
+
+fn elevated_args(mode: &str, id: &str, sid: &str) -> [String; 5] {
+    [
+        mode.to_owned(),
+        "--events".to_owned(),
+        id.to_owned(),
+        "--for-sid".to_owned(),
+        sid.to_owned(),
+    ]
+}
+
+/// Starts `target.runtime` elevated in `mode` with a fresh pipe id and waits for its exit code.
+fn run_elevated_mode(host: &Host<'_>, target: &Site, mode: &str) -> Result<(String, i32), Kind> {
+    let sid = host.sid.ok_or(Kind::Process)?;
+    let mut raw = [0u8; 16];
+    host.rng.fill(&mut raw).map_err(|_| Kind::Internal)?;
+    let id = hex(&raw);
+    let mut child = match host
+        .elevation
+        .run_elevated(&target.runtime, &elevated_args(mode, &id, sid))
+    {
+        Ok(Elevated::Started(child)) => child,
+        Ok(Elevated::Declined) => return Err(Kind::ElevationDeclined),
+        Err(_) => return Err(Kind::Process),
+    };
+    let code = child.wait().map_err(|_| Kind::Process)?;
+    Ok((id, code))
+}
+
+/// `repair` (M10-D13): an administrator's process (`Admin`, `UacElevated`) runs the engine's
+/// `repair` itself; a standard user's asks for the system's elevation and has the runtime of the
+/// current version inside `R` run `machine-repair`, the result being its exit code. With `silent`
+/// a standard user's run exits `elevation_required` and nothing is asked.
+pub fn repair(host: &Host<'_>, target: &Site, silent: bool) -> Result<(), Kind> {
+    match host.elevation.standing() {
+        Standing::Admin | Standing::UacElevated => {
+            host.ops.repair(&target.root, &target.name).map(|_| ())
+        }
+        Standing::Standard if silent => Err(Kind::ElevationRequired),
+        Standing::Standard => {
+            let (_, code) = run_elevated_mode(host, target, MACHINE_REPAIR)?;
+            match Kind::from_exit_code(code) {
+                Kind::Ok => Ok(()),
+                kind => Err(kind),
+            }
+        }
+    }
+}
+
+/// The marker phase 1 of the uninstall leaves in its folder: what phase 2 does is derived from it
+/// and from the machine record, never from its own arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marker {
+    /// The app.
+    pub app_id: AppId,
+    /// The display name.
+    pub name: String,
+    /// The install root to remove.
+    pub root: PathBuf,
+    /// The id of the pipe phase 2 reports into.
+    pub events: String,
+    /// The account that may read that pipe.
+    pub sid: String,
+}
+
+impl Marker {
+    fn encode(&self) -> Option<String> {
+        let root = self.root.to_str()?;
+        let plain = |t: &str| !t.is_empty() && !t.chars().any(char::is_control);
+        (plain(&self.name) && plain(root)).then(|| {
+            format!(
+                "{MARKER_HEAD}\napp {}\nname {}\nroot {root}\nevents {}\nsid {}\n",
+                self.app_id.as_str(),
+                self.name,
+                self.events,
+                self.sid
+            )
+        })
+    }
+
+    /// The marker of `text`; `None` for anything but exactly the lines `encode` writes, each value
+    /// of its form.
+    pub fn parse(text: &str) -> Option<Marker> {
+        let mut lines = text.strip_suffix('\n')?.split('\n');
+        if lines.next()? != MARKER_HEAD {
+            return None;
+        }
+        let mut value = |key: &str| -> Option<String> {
+            lines
+                .next()?
+                .strip_prefix(key)?
+                .strip_prefix(' ')
+                .filter(|v| !v.is_empty() && !v.chars().any(char::is_control))
+                .map(str::to_owned)
+        };
+        let app_id = AppId::parse(&value("app")?).ok()?;
+        let name = value("name")?;
+        let root = PathBuf::from(value("root")?);
+        let events = value("events")?;
+        let sid = value("sid")?;
+        if lines.next().is_some()
+            || !root.is_absolute()
+            || !crate::modes::is_events_id(&events)
+            || !crate::modes::is_sid_text(&sid)
+        {
+            return None;
+        }
+        Some(Marker {
+            app_id,
+            name,
+            root,
+            events,
+            sid,
+        })
+    }
+}
+
+/// Phase 1 of the machine uninstall (the hidden `machine-uninstall` mode with `--events` and
+/// `--for-sid`), run elevated from the runtime inside `R`: that image cannot be deleted while it
+/// runs, so it copies itself into a new admin-only folder `.lunepack-uninstall-<32 hex>` directly
+/// under the machine home with a marker naming the install, makes that folder its working
+/// directory, starts the copy with the wait arguments only (nothing from the command line or the
+/// environment) and ends. It deletes nothing and starts nothing from a place a standard user can
+/// write. Any failure removes the folder.
+pub fn run_uninstall_start(
+    base: &Base<'_>,
+    ops: &dyn Ops,
+    process: &dyn Process,
+    standing: Standing,
+    args: &MachineArgs,
+    exe: &Path,
+) -> Kind {
+    if standing == Standing::Standard {
+        return Kind::Usage;
+    }
+    let located = match locate(base.fs, base.hasher, base.home, exe) {
+        Ok(located) => located,
+        Err(kind) => return kind,
+    };
+    let Ok(me) = process.current() else {
+        return Kind::Process;
+    };
+    let marker = Marker {
+        app_id: located.app_id,
+        name: located.name,
+        root: located.root,
+        events: args.events.clone(),
+        sid: args.for_sid.clone(),
+    };
+    let Some(text) = marker.encode() else {
+        return Kind::UpdateConfig;
+    };
+    let mut raw = [0u8; 16];
+    if base.rng.fill(&mut raw).is_err() {
+        return Kind::Internal;
+    }
+    let dir = base.home.join(format!("{UNINSTALL_PREFIX}{}", hex(&raw)));
+    if base.protect.create_dir(&dir, DirClass::AdminOnly).is_err() {
+        return Kind::NotProtected;
+    }
+    let started = (|| {
+        let copy = dir.join(UNINSTALL_COPY);
+        base.fs.copy_file(exe, &copy).map_err(|_| Kind::Fs)?;
+        let mut out = base
+            .fs
+            .create_new(&dir.join(UNINSTALL_MARKER))
+            .map_err(|_| Kind::Fs)?;
+        out.write_all(text.as_bytes()).map_err(|_| Kind::Fs)?;
+        out.sync().map_err(|_| Kind::Fs)?;
+        drop(out);
+        // The copy inherits this directory, not one inside `R`.
+        if !ops.enter(&dir) {
+            return Err(Kind::Fs);
+        }
+        let mut spec = lunepack::SpawnSpec::new(copy);
+        spec.args = vec![
+            MACHINE_UNINSTALL.into(),
+            "--wait-pid".into(),
+            me.pid.to_string().into(),
+            "--wait-start".into(),
+            me.start_ticks.to_string().into(),
+        ];
+        spec.env_remove = vec![std::ffi::OsString::from(lunepack::HEALTH_TOKEN_VAR)];
+        process.spawn_detached(&spec).map_err(|_| Kind::Process)
+    })();
+    match started {
+        Ok(()) => Kind::Ok,
+        Err(kind) => {
+            let _ = base.fs.remove_dir_all_nofollow(&dir);
+            kind
+        }
+    }
+}
+
+/// Phase 2's own-folder rule: `exe` is the runtime copy directly inside a real, admin-only folder
+/// `.lunepack-uninstall-<32 lowercase hex>` directly under the machine home, which holds a
+/// marker. The folder, or `None` anywhere else (a usage error before any action).
+pub fn own_folder(fs: &dyn Fs, protect: &dyn Protect, home: &Path, exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    let name = dir.file_name()?.to_str()?;
+    let id = name.strip_prefix(UNINSTALL_PREFIX)?;
+    let exe_ok = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case(UNINSTALL_COPY));
+    if !exe_ok
+        || !crate::modes::is_events_id(id)
+        || !dir.parent().is_some_and(|p| same_dir(p, home))
+    {
+        return None;
+    }
+    let is = |path: &Path, kind: FileKind| matches!(fs.symlink_metadata(path), Ok(Some(m)) if m.kind == kind);
+    (is(dir, FileKind::Dir)
+        && is(&dir.join(UNINSTALL_MARKER), FileKind::File)
+        && protect.check(dir, DirClass::AdminOnly).is_ok())
+    .then(|| dir.to_path_buf())
+}
+
+/// A pipe end shared by the events sink and the final `end` line.
+#[derive(Clone)]
+struct Shared(Arc<Mutex<Box<dyn Write + Send>>>);
+
+impl Write for Shared {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("poisoned"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("poisoned"))?
+            .flush()
+    }
+}
+
+/// Phase 2 of the machine uninstall (the hidden `machine-uninstall` mode with the wait arguments),
+/// run elevated from its own folder: the own-folder rule first (a usage error, nothing done), the
+/// marker next, then the wait for phase 1, the pipe the unelevated side reads, the re-validation of
+/// the install the marker names against the machine record (`install_mismatch` when it is not a
+/// valid machine install: nothing is removed), and the engine's `uninstall`. The folder is
+/// registered for deletion at restart whatever the result, and the exit code is written to the pipe
+/// last. The unelevated side judges success by the record and takes the code as advice.
+#[allow(clippy::too_many_arguments)]
+pub fn run_uninstall_second(
+    base: &Base<'_>,
+    ops: &dyn Ops,
+    process: &dyn Process,
+    pipes: &dyn EventPipes,
+    standing: Standing,
+    wait: &lunepack::ProcessId,
+    exe: &Path,
+    accept: Duration,
+) -> Kind {
+    if standing == Standing::Standard {
+        return Kind::Usage;
+    }
+    let Some(dir) = own_folder(base.fs, base.protect, base.home, exe) else {
+        return Kind::Usage;
+    };
+    let marker = base
+        .fs
+        .read_capped(&dir.join(UNINSTALL_MARKER), MARKER_MAX)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| Marker::parse(&text));
+    let Some(marker) = marker else {
+        return Kind::InstallMismatch;
+    };
+    // Nothing of this process stays in `R` (the strict removal guard sees a working directory).
+    if !ops.enter(&dir) {
+        return Kind::Fs;
+    }
+    // A timeout or an unreadable process is not an error here: the removal guard decides.
+    let _ = process.wait_exit(wait, SECOND_WAIT);
+    let writer = match pipes.open(&marker.events, &marker.sid, accept) {
+        Ok(writer) => writer.map(|w| Shared(Arc::new(Mutex::new(w)))),
+        Err(PipeFail::InvalidSid) => return Kind::Usage,
+        // The uninstall does not depend on a reader.
+        Err(PipeFail::Failed) => None,
+    };
+    let events = Events::new(
+        None,
+        writer
+            .clone()
+            .map(|w| Box::new(RelaySink::new(Box::new(w))) as Box<dyn crate::events::Sink>),
+    );
+    events.emit(&Event::phase(Phase::Uninstall, None));
+    let valid = matches!(
+        find(base.fs, base.hasher, base.home, &marker.app_id, &marker.name),
+        Machine::Present(found, _) if same_dir(&found, &marker.root)
+    ) && root_valid_for_uninstall(
+        base.fs,
+        base.home,
+        &marker.root,
+        &marker.app_id,
+        LayoutScheme::WINDOWS,
+    );
+    let kind = if valid {
+        match ops.uninstall(&marker.root, &marker.name) {
+            Ok(()) => Kind::Ok,
+            Err(kind) => kind,
+        }
+    } else {
+        Kind::InstallMismatch
+    };
+    // Files first, then the folder: the system processes them in this order at the restart.
+    for path in [exe, &dir.join(UNINSTALL_MARKER), &dir] {
+        let _ = ops.delete_at_restart(path);
+    }
+    events.finish(Duration::from_secs(2));
+    if let Some(mut writer) = writer {
+        crate::relay::write_end(&mut writer, kind.code());
+    }
+    kind
+}
+
+/// What the unelevated side of `uninstall` does after the user confirmed: has the runtime inside
+/// `R` run `machine-uninstall` elevated (always through the system's elevation, whatever this
+/// process's standing: this process is a copy outside `R`, and the engine is not run from here),
+/// follows phase 2 through its pipe, and judges the result by the machine record: the install
+/// being gone is success. With `silent` a standard user's run exits `elevation_required` and
+/// nothing is asked. The caller removes this user's own home afterwards.
+pub fn uninstall(
+    host: &Host<'_>,
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    home: &Path,
+    target: &Site,
+    silent: bool,
+    events: &Events,
+) -> Result<(), Kind> {
+    if host.elevation.standing() == Standing::Standard && silent {
+        return Err(Kind::ElevationRequired);
+    }
+    let (id, code) = run_elevated_mode(host, target, MACHINE_UNINSTALL)?;
+    match Kind::from_exit_code(code) {
+        Kind::Ok => {}
+        kind => return Err(kind),
+    }
+    // Phase 1 only started phase 2: its progress, and its end, come through the pipe.
+    let (_, end) = crate::relay::relay_to_the_end(host.pipes, &id, events, SECOND_LIMIT);
+    match find(fs, hasher, home, &target.app_id, &target.name) {
+        Machine::Absent => Ok(()),
+        _ => Err(match end.map(|c| Kind::from_exit_code(i32::from(c))) {
+            Some(Kind::Ok) => Kind::State,
+            Some(kind) => kind,
+            None => Kind::Process,
+        }),
+    }
+}
+
 // ---- the Windows adapters --------------------------------------------------------------------
 
 /// The Windows adapters of the all-users install: the engine's ports, the elevation pipe's two
@@ -617,8 +1187,9 @@ pub mod native {
     use std::time::Duration;
 
     use lunepack::SystemClock;
+    use lunepack::Version;
     use lunepack_codec_lzma::LzmaCodec;
-    use lunepack_core::engine::{Installed, Ports};
+    use lunepack_core::engine::{Engine, Installed, MachineOpError, Ports};
     use lunepack_core::service::Duplex;
     use lunepack_crypto::{Ed25519Verifier, OsRng, Sha256Hasher};
     use lunepack_fs::StdFs;
@@ -628,7 +1199,7 @@ pub mod native {
         WindowsRegistrar, program_files,
     };
 
-    use super::{EventPipes, Installer, PipeFail, Staged, install_staged};
+    use super::{EventPipes, Installer, Ops, PipeFail, Staged, install_staged, kind_of};
     use crate::modes::Kind;
     use crate::relay::{Attempt, EventConnector, pipe_name};
 
@@ -703,6 +1274,38 @@ pub mod native {
         fn install(&self, home: &Path, staged: &Staged<'_>) -> Result<Installed, Kind> {
             let adapters = Adapters::new(staged.name()).ok_or(Kind::Internal)?;
             install_staged(adapters.ports(), home, staged)
+        }
+    }
+
+    /// The engine's one-shot operations and the process effects of the elevated modes, over the
+    /// Windows adapters. `enter` is the one thing this module does not do itself: it makes a
+    /// directory the working directory (the composition root passes it in).
+    pub struct NativeOps {
+        /// Makes the directory this process's working directory.
+        pub enter: fn(&Path) -> bool,
+    }
+
+    impl Ops for NativeOps {
+        fn repair(&self, root: &Path, name: &str) -> Result<Version, Kind> {
+            let adapters = Adapters::new(name).ok_or(Kind::Internal)?;
+            let engine = Engine::open(adapters.ports(), root)
+                .map_err(|e| kind_of(MachineOpError::from(e)))?;
+            engine.repair().map_err(kind_of)
+        }
+
+        fn uninstall(&self, root: &Path, name: &str) -> Result<(), Kind> {
+            let adapters = Adapters::new(name).ok_or(Kind::Internal)?;
+            let engine = Engine::open(adapters.ports(), root)
+                .map_err(|e| kind_of(MachineOpError::from(e)))?;
+            engine.uninstall().map_err(kind_of)
+        }
+
+        fn enter(&self, dir: &Path) -> bool {
+            (self.enter)(dir)
+        }
+
+        fn delete_at_restart(&self, path: &Path) -> bool {
+            lunepack_os_windows::delete_at_restart(path).is_ok()
         }
     }
 
@@ -822,7 +1425,9 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    use lunepack::ProcessId;
     use lunepack::{Channel, InstallMeta, RelPath, Target, UpdateConfig};
+    use lunepack_core::ServiceRegistrar as _;
     use lunepack_core::engine::Ports;
     use lunepack_core::setup::{SetupTrailer, TRAILER_SIZE};
     use lunepack_core::{CodecId, PayloadKind, TrustedRoot, UPDATE_CONFIG_FILE};
@@ -1963,5 +2568,736 @@ mod tests {
         assert_eq!(hand_off(&h, &events, &installed), Ok(()));
         events.finish(Duration::from_secs(1));
         assert!(installed());
+    }
+
+    // ---- repair and uninstall of an installed machine tree (M10 step 18) ----------------------
+
+    /// A machine install of 1.0.0 made by the engine over the host's fakes, and the runtime image
+    /// inside its tree.
+    fn installed(host: &Host) -> PathBuf {
+        let b = Built::new(0, "1.0.0", true);
+        let (events, _) = collecting();
+        let staged = stage_payload(&host.base(), &b.found(), &b.anchor(), &events).expect("staged");
+        install_staged(host.ports(), &host.home, &staged).expect("installed");
+        drop(staged);
+        let exe = host.home.join("Hello/app/1.0.0").join(UNINSTALL_COPY);
+        let mut w = host.mem.create_new(&exe).expect("runtime");
+        w.write_all(b"runtime").expect("write");
+        w.sync().expect("sync");
+        exe
+    }
+
+    /// The engine's operations over the host's fakes, recording the effects the elevated modes
+    /// ask of their process.
+    struct EngineOps<'h> {
+        host: &'h Host,
+        entered: Mutex<Vec<PathBuf>>,
+        deleted: Mutex<Vec<PathBuf>>,
+        engine_calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl<'h> EngineOps<'h> {
+        fn new(host: &'h Host) -> Self {
+            EngineOps {
+                host,
+                entered: Mutex::new(Vec::new()),
+                deleted: Mutex::new(Vec::new()),
+                engine_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Ops for EngineOps<'_> {
+        fn repair(&self, root: &Path, _: &str) -> Result<Version, Kind> {
+            self.engine_calls.lock().unwrap().push("repair");
+            let engine = lunepack_core::engine::Engine::open(self.host.ports(), root)
+                .map_err(|e| kind_of(MachineOpError::from(e)))?;
+            engine.repair().map_err(kind_of)
+        }
+
+        fn uninstall(&self, root: &Path, _: &str) -> Result<(), Kind> {
+            self.engine_calls.lock().unwrap().push("uninstall");
+            let engine = lunepack_core::engine::Engine::open(self.host.ports(), root)
+                .map_err(|e| kind_of(MachineOpError::from(e)))?;
+            engine.uninstall().map_err(kind_of)
+        }
+
+        fn enter(&self, dir: &Path) -> bool {
+            self.entered.lock().unwrap().push(dir.to_path_buf());
+            true
+        }
+
+        fn delete_at_restart(&self, path: &Path) -> bool {
+            self.deleted.lock().unwrap().push(path.to_path_buf());
+            true
+        }
+    }
+
+    fn app_id() -> AppId {
+        AppId::parse(lunepack_testkit::SUITE_APP_ID).unwrap()
+    }
+
+    #[test]
+    fn the_root_and_tree_of_a_runtime_are_found_only_directly_under_the_machine_home() {
+        let home = abs_path("/pf");
+        let exe = |p: &str| abs_path(p);
+        let (root, tree) = tree_of(&exe("/pf/Hello/app/1.0.0/rt.exe"), &home).expect("tree");
+        assert_eq!(root, abs_path("/pf/Hello"));
+        assert_eq!(tree, abs_path("/pf/Hello/app/1.0.0"));
+        // The runtime beside a nested entry.
+        let (root, tree) = tree_of(&exe("/pf/Hello/app/1.0.0/bin/rt.exe"), &home).expect("tree");
+        assert_eq!(
+            (root, tree),
+            (abs_path("/pf/Hello"), abs_path("/pf/Hello/app/1.0.0"))
+        );
+        for bad in [
+            "/pf/app/1.0.0/rt.exe",
+            "/pf/Hello/sub/app/1.0.0/rt.exe",
+            "/elsewhere/Hello/app/1.0.0/rt.exe",
+            "/pf/.hidden/app/1.0.0/rt.exe",
+            "/pf/Hello/versions/1.0.0/rt.exe",
+            "/pf/Hello/rt.exe",
+        ] {
+            assert_eq!(tree_of(&exe(bad), &home), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_runtime_is_located_by_its_own_files_and_the_machine_record_or_refused() {
+        let host = Host::new();
+        let exe = installed(&host);
+        let located = locate(&host.mem, &FakeHasher, &host.home, &exe).expect("located");
+        assert_eq!(located.root, host.home.join("Hello"));
+        assert_eq!(located.name, "Hello");
+        assert_eq!(located.app_id, app_id());
+        assert_eq!(located.version.to_string(), "1.0.0");
+        // A place that is no machine tree: usage, nothing read.
+        let other = abs_path("/dl/rt.exe");
+        assert_eq!(
+            locate(&host.mem, &FakeHasher, &host.home, &other),
+            Err(Kind::Usage)
+        );
+        // A tree in the home without a machine record of the app: not the install.
+        let stray = host.home.join("Other/app/1.0.0");
+        host.mem.create_dir_all(&stray).unwrap();
+        let config = host
+            .mem
+            .read_capped(
+                &host.home.join("Hello/app/1.0.0").join(UPDATE_CONFIG_FILE),
+                1 << 16,
+            )
+            .unwrap();
+        let mut w = host
+            .mem
+            .create_new(&stray.join(UPDATE_CONFIG_FILE))
+            .unwrap();
+        w.write_all(&config).unwrap();
+        w.sync().unwrap();
+        assert_eq!(
+            locate(
+                &host.mem,
+                &FakeHasher,
+                &host.home,
+                &stray.join(UNINSTALL_COPY)
+            ),
+            Err(Kind::InstallMismatch)
+        );
+        // A tree whose version directory does not name its config's version.
+        let renamed = host.home.join("Hello/app/9.9.9");
+        host.mem.create_dir_all(&renamed).unwrap();
+        let mut w = host
+            .mem
+            .create_new(&renamed.join(UPDATE_CONFIG_FILE))
+            .unwrap();
+        w.write_all(&config).unwrap();
+        w.sync().unwrap();
+        assert_eq!(
+            locate(
+                &host.mem,
+                &FakeHasher,
+                &host.home,
+                &renamed.join(UNINSTALL_COPY)
+            ),
+            Err(Kind::UpdateConfig)
+        );
+    }
+
+    fn target(host: &Host) -> Site {
+        Site {
+            root: host.home.join("Hello"),
+            app_id: app_id(),
+            name: "Hello".to_owned(),
+            runtime: host.home.join("Hello/app/1.0.0").join(UNINSTALL_COPY),
+        }
+    }
+
+    fn unelevated<'a>(
+        elevation: &'a FakeElevation,
+        ops: &'a EngineOps<'_>,
+        pipes: &'a ReaderConnector,
+        host: &'a Host,
+        sid: Option<&'a str>,
+    ) -> Host_<'a> {
+        Host_ {
+            elevation,
+            ops,
+            pipes,
+            service: &NoService,
+            policy: &host.policy,
+            rng: &host.rng,
+            sid,
+        }
+    }
+
+    /// The unelevated side's host (the module's `Host` is the engine fixture's name in these tests).
+    type Host_<'a> = super::Host<'a>;
+
+    struct NoService;
+
+    impl lunepack_core::ServiceConnector for NoService {
+        fn connect(
+            &self,
+            _: &AppId,
+        ) -> Result<Box<dyn lunepack_core::service::Duplex>, lunepack_core::ConnectError> {
+            panic!("repair and uninstall never reach the update service")
+        }
+    }
+
+    #[test]
+    fn repair_in_each_standing_asks_only_a_standard_user_to_elevate() {
+        for (standing, silent) in [
+            (Standing::Admin, false),
+            (Standing::UacElevated, false),
+            (Standing::Admin, true),
+            (Standing::UacElevated, true),
+        ] {
+            let host = Host::new();
+            installed(&host);
+            // The registration is gone; the engine's `repair` makes it again.
+            host.registrar.remove(&app_id()).unwrap();
+            assert_eq!(host.registrar.image(&app_id()).unwrap(), None);
+            let elevation = FakeElevation::new(standing, []);
+            let ops = EngineOps::new(&host);
+            let (_, reader) = lunepack_testkit::mem_duplex();
+            let pipes = ReaderConnector(Mutex::new(Some(reader)));
+            let h = unelevated(&elevation, &ops, &pipes, &host, Some(SID));
+            assert_eq!(repair(&h, &target(&host), silent), Ok(()), "{standing:?}");
+            assert!(elevation.calls().is_empty(), "{standing:?}: no prompt");
+            assert!(
+                host.registrar.image(&app_id()).unwrap().is_some(),
+                "{standing:?}"
+            );
+        }
+        // A standard user: one prompt, the runtime of the current version, the hidden mode's
+        // shape; the result is the child's exit code.
+        for (script, want) in [
+            (ElevationScript::Exit(0), Ok(())),
+            (ElevationScript::Exit(25), Err(Kind::InUse)),
+            (ElevationScript::Exit(35), Err(Kind::NotProtected)),
+            (
+                ElevationScript::Exit(0xC000_0005_u32 as i32),
+                Err(Kind::Process),
+            ),
+            (ElevationScript::Declined, Err(Kind::ElevationDeclined)),
+            (ElevationScript::Fails, Err(Kind::Process)),
+        ] {
+            let host = Host::new();
+            installed(&host);
+            let elevation = FakeElevation::new(Standing::Standard, [script]);
+            let ops = EngineOps::new(&host);
+            let (_, reader) = lunepack_testkit::mem_duplex();
+            let pipes = ReaderConnector(Mutex::new(Some(reader)));
+            let h = unelevated(&elevation, &ops, &pipes, &host, Some(SID));
+            assert_eq!(repair(&h, &target(&host), false), want, "{script:?}");
+            let calls = elevation.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, target(&host).runtime);
+            assert_eq!(calls[0].1[0], "machine-repair");
+            assert_eq!(calls[0].1[1], "--events");
+            assert!(crate::modes::is_events_id(&calls[0].1[2]));
+            assert_eq!((&calls[0].1[3][..], &calls[0].1[4][..]), ("--for-sid", SID));
+            // The unelevated side ran no engine operation of its own.
+            assert!(ops.engine_calls.lock().unwrap().is_empty());
+        }
+        // `--silent` as a standard user: 30, and the prompt is never shown.
+        let host = Host::new();
+        installed(&host);
+        let elevation = FakeElevation::new(Standing::Standard, [ElevationScript::Exit(0)]);
+        let ops = EngineOps::new(&host);
+        let (_, reader) = lunepack_testkit::mem_duplex();
+        let pipes = ReaderConnector(Mutex::new(Some(reader)));
+        let h = unelevated(&elevation, &ops, &pipes, &host, Some(SID));
+        assert_eq!(
+            repair(&h, &target(&host), true),
+            Err(Kind::ElevationRequired)
+        );
+        assert!(elevation.calls().is_empty());
+        // No SID to name the pipe's reader: nothing is asked.
+        let h = unelevated(&elevation, &ops, &pipes, &host, None);
+        assert_eq!(repair(&h, &target(&host), false), Err(Kind::Process));
+        assert!(elevation.calls().is_empty());
+    }
+
+    #[test]
+    fn the_elevated_repair_mode_is_for_administrators_and_for_an_install_it_finds() {
+        let host = Host::new();
+        let exe = installed(&host);
+        let ops = EngineOps::new(&host);
+        let run = |standing, exe: &Path| {
+            run_repair_mode(&ops, &host.mem, &FakeHasher, &host.home, standing, exe)
+        };
+        assert_eq!(run(Standing::Standard, &exe), Kind::Usage);
+        assert!(ops.engine_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            run(Standing::UacElevated, &abs_path("/dl/rt.exe")),
+            Kind::Usage
+        );
+        host.registrar.remove(&app_id()).unwrap();
+        assert_eq!(run(Standing::UacElevated, &exe), Kind::Ok);
+        assert!(host.registrar.image(&app_id()).unwrap().is_some());
+        assert_eq!(run(Standing::Admin, &exe), Kind::Ok);
+        // Not protected as it must be: the engine refuses and says so.
+        host.protect.set_unprotected(&host.home.join("Hello"), true);
+        assert_eq!(run(Standing::UacElevated, &exe), Kind::NotProtected);
+    }
+
+    #[test]
+    fn a_marker_round_trips_and_nothing_else_parses() {
+        let marker = Marker {
+            app_id: app_id(),
+            name: "My Hello App".to_owned(),
+            root: abs_path("/pf/My Hello App"),
+            events: ID.to_owned(),
+            sid: SID.to_owned(),
+        };
+        let text = marker.encode().expect("encoded");
+        assert_eq!(Marker::parse(&text), Some(marker.clone()));
+        for bad in [
+            String::new(),
+            text.replace("lunepack-uninstall 1", "lunepack-uninstall 2"),
+            text.replace("app ", "App "),
+            text.trim_end().to_owned(),
+            format!("{text}extra\n"),
+            text.replace(ID, "short"),
+            text.replace(SID, "not-a-sid"),
+            text.replace("root /", "root pf/"),
+            text.replace("name My Hello App", "name "),
+            text.replace("name My Hello App", "name My\tHello"),
+            text.replace("\nroot ", "\r\nroot "),
+        ] {
+            assert_eq!(Marker::parse(&bad), None, "{bad:?}");
+        }
+        // A name with a control character is not written at all.
+        let mut odd = marker;
+        odd.name = "a\nb".to_owned();
+        assert_eq!(odd.encode(), None);
+    }
+
+    fn uninstall_folders(host: &Host) -> Vec<String> {
+        host.mem
+            .list_dir(&host.home)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name.to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(UNINSTALL_PREFIX))
+            .collect()
+    }
+
+    /// Phase 1 for the install, returning the folder it made and the spawn it did.
+    fn start_phase_one(host: &Host, ops: &EngineOps<'_>, exe: &Path) -> (PathBuf, Vec<String>) {
+        let kind = run_uninstall_start(
+            &host.base(),
+            ops,
+            &host.process,
+            Standing::UacElevated,
+            &args(),
+            exe,
+        );
+        assert_eq!(kind, Kind::Ok);
+        let folders = uninstall_folders(host);
+        assert_eq!(folders.len(), 1, "{folders:?}");
+        let dir = host.home.join(&folders[0]);
+        let spawns = host.process.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert!(spawns[0].detached);
+        assert_eq!(spawns[0].program, dir.join(UNINSTALL_COPY));
+        let args = spawns[0]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        (dir, args)
+    }
+
+    #[test]
+    fn phase_one_copies_the_runtime_into_an_admin_only_folder_and_starts_it_with_the_wait_only() {
+        let host = Host::new();
+        let exe = installed(&host);
+        let ops = EngineOps::new(&host);
+        let (dir, args) = start_phase_one(&host, &ops, &exe);
+        assert_eq!(host.protect.class_of(&dir), Some(DirClass::AdminOnly));
+        // The wait arguments, and nothing else: no path, no pipe id, no SID.
+        let me = host.process.current().expect("me");
+        assert_eq!(
+            args,
+            vec![
+                "machine-uninstall".to_owned(),
+                "--wait-pid".to_owned(),
+                me.pid.to_string(),
+                "--wait-start".to_owned(),
+                me.start_ticks.to_string(),
+            ]
+        );
+        assert_eq!(*ops.entered.lock().unwrap(), vec![dir.clone()], "outside R");
+        // The marker names the install and the pipe; the copy is the runtime's bytes.
+        let marker = host
+            .mem
+            .read_capped(&dir.join(UNINSTALL_MARKER), 4096)
+            .unwrap();
+        let marker = Marker::parse(&String::from_utf8(marker).unwrap()).expect("marker");
+        assert_eq!(marker.root, host.home.join("Hello"));
+        assert_eq!((marker.events.as_str(), marker.sid.as_str()), (ID, SID));
+        assert_eq!(
+            host.mem
+                .read_capped(&dir.join(UNINSTALL_COPY), 100)
+                .unwrap(),
+            b"runtime"
+        );
+        // Nothing was deleted and nothing of the install changed.
+        assert!(matches!(host.machine(), Machine::Present(..)));
+        assert!(ops.engine_calls.lock().unwrap().is_empty());
+        // Refusals that start nothing: a standard user, a place that is no install.
+        let again = |standing, exe: &Path| {
+            run_uninstall_start(&host.base(), &ops, &host.process, standing, &args_(), exe)
+        };
+        assert_eq!(again(Standing::Standard, &exe), Kind::Usage);
+        assert_eq!(
+            again(Standing::UacElevated, &abs_path("/dl/rt.exe")),
+            Kind::Usage
+        );
+        assert_eq!(uninstall_folders(&host).len(), 1);
+        assert_eq!(host.process.spawns().len(), 1);
+    }
+
+    fn args_() -> MachineArgs {
+        args()
+    }
+
+    /// Runs phase 2 from the folder phase 1 made, with the pipe's reader kept.
+    fn run_phase_two(
+        host: &Host,
+        ops: &EngineOps<'_>,
+        dir: &Path,
+        standing: Standing,
+    ) -> (Kind, String) {
+        let (pipes, mut reader) = FakePipes::new();
+        let wait = ProcessId {
+            pid: 4242,
+            start_ticks: 17,
+        };
+        let kind = run_uninstall_second(
+            &host.base(),
+            ops,
+            &host.process,
+            &pipes,
+            standing,
+            &wait,
+            &dir.join(UNINSTALL_COPY),
+            Duration::from_millis(10),
+        );
+        assert_eq!(host.process.waits().last().map(|w| w.0), Some(wait));
+        let mut seen = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut seen).expect("the pipe");
+        (kind, seen)
+    }
+
+    #[test]
+    fn phase_two_removes_the_install_reports_through_the_pipe_and_registers_its_folder_for_the_restart()
+     {
+        let host = Host::new();
+        let exe = installed(&host);
+        let ops = EngineOps::new(&host);
+        let (dir, _) = start_phase_one(&host, &ops, &exe);
+        ops.entered.lock().unwrap().clear();
+        let (kind, seen) = run_phase_two(&host, &ops, &dir, Standing::UacElevated);
+        assert_eq!(kind, Kind::Ok);
+        assert!(
+            matches!(host.machine(), Machine::Absent),
+            "the install is gone"
+        );
+        assert_eq!(seen, "phase uninstall\nend 0\n");
+        assert_eq!(*ops.engine_calls.lock().unwrap(), vec!["uninstall"]);
+        // Its own folder is its working directory, and is registered for the restart: the files
+        // first, the folder last.
+        assert_eq!(*ops.entered.lock().unwrap(), vec![dir.clone()]);
+        assert_eq!(
+            *ops.deleted.lock().unwrap(),
+            vec![
+                dir.join(UNINSTALL_COPY),
+                dir.join(UNINSTALL_MARKER),
+                dir.clone()
+            ]
+        );
+        // The removal asked the strict guard, as the engine does, about the install.
+        assert!(!host.process.strict_calls().is_empty());
+    }
+
+    #[test]
+    fn phase_two_refused_while_a_process_runs_from_the_install_leaves_it_whole_and_says_25() {
+        let host = Host::new();
+        let exe = installed(&host);
+        let ops = EngineOps::new(&host);
+        let (dir, _) = start_phase_one(&host, &ops, &exe);
+        host.process.script_in_use_strict(true);
+        let (kind, seen) = run_phase_two(&host, &ops, &dir, Standing::UacElevated);
+        assert_eq!(kind, Kind::InUse);
+        assert_eq!(seen, "phase uninstall\nend 25\n");
+        match host.machine() {
+            Machine::Present(root, Some(v)) => {
+                assert_eq!(
+                    (root, v.to_string()),
+                    (host.home.join("Hello"), "1.0.0".into())
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // The service stays registered (the engine undoes what it did before it refused).
+        assert!(host.registrar.image(&app_id()).unwrap().is_some());
+        // The folder is registered for deletion all the same: a retry makes a new copy.
+        assert_eq!(ops.deleted.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn phase_two_ignores_a_marker_that_names_no_valid_machine_install() {
+        for (what, edit) in [
+            (
+                "another folder",
+                Box::new(|m: &mut Marker| m.root = abs_path("/pf/Other"))
+                    as Box<dyn Fn(&mut Marker)>,
+            ),
+            (
+                "another app",
+                Box::new(|m: &mut Marker| {
+                    m.app_id = AppId::parse("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").unwrap();
+                }),
+            ),
+            (
+                "outside the home",
+                Box::new(|m: &mut Marker| m.root = abs_path("/elsewhere/Hello")),
+            ),
+            (
+                "the home itself",
+                Box::new(|m: &mut Marker| m.root = abs_path("/pf")),
+            ),
+            (
+                "a hidden folder",
+                Box::new(|m: &mut Marker| m.root = abs_path("/pf/.lunepack-x")),
+            ),
+        ] {
+            let host = Host::new();
+            let exe = installed(&host);
+            let ops = EngineOps::new(&host);
+            let (dir, _) = start_phase_one(&host, &ops, &exe);
+            let text = host
+                .mem
+                .read_capped(&dir.join(UNINSTALL_MARKER), 4096)
+                .unwrap();
+            let mut marker = Marker::parse(&String::from_utf8(text).unwrap()).unwrap();
+            edit(&mut marker);
+            host.mem.remove_file(&dir.join(UNINSTALL_MARKER)).unwrap();
+            let mut w = host.mem.create_new(&dir.join(UNINSTALL_MARKER)).unwrap();
+            w.write_all(marker.encode().unwrap().as_bytes()).unwrap();
+            w.sync().unwrap();
+            let (kind, _) = run_phase_two(&host, &ops, &dir, Standing::UacElevated);
+            assert_eq!(kind, Kind::InstallMismatch, "{what}");
+            assert!(
+                ops.engine_calls.lock().unwrap().is_empty(),
+                "{what}: the engine ran"
+            );
+            assert!(matches!(host.machine(), Machine::Present(..)), "{what}");
+        }
+    }
+
+    #[test]
+    fn phase_two_runs_only_from_its_own_admin_only_folder_for_an_administrator() {
+        let host = Host::new();
+        let exe = installed(&host);
+        let ops = EngineOps::new(&host);
+        let (dir, _) = start_phase_one(&host, &ops, &exe);
+        let (pipes, _reader) = FakePipes::new();
+        let wait = ProcessId {
+            pid: 1,
+            start_ticks: 1,
+        };
+        let go = |standing, copy: &Path| {
+            run_uninstall_second(
+                &host.base(),
+                &ops,
+                &host.process,
+                &pipes,
+                standing,
+                &wait,
+                copy,
+                Duration::from_millis(10),
+            )
+        };
+        // A standard user's process, the runtime inside `R`, a copy somewhere else, a folder with
+        // another name: a usage error before any action.
+        assert_eq!(
+            go(Standing::Standard, &dir.join(UNINSTALL_COPY)),
+            Kind::Usage
+        );
+        assert_eq!(go(Standing::UacElevated, &exe), Kind::Usage);
+        assert_eq!(
+            go(Standing::UacElevated, &abs_path("/dl/lunepack-runtime.exe")),
+            Kind::Usage
+        );
+        let wrong = host
+            .home
+            .join(format!("{UNINSTALL_PREFIX}{}", "f".repeat(31)));
+        assert_eq!(
+            go(Standing::UacElevated, &wrong.join(UNINSTALL_COPY)),
+            Kind::Usage
+        );
+        // A folder a standard user could write in is no folder of ours.
+        host.protect.set_unprotected(&dir, true);
+        assert_eq!(
+            go(Standing::UacElevated, &dir.join(UNINSTALL_COPY)),
+            Kind::Usage
+        );
+        host.protect.set_unprotected(&dir, false);
+        assert!(ops.engine_calls.lock().unwrap().is_empty());
+        assert!(ops.entered.lock().unwrap().iter().all(|d| d == &dir));
+        assert_eq!(
+            ops.entered.lock().unwrap().len(),
+            1,
+            "only phase 1 entered a folder"
+        );
+        assert!(
+            pipes.opened.lock().unwrap().is_empty(),
+            "no pipe before the rule held"
+        );
+        assert!(matches!(host.machine(), Machine::Present(..)));
+    }
+
+    #[test]
+    fn the_unelevated_side_asks_then_follows_phase_two_and_judges_by_the_record() {
+        // Gone: success, whatever the pipe said.
+        for (script, lines, installed_still, want) in [
+            (
+                ElevationScript::Exit(0),
+                "phase uninstall\nend 0\n",
+                false,
+                Ok(()),
+            ),
+            (ElevationScript::Exit(0), "", false, Ok(())),
+            (
+                ElevationScript::Exit(0),
+                "phase uninstall\nend 25\n",
+                true,
+                Err(Kind::InUse),
+            ),
+            (
+                ElevationScript::Exit(0),
+                "phase uninstall\nend 0\n",
+                true,
+                Err(Kind::State),
+            ),
+            (ElevationScript::Exit(0), "", true, Err(Kind::Process)),
+            (
+                ElevationScript::Exit(0),
+                "phase uninstall\nnonsense\n",
+                true,
+                Err(Kind::Process),
+            ),
+            (ElevationScript::Exit(35), "", true, Err(Kind::NotProtected)),
+            (
+                ElevationScript::Declined,
+                "",
+                true,
+                Err(Kind::ElevationDeclined),
+            ),
+        ] {
+            let host = Host::new();
+            installed(&host);
+            if !installed_still {
+                host.mem
+                    .remove_dir_all_nofollow(&host.home.join("Hello"))
+                    .unwrap();
+            }
+            let elevation = FakeElevation::new(Standing::Admin, [script]);
+            let ops = EngineOps::new(&host);
+            let (mut child, reader) = lunepack_testkit::mem_duplex();
+            std::io::Write::write_all(&mut child, lines.as_bytes()).unwrap();
+            drop(child);
+            let pipes = ReaderConnector(Mutex::new(Some(reader)));
+            let h = unelevated(&elevation, &ops, &pipes, &host, Some(SID));
+            let (events, seen) = collecting();
+            let got = super::uninstall(
+                &h,
+                &host.mem,
+                &FakeHasher,
+                &host.home,
+                &target(&host),
+                false,
+                &events,
+            );
+            assert_eq!(got, want, "{script:?} {lines:?}");
+            events.finish(Duration::from_secs(1));
+            // One prompt, whatever this process's standing: the runtime inside `R`, always.
+            let calls = elevation.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, target(&host).runtime);
+            assert_eq!(calls[0].1[0], "machine-uninstall");
+            // Progress came through, as events.
+            if lines.starts_with("phase uninstall") && matches!(script, ElevationScript::Exit(0)) {
+                assert_eq!(seen.lock().unwrap().len(), 1, "{lines:?}");
+            }
+            assert!(
+                ops.engine_calls.lock().unwrap().is_empty(),
+                "the engine does not run here"
+            );
+        }
+        // `--silent` as a standard user asks nothing.
+        let host = Host::new();
+        installed(&host);
+        let elevation = FakeElevation::new(Standing::Standard, [ElevationScript::Exit(0)]);
+        let ops = EngineOps::new(&host);
+        let (_, reader) = lunepack_testkit::mem_duplex();
+        let pipes = ReaderConnector(Mutex::new(Some(reader)));
+        let h = unelevated(&elevation, &ops, &pipes, &host, Some(SID));
+        let (events, _) = collecting();
+        let got = super::uninstall(
+            &h,
+            &host.mem,
+            &FakeHasher,
+            &host.home,
+            &target(&host),
+            true,
+            &events,
+        );
+        assert_eq!(got, Err(Kind::ElevationRequired));
+        assert!(elevation.calls().is_empty());
+    }
+
+    #[test]
+    fn the_policy_that_switches_the_update_window_off_rules_machine_installs_only() {
+        let policy = FakePolicy::new();
+        assert!(!no_update_ui(true, &policy, &app_id()));
+        policy.set(lunepack_core::MachinePolicy {
+            self_update_disabled: false,
+            no_update_ui: true,
+        });
+        assert!(no_update_ui(true, &policy, &app_id()));
+        assert!(
+            !no_update_ui(false, &policy, &app_id()),
+            "a user install is not ruled by it"
+        );
+        // `DisableSelfUpdate` alone does not hide the window.
+        policy.set(lunepack_core::MachinePolicy {
+            self_update_disabled: true,
+            no_update_ui: false,
+        });
+        assert!(!no_update_ui(true, &policy, &app_id()));
     }
 }

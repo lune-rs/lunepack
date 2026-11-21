@@ -82,6 +82,66 @@ pub const PUBLISHER_REASONS: [PublisherOutcome; 5] = [
     PublisherOutcome::Os,
 ];
 
+/// Why the update service of a machine install cannot be used (M10-D13): the closed set of
+/// `reason` of the `service_unavailable` outcome (exit 32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ServiceWhy {
+    /// No service is registered (an administrator runs `repair`).
+    NotInstalled,
+    /// An administrator disabled the service (until `repair` or re-enabling).
+    Disabled,
+    /// The service could not be started.
+    StartFailed,
+    /// The service's channel is not owned by the account that must own it.
+    Untrusted,
+    /// The service did not answer in time.
+    Timeout,
+    /// The service broke the protocol, or the channel failed in the middle of an exchange.
+    Protocol,
+    /// The service speaks no protocol version this runtime does.
+    Unsupported,
+}
+
+impl ServiceWhy {
+    /// Every reason, in the order the docs list them.
+    #[allow(dead_code)]
+    pub const ALL: [ServiceWhy; 7] = [
+        ServiceWhy::NotInstalled,
+        ServiceWhy::Disabled,
+        ServiceWhy::StartFailed,
+        ServiceWhy::Untrusted,
+        ServiceWhy::Timeout,
+        ServiceWhy::Protocol,
+        ServiceWhy::Unsupported,
+    ];
+
+    /// The `reason` text.
+    pub const fn name(self) -> &'static str {
+        match self {
+            ServiceWhy::NotInstalled => "not_installed",
+            ServiceWhy::Disabled => "disabled",
+            ServiceWhy::StartFailed => "start_failed",
+            ServiceWhy::Untrusted => "untrusted",
+            ServiceWhy::Timeout => "timeout",
+            ServiceWhy::Protocol => "protocol",
+            ServiceWhy::Unsupported => "unsupported",
+        }
+    }
+
+    /// The reason the facade reports; a reason a later facade adds is `protocol`.
+    pub fn of(reason: lunepack::ServiceReason) -> ServiceWhy {
+        use lunepack::ServiceReason as R;
+        match reason {
+            R::NotInstalled => ServiceWhy::NotInstalled,
+            R::Disabled => ServiceWhy::Disabled,
+            R::StartFailed => ServiceWhy::StartFailed,
+            R::Untrusted => ServiceWhy::Untrusted,
+            R::Timeout => ServiceWhy::Timeout,
+            _ => ServiceWhy::Protocol,
+        }
+    }
+}
+
 /// The outcome classes of the runtime, each with a stable exit code and a stable `kind` name
 /// (C4: one per error class of the facade's error enum, plus the runtime's own outcomes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,6 +216,12 @@ pub enum Kind {
     ElevationRequired,
     /// The user declined the administrator prompt (M10-D15).
     ElevationDeclined,
+    /// The update service of a machine install cannot be used (M10-D13); the output names the
+    /// reason, a closed code. The app keeps running its current version.
+    ServiceUnavailable(ServiceWhy),
+    /// An administrator's policy switched self-update off for this machine install (M10-D12);
+    /// nothing was requested or changed.
+    DisabledByPolicy,
     /// The release carries no update service, so it installs per user only (M10-D7).
     PerMachineUnavailable,
     /// A directory of the machine install is not protected as it must be (M10-D9).
@@ -167,7 +233,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind, in code order (for the golden of step 12).
     #[allow(dead_code)]
-    pub const ALL: [Kind; 34] = [
+    pub const ALL: [Kind; 36] = [
         Kind::Ok,
         Kind::Usage,
         Kind::NotInstalled,
@@ -201,6 +267,9 @@ impl Kind {
         Kind::PublisherMismatch(PublisherOutcome::Different),
         Kind::ElevationRequired,
         Kind::ElevationDeclined,
+        // One representative: every reason shares the code and the name (`ServiceWhy::ALL`).
+        Kind::ServiceUnavailable(ServiceWhy::NotInstalled),
+        Kind::DisabledByPolicy,
         Kind::PerMachineUnavailable,
         Kind::NotProtected,
         Kind::Internal,
@@ -240,6 +309,8 @@ impl Kind {
             Kind::PublisherMismatch(_) => 29,
             Kind::ElevationRequired => 30,
             Kind::ElevationDeclined => 31,
+            Kind::ServiceUnavailable(_) => 32,
+            Kind::DisabledByPolicy => 33,
             Kind::PerMachineUnavailable => 34,
             Kind::NotProtected => 35,
             Kind::Internal => 70,
@@ -280,6 +351,8 @@ impl Kind {
             Kind::PublisherMismatch(_) => "publisher_mismatch",
             Kind::ElevationRequired => "elevation_required",
             Kind::ElevationDeclined => "elevation_declined",
+            Kind::ServiceUnavailable(_) => "service_unavailable",
+            Kind::DisabledByPolicy => "disabled_by_policy",
             Kind::PerMachineUnavailable => "per_machine_unavailable",
             Kind::NotProtected => "not_protected",
             Kind::Internal => "internal",
@@ -291,11 +364,12 @@ impl Kind {
         match self {
             Kind::UnsupportedLocation(place) => Some(place.name()),
             Kind::PublisherMismatch(reason) => Some(reason.code()),
+            Kind::ServiceUnavailable(why) => Some(why.name()),
             _ => None,
         }
     }
 
-    /// The kind a child's exit code names: success, one of this table's codes (the two kinds that
+    /// The kind a child's exit code names: success, one of this table's codes (the kinds that
     /// carry a reason are never a child's answer here), else `process`.
     pub fn from_exit_code(code: i32) -> Kind {
         let Ok(code) = u8::try_from(code) else {
@@ -305,7 +379,14 @@ impl Kind {
             .iter()
             .copied()
             .find(|k| k.code() == code)
-            .filter(|k| !matches!(k, Kind::UnsupportedLocation(_) | Kind::PublisherMismatch(_)))
+            .filter(|k| {
+                !matches!(
+                    k,
+                    Kind::UnsupportedLocation(_)
+                        | Kind::PublisherMismatch(_)
+                        | Kind::ServiceUnavailable(_)
+                )
+            })
             .unwrap_or(Kind::Process)
     }
 
@@ -343,6 +424,23 @@ impl Kind {
                 Place::of(*reason).map_or(Kind::Internal, Kind::UnsupportedLocation)
             }
             E::PublisherMismatch { reason } => Kind::PublisherMismatch(*reason),
+            E::DisabledByPolicy => Kind::DisabledByPolicy,
+            E::ServiceUnavailable { reason } => Kind::ServiceUnavailable(ServiceWhy::of(*reason)),
+            E::ServiceUnsupported => Kind::ServiceUnavailable(ServiceWhy::Unsupported),
+            // The service's own refusals: a refused document is `verify`, a tree that is not
+            // protected as it must be is `not_protected`; the rest carries no class of its own.
+            E::ServiceRefused { code, .. } => {
+                use lunepack_core::service::ErrorCode as C;
+                match code {
+                    C::VerifyFailed | C::NotInManifest | C::SizeMismatch | C::HashMismatch => {
+                        Kind::Verify
+                    }
+                    C::NotProtected => Kind::NotProtected,
+                    // As a user install reports the core's refusals of the same transitions.
+                    C::PendingExists | C::BadFull => Kind::Verify,
+                    _ => Kind::Internal,
+                }
+            }
             // WorkerPanicked, and any variant a later facade adds (the enum is non-exhaustive).
             _ => Kind::Internal,
         }
@@ -421,8 +519,27 @@ pub enum Mode {
     /// [--silent | /S]`, phase 2 of the hand-off, accepted only from the uninstaller's own temp
     /// copy (checked before any action, M7-D5).
     UninstallHandOff(HandOffArgs),
-    /// An app-facing command (`check`, `download`, `startup`, `confirm`).
+    /// An app-facing command (`check`, `download`, `startup`, `confirm`, `apply-and-restart`,
+    /// `repair`).
     Command(crate::cli::args::Parsed),
+    /// Windows only, hidden: `machine-repair --events <id> --for-sid <SID>`, the engine's `repair`
+    /// in an elevated runtime started by the unelevated `repair` command (M10 step 18).
+    MachineRepair(MachineArgs),
+    /// Windows only, hidden: the two phases of the elevated machine uninstall (M10 step 18).
+    MachineUninstall(MachineUninstall),
+}
+
+/// The phases of the hidden `machine-uninstall` mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MachineUninstall {
+    /// Phase 1, from the runtime inside `R`: `--events <id> --for-sid <SID>`.
+    Start(MachineArgs),
+    /// Phase 2, from the copy in its own admin-only folder: `--wait-pid <u32> --wait-start <u64>`
+    /// and nothing else; everything else it needs is in its folder's marker.
+    Second {
+        /// Phase 1, waited for before anything changes.
+        wait: ProcessId,
+    },
 }
 
 /// The arguments of phase 2 of the Windows uninstall hand-off.
@@ -461,6 +578,12 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
             parse_hand_off(rest).map(Mode::UninstallHandOff)
         }
         Some("uninstall") => silent_or_s(rest).map(|silent| Mode::Uninstall { silent }),
+        // The elevated modes of a machine install exist on Windows only; elsewhere they are not
+        // a word of the grammar.
+        Some(MACHINE_REPAIR) if MACHINE_MODES => {
+            parse_machine_install(rest).map(Mode::MachineRepair)
+        }
+        Some(MACHINE_UNINSTALL) if MACHINE_MODES => parse_machine_uninstall(rest),
         Some(word) => match crate::cli::args::Command::named(word) {
             Some(command) => crate::cli::args::parse(command, rest).map(Mode::Command),
             None => Err(UsageError),
@@ -480,6 +603,10 @@ pub fn parse_setup(args: &[OsString]) -> Result<bool, UsageError> {
 pub const ALL_USERS_FLAG: &str = "--all-users";
 /// The hidden mode of a Windows setup file's elevated copy (M10 step 16).
 pub const MACHINE_INSTALL: &str = "machine-install";
+/// The hidden mode of the elevated `repair` (M10 step 18).
+pub const MACHINE_REPAIR: &str = "machine-repair";
+/// The hidden mode of the elevated machine uninstall, both phases (M10 step 18).
+pub const MACHINE_UNINSTALL: &str = "machine-uninstall";
 
 /// The options of a setup file's run on a system with per-machine installs (Windows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,7 +688,7 @@ pub fn parse_setup_command_with(
 
 /// `--events <id> --for-sid <SID>`, in either order, each once.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn parse_machine_install(args: &[OsString]) -> Result<MachineArgs, UsageError> {
+pub(crate) fn parse_machine_install(args: &[OsString]) -> Result<MachineArgs, UsageError> {
     let mut events: Option<String> = None;
     let mut sid: Option<String> = None;
     let mut i = 0;
@@ -583,16 +710,54 @@ fn parse_machine_install(args: &[OsString]) -> Result<MachineArgs, UsageError> {
     }
 }
 
+/// Whether the hidden elevated modes of a machine install exist: Windows only (M10).
+const MACHINE_MODES: bool = cfg!(windows);
+
+/// `machine-uninstall`: phase 1's `--events <id> --for-sid <SID>`, or phase 2's `--wait-pid <u32>
+/// --wait-start <u64>` and nothing else, each once.
+fn parse_machine_uninstall(args: &[OsString]) -> Result<Mode, UsageError> {
+    if args.first().is_some_and(|a| a == "--wait-pid") {
+        let mut pid: Option<u32> = None;
+        let mut start: Option<u64> = None;
+        let mut i = 0;
+        while i < args.len() {
+            let name = args[i].to_str().ok_or(UsageError)?;
+            let value = args.get(i + 1).ok_or(UsageError)?;
+            match name {
+                "--wait-pid" if pid.is_none() => {
+                    let p: u32 = decimal(value)?;
+                    if p == 0 {
+                        return Err(UsageError);
+                    }
+                    pid = Some(p);
+                }
+                "--wait-start" if start.is_none() => start = Some(decimal(value)?),
+                _ => return Err(UsageError),
+            }
+            i += 2;
+        }
+        return match (pid, start) {
+            (Some(pid), Some(start_ticks)) => {
+                Ok(Mode::MachineUninstall(MachineUninstall::Second {
+                    wait: ProcessId { pid, start_ticks },
+                }))
+            }
+            _ => Err(UsageError),
+        };
+    }
+    parse_machine_install(args).map(|a| Mode::MachineUninstall(MachineUninstall::Start(a)))
+}
+
 /// Exactly 32 lowercase hexadecimal characters.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn is_events_id(text: &str) -> bool {
+pub(crate) fn is_events_id(text: &str) -> bool {
     text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The form of a SID's text: `S-1-<authority>` and one to fifteen sub-authorities, all decimal,
 /// at most 184 characters. The system parses it when it is used.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn is_sid_text(text: &str) -> bool {
+pub(crate) fn is_sid_text(text: &str) -> bool {
     let Some(rest) = text.strip_prefix("S-1-") else {
         return false;
     };
@@ -1079,6 +1244,7 @@ mod tests {
         assert_eq!(Kind::from_exit_code(23), Kind::AlreadyInstalled);
         assert_eq!(Kind::from_exit_code(30), Kind::ElevationRequired);
         assert_eq!(Kind::from_exit_code(31), Kind::ElevationDeclined);
+        assert_eq!(Kind::from_exit_code(33), Kind::DisabledByPolicy);
         assert_eq!(Kind::from_exit_code(34), Kind::PerMachineUnavailable);
         assert_eq!(Kind::from_exit_code(35), Kind::NotProtected);
         assert_eq!(Kind::from_exit_code(70), Kind::Internal);
@@ -1088,7 +1254,6 @@ mod tests {
             28,
             29,
             32,
-            33,
             36,
             255,
             -1,
@@ -1101,7 +1266,9 @@ mod tests {
         for kind in Kind::ALL {
             if !matches!(
                 kind,
-                Kind::UnsupportedLocation(_) | Kind::PublisherMismatch(_)
+                Kind::UnsupportedLocation(_)
+                    | Kind::PublisherMismatch(_)
+                    | Kind::ServiceUnavailable(_)
             ) {
                 assert_eq!(Kind::from_exit_code(i32::from(kind.code())), kind);
             }
@@ -1280,6 +1447,8 @@ mod tests {
         assert_eq!(Kind::NoRelease.code(), 27);
         assert_eq!(Kind::ElevationRequired.code(), 30);
         assert_eq!(Kind::ElevationDeclined.code(), 31);
+        assert_eq!(Kind::ServiceUnavailable(ServiceWhy::Disabled).code(), 32);
+        assert_eq!(Kind::DisabledByPolicy.code(), 33);
         assert_eq!(Kind::PerMachineUnavailable.code(), 34);
         assert_eq!(Kind::NotProtected.code(), 35);
         assert_eq!(Kind::of(&lunepack::Error::NoRelease), Kind::NoRelease);
@@ -1423,6 +1592,122 @@ mod tests {
         assert_eq!(refused, listed);
     }
 
+    /// Every reason of exit 32 is a closed code of its own and has a golden object; the facade's
+    /// reasons and errors map onto the kinds M10 step 18 names.
+    #[test]
+    fn every_service_reason_has_a_closed_code_and_a_golden_object() {
+        use lunepack::{Error as E, ServiceReason as R};
+        let golden = include_str!("../tests/golden/objects.jsonl");
+        for why in ServiceWhy::ALL {
+            let want = format!(
+                "\"kind\":\"service_unavailable\",\"exit_code\":32,\"reason\":\"{}\"}}",
+                why.name()
+            );
+            assert!(golden.lines().any(|l| l.ends_with(&want)), "{}", why.name());
+        }
+        for (reason, why) in [
+            (R::NotInstalled, ServiceWhy::NotInstalled),
+            (R::Disabled, ServiceWhy::Disabled),
+            (R::StartFailed, ServiceWhy::StartFailed),
+            (R::Untrusted, ServiceWhy::Untrusted),
+            (R::Timeout, ServiceWhy::Timeout),
+            (R::Protocol, ServiceWhy::Protocol),
+        ] {
+            assert_eq!(
+                Kind::of(&E::ServiceUnavailable { reason }),
+                Kind::ServiceUnavailable(why)
+            );
+        }
+        assert_eq!(
+            Kind::of(&E::ServiceUnsupported),
+            Kind::ServiceUnavailable(ServiceWhy::Unsupported)
+        );
+        assert_eq!(Kind::of(&E::DisabledByPolicy), Kind::DisabledByPolicy);
+        let refused = |code| Kind::of(&E::ServiceRefused { code, class: None });
+        use lunepack_core::service::ErrorCode as C;
+        assert_eq!(refused(C::VerifyFailed), Kind::Verify);
+        assert_eq!(refused(C::HashMismatch), Kind::Verify);
+        assert_eq!(refused(C::NotProtected), Kind::NotProtected);
+        assert_eq!(refused(C::PendingExists), Kind::Verify);
+        assert_eq!(refused(C::Internal), Kind::Internal);
+    }
+
+    /// The hidden machine modes: `machine-repair` takes `machine-install`'s shape, `machine-uninstall`
+    /// takes it for phase 1 and the wait pair only for phase 2; Windows only.
+    #[test]
+    fn the_hidden_machine_modes_take_their_shapes_on_windows_only() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let sid = "S-1-5-21-1-2-3-1001";
+        let shape = |mode: &str| os(&[mode, "--events", id, "--for-sid", sid]);
+        let wait = os(&["machine-uninstall", "--wait-pid", "42", "--wait-start", "7"]);
+        if !cfg!(windows) {
+            for args in [shape("machine-repair"), shape("machine-uninstall"), wait] {
+                assert_eq!(parse(&args), Err(UsageError), "{args:?}");
+            }
+            return;
+        }
+        let args = MachineArgs {
+            events: id.to_owned(),
+            for_sid: sid.to_owned(),
+        };
+        assert_eq!(
+            parse(&shape("machine-repair")),
+            Ok(Mode::MachineRepair(args.clone()))
+        );
+        assert_eq!(
+            parse(&shape("machine-uninstall")),
+            Ok(Mode::MachineUninstall(MachineUninstall::Start(args)))
+        );
+        assert_eq!(
+            parse(&wait),
+            Ok(Mode::MachineUninstall(MachineUninstall::Second {
+                wait: ProcessId {
+                    pid: 42,
+                    start_ticks: 7
+                }
+            }))
+        );
+        // Closed: no path, no other option, no repeat, no mixing of the two shapes.
+        for bad in [
+            os(&["machine-repair"]),
+            os(&["machine-repair", "--install-root", "C:\\x"]),
+            os(&["machine-repair", "--wait-pid", "1", "--wait-start", "1"]),
+            os(&["machine-uninstall"]),
+            os(&["machine-uninstall", "--wait-pid", "42"]),
+            os(&["machine-uninstall", "--wait-pid", "0", "--wait-start", "1"]),
+            os(&[
+                "machine-uninstall",
+                "--wait-pid",
+                "4",
+                "--wait-pid",
+                "5",
+                "--wait-start",
+                "1",
+            ]),
+            os(&[
+                "machine-uninstall",
+                "--wait-pid",
+                "4",
+                "--wait-start",
+                "1",
+                "--events",
+                id,
+            ]),
+            os(&[
+                "machine-uninstall",
+                "--events",
+                id,
+                "--for-sid",
+                sid,
+                "--wait-pid",
+                "4",
+            ]),
+            os(&["machine-uninstall", "--silent"]),
+        ] {
+            assert_eq!(parse(&bad), Err(UsageError), "{bad:?}");
+        }
+    }
+
     #[test]
     fn the_documented_commands_are_the_parsed_ones() {
         let doc = include_str!("../../../docs/RUNTIME.md");
@@ -1439,7 +1724,7 @@ mod tests {
                 "{name} is not in the command table of docs/RUNTIME.md"
             );
         }
-        for name in ["apply", "install", "uninstall"] {
+        for name in ["apply", "install", "uninstall", "repair"] {
             assert!(
                 doc.contains(&format!("`{name}")),
                 "{name} is not in docs/RUNTIME.md"

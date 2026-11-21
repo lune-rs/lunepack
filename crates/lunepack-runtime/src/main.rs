@@ -74,29 +74,36 @@ fn main() -> ExitCode {
                 Ok(inst) => inst,
                 Err(e) => return fail(apply::COMMAND, Kind::of(&e)),
             };
-            let ui = ui_for(
-                ad,
-                args.no_ui,
-                Flow::Update,
-                ui_host::card(
-                    &inst.meta().name,
-                    &args.version.to_string(),
-                    Some(&inst.tree_version().to_string()),
-                ),
-                None,
-            );
-            let events = events_for(ad, &inst, ui.sink());
-            ui.report(&events);
-            let kind = apply::run_apply(ad, &inst, &args, &events, &ui);
-            ui.close(&events);
-            events.finish(SINK_DRAIN);
-            kind
+            with_host(ad, |host| {
+                // A machine install's policy can switch the update window off (M10-D12).
+                let ui = ui_for(
+                    ad,
+                    args.no_ui || policy_quiet(host, &inst),
+                    Flow::Update,
+                    ui_host::card(
+                        &inst.meta().name,
+                        &args.version.to_string(),
+                        Some(&inst.tree_version().to_string()),
+                    ),
+                    None,
+                );
+                let events = events_for(ad, &inst, ui.sink());
+                ui.report(&events);
+                let service = host.map(|h| apply::ServiceEnd {
+                    connector: h.service,
+                    policy: h.policy,
+                });
+                let kind = apply::run_apply(ad, service.as_ref(), &inst, &args, &events, &ui);
+                ui.close(&events);
+                events.finish(SINK_DRAIN);
+                kind
+            })
         }),
         Mode::Command(parsed) => {
             // A pid given on the command line is named (with its start time) at once, too.
             let wait = (parsed.command == cli::args::Command::ApplyAndRestart)
                 .then(|| wait_target(parsed.wait_pid, parent));
-            run(|ad| cli::execute(ad, &parsed, wait))
+            run(|ad| with_host(ad, |host| cli::execute(ad, host, &parsed, wait)))
         }
         // R is `<data home>/<app id>`, with the data home from this environment (M5-D2).
         Mode::Install { silent } => run(|ad| {
@@ -139,6 +146,10 @@ fn main() -> ExitCode {
             };
             uninstall_mode(ad, &inst, &data_home, silent)
         }),
+        // The elevated modes of a machine install (Windows; the grammar has no such word
+        // elsewhere). They build their own adapters and read no environment variable.
+        Mode::MachineRepair(args) => machine_repair_mode(&args),
+        Mode::MachineUninstall(phase) => machine_uninstall_mode(&phase),
         // Windows: phase 2, from the uninstaller's own temp copy only; anywhere else a usage
         // error before any action (M7-D5).
         Mode::UninstallHandOff(args) => run(|ad| hand_off_phase_2(ad, &args)),
@@ -158,7 +169,17 @@ fn uninstall_mode(
         return headless_fail(uninstall::COMMAND, Kind::Fs);
     };
     clear_temp_dirs(ad);
-    match uninstall::hand_off(ad, inst, data_home, &temp, silent) {
+    // A machine install's removal asks and reports from a copy outside `R` too: the engine's
+    // removal guard refuses while any process runs from `R` (M10 step 18).
+    let handed = if inst.is_machine() {
+        match machine::native::machine_home() {
+            Some(home) => uninstall::machine_hand_off(ad, inst, &home, &temp, silent),
+            None => Err(Kind::Fs),
+        }
+    } else {
+        uninstall::hand_off(ad, inst, data_home, &temp, silent)
+    };
+    match handed {
         Ok(()) => Kind::Ok,
         Err(kind) => headless_fail(uninstall::COMMAND, kind),
     }
@@ -173,31 +194,42 @@ fn uninstall_mode(
     data_home: &std::path::Path,
     silent: bool,
 ) -> Kind {
-    uninstall_flow(ad, inst, data_home, silent)
+    uninstall_flow(ad, None, inst, data_home, silent)
 }
 
 /// The uninstall of `inst` with its UI and its outcome (M5-D10, M6): the confirm prompt, the
 /// removal, the done or failed prompt, the result line and a native notice where one is due.
 fn uninstall_flow(
     ad: &modes::Adapters,
+    host: Option<&machine::Host<'_>>,
     inst: &lunepack::Installation,
     data_home: &std::path::Path,
     silent: bool,
 ) -> Kind {
+    // A machine install's policy makes every runtime mode headless, as `LUNEPACK_NO_UI` does.
+    let quiet = silent || policy_quiet(host, inst);
+    let location = match inst.machine_layout() {
+        Some(machine) => Some(machine.root().to_path_buf()),
+        None => inst.layout().map(|l| l.root().to_path_buf()),
+    };
     let ui = ui_for(
         ad,
-        silent,
+        quiet,
         Flow::Uninstall,
         ui_host::card(&inst.meta().name, &inst.tree_version().to_string(), None),
-        inst.layout().map(|l| l.root().to_path_buf()),
+        location,
     );
     let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
     ui.report(&events);
-    let (kind, last) = uninstall::run_uninstall(ad, inst, data_home, &events, &ui);
+    let (kind, last) = if inst.is_machine() {
+        uninstall::run_machine_uninstall(ad, host, inst, silent, &events, &ui)
+    } else {
+        uninstall::run_uninstall(ad, inst, data_home, &events, &ui)
+    };
     let seen = ui.outcome_acknowledged();
     ui.close(&events);
     conclude(events, &last);
-    notice(silent, seen, &inst.meta().name, Operation::Uninstall, kind);
+    notice(quiet, seen, &inst.meta().name, Operation::Uninstall, kind);
     kind
 }
 
@@ -221,16 +253,28 @@ fn hand_off_phase_2(ad: &modes::Adapters, args: &modes::HandOffArgs) -> Kind {
         Ok(dir) => dir,
         Err(kind) => return headless_fail(uninstall::COMMAND, kind),
     };
-    let inst = match uninstall::hand_off_installation(
-        ad,
-        &data_home,
-        &args.install_root,
-        &marker.app_id,
-    ) {
+    // A root directly in the Program Files folder is a machine install's; anything else is a
+    // per-user install's (the two homes never coincide).
+    let machine_home = machine::native::machine_home().filter(|home| {
+        args.install_root
+            .parent()
+            .is_some_and(|p| p == home.as_path())
+    });
+    let installed = match &machine_home {
+        Some(home) => {
+            uninstall::hand_off_machine_installation(ad, home, &args.install_root, &marker.app_id)
+        }
+        None => {
+            uninstall::hand_off_installation(ad, &data_home, &args.install_root, &marker.app_id)
+        }
+    };
+    let inst = match installed {
         Ok(inst) => inst,
         Err(kind) => return headless_fail(uninstall::COMMAND, kind),
     };
-    let kind = uninstall_flow(ad, &inst, &data_home, args.silent);
+    let kind = with_host(ad, |host| {
+        uninstall_flow(ad, host, &inst, &data_home, args.silent)
+    });
     // The UI has exited (`close` waited for it): its copy goes, best effort.
     let ui_copy = dir.join(ui_host::UI_FILE);
     if matches!(ad.fs.symlink_metadata(&ui_copy), Ok(Some(m)) if m.kind == lunepack::FileKind::File)
@@ -520,6 +564,123 @@ fn wait_target(_wait_pid: Option<u32>, parent: cli::WaitTarget) -> cli::WaitTarg
     parent
 }
 
+/// Runs `body` with what a machine install's modes hand their work to: the Windows adapters on
+/// Windows, nothing elsewhere (there is no machine install elsewhere).
+#[cfg(windows)]
+fn with_host<T>(ad: &modes::Adapters, body: impl FnOnce(Option<&machine::Host<'_>>) -> T) -> T {
+    let elevation = lunepack_os_windows::WindowsElevation;
+    let ops = machine::native::NativeOps { enter: enter_dir };
+    let pipes = machine::native::NativeConnector;
+    let service = lunepack_os_windows::WindowsConnector::new();
+    let policy = lunepack_os_windows::RegistryPolicy::new();
+    let sid = lunepack_os_windows::current_user_sid().ok();
+    body(Some(&machine::Host {
+        elevation: &elevation,
+        ops: &ops,
+        pipes: &pipes,
+        service: &service,
+        policy: &policy,
+        rng: &*ad.rng,
+        sid: sid.as_deref(),
+    }))
+}
+
+#[cfg(not(windows))]
+fn with_host<T>(_ad: &modes::Adapters, body: impl FnOnce(Option<&machine::Host<'_>>) -> T) -> T {
+    body(None)
+}
+
+/// Whether an administrator's policy makes this machine install's runtime headless (`NoUpdateUi`,
+/// M10-D12), as `LUNEPACK_NO_UI` does for every install.
+fn policy_quiet(host: Option<&machine::Host<'_>>, inst: &lunepack::Installation) -> bool {
+    host.is_some_and(|h| machine::no_update_ui(inst.is_machine(), h.policy, inst.app_id()))
+}
+
+/// Makes `dir` the working directory of this process.
+#[cfg(windows)]
+fn enter_dir(dir: &std::path::Path) -> bool {
+    std::env::set_current_dir(dir).is_ok()
+}
+
+/// The hidden `machine-repair` mode: the engine's `repair` in an elevated runtime inside `R`.
+#[cfg(windows)]
+fn machine_repair_mode(_args: &modes::MachineArgs) -> Kind {
+    use lunepack::Process as _;
+    use lunepack_core::Elevation as _;
+
+    let process = lunepack_os_windows::WindowsProcess::new();
+    let (Some(home), Ok(exe)) = (machine::native::machine_home(), process.current_exe()) else {
+        return Kind::Fs;
+    };
+    let ops = machine::native::NativeOps { enter: enter_dir };
+    machine::run_repair_mode(
+        &ops,
+        &lunepack_fs::StdFs::new(),
+        &lunepack_crypto::Sha256Hasher,
+        &home,
+        lunepack_os_windows::WindowsElevation.standing(),
+        &exe,
+    )
+}
+
+/// The hidden `machine-uninstall` mode, either phase.
+#[cfg(windows)]
+fn machine_uninstall_mode(phase: &modes::MachineUninstall) -> Kind {
+    use lunepack::Process as _;
+    use lunepack_core::Elevation as _;
+
+    let process = lunepack_os_windows::WindowsProcess::new();
+    let (Some(home), Ok(exe)) = (machine::native::machine_home(), process.current_exe()) else {
+        return Kind::Fs;
+    };
+    let (fs, codec, hasher, verifier, rng) = (
+        lunepack_fs::StdFs::new(),
+        lunepack_codec_lzma::LzmaCodec,
+        lunepack_crypto::Sha256Hasher,
+        lunepack_crypto::Ed25519Verifier,
+        lunepack_crypto::OsRng,
+    );
+    let protect = lunepack_os_windows::WindowsProtect;
+    let base = machine::Base {
+        fs: &fs,
+        codec: &codec,
+        hasher: &hasher,
+        verifier: &verifier,
+        clock: &lunepack::SystemClock,
+        rng: &rng,
+        protect: &protect,
+        home: &home,
+    };
+    let ops = machine::native::NativeOps { enter: enter_dir };
+    let standing = lunepack_os_windows::WindowsElevation.standing();
+    match phase {
+        modes::MachineUninstall::Start(args) => {
+            machine::run_uninstall_start(&base, &ops, &process, standing, args, &exe)
+        }
+        modes::MachineUninstall::Second { wait } => machine::run_uninstall_second(
+            &base,
+            &ops,
+            &process,
+            &machine::native::NativePipes,
+            standing,
+            wait,
+            &exe,
+            machine::ACCEPT_WAIT,
+        ),
+    }
+}
+
+/// The hidden modes exist on Windows only; the grammar refuses them elsewhere.
+#[cfg(not(windows))]
+fn machine_repair_mode(_args: &modes::MachineArgs) -> Kind {
+    Kind::Usage
+}
+
+#[cfg(not(windows))]
+fn machine_uninstall_mode(_phase: &modes::MachineUninstall) -> Kind {
+    Kind::Usage
+}
+
 /// The events of a mode: to `R/logs/runtime.log` when the tree is installed, else to stderr
 /// (M5-D15), and to the UI when there is one.
 fn events_for(
@@ -527,12 +688,15 @@ fn events_for(
     inst: &lunepack::Installation,
     ui: Option<Box<dyn Sink>>,
 ) -> Events {
-    match inst.layout() {
-        Some(layout) => Events::new(
-            Some(Box::new(LogSink::new(
-                std::sync::Arc::clone(&ad.fs),
-                layout.logs_dir(),
-            ))),
+    // A machine install's `R` is no place for this user to write: the log is in the user's home.
+    let logs = match (inst.layout(), inst.user_home()) {
+        (Some(layout), _) => Some(layout.logs_dir()),
+        (None, Some(home)) if inst.is_machine() => Some(home.join("logs")),
+        _ => None,
+    };
+    match logs {
+        Some(dir) => Events::new(
+            Some(Box::new(LogSink::new(std::sync::Arc::clone(&ad.fs), dir))),
             ui,
         ),
         None => Events::new(Some(Box::new(StderrSink)), ui),

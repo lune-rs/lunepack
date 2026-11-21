@@ -96,8 +96,9 @@ pub use security::{
 #[cfg(windows)]
 pub use security::{WindowsProtect, check_dir, current_user_sid, read_descriptor, standing};
 pub use shell::{
-    MessageKind, allow_set_foreground, common_start_menu_programs, local_app_data, message_box,
-    process_aumid, program_files, set_process_aumid, start_menu_programs, user_program_files,
+    MessageKind, allow_set_foreground, common_start_menu_programs, delete_at_restart,
+    local_app_data, message_box, process_aumid, program_files, set_process_aumid,
+    start_menu_programs, user_program_files,
 };
 #[cfg(windows)]
 pub use stub_place::remove_stub_leftovers;

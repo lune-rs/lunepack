@@ -48,14 +48,14 @@ const APP_ARGS: &str = "app-args";
 const APP_SLEEP_SECS: u64 = 3;
 /// The golden lines of `apply-and-restart`: its result, `nothing_staged`, `unexpected_version`.
 #[cfg(unix)]
-const GOLDEN_SCHEDULED: usize = 44;
-const GOLDEN_NOTHING_STAGED: usize = 45;
-const GOLDEN_UNEXPECTED: usize = 46;
+const GOLDEN_SCHEDULED: usize = 46;
+const GOLDEN_NOTHING_STAGED: usize = 47;
+const GOLDEN_UNEXPECTED: usize = 48;
 
 const GOLDEN_OBJECTS: &str = include_str!("golden/objects.jsonl");
 /// The golden line of a check that adopted the running bundle and found no update (M8-D9).
 #[cfg(target_os = "macos")]
-const GOLDEN_ADOPTED: usize = 51;
+const GOLDEN_ADOPTED: usize = 53;
 
 fn app_id() -> AppId {
     AppId::parse(SUITE_APP_ID).expect("app id")
@@ -1451,4 +1451,41 @@ fn apply_and_restart_with_nothing_staged_or_another_version_starts_nothing() {
             .to_string(),
         "1.1.0"
     );
+}
+
+// ---- repair (M10 step 18) --------------------------------------------------------------------
+
+/// `repair` is for a machine install: anywhere else it is a usage error, as a JSON object that
+/// names the command; its `--silent` is its own; and a build that is not on Windows has no
+/// elevated modes in its grammar at all.
+#[test]
+fn repair_is_for_a_machine_install_only_and_its_flag_is_its_own() {
+    let lab = Lab::installed();
+    let want = "{\"schema\":1,\"type\":\"error\",\"command\":\"repair\",\"tree_version\":\"1.0.0\",\"kind\":\"usage\",\"exit_code\":2}";
+    for args in [&["repair", "--json"][..], &["repair", "--silent", "--json"]] {
+        let run = lab.cmd(args);
+        assert_eq!(run.code, 2, "{args:?}: {run:?}");
+        assert_eq!(run.line(), want, "{args:?}");
+        assert_eq!(run.stderr, "");
+    }
+    let run = lab.cmd(&["repair"]);
+    assert_eq!(run.code, 2, "{run:?}");
+    assert_eq!(run.stdout, "");
+    assert!(
+        run.stderr.starts_with("repair: error: usage (exit 2)"),
+        "{run:?}"
+    );
+    // `--silent` belongs to `repair`, and a repeat or a value is a usage error before anything.
+    for args in [
+        &["check", "--silent"][..],
+        &["repair", "--silent", "--silent"],
+        &["repair", "--silent=1"],
+        &["repair", "--channel", "stable"],
+        &["repair", "--"],
+    ] {
+        let run = lab.cmd(args);
+        assert_eq!(run.code, 2, "{args:?}: {run:?}");
+        assert_eq!(run.stderr, USAGE_STDERR, "{args:?}");
+        assert_eq!(run.stdout, "", "{args:?}");
+    }
 }

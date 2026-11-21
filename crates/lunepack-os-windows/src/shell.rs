@@ -80,6 +80,20 @@ pub fn allow_set_foreground(pid: u32) -> io::Result<()> {
     imp::allow_set_foreground(pid)
 }
 
+/// Registers `path` for deletion when the system next restarts (`MoveFileExW` with
+/// `MOVEFILE_DELAY_UNTIL_REBOOT`, a write to the system's pending-rename list that needs an
+/// administrator's token). A folder is deleted only when it is empty by then, so register its
+/// files first. Rejects a path that is not absolute or has an interior NUL.
+pub fn delete_at_restart(path: &std::path::Path) -> io::Result<()> {
+    if !path.is_absolute() || path.to_string_lossy().contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not an absolute path",
+        ));
+    }
+    imp::delete_at_restart(path)
+}
+
 #[cfg(windows)]
 mod imp {
     use super::MessageKind;
@@ -234,6 +248,27 @@ mod imp {
     }
 
     #[allow(unsafe_code)]
+    pub(super) fn delete_at_restart(path: &std::path::Path) -> io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call; the new name is
+        // null, which with MOVEFILE_DELAY_UNTIL_REBOOT means "delete".
+        let moved = unsafe {
+            MoveFileExW(
+                wide.as_ptr(),
+                core::ptr::null(),
+                MOVEFILE_DELAY_UNTIL_REBOOT,
+            )
+        };
+        if moved == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[allow(unsafe_code)]
     pub(super) fn allow_set_foreground(pid: u32) -> io::Result<()> {
         // SAFETY: the call takes a process id by value and no pointer.
         if unsafe { AllowSetForegroundWindow(pid) } == 0 {
@@ -279,6 +314,10 @@ mod imp {
     }
 
     pub(super) fn allow_set_foreground(_pid: u32) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub(super) fn delete_at_restart(_path: &std::path::Path) -> io::Result<()> {
         unsupported()
     }
 }

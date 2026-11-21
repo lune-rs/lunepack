@@ -34,6 +34,15 @@
 //! then `R` each leave their path in one rename to a tombstone beside them and are removed, and the
 //! LaunchAgent goes last, when its `Label` is ours ([`uninstall_bundle`]).
 //!
+//! A machine install (M10 step 18, Windows) is removed by the engine, in an elevated process; this
+//! runtime only asks and reports. Anything that runs from inside `R` makes the engine's removal
+//! guard refuse, so the run the user started (from a version tree in `R`) first hands off to a copy
+//! of itself under `%TEMP%` exactly as above ([`machine_hand_off`], validated against the machine
+//! home and the machine record), and that copy asks in the window, has the runtime of the current
+//! version inside `R` run the elevated `machine-uninstall` ([`crate::machine::uninstall`]), reports
+//! what the elevated side relays and, when the install is gone, removes this user's own home. The
+//! homes of other users are left.
+//!
 //! With a UI (M6), the confirm prompt comes before anything else: `cancel` there, or the UI lost
 //! there, ends the mode with `cancelled` and nothing changed (M6-D5). The UI process, started from
 //! the tree being removed, is the one process besides this one the in-use scan excludes (by pid
@@ -51,6 +60,7 @@ use lunepack_core::ui::{ChoiceValue, Outcome, PromptKind, StepItem};
 
 use crate::apply::{LOCK_WAIT, lock_retry};
 use crate::events::{Event, Events, Warning};
+use crate::machine::{self, Host};
 use crate::modes::{Adapters, Kind};
 use crate::ui_host::{self, UiHost};
 
@@ -100,6 +110,65 @@ pub fn run_uninstall(
         }
     }
     report(inst, result.map(|kept| !kept.is_empty()))
+}
+
+/// [`run_uninstall`] for a machine install (the copy outside `R`): the confirm prompt, the
+/// elevated removal through `host` and the outcome in `ui`; the user's own home goes when the
+/// install is gone. `silent`: a standard user is not asked for administrator rights (30).
+pub fn run_machine_uninstall(
+    ad: &Adapters,
+    host: Option<&Host<'_>>,
+    inst: &Installation,
+    silent: bool,
+    events: &Events,
+    ui: &UiHost,
+) -> (Kind, Event) {
+    if ui.prompt(PromptKind::Confirm, events, &mut |_| {}) != ChoiceValue::Proceed {
+        ui.outcome(Outcome::Cancelled);
+        return report(inst, Err(Kind::Cancelled));
+    }
+    let result = machine_uninstall(ad, host, inst, silent, events);
+    match &result {
+        Ok(()) => {
+            ui.steps(&[StepItem::Integrate, StepItem::Remove]);
+            ui.outcome(Outcome::Uninstalled {
+                leftovers: Vec::new(),
+            });
+            ui.prompt(PromptKind::Done, events, &mut |_| {});
+        }
+        Err(kind) => {
+            ui.outcome(Outcome::UninstallFailed {
+                code: u32::from(kind.code()),
+            });
+            ui.prompt(PromptKind::Failed, events, &mut |_| {});
+        }
+    }
+    report(inst, result.map(|()| false))
+}
+
+/// The elevated removal of the machine install `inst` is a version of, then this user's home.
+fn machine_uninstall(
+    ad: &Adapters,
+    host: Option<&Host<'_>>,
+    inst: &Installation,
+    silent: bool,
+    events: &Events,
+) -> Result<(), Kind> {
+    let host = host.ok_or(Kind::Unsupported)?;
+    let target = machine::target_of(&*ad.fs, &*ad.hasher, inst).ok_or(Kind::NotInstalled)?;
+    let home = target
+        .root
+        .parent()
+        .ok_or(Kind::InstallMismatch)?
+        .to_path_buf();
+    events.emit(&Event::phase(Phase::Uninstall, Some(inst.tree_version())));
+    machine::uninstall(host, &*ad.fs, &*ad.hasher, &home, &target, silent, events)?;
+    // This user's counters, cache and log; the homes of other users are theirs. Best effort: the
+    // install is gone either way.
+    if let Some(user_home) = inst.user_home() {
+        let _ = ad.fs.remove_dir_all_nofollow(user_home);
+    }
+    Ok(())
 }
 
 fn report(inst: &Installation, result: Result<bool, Kind>) -> (Kind, Event) {
@@ -512,8 +581,6 @@ pub fn hand_off(
     temp: &Path,
     silent: bool,
 ) -> Result<(), Kind> {
-    use crate::tempdirs::{self, Marker};
-
     let layout = inst.layout().ok_or(Kind::NotInstalled)?;
     let root = layout.root();
     if !lunepack_core::root_valid_for_uninstall(
@@ -526,10 +593,52 @@ pub fn hand_off(
     {
         return Err(Kind::InstallMismatch);
     }
+    hand_off_copy_and_start(ad, inst.app_id().as_str(), root, temp, silent)
+}
+
+/// Phase 1 for a machine install (M10 step 18): the same hand-off, with `R` validated against the
+/// machine home `home` and the machine record (the install is `inst`, found as one). Nothing is
+/// deleted, and nothing elevated is started: the copy asks first.
+#[cfg(windows)]
+pub fn machine_hand_off(
+    ad: &Adapters,
+    inst: &Installation,
+    home: &Path,
+    temp: &Path,
+    silent: bool,
+) -> Result<(), Kind> {
+    let layout = inst.machine_layout().ok_or(Kind::NotInstalled)?;
+    let root = layout.root();
+    if !lunepack_core::root_valid_for_uninstall(
+        &*ad.fs,
+        home,
+        root,
+        inst.app_id(),
+        lunepack_core::LayoutScheme::WINDOWS,
+    ) || !real_canonical_dir(ad, root)
+    {
+        return Err(Kind::InstallMismatch);
+    }
+    hand_off_copy_and_start(ad, inst.app_id().as_str(), root, temp, silent)
+}
+
+/// The rest of phase 1: this runtime (and the UI beside it, when it is a regular file) is copied
+/// into a fresh hand-off directory under `temp`, created new with its marker, and the copy is
+/// started detached as phase 2.
+#[cfg(windows)]
+fn hand_off_copy_and_start(
+    ad: &Adapters,
+    app_id: &str,
+    root: &Path,
+    temp: &Path,
+    silent: bool,
+) -> Result<(), Kind> {
+    use crate::tempdirs::{self, Marker};
+
     let exe = ad.process.current_exe().map_err(|e| Kind::of(&e.into()))?;
     let me = ad.process.current().map_err(|e| Kind::of(&e.into()))?;
     let marker = Marker {
-        app_id: inst.app_id().as_str().to_owned(),
+        app_id: app_id.to_owned(),
         owner: me,
     };
     let dir = tempdirs::create(&*ad.fs, &*ad.rng, temp, tempdirs::UNINSTALL_PREFIX, &marker)
@@ -665,6 +774,80 @@ pub fn hand_off_installation(
     )
     .map_err(|e| Kind::of(&e))?;
     match inst.layout() {
+        Some(l) if l.root() == root && inst.app_id() == &app => Ok(inst),
+        _ => Err(Kind::InstallMismatch),
+    }
+}
+
+/// Phase 2's installation for a machine install (M10 step 18): `given` must be a real directory
+/// whose canonical path is a real directory with the canonical machine home `home` as its parent
+/// ([`lunepack_core::root_valid_for_uninstall`] under the Windows scheme), holding a machine record
+/// of `app_id`; the installation is the record's current version's tree there, and it must be found
+/// as that machine install. Any mismatch is `install_mismatch`, with nothing changed.
+#[cfg(windows)]
+pub fn hand_off_machine_installation(
+    ad: &Adapters,
+    home: &Path,
+    given: &Path,
+    app_id: &str,
+) -> Result<Installation, Kind> {
+    use lunepack::{AppId, UpdateConfig};
+    use lunepack_core::state::MachineStore;
+    use lunepack_core::update_config::{MAX_UPDATE_CONFIG_BYTES, runtime_file};
+    use lunepack_core::{LayoutScheme, MachineLayout};
+
+    let is_dir =
+        |p: &Path| matches!(ad.fs.symlink_metadata(p), Ok(Some(m)) if m.kind == FileKind::Dir);
+    let app = AppId::parse(app_id).map_err(|_| Kind::InstallMismatch)?;
+    if !is_dir(given) {
+        return Err(Kind::InstallMismatch);
+    }
+    let root = std::fs::canonicalize(given).map_err(|_| Kind::InstallMismatch)?;
+    if !is_dir(&root)
+        || !lunepack_core::root_valid_for_uninstall(
+            &*ad.fs,
+            home,
+            &root,
+            &app,
+            LayoutScheme::WINDOWS,
+        )
+    {
+        return Err(Kind::InstallMismatch);
+    }
+    let layout = MachineLayout::new(&root);
+    let store = MachineStore {
+        dir: layout.state_dir(),
+        app_id: app.clone(),
+    };
+    let record = match store.load(&*ad.fs, &*ad.hasher) {
+        Ok(loaded) => loaded.record.ok_or(Kind::InstallMismatch)?,
+        Err(_) => return Err(Kind::InstallMismatch),
+    };
+    if record.app_id != app {
+        return Err(Kind::InstallMismatch);
+    }
+    let current = record.current.ok_or(Kind::NotInstalled)?.version;
+    let tree = layout.version_dir(&current);
+    let mut config_path = tree.clone();
+    for part in LayoutScheme::WINDOWS.config.split('/') {
+        config_path.push(part);
+    }
+    if !matches!(ad.fs.symlink_metadata(&config_path), Ok(Some(m)) if m.kind == FileKind::File) {
+        return Err(Kind::UpdateConfig);
+    }
+    let bytes = ad
+        .fs
+        .read_capped(&config_path, MAX_UPDATE_CONFIG_BYTES)
+        .map_err(|_| Kind::UpdateConfig)?;
+    let config = UpdateConfig::parse(&bytes).map_err(|_| Kind::UpdateConfig)?;
+    let mut runtime = tree;
+    for part in config.install.entry.components() {
+        runtime.push(part);
+    }
+    runtime.set_file_name(runtime_file(config.target));
+    let inst =
+        Installation::from_exe_with(&runtime, ad.platform.clone()).map_err(|e| Kind::of(&e))?;
+    match inst.machine_layout() {
         Some(l) if l.root() == root && inst.app_id() == &app => Ok(inst),
         _ => Err(Kind::InstallMismatch),
     }

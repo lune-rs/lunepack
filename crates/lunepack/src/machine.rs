@@ -163,7 +163,7 @@ impl PolicySource for NoPolicy {
 // ---- errors ----------------------------------------------------------------------------------
 
 /// What a connection failure is to the app.
-pub(crate) fn connect_error(e: ConnectError) -> Error {
+pub fn connect_error(e: ConnectError) -> Error {
     let unavailable = |reason| Error::ServiceUnavailable { reason };
     match e {
         ConnectError::NotInstalled => unavailable(ServiceReason::NotInstalled),
@@ -176,7 +176,7 @@ pub(crate) fn connect_error(e: ConnectError) -> Error {
 }
 
 /// What a failed exchange with the service is to the app. Carries no value from the wire.
-pub(crate) fn service_error(e: ServiceError) -> Error {
+pub fn service_error(e: ServiceError) -> Error {
     use lunepack_core::service::ErrorCode as Code;
     let unavailable = |reason| Error::ServiceUnavailable { reason };
     match e {

@@ -170,6 +170,7 @@ pub mod unstable_internals {
         acquire_op_lock, download, fetch_artifact_doc, fetch_document, fetch_pack, fetch_root_doc,
         fetch_run,
     };
+    pub use crate::machine::{connect_error, service_error};
     pub use crate::pipe::{
         AsyncReceiver, AsyncSender, BLOCKING_RECHECK, BlockingReceiver, BlockingSender, Closed,
         DEFAULT_CAPACITY, RecvFuture, SendFuture, from_async, to_async,

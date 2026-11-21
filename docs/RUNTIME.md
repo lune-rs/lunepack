@@ -50,6 +50,7 @@ lunepack-runtime <command> [options] [-- <args>]
 | `startup` | `-- <args>` | Delivers the lifecycle events queued for this version and says whether to go on. |
 | `confirm` | none | Confirms that this version works. |
 | `apply-and-restart` | `--wait-pid <pid>`, `--expect-version <version>`, `--no-ui`, `--background`, `-- <args>` | Starts the applier for the staged version, which applies it and starts the new version with `<args>` once the waited-for process has exited. With `--no-ui` the applier shows no update window. With `--background` (macOS only; no effect elsewhere) the new version is started without being brought to the front. |
+| `repair` | `--silent` | (a machine install, Windows) Re-creates the update service's registration, its descriptor and its demand start from the confirmed current version, after one administrator approval; an administrator's own process needs none. With `--silent` a standard user's run exits 30 and asks nothing. Anywhere else it is a usage error. |
 
 Global options, accepted by every command: `--json` (output JSON Lines instead of text) and
 `--expect-schema <N>` (the schema the caller understands; anything but `1` is the error
@@ -143,6 +144,8 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 29 | `publisher_mismatch` | (download) the installed version's publisher policy (`enforce`) refused the update: the error object carries `reason`, one of `different`, `installed_invalid`, `candidate_unsigned`, `candidate_invalid`, `os`; nothing was staged. On `different`, `candidate_unsigned` and `candidate_invalid` the version is marked bad and never offered again; on `installed_invalid` and `os` nothing is marked and a later `download` checks again |
 | 30 | `elevation_required` | (setup, Windows) the install is for all users and needs administrator rights, and the run cannot ask for them (`--all-users --silent` as a standard user); nothing was changed |
 | 31 | `elevation_declined` | (setup, Windows) the user declined the administrator prompt; nothing was changed |
+| 32 | `service_unavailable` | (a machine install, Windows) the update service cannot be used: the error object carries `reason`, one of `not_installed`, `disabled`, `start_failed`, `untrusted`, `timeout`, `protocol`, `unsupported`; the app keeps running its current version. An administrator's `repair` (or re-enabling the service) fixes `not_installed` and `disabled` |
+| 33 | `disabled_by_policy` | (a machine install, Windows) an administrator's policy switched self-update off; nothing was requested or changed |
 | 34 | `per_machine_unavailable` | (setup, Windows) the release carries no update service, so it installs per user only |
 | 35 | `not_protected` | (setup, Windows) a directory of the all-users install is not protected as it must be; nothing was changed |
 | 70 | `internal` | anything else (a worker panic, a library error this build does not know) |
