@@ -1,8 +1,8 @@
 //! The per-machine pieces of the Windows adapter against the real system (M10 step 10): the
 //! all-users scope of `WindowsIntegration` (under a registry prefix and a temporary Start-menu
 //! folder, and, as an administrator who opts in, the real `HKLM`), the policy reader, the
-//! elevation hand-off for a process that cannot be prompted, and assumption A2 (a directory
-//! cannot be renamed while a program runs from a file inside it).
+//! elevation hand-off for a process that cannot be prompted, and what a rename of a folder does
+//! and does not tell about a program using it (a record of measured behaviour; M10-D20).
 //!
 //! Registry state is read with `reg.exe`, an instrument independent of the adapter's own registry
 //! code. The rows that write the real `HKLM` need an administrator and say so when they do not
@@ -10,6 +10,7 @@
 
 #[cfg(windows)]
 mod windows {
+    use std::os::windows::fs::OpenOptionsExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::Duration;
@@ -383,11 +384,15 @@ mod windows {
         ));
     }
 
-    /// Assumption A2: renaming a directory fails while a program runs from a file inside it, and
-    /// works once the program has ended. (The core's `Fs::rename` is `std::fs::rename` with a
-    /// bounded retry on transient errors, so a rename that fails here fails there too.)
+    /// What a folder rename does and does not tell on Windows, measured: it is not an in-use
+    /// guard. A folder CAN be renamed while a program runs from an exe inside it (the running
+    /// image itself cannot be deleted); it CANNOT be renamed while a child's working directory
+    /// is inside it or while a file inside is held without delete sharing. This test exists
+    /// because the engine's first design leaned on the rename as the check before a deletion
+    /// (assumption A2, which was false); the removal guard is `tree_in_use_strict` (Revision 2,
+    /// M10-D20), and this test keeps the premise visible so nobody leans on the rename again.
     #[test]
-    fn a_folder_cannot_be_renamed_while_a_program_runs_from_it() {
+    fn a_folder_can_be_renamed_while_a_program_runs_from_it() {
         let t = tag();
         let base = std::env::temp_dir().join(format!("lp-a2-{t}"));
         let cleanup = Cleanup {
@@ -399,7 +404,9 @@ mod windows {
         std::fs::create_dir_all(&from).expect("tree");
         let exe = from.join("cmd.exe");
         std::fs::copy(r"C:\Windows\System32\cmd.exe", &exe).expect("copy a system executable");
-        // A long-lived child: the copy waits for input on a pipe this test keeps open.
+
+        // 1. A program runs from an exe inside the folder: the folder renames, there and back;
+        //    the running image cannot be deleted.
         let mut child = Command::new(&exe)
             .arg("/q")
             .stdin(Stdio::piped())
@@ -416,31 +423,77 @@ mod windows {
             std::fs::remove_file(&exe).is_err(),
             "INVALID: a running image could be deleted"
         );
-        let while_running = std::fs::rename(&from, &to);
+        std::fs::rename(&from, &to).expect("renamed while a program runs from an exe inside");
+        assert!(to.join("cmd.exe").exists() && !from.exists());
+        std::fs::rename(&to, &from).expect("renamed back while it still runs");
         assert!(
-            while_running.is_err(),
-            "A2 IS FALSE: the folder was renamed while a program ran from it; the engine's GC \
-             contract depends on this (stop and report)"
+            std::fs::remove_file(&exe).is_err(),
+            "the running image still cannot be deleted after the renames"
+        );
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        rename_eventually(&from, &to);
+        rename_eventually(&to, &from);
+
+        // 2. A child's working directory inside the folder: the rename fails; undone after.
+        let mut child = Command::new(r"C:\Windows\System32\cmd.exe")
+            .arg("/q")
+            .current_dir(&from)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start a program in the folder");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            child.try_wait().expect("poll").is_none(),
+            "INVALID: the program ended early, so the test proves nothing"
+        );
+        assert!(
+            std::fs::rename(&from, &to).is_err(),
+            "a folder cannot be renamed while a child's working directory is inside it"
         );
         assert!(
             from.exists() && !to.exists(),
             "a failed rename changed nothing"
         );
-        // End the child (closing its input ends cmd), then the rename works.
         drop(child.stdin.take());
         let _ = child.kill();
         let _ = child.wait();
-        let mut renamed = false;
+        rename_eventually(&from, &to);
+        rename_eventually(&to, &from);
+
+        // 3. A file inside held with share read only: the rename fails; undone after.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ
+            .open(&exe)
+            .expect("hold a file");
+        assert!(
+            std::fs::rename(&from, &to).is_err(),
+            "a folder cannot be renamed while a file inside is held without delete sharing"
+        );
+        assert!(
+            from.exists() && !to.exists(),
+            "a failed rename changed nothing"
+        );
+        drop(held);
+        rename_eventually(&from, &to);
+        assert!(to.join("cmd.exe").exists());
+        drop(cleanup);
+    }
+
+    /// Renames, allowing a moment for a just-ended program's handles to go.
+    #[track_caller]
+    fn rename_eventually(from: &Path, to: &Path) {
         for _ in 0..50 {
-            if std::fs::rename(&from, &to).is_ok() {
-                renamed = true;
-                break;
+            if std::fs::rename(from, to).is_ok() {
+                return;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(renamed, "the folder can be renamed after the program ended");
-        assert!(to.join("cmd.exe").exists());
-        drop(cleanup);
+        panic!("the folder can be renamed once nothing holds it");
     }
 }
 

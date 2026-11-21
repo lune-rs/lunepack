@@ -10,6 +10,8 @@
 //!   `control-file` whether a raw spawn with `CREATE_BREAKAWAY_FROM_JOB` is refused there
 //!   (`denied`, the premise of the test) or not (`allowed`), then starts `write <file> done`
 //!   through `WindowsProcess::spawn_detached`, which must work anyway.
+//! - `load-dll <dll> <ready> <secs>`: loads the library at `dll` with `LoadLibraryW` (a real load,
+//!   not a data mapping), creates `ready`, then sleeps `secs` with the library still loaded.
 //! - `window <ready>`: creates a hidden top-level window, creates `ready`, and exits 0 once the
 //!   window is destroyed (a `WM_CLOSE` does that).
 //!
@@ -28,7 +30,7 @@ use windows_sys::Win32::System::Console::{
     STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, GetCurrentProcess};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DispatchMessageW, IsWindow, MSG, PM_REMOVE, PeekMessageW, WS_POPUP,
@@ -48,6 +50,7 @@ const MODES: &[&str] = &[
     "parent-report",
     "in-job",
     "window",
+    "load-dll",
 ];
 
 /// Runs the helper mode named by `args[0]` and never returns; `false` when `args` names no mode.
@@ -134,6 +137,11 @@ pub fn run(args: &[String]) -> bool {
         }
         "in-job" => in_job(&rest[0], &rest[1]),
         "window" => window(Path::new(&rest[0])),
+        "load-dll" => {
+            load_dll(&rest[0]);
+            create(Path::new(&rest[1]), "ready\n");
+            sleep(&rest[2]);
+        }
         _ => unreachable!(),
     }
     std::process::exit(0);
@@ -246,4 +254,13 @@ fn window(ready: &Path) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[allow(unsafe_code)]
+fn load_dll(path: &str) {
+    let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the module handle is leaked on
+    // purpose, so the library stays loaded for as long as this process runs.
+    let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+    assert!(!module.is_null(), "load the library");
 }
