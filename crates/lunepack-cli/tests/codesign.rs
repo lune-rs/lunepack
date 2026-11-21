@@ -1157,6 +1157,10 @@ mod real_windows {
 
     fn powershell(script: &str) -> Option<String> {
         let out = Command::new("powershell")
+            // Windows PowerShell 5.1 under a PowerShell 7 parent (CI's `pwsh` steps) inherits a
+            // module path that puts 7's modules first; it then has no `Cert:` drive. Without the
+            // variable it builds its own default.
+            .env_remove("PSModulePath")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .output()
             .ok()?;
