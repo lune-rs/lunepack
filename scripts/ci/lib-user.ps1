@@ -71,9 +71,11 @@ function Set-DirAcl {
 # single-digit errorlevel must never sit directly before the `>`.
 # Launch: a process made from the user's batch-logon token (see the head of this file), then a
 # scheduled task with the password, then Start-Process -Credential. `Method` says which ran,
-# and a caller that times out names it.
+# and a caller that times out names it. With -WithProfile the token launch loads (and, at the
+# first time, creates) the user's profile, so the commands see the user's own USERPROFILE and
+# LocalAppData; the other launches have their own rules.
 function Invoke-AsUser {
-    param($User, [string[]]$Lines, [string]$WorkDir, [string]$OutDir, [string]$Tag, [int]$TimeoutSec = 120)
+    param($User, [string[]]$Lines, [string]$WorkDir, [string]$OutDir, [string]$Tag, [int]$TimeoutSec = 120, [switch]$WithProfile)
     $bat = Join-Path $WorkDir "$Tag.cmd"
     $outFile = Join-Path $OutDir "$Tag.out.txt"
     $rcFile = Join-Path $OutDir "$Tag.rc.txt"
@@ -85,8 +87,8 @@ function Invoke-AsUser {
     $taskName = "lpadapter-run-$Tag"
     # Primary: a process made from the user's batch-logon token.
     $err = 0
-    $code = [LpRun]::Run($User.Name, $User.Password, "`"$env:windir\System32\cmd.exe`" /c `"$bat`"", $OutDir, $TimeoutSec * 1000, [ref]$err)
-    $method = 'CreateProcessWithTokenW (batch logon token, no profile)'
+    $code = [LpRun]::Run($User.Name, $User.Password, "`"$env:windir\System32\cmd.exe`" /c `"$bat`"", $OutDir, $TimeoutSec * 1000, [bool]$WithProfile, [ref]$err)
+    $method = if ($WithProfile) { 'CreateProcessWithTokenW (batch logon token, profile loaded)' } else { 'CreateProcessWithTokenW (batch logon token, no profile)' }
     $launched = ($code -ge 0) -and ($code -ne -1073741502)
     if ($code -eq -1) {
         $timedOut = $true

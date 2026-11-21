@@ -20,6 +20,27 @@
 //! `--after-update` as the restart argument; with `--no-ui` as well, the applier shows no
 //! window ([`lunepack::UiChoice::Never`]).
 //!
+//! The per-machine suite (`scripts/e2e-windows-machine.ps1`, M10 step 19) adds three things.
+//! `--stage-after <file>` (with `--update`) stops between the download and the stage and waits
+//! until that file exists, so the suite can change what the download holds before the upload.
+//! The environment variable `LUNEPACK_E2E_NO_CONFIRM`, set to the version of a tree, makes the app
+//! of that tree exit without confirming exactly as the flag `exit-without-confirm` does, for the
+//! runs of one process tree the suite starts it in (the flag is in the tree for every start). And, on Windows only,
+//! `--service-probe <case>` talks to the install's update service with the core's protocol
+//! client, on its own, to put what no library call would send in front of it:
+//!
+//! - `garbage`: 96 bytes of garbage in place of the hello (the connection must be closed), then a
+//!   hello and a `status` (the service keeps serving);
+//! - `oversize`: a hello, then a frame header of 2 MiB (closed), then a hello and a `status`;
+//! - `wrong-token`: `confirm` and `rollback` of the pending version with a token that is not its
+//!   own (both must answer `token_mismatch`), then a `status` that shows the same attempts;
+//! - `status`: the `status` answer;
+//! - `stage-docs <dir>`: `stage_begin` with the documents in `<dir>`, which the suite assembles
+//!   (`root-<n>.json` files in numeric order, `keys.json`, `feed.json`, `manifest.json`): the
+//!   service's answer, as one word.
+//!
+//! A probe writes `probe <case> <word> ...` lines; versions, closed words and counts only.
+//!
 //! The harness names two files in the environment. `LUNEPACK_E2E_OUT` gets one line per outcome,
 //! `<tree version> <outcome>`: versions and outcomes only, so the suite can compare runs of
 //! different apps. `LUNEPACK_E2E_DETAIL` gets facts that differ by app (the executable's real
@@ -129,7 +150,8 @@ fn main() -> ExitCode {
         out("crash");
         return ExitCode::from(3);
     }
-    if flags.exit_without_confirm {
+    let no_confirm_here = std::env::var("LUNEPACK_E2E_NO_CONFIRM").is_ok_and(|v| v == version);
+    if flags.exit_without_confirm || no_confirm_here {
         out("exit-without-confirm");
         return ExitCode::SUCCESS;
     }
@@ -170,10 +192,14 @@ fn main() -> ExitCode {
     if let Some(runs) = arg_value(&args, "--check") {
         check_runs(&inst, runs, &out);
     }
+    if let Some(case) = arg_text(&args, "--service-probe") {
+        return service_probe(&inst, &case, &args, &out);
+    }
     if args.iter().any(|a| a == "--update") {
         let no_ui = args.iter().any(|a| a == "--no-ui");
         let background = args.iter().any(|a| a == "--background");
-        return match update(&inst, no_ui, background) {
+        let stage_after = arg_text(&args, "--stage-after").map(std::path::PathBuf::from);
+        return match update(&inst, no_ui, background, stage_after.as_deref()) {
             Ok(line) => {
                 out(&line);
                 ExitCode::SUCCESS
@@ -202,6 +228,12 @@ fn process_aumid() -> String {
 #[cfg(not(windows))]
 fn process_aumid() -> String {
     "none".to_owned()
+}
+
+/// The text that follows `flag` among `args`.
+fn arg_text(args: &[OsString], flag: &str) -> Option<String> {
+    let at = args.iter().position(|a| a == flag)?;
+    args.get(at + 1)?.to_str().map(str::to_owned)
 }
 
 /// The number that follows `flag` among `args`.
@@ -253,7 +285,12 @@ fn check_runs(inst: &Installation, runs: u64, out: &dyn Fn(&str)) {
 
 /// Check, download, stage and hand over. Returns the last outcome line; the earlier ones are
 /// written on the way.
-fn update(inst: &Installation, no_ui: bool, background: bool) -> Result<String, &'static str> {
+fn update(
+    inst: &Installation,
+    no_ui: bool,
+    background: bool,
+    stage_after: Option<&Path>,
+) -> Result<String, &'static str> {
     let version = inst.tree_version().to_string();
     let out = |line: &str| note(OUT_VAR, &format!("{version} {line}"));
     let builder = inst.updater_builder().map_err(|_| "builder")?;
@@ -266,6 +303,17 @@ fn update(inst: &Installation, no_ui: bool, background: bool) -> Result<String, 
     let downloaded = updater
         .download(&info, DownloadOptions::default(), &cancel)
         .map_err(|_| "download")?;
+    if let Some(file) = stage_after {
+        // The suite changes what the download holds, then creates this file.
+        out("downloaded");
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while !file.exists() {
+            if std::time::Instant::now() > deadline {
+                return Err("stage-wait");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     let staged = updater.stage(downloaded, &cancel).map_err(|_| "stage")?;
     out(&format!("staged {}", staged.version()));
     lunepack::apply_and_restart(ApplyOptions {
@@ -281,4 +329,223 @@ fn update(inst: &Installation, no_ui: bool, background: bool) -> Result<String, 
     })
     .map_err(|_| "apply")?;
     Ok("apply-scheduled".to_owned())
+}
+
+// ---- the service probe (Windows) ------------------------------------------------------------
+
+/// Only Windows has an update service.
+#[cfg(not(windows))]
+fn service_probe(_: &Installation, _: &str, _: &[OsString], out: &dyn Fn(&str)) -> ExitCode {
+    out("probe unsupported");
+    ExitCode::from(1)
+}
+
+/// What a probe says of a failed request: the service's own word, or the kind of failure.
+#[cfg(windows)]
+fn failure_word(e: &lunepack_core::ServiceError) -> String {
+    use lunepack_core::ServiceError;
+    match e {
+        ServiceError::Answered {
+            code,
+            class: Some(class),
+        } => format!("{} {}", code.as_str(), class.as_str()),
+        ServiceError::Answered { code, class: None } => code.as_str().to_owned(),
+        ServiceError::Closed => "closed".to_owned(),
+        ServiceError::Timeout => "timeout".to_owned(),
+        ServiceError::Io(_) => "io".to_owned(),
+        _ => "other".to_owned(),
+    }
+}
+
+/// Probes the service of the running install (see the head of this file).
+#[cfg(windows)]
+fn service_probe(
+    inst: &Installation,
+    case: &str,
+    args: &[OsString],
+    out: &dyn Fn(&str),
+) -> ExitCode {
+    use lunepack_core::service::{
+        ClientSession, ClientTimeouts, DocumentKind, OutgoingDocument, StageBegun, Token,
+    };
+    use lunepack_core::{Channel, ServiceConnector as _};
+    use std::io::{Read as _, Write as _};
+
+    let connector = lunepack_os_windows::WindowsConnector::new();
+    let timeouts = ClientTimeouts {
+        hello: Some(Duration::from_secs(15)),
+        answer: Some(Duration::from_secs(60)),
+    };
+    let app = inst.app_id().clone();
+    let session = || -> Result<_, String> {
+        let io = connector
+            .connect(&app)
+            .map_err(|_| "connect-failed".to_owned())?;
+        ClientSession::connect(io, app.clone(), timeouts).map_err(|e| failure_word(&e))
+    };
+    // A `status` on a fresh connection: the service still serves.
+    let serving = || -> String {
+        match session().and_then(|mut s| s.status().map_err(|e| failure_word(&e))) {
+            Ok(_) => "serving".to_owned(),
+            Err(word) => format!("not-serving {word}"),
+        }
+    };
+    // Whether the service ends a connection whose peer sent `bytes` (after `io`'s hello, if any):
+    // a read answers an error frame and then ends, or ends at once.
+    let ends = |io: &mut Box<dyn lunepack_core::service::Duplex>| -> bool {
+        let _ = io.set_read_deadline(Some(Duration::from_secs(20)));
+        let mut buf = [0u8; 4096];
+        for _ in 0..16 {
+            match io.read(&mut buf) {
+                Ok(0) | Err(_) => return true,
+                Ok(_) => {}
+            }
+        }
+        false
+    };
+    match case {
+        "garbage" => {
+            let Ok(mut io) = connector.connect(&app) else {
+                out("probe garbage connect-failed");
+                return ExitCode::from(1);
+            };
+            let _ = io.write_all(&[0xFF; 96]);
+            let _ = io.flush();
+            out(&format!("probe garbage closed={}", ends(&mut io)));
+            drop(io);
+            out(&format!("probe garbage {}", serving()));
+        }
+        "oversize" => {
+            match session() {
+                Ok(s) => {
+                    let mut io = s.into_inner();
+                    // A frame of kind `message` whose length says 2 MiB; no body follows.
+                    let mut head = Vec::new();
+                    head.extend_from_slice(&(((2u32 << 20) + 1).to_le_bytes()));
+                    head.push(lunepack_core::service::KIND_MESSAGE);
+                    let _ = io.write_all(&head);
+                    let _ = io.flush();
+                    out(&format!("probe oversize closed={}", ends(&mut io)));
+                }
+                Err(word) => out(&format!("probe oversize hello-failed {word}")),
+            }
+            out(&format!("probe oversize {}", serving()));
+        }
+        "wrong-token" => {
+            let mut s = match session() {
+                Ok(s) => s,
+                Err(word) => {
+                    out(&format!("probe wrong-token hello-failed {word}"));
+                    return ExitCode::from(1);
+                }
+            };
+            let before = s.status().ok();
+            let Some(pending) = before.as_ref().and_then(|b| b.pending.as_ref()) else {
+                out("probe wrong-token nothing-pending");
+                return ExitCode::from(1);
+            };
+            let version = pending.version.clone();
+            let attempts = pending.attempts;
+            let wrong = Token::from_bytes([0x5A; 32]);
+            let confirm = match s.confirm(&version, &wrong) {
+                Ok(_) => "accepted".to_owned(),
+                Err(e) => failure_word(&e),
+            };
+            out(&format!("probe wrong-token confirm {confirm}"));
+            let rollback = match s.rollback(&version, &wrong) {
+                Ok(_) => "accepted".to_owned(),
+                Err(e) => failure_word(&e),
+            };
+            out(&format!("probe wrong-token rollback {rollback}"));
+            // The same connection is still good after an answered error.
+            match s.status() {
+                Ok(after) => {
+                    let same = after
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| p.version == version && p.attempts == attempts);
+                    out(&format!("probe wrong-token still-pending={same}"));
+                }
+                Err(e) => out(&format!("probe wrong-token status {}", failure_word(&e))),
+            }
+        }
+        "status" => match session().and_then(|mut s| s.status().map_err(|e| failure_word(&e))) {
+            Ok(st) => out(&format!(
+                "probe status current={} pending={} staged={} service={} disabled={}",
+                st.current,
+                st.pending.as_ref().map_or_else(
+                    || "none".to_owned(),
+                    |p| format!("{}/{}", p.version, p.attempts)
+                ),
+                st.staged
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), ToString::to_string),
+                st.service,
+                st.self_update_disabled
+            )),
+            Err(word) => {
+                out(&format!("probe status {word}"));
+                return ExitCode::from(1);
+            }
+        },
+        "stage-docs" => {
+            let Some(dir) = arg_text(args, "--docs").map(std::path::PathBuf::from) else {
+                out("probe stage-docs usage");
+                return ExitCode::from(1);
+            };
+            let read = |name: &str| std::fs::read(dir.join(name)).ok();
+            let mut roots: Vec<(u64, Vec<u8>)> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if let Some(n) = name
+                        .strip_prefix("root-")
+                        .and_then(|r| r.strip_suffix(".json"))
+                        .and_then(|n| n.parse::<u64>().ok())
+                        && let Ok(bytes) = std::fs::read(e.path())
+                    {
+                        roots.push((n, bytes));
+                    }
+                }
+            }
+            roots.sort_by_key(|(n, _)| *n);
+            let (Some(keys), Some(feed), Some(manifest)) =
+                (read("keys.json"), read("feed.json"), read("manifest.json"))
+            else {
+                out("probe stage-docs missing-documents");
+                return ExitCode::from(1);
+            };
+            let mut docs: Vec<OutgoingDocument<'_>> = roots
+                .iter()
+                .map(|(_, bytes)| OutgoingDocument {
+                    kind: DocumentKind::Root,
+                    bytes,
+                })
+                .collect();
+            for (kind, bytes) in [
+                (DocumentKind::Keys, &keys),
+                (DocumentKind::Feed, &feed),
+                (DocumentKind::Manifest, &manifest),
+            ] {
+                docs.push(OutgoingDocument { kind, bytes });
+            }
+            let Ok(channel) = Channel::parse("stable") else {
+                return ExitCode::from(1);
+            };
+            let word = match session() {
+                Ok(mut s) => match s.stage_begin(&channel, &docs) {
+                    Ok(StageBegun::Ready(v)) => format!("ready {v}"),
+                    Ok(StageBegun::NoUpdate) => "no-update".to_owned(),
+                    Err(e) => format!("refused {}", failure_word(&e)),
+                },
+                Err(word) => format!("hello-failed {word}"),
+            };
+            out(&format!("probe stage-docs {word}"));
+        }
+        _ => {
+            out("probe unknown-case");
+            return ExitCode::from(2);
+        }
+    }
+    ExitCode::SUCCESS
 }

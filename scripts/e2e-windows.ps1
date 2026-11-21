@@ -366,8 +366,10 @@ function CodeSign-Toml([string]$certVar, [bool]$verify) {
 
 # Packs and publishes one version of an app. Options: Flags (lines of e2e-flags), Timeout
 # (health_timeout_secs), Name (a new display name from this version on), CodeSign (TOML appended
-# to the config: a [codesign.windows] table), Runtime, Stub, Ui and Entry (other files than the
-# build's, e.g. copies signed beforehand), Files (relative path -> source file, put into the input).
+# to the config: a [codesign.windows] table), Runtime, Stub, Ui, Service and Entry (other files
+# than the build's, e.g. copies signed beforehand), Files (relative path -> source file, put into
+# the input). Every release carries the update service (`--service`, M10-D7), so its Setup file
+# offers the all-users choice; the per-user rows below never take it.
 function Publish-Version($app, [string]$version, [hashtable]$options = @{}) {
     $flags = @()
     if ($options.ContainsKey('Flags')) { $flags = $options.Flags }
@@ -401,7 +403,9 @@ function Publish-Version($app, [string]$version, [hashtable]$options = @{}) {
     if ($options.ContainsKey('Stub')) { $stubFile = $options.Stub }
     $runtimeFile = $runtime
     if ($options.ContainsKey('Runtime')) { $runtimeFile = $options.Runtime }
-    $packArgs = @('pack', '--input', $in, '--version', $version, '--target', 'windows-x86_64', '--release-dir', $app.Rel, '--sign', "file:$($app.RelKey)", '--runtime', $runtimeFile, '--stub', $stubFile)
+    $serviceFile = $service
+    if ($options.ContainsKey('Service')) { $serviceFile = $options.Service }
+    $packArgs = @('pack', '--input', $in, '--version', $version, '--target', 'windows-x86_64', '--release-dir', $app.Rel, '--sign', "file:$($app.RelKey)", '--runtime', $runtimeFile, '--stub', $stubFile, '--service', $serviceFile)
     $uiFile = $app.Ui
     if ($options.ContainsKey('Ui')) { $uiFile = $options.Ui }
     if ($uiFile) { $packArgs += @('--ui', $uiFile) }
@@ -663,7 +667,7 @@ try {
     Write-Output "e2e-windows: building"
     Push-Location $repo
     try {
-        cargo build --locked --release -p lunepack-cli -p lunepack-runtime -p lunepack-stub
+        cargo build --locked --release -p lunepack-cli -p lunepack-runtime -p lunepack-stub -p lunepack-service
         if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
         cargo build --locked --release -p lunepack --example e2e_app
         if ($LASTEXITCODE -ne 0) { throw 'cargo build (example) failed' }
@@ -674,9 +678,10 @@ try {
     $runtime = Join-Path $rel 'lunepack-runtime.exe'
     $stub = Join-Path $rel 'lunepack-stub.exe'
     $stubConsole = Join-Path $rel 'lunepack-stub-console.exe'
+    $service = Join-Path $rel 'lunepack-service.exe'
     $appExe = Join-Path $rel 'examples\e2e_app.exe'
     $fakeUi = Join-Path $rel 'examples\e2e_fake_ui.exe'
-    foreach ($f in $cli, $runtime, $stub, $stubConsole, $appExe, $fakeUi) { Require (Test-Path $f) "a built file exists" }
+    foreach ($f in $cli, $runtime, $stub, $stubConsole, $service, $appExe, $fakeUi) { Require (Test-Path $f) "a built file exists" }
     New-Item -ItemType Directory $work, $uiDir | Out-Null
     $env:LUNEPACK_E2E_UI_DIR = $uiDir
 
@@ -1147,6 +1152,7 @@ try {
                             Runtime = (& $signCopy $runtime 'lunepack-runtime.exe')
                             Stub = (& $signCopy $stub 'lunepack-stub.exe')
                             Ui = (& $signCopy $fakeUi 'ui.exe')
+                            Service = (& $signCopy $service 'lunepack-service.exe')
                         }
                         $files.Files = @{ 'extra.dll' = $appExe }
                         Publish-Version $A '2.3.0' $files

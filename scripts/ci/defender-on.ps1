@@ -17,8 +17,10 @@
 # is code signing (M9), not an exclusion. A detection is IGNORED (listed as "ignored (outside the
 # suite)", not counted) only when it has at least one resource and EVERY resource is a file path
 # outside all of the suite's roots ($suiteRoots below: the workspace, the runner and user temp
-# folders, the per-user install folder and the user's Start-menu Programs folder), because the
-# hosted runner's own tooling can trigger detections the suite has nothing to do with. A resource
+# folders, the per-user install folder and the user's Start-menu Programs folder, and the
+# per-machine suite's own folders: the names $suitePrefixes lists, under Program Files, ProgramData
+# and the users folder, and nothing broader), because the hosted runner's own tooling can trigger
+# detections the suite has nothing to do with. A resource
 # of another kind than `file`, a path that does not parse or is not drive-rooted, a path under a
 # root, and a detection with no resource all count. No filter by threat, process or file name.
 # The runner is disposable; nothing is restored.
@@ -45,6 +47,21 @@ $suiteRoots = @(
     $(if ($env:APPDATA) { Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs' })
 ) | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\', '/') + '\' }
 
+# The per-machine suite (scripts/e2e-windows-machine.ps1, step 19) works under folders it names
+# itself, in places whose parent also holds other software, so those are name prefixes, not
+# directory roots: the app folders it installs (`<Program Files>\Lunepack E2E ...`), the
+# elevated install's and the uninstall's own folders (`.lunepack-install-<hex>`,
+# `.lunepack-uninstall-<hex>`), its work folder under ProgramData and the profile folder of the
+# standard user it creates (`lpe2em<digits>`). A path counts as the suite's when it starts with one
+# of these (case-insensitive); the suite's names are the only things they match.
+$suitePrefixes = @(
+    $(if ($env:ProgramFiles) { Join-Path $env:ProgramFiles 'Lunepack E2E' }),
+    $(if ($env:ProgramFiles) { Join-Path $env:ProgramFiles '.lunepack-install-' }),
+    $(if ($env:ProgramFiles) { Join-Path $env:ProgramFiles '.lunepack-uninstall-' }),
+    $(if ($env:ProgramData) { Join-Path $env:ProgramData 'lunepack-e2e-machine-' }),
+    $(if ($env:SystemDrive) { Join-Path $env:SystemDrive 'Users\lpe2em' })
+) | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_) }
+
 function Get-Leaf([string]$path) {
     try { return (Split-Path $path -Leaf) } catch { return '?' }
 }
@@ -60,6 +77,9 @@ function Test-OutsideSuite([string]$resource) {
     try { $full = [IO.Path]::GetFullPath($path).TrimEnd('\', '/') + '\' } catch { return $false }
     foreach ($root in $suiteRoots) {
         if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    foreach ($prefix in $suitePrefixes) {
+        if ($full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $false }
     }
     return $true
 }

@@ -71,8 +71,17 @@ public static class LpRun {
 
     // Runs `cmdline` as `user` with a batch logon token and no window; returns the exit code, or
     // -2 (logon failed), -3 (the process could not be made) or -1 (timed out; the process is
-    // ended). `error` carries the Windows error code of a -2 or -3.
+    // ended). `error` carries the Windows error code of a -2 or -3. The account's profile is not
+    // loaded (the process sees the default profile's folders).
     public static int Run(string user, string password, string cmdline, string dir, int timeoutMs, out int error) {
+        return Run(user, password, cmdline, dir, timeoutMs, false, out error);
+    }
+
+    // The same, loading the account's profile first (LOGON_WITH_PROFILE; the profile is created at
+    // the first load), so the process has its own USERPROFILE and LocalAppData. Measured on
+    // Windows 11: the profile is unloaded again when the last process of the run has ended, and
+    // Remove-StandardUser then deletes it.
+    public static int Run(string user, string password, string cmdline, string dir, int timeoutMs, bool loadProfile, out int error) {
         error = 0;
         IntPtr token;
         if (!LogonUserW(user, ".", password, 4, 0, out token)) { error = Marshal.GetLastWin32Error(); return -2; }
@@ -82,7 +91,7 @@ public static class LpRun {
             PROCESS_INFORMATION pi;
             // CREATE_NO_WINDOW; a null environment: the new process gets the one the system builds
             // for the token.
-            if (!CreateProcessWithTokenW(token, 0, null, cmdline, 0x08000000, IntPtr.Zero, dir, ref si, out pi)) {
+            if (!CreateProcessWithTokenW(token, loadProfile ? 1 : 0, null, cmdline, 0x08000000, IntPtr.Zero, dir, ref si, out pi)) {
                 error = Marshal.GetLastWin32Error();
                 return -3;
             }

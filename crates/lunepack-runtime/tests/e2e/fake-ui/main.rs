@@ -13,7 +13,9 @@
 //!   without launching, close, acknowledge); `die` does the same until the operation reports
 //!   progress, a finished step or its outcome, and then aborts the process (SIGABRT);
 //!   `all-users` is `proceed`, except that at the welcome screen it answers `ProceedAllUsers`
-//!   when the hello offered the all-users install (and plain `Proceed` when it did not).
+//!   when the hello offered the all-users install (and plain `Proceed` when it did not);
+//!   `all-users-die` is `all-users` followed by `die` (the per-machine suite's hand-off whose
+//!   window is lost mid-install).
 //!
 //! On Windows it is a GUI-subsystem program with the build's hardening (the runtime's `build.rs`
 //! links examples too), because `pack --ui` holds a `windows-*` UI to the runtime's own image
@@ -133,8 +135,8 @@ impl Mode {
     fn from_env() -> Mode {
         let mode = std::env::var(MODE_VAR).ok();
         Mode {
-            die: mode.as_deref() == Some("die"),
-            all_users: mode.as_deref() == Some("all-users"),
+            die: matches!(mode.as_deref(), Some("die" | "all-users-die")),
+            all_users: matches!(mode.as_deref(), Some("all-users" | "all-users-die")),
         }
     }
 }

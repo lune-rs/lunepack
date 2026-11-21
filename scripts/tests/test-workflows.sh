@@ -209,6 +209,7 @@ e2e_windows_jobs_ok() {
   block=$(job_block "$1" e2e-windows)
   if ! printf '%s\n' "$block" | grep -q 'run: ./scripts/ci/windows-publisher-test.ps1'; then echo "e2e-windows does not run windows-publisher-test.ps1"; bad=1; fi
   block=$(job_block "$1" e2e-windows-defender)
+  if ! printf '%s\n' "$block" | grep -q 'run: ./scripts/e2e-windows-machine.ps1'; then echo "the Defender job does not run e2e-windows-machine.ps1"; bad=1; fi
   if ! printf '%s\n' "$block" | grep -q 'scripts/ci/defender-on.ps1'; then echo "the Defender job does not run defender-on.ps1"; bad=1; fi
   if ! printf '%s\n' "$block" | grep -q 'defender-on.ps1 -Report'; then echo "the Defender job does not report detections"; bad=1; fi
   if ! printf '%s\n' "$block" | grep -q 'if: always()'; then echo "the Defender job's report does not run after a failure"; bad=1; fi
@@ -237,6 +238,52 @@ if [ -f "$ci" ]; then
   RC=0
   e2e_windows_jobs_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
   t_check "a file with no Windows e2e jobs fails" rc_nonzero
+fi
+# --- the Windows per-machine end-to-end job (M10 step 19) ---------------------------------------
+# Required (no continue-on-error), time-bounded, on a Windows runner, runs the suite (a created
+# standard user, a service, HKLM keys; removed again by the script) and keeps its log as an
+# artifact when it fails.
+e2e_windows_machine_job_ok() {
+  local block bad=0
+  block=$(job_block "$1" e2e-windows-machine)
+  if [ -z "$block" ]; then echo "no e2e-windows-machine job"; return 1; fi
+  if ! printf '%s\n' "$block" | grep -q 'timeout-minutes:'; then echo "e2e-windows-machine has no timeout-minutes"; bad=1; fi
+  if printf '%s\n' "$block" | grep -q 'continue-on-error'; then echo "e2e-windows-machine must not be continue-on-error"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'runs-on: windows-latest'; then echo "e2e-windows-machine does not run on windows-latest"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'scripts/e2e-windows-machine.ps1'; then echo "e2e-windows-machine does not run e2e-windows-machine.ps1"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'actions/upload-artifact@'; then echo "e2e-windows-machine does not upload its log"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'if: failure()'; then echo "e2e-windows-machine's log is not kept after a failure"; bad=1; fi
+  return "$bad"
+}
+
+if [ -f "$ci" ]; then
+  RC=0
+  e2e_windows_machine_job_ok "$ci" >"$OUT" 2>&1 || RC=$?
+  t_check "ci.yml has the e2e-windows-machine job, required and time-bounded" rc_is 0
+  if [ "$RC" -ne 0 ]; then sed 's/^/    /' "$OUT" >&2; fi
+  sed 's|^  e2e-windows-machine:|  e2e-windows-machine:\n    continue-on-error: true|' "$ci" >"$T_TMP/em-coe.yml"
+  RC=0
+  e2e_windows_machine_job_ok "$T_TMP/em-coe.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded continue-on-error on the machine e2e job fails" rc_nonzero
+  t_check "seeded continue-on-error on the machine e2e job reports why" out_has "continue-on-error"
+  grep -v 'scripts/e2e-windows-machine.ps1' "$ci" >"$T_TMP/em-noscript.yml" || true
+  RC=0
+  e2e_windows_machine_job_ok "$T_TMP/em-noscript.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded machine e2e job without its script fails" rc_nonzero
+  t_check "seeded machine e2e job without its script reports why" out_has "e2e-windows-machine.ps1"
+  sed 's|^        if: failure()$|        if: success()|' "$ci" >"$T_TMP/em-nolog.yml"
+  RC=0
+  e2e_windows_machine_job_ok "$T_TMP/em-nolog.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded machine e2e job that keeps no log after a failure fails" rc_nonzero
+  # the Defender job must run the machine suite too
+  grep -v 'run: ./scripts/e2e-windows-machine.ps1' "$ci" >"$T_TMP/em-nodefender.yml" || true
+  RC=0
+  e2e_windows_jobs_ok "$T_TMP/em-nodefender.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded Defender job without the machine suite fails" rc_nonzero
+  t_check "seeded Defender job without the machine suite reports why" out_has "does not run e2e-windows-machine.ps1"
+  RC=0
+  e2e_windows_machine_job_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "a file with no machine e2e job fails" rc_nonzero
 fi
 # --- the Windows machine-adapter job (M10 step 11) --------------------------------------------
 # Required (no continue-on-error), time-bounded, on a Windows runner, runs the acceptance script
@@ -330,6 +377,25 @@ if command -v pwsh >/dev/null 2>&1; then
   env -u CI -u GITHUB_ACTIONS pwsh -NoProfile -File "$repo/scripts/ci/windows-machine-adapter-test.ps1" >"$OUT" 2>&1 || RC=$?
   t_check "windows-machine-adapter-test.ps1 refuses without CI or -Install: exit 3" rc_is 3
   t_check "windows-machine-adapter-test.ps1 names why" out_has "refused"
+fi
+
+# The per-machine suite (M10 step 19) runs its install rows only on CI or with -Install, and only as
+# an administrator; it removes what it made and fails on a leftover. Its planted-DLL list is read
+# from plant-dll-test.ps1, which prints it with -Describe (the list is in one place).
+e2e_machine="$repo/scripts/e2e-windows-machine.ps1"
+# shellcheck disable=SC2016  # the script's own PowerShell text, searched literally
+t_check "e2e-windows-machine.ps1 gates its install rows on CI or -Install" grep -Fq "if (\$env:CI -eq 'true' -or \$env:LUNEPACK_E2E_INSTALL -eq '1') { \$Install = \$true }" "$e2e_machine"
+# shellcheck disable=SC2016
+t_check "e2e-windows-machine.ps1 runs the install rows as an administrator only" grep -Fq '$runInstall = $Install -and $isAdmin' "$e2e_machine"
+# shellcheck disable=SC2016
+t_check "e2e-windows-machine.ps1 fails on a leftover" grep -Fq "FAIL leftovers" "$e2e_machine"
+t_check "e2e-windows-machine.ps1 reads the planted list from plant-dll-test.ps1" grep -Fq "plant-dll-test.ps1') -Describe" "$e2e_machine"
+if command -v pwsh >/dev/null 2>&1; then
+  RC=0
+  # shellcheck disable=SC2016  # PowerShell text
+  PLANT_SCRIPT="$repo/scripts/ci/plant-dll-test.ps1" pwsh -NoProfile -Command '$d = & $env:PLANT_SCRIPT -Describe; "$($d.Planted.Count) $($d.LoaderFailures.Count) $($d.Content.Length)"' >"$OUT" 2>&1 || RC=$?
+  t_check "plant-dll-test.ps1 -Describe prints the list, the failure set and the content" rc_is 0
+  t_check "plant-dll-test.ps1 -Describe: twelve names, eight failure codes, eight bytes" out_has "12 8 8"
 fi
 
 # The scripts refuse off CI (exit 3) before touching anything: no scratch directory appears.
