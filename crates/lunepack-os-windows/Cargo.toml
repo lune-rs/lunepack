@@ -23,6 +23,8 @@ undocumented_unsafe_blocks = "deny"
 lunepack-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# The policy reader logs a value it could not read (without the value).
+tracing.workspace = true
 # SystemParametersInfoW for the client-area animation setting (M6-D8); the DLL search hardening, the
 # known folders, the message box and the app user model id (M7).
 windows-sys = { workspace = true }

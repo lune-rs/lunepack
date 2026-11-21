@@ -21,8 +21,9 @@ const MAX_VALUE_BYTES: u32 = 64 * 1024;
 pub(crate) enum Hive {
     /// `HKEY_CURRENT_USER`.
     CurrentUser,
-    /// `HKEY_LOCAL_MACHINE`: read only here (what another program registered per machine); per-user
-    /// installs never write it (M10's per-machine scope will).
+    /// `HKEY_LOCAL_MACHINE`: what another program registered per machine (read by a per-user
+    /// scope), the policy (read), and the per-machine scope's own entries (written, M10; needs an
+    /// administrator's token). A per-user scope never writes it.
     LocalMachine,
 }
 

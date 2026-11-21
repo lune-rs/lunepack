@@ -69,6 +69,9 @@ pub struct WinScope {
     programs: Option<PathBuf>,
     /// Whether a change to an association tells the shell (`SHCNE_ASSOCCHANGED`).
     notify: bool,
+    /// Whether this is the per-machine scope: the all-users Start-menu folder, and only
+    /// `Scope::Machine` uses it.
+    machine: bool,
 }
 
 impl WinScope {
@@ -83,7 +86,44 @@ impl WinScope {
             run: RUN_KEY.to_owned(),
             programs: None,
             notify: true,
+            machine: false,
         }
+    }
+
+    /// All users (M10): `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall` and `Run`,
+    /// `HKLM\Software\Classes` (native registry view), and the all-users Start-menu programs
+    /// folder (`FOLDERID_CommonPrograms`). There is no separate per-machine classes root to read:
+    /// the classes key written is the machine one. Used for `Scope::Machine` only, and writes
+    /// nothing under `HKCU` or the calling user's profile. Writing needs an administrator's token.
+    pub fn machine() -> WinScope {
+        WinScope {
+            hive: Hive::LocalMachine,
+            uninstall: UNINSTALL_KEY.to_owned(),
+            classes: CLASSES_KEY.to_owned(),
+            machine_classes: None,
+            run: RUN_KEY.to_owned(),
+            programs: None,
+            notify: true,
+            machine: true,
+        }
+    }
+
+    /// The per-machine layout moved under `HKCU\<prefix>\Machine` (for tests and tools: the
+    /// stand-in for `HKLM`, so a test needs no administrator rights for the registry), without
+    /// telling the shell of association changes. `None` for a prefix [`WinScope::with_registry_prefix`]
+    /// refuses. The shortcut still goes to the real all-users Start menu unless
+    /// [`WinScope::with_start_menu`] moves it.
+    pub fn machine_with_registry_prefix(prefix: &str) -> Option<WinScope> {
+        prefix_ok(prefix).then(|| WinScope {
+            hive: Hive::CurrentUser,
+            uninstall: format!(r"{prefix}\{MACHINE_PREFIX}\{UNINSTALL_KEY}"),
+            classes: format!(r"{prefix}\{MACHINE_PREFIX}\{CLASSES_KEY}"),
+            machine_classes: None,
+            run: format!(r"{prefix}\{MACHINE_PREFIX}\{RUN_KEY}"),
+            programs: None,
+            notify: false,
+            machine: true,
+        })
     }
 
     /// The current user's layout moved under `HKCU\<prefix>` (for tests and tools: the uninstall
@@ -95,10 +135,7 @@ impl WinScope {
     /// a `/` or a control character. The shortcut still goes to the real Start menu unless
     /// [`WinScope::with_start_menu`] moves it.
     pub fn with_registry_prefix(prefix: &str) -> Option<WinScope> {
-        let ok = !prefix.is_empty()
-            && prefix.split('\\').all(|c| !c.is_empty())
-            && !prefix.chars().any(|c| c.is_control() || c == '/');
-        ok.then(|| WinScope {
+        prefix_ok(prefix).then(|| WinScope {
             hive: Hive::CurrentUser,
             uninstall: format!(r"{prefix}\{UNINSTALL_KEY}"),
             classes: format!(r"{prefix}\{CLASSES_KEY}"),
@@ -109,6 +146,7 @@ impl WinScope {
             run: format!(r"{prefix}\{RUN_KEY}"),
             programs: None,
             notify: false,
+            machine: false,
         })
     }
 
@@ -124,16 +162,40 @@ impl WinScope {
     }
 }
 
-/// The Windows [`OsIntegration`]. Per-machine scope is `Unsupported` until M10.
+/// Whether `prefix` is usable as a registry prefix: non-empty components, no `/`, no control
+/// character.
+pub(crate) fn prefix_ok(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix.split('\\').all(|c| !c.is_empty())
+        && !prefix.chars().any(|c| c.is_control() || c == '/')
+}
+
+/// The Windows [`OsIntegration`]. `Scope::Machine` is served only when a machine scope was added
+/// with [`WindowsIntegration::with_machine`]; without one it is `Unsupported`, as before M10.
 #[derive(Debug, Clone)]
 pub struct WindowsIntegration {
     user: WinScope,
+    machine: Option<WinScope>,
 }
 
 impl WindowsIntegration {
     /// An integration whose per-user entries go where `user` says.
     pub fn new(user: WinScope) -> WindowsIntegration {
-        WindowsIntegration { user }
+        WindowsIntegration {
+            user,
+            machine: None,
+        }
+    }
+
+    /// This integration also serving `Scope::Machine` from `machine` (a scope made by
+    /// [`WinScope::machine`] or [`WinScope::machine_with_registry_prefix`]). `None` when `machine`
+    /// is a per-user scope, so `Scope::Machine` can never write the user's hive.
+    #[must_use]
+    pub fn with_machine(mut self, machine: WinScope) -> Option<WindowsIntegration> {
+        machine.machine.then(|| {
+            self.machine = Some(machine);
+            self
+        })
     }
 
     /// The real per-user integration ([`WinScope::current_user`]).
@@ -143,7 +205,8 @@ impl WindowsIntegration {
 
     fn scope(&self, scope: Scope) -> Result<&WinScope, IntegrationError> {
         match scope {
-            Scope::User => Ok(&self.user),
+            Scope::User if !self.user.machine => Ok(&self.user),
+            Scope::Machine => self.machine.as_ref().ok_or(IntegrationError::Unsupported),
             _ => Err(IntegrationError::Unsupported),
         }
     }
@@ -348,8 +411,12 @@ fn prepare<'a>(
 
     let programs = match &scope.programs {
         Some(dir) => dir.clone(),
-        None => crate::start_menu_programs()
-            .map_err(|_| IntegrationError::Failed("the Start-menu folder is not available"))?,
+        None => if scope.machine {
+            crate::common_start_menu_programs()
+        } else {
+            crate::start_menu_programs()
+        }
+        .map_err(|_| IntegrationError::Failed("the Start-menu folder is not available"))?,
     };
     let lnk = programs.join(format!("{}.lnk", meta.name));
     let old_lnk = req.previous.as_ref().and_then(|prev| {
