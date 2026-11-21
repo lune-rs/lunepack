@@ -107,8 +107,8 @@ pub use stage::{
 };
 pub use state::{
     CurrentRef, Floors, Health, InstallCounters, InstallState, Lifecycle, LifecycleEvent, Loaded,
-    MachineScope, PendingRef, PreviousRef, Record, RootParts, Scope, StagedIssued, StagedRef,
-    UserScope,
+    MachineScope, MachineStore, PendingRef, PreviousRef, Record, RootParts, Scope, StagedIssued,
+    StagedRef, UserScope,
 };
 pub use stub::{LaunchTarget, STUB_CONTRACT_VERSION, STUB_FILE, StubError, launch_target};
 pub use target::Target;

@@ -470,6 +470,10 @@ pub enum LifecycleError {
     /// The record is a machine install's, which only the privileged engine writes.
     #[error("a machine install's state is not written here")]
     MachineScope,
+    /// The record is a per-user install's, which the machine transitions
+    /// ([`crate::lifecycle::machine`]) never write.
+    #[error("a per-user install's state is not written by the machine engine")]
+    UserScope,
     /// The record has no current version.
     #[error("nothing is installed")]
     NotInstalled,

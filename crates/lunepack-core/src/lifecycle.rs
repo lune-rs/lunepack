@@ -6,9 +6,10 @@
 //! Each transition takes the record loaded under the install's lock and returns the record to
 //! commit; nothing here touches a file, a process or the time. Floors are copied untouched (a
 //! commit refuses a lowered floor anyway), unknown top-level members are kept, and only a token's
-//! SHA-256 is ever recorded. Every write refuses a machine-scope record
-//! ([`LifecycleError::MachineScope`]): the privileged engine owns those, and nothing here reads a
-//! root or a floor from a counters record (M4-SEC-obs1).
+//! SHA-256 is ever recorded. Every write at the top level refuses a machine-scope record
+//! ([`LifecycleError::MachineScope`]): the privileged engine owns those through [`machine`], whose
+//! transitions refuse a per-user record ([`LifecycleError::UserScope`]). Both share the same
+//! bodies, and nothing here reads a root or a floor from a counters record (M4-SEC-obs1).
 
 use std::collections::BTreeSet;
 
@@ -111,6 +112,24 @@ pub fn install_first(
     install_id: [u8; INSTALL_ID_BYTES],
 ) -> Result<InstallState, LifecycleError> {
     user_only(s)?;
+    install_first_body(s, version, issued, install_id, Events::Queue)
+}
+
+/// Whether a transition queues lifecycle events (per user) or leaves `lifecycle` untouched (a
+/// machine record queues none, M10-D16).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Events {
+    Queue,
+    None,
+}
+
+fn install_first_body(
+    s: &InstallState,
+    version: Version,
+    issued: u64,
+    install_id: [u8; INSTALL_ID_BYTES],
+    events: Events,
+) -> Result<InstallState, LifecycleError> {
     if s.current.is_some() {
         return Err(LifecycleError::AlreadyInstalled);
     }
@@ -127,13 +146,15 @@ pub fn install_first(
     out.pending = None;
     out.health = None;
     out.install_id = install_id;
-    // A first install has no earlier version to deliver to.
-    out.lifecycle = lifecycle_of(vec![
-        LifecycleEvent::Installed {
-            version: version.clone(),
-        },
-        LifecycleEvent::FirstRun { version },
-    ]);
+    if events == Events::Queue {
+        // A first install has no earlier version to deliver to.
+        out.lifecycle = lifecycle_of(vec![
+            LifecycleEvent::Installed {
+                version: version.clone(),
+            },
+            LifecycleEvent::FirstRun { version },
+        ]);
+    }
     Ok(out)
 }
 
@@ -227,6 +248,15 @@ pub fn apply(
     token_sha256: Sha256Digest,
 ) -> Result<InstallState, LifecycleError> {
     user_only(s)?;
+    apply_body(s, version, token_sha256, Events::Queue)
+}
+
+fn apply_body(
+    s: &InstallState,
+    version: &Version,
+    token_sha256: Sha256Digest,
+    events: Events,
+) -> Result<InstallState, LifecycleError> {
     let current = s.current.as_ref().ok_or(LifecycleError::NotInstalled)?;
     if s.pending.is_some() {
         return Err(LifecycleError::PendingExists);
@@ -266,22 +296,24 @@ pub fn apply(
     });
     out.staged = None;
     out.staged_issued = None;
-    let mut events: Vec<LifecycleEvent> = s
-        .lifecycle
-        .clone()
-        .map(|l| l.events)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| same(e.recipient(), version))
-        .collect();
-    events.push(LifecycleEvent::Updated {
-        from,
-        to: version.clone(),
-    });
-    events.push(LifecycleEvent::FirstRun {
-        version: version.clone(),
-    });
-    out.lifecycle = lifecycle_of(events);
+    if events == Events::Queue {
+        let mut queued: Vec<LifecycleEvent> = s
+            .lifecycle
+            .clone()
+            .map(|l| l.events)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| same(e.recipient(), version))
+            .collect();
+        queued.push(LifecycleEvent::Updated {
+            from,
+            to: version.clone(),
+        });
+        queued.push(LifecycleEvent::FirstRun {
+            version: version.clone(),
+        });
+        out.lifecycle = lifecycle_of(queued);
+    }
     Ok(out)
 }
 
@@ -299,18 +331,30 @@ pub fn confirm(
     token: TokenCheck,
 ) -> Result<(InstallState, ConfirmOutcome), LifecycleError> {
     user_only(s)?;
+    confirm_body(s, own, token)
+}
+
+/// Whether `presented` matches the digest recorded for the pending version `pending` (constant
+/// time); `false` when no digest is recorded for it.
+fn token_matches(s: &InstallState, pending: &Version, presented: &Sha256Digest) -> bool {
+    s.health
+        .as_ref()
+        .filter(|h| same(&h.version, pending))
+        .is_some_and(|h| digest_eq(&h.token_sha256, presented))
+}
+
+fn confirm_body(
+    s: &InstallState,
+    own: &Version,
+    token: TokenCheck,
+) -> Result<(InstallState, ConfirmOutcome), LifecycleError> {
     let Some(pending) = s.pending.as_ref().filter(|p| same(&p.version, own)) else {
         return Ok((s.clone(), ConfirmOutcome::NothingPending));
     };
-    if let TokenCheck::Presented(presented) = token {
-        let matches = s
-            .health
-            .as_ref()
-            .filter(|h| same(&h.version, &pending.version))
-            .is_some_and(|h| digest_eq(&h.token_sha256, &presented));
-        if !matches {
-            return Err(LifecycleError::TokenMismatch);
-        }
+    if let TokenCheck::Presented(presented) = token
+        && !token_matches(s, &pending.version, &presented)
+    {
+        return Err(LifecycleError::TokenMismatch);
     }
     let mut out = s.next();
     out.pending = None;
@@ -328,6 +372,13 @@ pub fn count_attempt(
     own: &Version,
 ) -> Result<(InstallState, AttemptOutcome), LifecycleError> {
     user_only(s)?;
+    count_attempt_body(s, own)
+}
+
+fn count_attempt_body(
+    s: &InstallState,
+    own: &Version,
+) -> Result<(InstallState, AttemptOutcome), LifecycleError> {
     let pending = s
         .pending
         .as_ref()
@@ -356,6 +407,10 @@ pub fn count_attempt(
 /// current because the list is full.
 pub fn rollback(s: &InstallState, bad_version: &Version) -> Result<InstallState, LifecycleError> {
     user_only(s)?;
+    rollback_body(s, bad_version)
+}
+
+fn rollback_body(s: &InstallState, bad_version: &Version) -> Result<InstallState, LifecycleError> {
     if !s
         .pending
         .as_ref()
@@ -422,4 +477,129 @@ pub fn gc_keep(s: &InstallState) -> BTreeSet<Version> {
         .chain(s.pending.iter().map(|p| p.version.clone()))
         .chain(s.staged.iter().map(|st| st.version.clone()))
         .collect()
+}
+
+/// The transitions of a per-machine install's record (M10), made only by the privileged engine
+/// under the machine lock. Each refuses a per-user record ([`LifecycleError::UserScope`]), takes no
+/// counters record, and changes exactly the fields its per-user twin changes, except that no
+/// lifecycle event is ever queued (`lifecycle` is left as it was; a machine record has none, and
+/// each user's library derives its events from its own counters, M10-D16).
+///
+/// The health token is always required on a machine install: a start with no token never
+/// confirms, it counts an [`attempt`] instead (M10-D3).
+pub mod machine {
+    use super::{
+        AttemptOutcome, ConfirmOutcome, Events, Health, INSTALL_ID_BYTES, InstallState,
+        LifecycleError, MAX_ATTEMPTS, Scope, Sha256Digest, TokenCheck, Version, apply_body,
+        confirm_body, count_attempt_body, install_first_body, rollback_body, same, token_matches,
+    };
+
+    fn machine_only(s: &InstallState) -> Result<(), LifecycleError> {
+        match s.scope {
+            Scope::Machine => Ok(()),
+            Scope::User => Err(LifecycleError::UserScope),
+        }
+    }
+
+    /// [`super::install_first`] for a machine record, queuing no lifecycle event.
+    pub fn install_first(
+        s: &InstallState,
+        version: Version,
+        issued: u64,
+        install_id: [u8; INSTALL_ID_BYTES],
+    ) -> Result<InstallState, LifecycleError> {
+        machine_only(s)?;
+        install_first_body(s, version, issued, install_id, Events::None)
+    }
+
+    /// [`super::apply`] for a machine record, queuing no lifecycle event: `token_sha256` is the
+    /// digest of the token the service returns to the applying runtime.
+    pub fn apply(
+        s: &InstallState,
+        version: &Version,
+        token_sha256: Sha256Digest,
+    ) -> Result<InstallState, LifecycleError> {
+        machine_only(s)?;
+        apply_body(s, version, token_sha256, Events::None)
+    }
+
+    /// A start of `version` presenting a token whose SHA-256 is `presented` confirms it.
+    ///
+    /// `version` pending and `presented` equal to the digest recorded for it (constant time):
+    /// [`ConfirmOutcome::Confirmed`], `pending` and `health` cleared. Nothing pending or another
+    /// version pending: [`ConfirmOutcome::NothingPending`], the record unchanged. No digest
+    /// recorded for it, or another one: [`LifecycleError::TokenMismatch`], the record unchanged.
+    pub fn confirm(
+        s: &InstallState,
+        version: &Version,
+        presented: Sha256Digest,
+    ) -> Result<(InstallState, ConfirmOutcome), LifecycleError> {
+        machine_only(s)?;
+        confirm_body(s, version, TokenCheck::Presented(presented))
+    }
+
+    /// A start of the pending `version` without a token while no supervision lease runs
+    /// (M10-D3): counts one attempt and records `new_token_sha256` as the version's health token,
+    /// so the instance the service hands that token to can confirm.
+    ///
+    /// `version` not pending: [`LifecycleError::NotPending`]. One more attempt would exceed
+    /// [`MAX_ATTEMPTS`]: [`AttemptOutcome::RollBack`], the record unchanged (the caller then uses
+    /// [`rollback_at_limit`]). Otherwise [`AttemptOutcome::Counted`] with the new count, and
+    /// `health = { version, new_token_sha256 }`.
+    pub fn attempt(
+        s: &InstallState,
+        version: &Version,
+        new_token_sha256: Sha256Digest,
+    ) -> Result<(InstallState, AttemptOutcome), LifecycleError> {
+        machine_only(s)?;
+        let (mut out, outcome) = count_attempt_body(s, version)?;
+        if let AttemptOutcome::Counted(_) = outcome {
+            out.health = Some(Health {
+                version: version.clone(),
+                token_sha256: new_token_sha256,
+            });
+        }
+        Ok((out, outcome))
+    }
+
+    /// The supervised rollback of the pending `version`: the token is checked as [`confirm`]
+    /// checks it, then the record rolls back as [`super::rollback`] does.
+    ///
+    /// `version` not pending: [`LifecycleError::NotPending`]. No digest recorded for it, or
+    /// another one: [`LifecycleError::TokenMismatch`]. Both leave the record unchanged.
+    pub fn rollback(
+        s: &InstallState,
+        version: &Version,
+        presented: Sha256Digest,
+    ) -> Result<InstallState, LifecycleError> {
+        machine_only(s)?;
+        let pending = s
+            .pending
+            .as_ref()
+            .filter(|p| same(&p.version, version))
+            .ok_or(LifecycleError::NotPending)?;
+        if !token_matches(s, &pending.version, &presented) {
+            return Err(LifecycleError::TokenMismatch);
+        }
+        rollback_body(s, version)
+    }
+
+    /// The rollback of the pending `version` after its last unconfirmed attempt (M10-D3): no
+    /// token, but `version` must be pending with exactly [`MAX_ATTEMPTS`] attempts counted;
+    /// anything else is [`LifecycleError::NotPending`] with the record unchanged. Then as
+    /// [`super::rollback`].
+    pub fn rollback_at_limit(
+        s: &InstallState,
+        version: &Version,
+    ) -> Result<InstallState, LifecycleError> {
+        machine_only(s)?;
+        let at_limit = s
+            .pending
+            .as_ref()
+            .is_some_and(|p| same(&p.version, version) && p.attempts == MAX_ATTEMPTS);
+        if !at_limit {
+            return Err(LifecycleError::NotPending);
+        }
+        rollback_body(s, version)
+    }
 }

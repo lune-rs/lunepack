@@ -56,6 +56,9 @@ pub const MAX_CHANNELS: usize = 64;
 pub const HEALTH_KEY: &str = "health";
 /// The top-level key of the queued lifecycle events (M5-D6).
 pub const LIFECYCLE_KEY: &str = "lifecycle";
+/// The top-level key of an install-counters record naming the version this user last ran
+/// (M10-D16); absent until it is first written.
+pub const LAST_RUN_KEY: &str = "last_run";
 /// The top-level key of the staged manifest's `issued` (P9).
 pub const STAGED_ISSUED_KEY: &str = "staged_issued";
 /// Most queued lifecycle events.
@@ -87,7 +90,7 @@ const STATE_KEYS: [&str; 12] = [
     LIFECYCLE_KEY,
     STAGED_ISSUED_KEY,
 ];
-const COUNTERS_KEYS: [&str; 2] = ["install_id", "floors"];
+const COUNTERS_KEYS: [&str; 3] = ["install_id", "floors", LAST_RUN_KEY];
 
 // ---- record contents ------------------------------------------------------------------------------
 
@@ -439,8 +442,12 @@ pub struct InstallCounters {
     pub app_id: AppId,
     /// The machine install's id.
     pub install_id: [u8; INSTALL_ID_BYTES],
-    /// The floors this user has verified.
+    /// The floors this user has verified. On a machine install only the key-set version and the
+    /// feed seqs count; the root is the machine record's alone (M4-SEC-obs1, M10-D17).
     pub floors: Floors,
+    /// The version this user last ran (M10-D16); `None` in a record written before it existed or
+    /// before the first run. Written only when set: `None` leaves the member out.
+    pub last_run: Option<Version>,
     /// Critical features the record uses (v1: none).
     pub critical: Vec<String>,
     /// Top-level keys this build does not define, kept verbatim.
@@ -581,6 +588,7 @@ impl InstallCounters {
             app_id,
             install_id,
             floors: Floors::default(),
+            last_run: None,
             critical: Vec::new(),
             extra: BTreeMap::new(),
         }
@@ -760,6 +768,9 @@ impl Record for InstallCounters {
         )?;
         put(&mut out, "install_id", &hex_encode(&self.install_id))?;
         put(&mut out, "floors", &self.floors)?;
+        if let Some(last_run) = &self.last_run {
+            put(&mut out, LAST_RUN_KEY, last_run)?;
+        }
         Ok(out)
     }
 
@@ -774,6 +785,8 @@ impl Record for InstallCounters {
             app_id,
             install_id: fields.install_id()?,
             floors: fields.take("floors")?,
+            // Present means a version text; `null` is not one (it would not write back).
+            last_run: fields.take_optional(LAST_RUN_KEY)?,
             critical,
             extra: fields.rest(),
         };
@@ -849,6 +862,18 @@ impl Fields {
             return Ok(None);
         }
         self.take(key)
+    }
+
+    /// Removes and parses a member that may be absent but, when present, must parse as `T` itself
+    /// (`null` is refused unless `T` accepts it).
+    fn take_optional<T: DeserializeOwned>(
+        &mut self,
+        key: &'static str,
+    ) -> Result<Option<T>, StateError> {
+        if !self.0.contains_key(key) {
+            return Ok(None);
+        }
+        self.take(key).map(Some)
     }
 
     fn install_id(&mut self) -> Result<[u8; INSTALL_ID_BYTES], StateError> {
@@ -1372,13 +1397,60 @@ impl MachineScope {
         commit(fs, &self.counters_dir(machine), loaded, next, hasher)
     }
 
-    /// The floors a check of the machine install starts from: field-wise the higher of the
-    /// machine record's and this user's (C3).
+    /// The floors a check of the machine install starts from (C3, M4-SEC-obs1, M10-D17): the
+    /// root is the machine record's alone, whatever this user's counters hold; the key-set version
+    /// and each channel's feed seq are the higher of the machine record's and this user's.
     pub fn effective_floors(machine: &InstallState, counters: Option<&InstallCounters>) -> Floors {
         match counters {
-            Some(c) => machine.floors.max(&c.floors),
+            Some(c) => {
+                // A counters record lives in a user-writable directory: it may raise monotone
+                // counters but never names a trust root.
+                let mut out = machine.floors.max(&c.floors);
+                out.root = machine.floors.root.clone();
+                out
+            }
             None => machine.floors.clone(),
         }
+    }
+}
+
+/// The machine record of a per-machine install as the privileged engine keeps it, in the machine
+/// state directory `dir` (M10). It names no user directory and reads no counters record, so
+/// nothing a user can write reaches a root or a floor it yields (M4-SEC-obs1). It is the only
+/// scope API that commits a machine record; [`MachineScope`] reads it and has no commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineStore {
+    /// The machine state directory.
+    pub dir: PathBuf,
+    /// The app id every record must carry.
+    pub app_id: AppId,
+}
+
+impl MachineStore {
+    /// Loads the machine record; a record of scope `user` is [`StateError::Invalid`].
+    pub fn load(
+        &self,
+        fs: &dyn Fs,
+        hasher: &dyn Hasher,
+    ) -> Result<Loaded<InstallState>, StateError> {
+        let loaded = load::<InstallState>(fs, &self.dir, &self.app_id, hasher)?;
+        expect_scope(&loaded, Scope::Machine)?;
+        Ok(loaded)
+    }
+
+    /// Commits the next machine record ([`commit`], with all its rules: the store's seq, the app
+    /// id, no lowered floor); it must be of scope `machine`.
+    pub fn commit(
+        &self,
+        fs: &dyn Fs,
+        loaded: &Loaded<InstallState>,
+        next: &InstallState,
+        hasher: &dyn Hasher,
+    ) -> Result<InstallState, StateError> {
+        if next.scope != Scope::Machine {
+            return Err(invalid("record scope does not match"));
+        }
+        commit(fs, &self.dir, loaded, next, hasher)
     }
 }
 
