@@ -106,6 +106,20 @@ cleanup() {
       "$root"/*) limited 60 hdiutil detach -force "$point" >/dev/null 2>&1 || true ;;
     esac
   done
+  # Detach what is still attached from an image file under the root, mounted or not (a `hdiutil
+  # create` stopped mid-run, a killed `lunepack setup`, a row that ended before its guard ran).
+  limited 60 hdiutil info 2>/dev/null | awk -v root="$root/" '
+    /^=====/ { ours = 0; next }
+    /^image-path[[:space:]]*:/ { p = $0; sub(/^image-path[[:space:]]*:[[:space:]]*/, "", p); ours = (index(p, root) == 1); next }
+    ours && $1 ~ /^\/dev\/disk[0-9]+$/ { print $1 }
+  ' | sort -u | while IFS= read -r dev; do
+    limited 60 hdiutil detach -force "$dev" >/dev/null 2>&1 || true
+  done || true
+  left_images=$(limited 60 hdiutil info 2>/dev/null | grep -c "^image-path[[:space:]]*:[[:space:]]*$root/" || true)
+  if [ "${left_images:-0}" -ne 0 ]; then
+    echo "e2e-macos: WARNING: $left_images disk image(s) under the root are still attached" >&2
+    status=1
+  fi
   # Unregister the bundles LaunchServices saw under the root.
   if [ -x "$lsregister" ]; then
     find "$root" -name '*.app' -type d -prune 2>/dev/null | while IFS= read -r app; do
