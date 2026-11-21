@@ -156,16 +156,30 @@ if command -v shellcheck >/dev/null 2>&1; then
   shellcheck -s sh "$shell_app"
 fi
 
+# The real user's folders among the arguments that exist. A fresh account (a CI runner) may have
+# none of them; `find` over a missing one fails, and under `set -e -o pipefail` that ended the run
+# with no message.
+existing_dirs() {
+  local d
+  for d in "$@"; do
+    if [ -d "$d" ]; then printf '%s\n' "$d"; fi
+  done
+}
+
 # How many crash reports named after what the suite starts the real user's own folder holds.
 real_reports() {
-  find "$real_home/Library/Logs/DiagnosticReports" -maxdepth 2 \
-    \( -name 'lunepack*' -o -name 'e2e_*' -o -name 'e2e-*' \) 2>/dev/null | wc -l | tr -d ' '
+  local d dirs=()
+  while IFS= read -r d; do dirs+=("$d"); done < <(existing_dirs "$real_home/Library/Logs/DiagnosticReports")
+  if [ "${#dirs[@]}" -eq 0 ]; then echo 0; return; fi
+  find "${dirs[@]}" -maxdepth 2 \( -name 'lunepack*' -o -name 'e2e_*' -o -name 'e2e-*' \) | wc -l | tr -d ' '
 }
 
 # How many entries named after the e2e app the real user's own folders hold.
 real_entries() {
-  find "$real_home/Applications" "$real_home/Library/Application Support" -maxdepth 1 \
-    \( -name 'org.lunepack.e2e*' -o -name 'Lunepack E2E*' \) 2>/dev/null | wc -l | tr -d ' '
+  local d dirs=()
+  while IFS= read -r d; do dirs+=("$d"); done < <(existing_dirs "$real_home/Applications" "$real_home/Library/Application Support")
+  if [ "${#dirs[@]}" -eq 0 ]; then echo 0; return; fi
+  find "${dirs[@]}" -maxdepth 1 \( -name 'org.lunepack.e2e*' -o -name 'Lunepack E2E*' \) | wc -l | tr -d ' '
 }
 
 # The real user's own folders must not gain an entry named after the e2e app (checked at the end).
@@ -173,8 +187,8 @@ real_home=$(cd "$real_home" 2>/dev/null && pwd -P || true)
 before=
 reports_before=
 if [ -n "$real_home" ] && [ "$real_home" != "$HOME" ]; then
-  before=$(real_entries)
-  reports_before=$(real_reports)
+  before=$(real_entries) || die "cannot count the e2e entries in the real user's folders"
+  reports_before=$(real_reports) || die "cannot count the crash reports in the real user's folder"
 fi
 
 if [ "$ci" = 1 ]; then
@@ -211,9 +225,9 @@ LUNEPACK_E2E_ROOT=$root/rows \
   cargo test --locked -p lunepack-runtime --test e2e
 
 if [ -n "$real_home" ] && [ "$real_home" != "$HOME" ]; then
-  after=$(real_entries)
+  after=$(real_entries) || die "cannot count the e2e entries in the real user's folders"
   [ "$after" = "$before" ] || die "FAIL: the real user's folders gained an e2e entry"
-  reports_after=$(real_reports)
+  reports_after=$(real_reports) || die "cannot count the crash reports in the real user's folder"
   [ "$reports_after" = "$reports_before" ] || die "FAIL: a helper crashed: $((reports_after - reports_before)) new crash report(s) named after lunepack or the e2e apps"
 fi
 echo "e2e-macos: PASS"
