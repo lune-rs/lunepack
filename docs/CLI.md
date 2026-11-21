@@ -90,9 +90,12 @@ icon = "assets/hello.ico"    # an .ico file, relative to this file
 icon = "assets/hello.icns"   # an .icns file, relative to this file; read only with --ui on a macos-* target
 
 [codesign.windows]           # optional (M9): how a release is signed with the OS's code signing, as argv
-sign = ["signtool", "sign", "/fd", "sha256", "{path}"]    # templates with no shell; see "Code signing"
+                             # templates with no shell, always timestamped; see "Code signing"
+sign = ["signtool", "sign", "/fd", "sha256", "/tr", "https://timestamp.example.com", "/td", "sha256",
+        "{path}"]
 [codesign.macos]             # optional (M9): the same for a macos-* target
-sign = ["/usr/bin/codesign", "--force", "--sign", "{env:LUNEPACK_SIGN_IDENTITY}", "{path}"]
+sign = ["/usr/bin/codesign", "--force", "--options", "runtime", "--timestamp",
+        "--sign", "{env:LUNEPACK_SIGN_IDENTITY}", "{path}"]
 ```
 
 ## The publisher state file (M3-R2-D1)
@@ -538,7 +541,9 @@ is written to the release.
 
 **What is signed (M9-D4).** On a `windows-*` target, every file of the tree whose header is a PE (the
 header decides, not the extension) and that has no certificate table, deepest first; PE files that are
-already signed (a third party's runtime DLL, the developer's own) are left as they are. On a `macos-*` bundle
+already signed (a third party's runtime DLL, the developer's own) are left as they are. A file that starts with
+`MZ` and has `PE\0\0` where its `e_lfanew` points is a PE wherever that is, even past the first 64 KiB; one whose
+headers lunepack cannot read (such a far-header image included) fails the pack instead of being left unsigned. On a `macos-*` bundle
 with no `Contents/_CodeSignature`: for each nested bundle (`*.app`, `*.framework`, `*.appex`, `*.xpc`,
 `*.bundle` and `*.plugin` directories under `Contents/`), deepest first, its loose Mach-O files and then the
 bundle with `sign_bundle`; then the outer bundle's own loose Mach-O files (the main executable excluded);
