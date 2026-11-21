@@ -5,11 +5,15 @@
 //! `Send + Sync`; implementations live in adapter crates, fakes in `lunepack-testkit`.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::digest::Sha256Digest;
-use crate::error::{Error, PublisherError, Result};
+use crate::error::{
+    ConnectError, ElevationError, Error, ProtectError, PublisherError, Result, ServiceRegError,
+};
+use crate::ident::AppId;
 use crate::path::RelPath;
+use crate::service::Duplex;
 
 /// A streaming SHA-256 computation, created by [`Hasher::sha256_start`].
 pub trait HashState: Send {
@@ -265,4 +269,124 @@ pub trait PublisherCheck: Send + Sync {
         installed: &SignedTree,
         candidate: &SignedTree,
     ) -> std::result::Result<bool, PublisherError>;
+}
+
+// ---- the machine-install ports (M10) -------------------------------------------------------------
+
+/// The protection class of a directory the privileged engine creates or checks (M10-D9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DirClass {
+    /// A directory of the machine tree (`R`, `R\app`, `R\.lunepack`, `R\.lunepack\state`):
+    /// owner Administrators, full control for LocalSystem and Administrators, read and execute
+    /// for Users and app packages, nothing else.
+    MachineTree,
+    /// An admin-only directory (`R\.lunepack\machine` and below): owner Administrators, full
+    /// control for LocalSystem and Administrators, nothing for anyone else.
+    AdminOnly,
+}
+
+/// Protected directories (M10-D9): creates a directory with an explicit protected descriptor of
+/// its class, and checks that an existing one is protected as its class says. Object-safe and
+/// `Send + Sync`.
+pub trait Protect: Send + Sync {
+    /// Creates the directory `path` (its parent must exist) with the descriptor of `class`. An
+    /// existing entry at `path` is [`ProtectError::Exists`] and is left unchanged.
+    fn create_dir(&self, path: &Path, class: DirClass) -> std::result::Result<(), ProtectError>;
+
+    /// `Ok(())` when `path` is a real directory (not a link) protected as `class` says: nobody
+    /// outside the class's writers holds a write-class right and the owner is Administrators,
+    /// LocalSystem or TrustedInstaller. A missing directory is [`ProtectError::NotFound`]; any
+    /// other shape is [`ProtectError::NotProtected`].
+    fn check(&self, path: &Path, class: DirClass) -> std::result::Result<(), ProtectError>;
+}
+
+/// The operating system's registration of an app's update service (M10-D10). Object-safe and
+/// `Send + Sync`.
+pub trait ServiceRegistrar: Send + Sync {
+    /// Registers the service of `app_id` with the binary `image`, replacing a registration that
+    /// exists, with its descriptor and demand start.
+    fn register(&self, app_id: &AppId, image: &Path) -> std::result::Result<(), ServiceRegError>;
+
+    /// The binary the registration names; `None` when the service is not registered.
+    fn image(&self, app_id: &AppId) -> std::result::Result<Option<PathBuf>, ServiceRegError>;
+
+    /// Points the registration at `image`; the running service is not restarted.
+    fn set_image(&self, app_id: &AppId, image: &Path) -> std::result::Result<(), ServiceRegError>;
+
+    /// Runs `image --self-test` once; `Ok(())` only when it exits 0 within its time limit.
+    fn self_test(&self, image: &Path) -> std::result::Result<(), ServiceRegError>;
+
+    /// Stops and deletes the registration; a missing one is not an error.
+    fn remove(&self, app_id: &AppId) -> std::result::Result<(), ServiceRegError>;
+}
+
+/// An administrator's policy for one app (M10-D12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MachinePolicy {
+    /// Self-update is switched off: the engine refuses `stage_begin` and `apply`.
+    pub self_update_disabled: bool,
+    /// The runtime shows no update window.
+    pub no_update_ui: bool,
+}
+
+/// Reads the machine policy (M10-D12). An unreadable policy counts as on: the implementation
+/// returns `true` for each value it cannot read, so the answer is infallible.
+pub trait PolicySource: Send + Sync {
+    /// The policy for `app_id`.
+    fn read(&self, app_id: &AppId) -> MachinePolicy;
+}
+
+/// Connects a client to the update service of an app (the named pipe on Windows). Object-safe and
+/// `Send + Sync`.
+pub trait ServiceConnector: Send + Sync {
+    /// A channel to the service of `app_id`, its owner checked; the caller then runs the hello.
+    fn connect(&self, app_id: &AppId) -> std::result::Result<Box<dyn Duplex>, ConnectError>;
+}
+
+/// What the current process may do (M10-D15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// A standard user's process.
+    Standard,
+    /// An administrator's process without a split token (UAC off, or the built-in account).
+    Admin,
+    /// An administrator's process holding the full token of a UAC elevation.
+    UacElevated,
+}
+
+/// An elevated child process started by [`Elevation::run_elevated`].
+pub trait ElevatedChild: Send {
+    /// Waits for the child and returns its exit code.
+    fn wait(&mut self) -> std::result::Result<i32, ElevationError>;
+}
+
+/// What [`Elevation::run_elevated`] did.
+pub enum Elevated {
+    /// The child runs elevated.
+    Started(Box<dyn ElevatedChild>),
+    /// The user declined the elevation prompt; nothing runs.
+    Declined,
+}
+
+impl std::fmt::Debug for Elevated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Elevated::Started(_) => "Started(..)",
+            Elevated::Declined => "Declined",
+        })
+    }
+}
+
+/// The current process's standing and the hand-off to an elevated child (M10-D15). Object-safe
+/// and `Send + Sync`.
+pub trait Elevation: Send + Sync {
+    /// The current process's standing.
+    fn standing(&self) -> Standing;
+
+    /// Starts `exe` with `args` elevated, asking the user when the system needs to.
+    fn run_elevated(
+        &self,
+        exe: &Path,
+        args: &[String],
+    ) -> std::result::Result<Elevated, ElevationError>;
 }

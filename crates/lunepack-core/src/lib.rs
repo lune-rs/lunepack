@@ -5,6 +5,7 @@ pub mod chain;
 pub mod codesign;
 pub mod digest;
 pub mod encoding;
+pub mod engine;
 pub mod envelope;
 pub mod error;
 pub mod feed;
@@ -54,8 +55,9 @@ pub use codesign::{
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
 pub use error::{
-    DesktopPathError, Error, FeedRule, LayoutError, LifecycleError, PublisherError, Result,
-    ServiceError, StageError, StateError, UpdateConfigError,
+    ConnectError, DesktopPathError, ElevationError, Error, FeedRule, LayoutError, LifecycleError,
+    ProtectError, PublisherError, Result, ServiceError, ServiceRegError, StageError, StateError,
+    UpdateConfigError,
 };
 pub use feed::{
     ArtifactRef, CheckedRef, FeedDocument, FeedTargetEntry, ReleaseDoc, Rollout, RolloutDoc,
@@ -121,6 +123,10 @@ pub use target::Target;
 pub use traits::{
     Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,
     HashState, Hasher, PublisherCheck, Rng, SignatureAlg, SignedTree, Signer, StreamView, Verifier,
+};
+pub use traits::{
+    DirClass, Elevated, ElevatedChild, Elevation, MachinePolicy, PolicySource, Protect,
+    ServiceConnector, ServiceRegistrar, Standing,
 };
 pub use transport::{
     BlockingResponse, BlockingTransport, Body, BoxFuture, ByteRange, Head, Request, Response,

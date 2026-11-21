@@ -708,6 +708,73 @@ pub enum UpdateConfigError {
     RootMismatch(&'static str),
 }
 
+/// Why a [`crate::traits::Protect`] call failed (M10-D9). Carries no path.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProtectError {
+    /// The directory is not protected as its class says (a write right for someone else, another
+    /// owner, a link or not a directory).
+    #[error("the directory is not protected")]
+    NotProtected,
+    /// The directory does not exist.
+    #[error("the directory does not exist")]
+    NotFound,
+    /// An entry already exists where a directory was to be created.
+    #[error("the directory already exists")]
+    Exists,
+    /// A filesystem operation failed.
+    #[error("{0}")]
+    Fs(#[from] FsError),
+    /// The operating system refused (a fixed description, never OS text).
+    #[error("protection failed: {0}")]
+    Os(&'static str),
+}
+
+/// Why a [`crate::traits::ServiceRegistrar`] call failed. Carries no path or OS text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ServiceRegError {
+    /// The service is not registered.
+    #[error("the service is not registered")]
+    NotRegistered,
+    /// The binary's self-test failed or timed out.
+    #[error("the service self-test failed")]
+    SelfTestFailed,
+    /// The service control manager refused (a fixed description).
+    #[error("service registration failed: {0}")]
+    Os(&'static str),
+}
+
+/// Why a [`crate::traits::ServiceConnector`] could not connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConnectError {
+    /// No service is registered for the app.
+    #[error("the update service is not installed")]
+    NotInstalled,
+    /// An administrator disabled the service.
+    #[error("the update service is disabled")]
+    Disabled,
+    /// Another client holds the service's only connection.
+    #[error("the update service is busy")]
+    Busy,
+    /// The channel's owner is not the expected account (a fake server).
+    #[error("the update service's channel has an unexpected owner")]
+    WrongOwner,
+    /// Anything else (a fixed description).
+    #[error("connecting to the update service failed: {0}")]
+    Failed(&'static str),
+}
+
+/// Why an elevation hand-off failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ElevationError {
+    /// The operating system refused (a fixed description).
+    #[error("elevation failed: {0}")]
+    Failed(&'static str),
+}
+
 /// Why a service-protocol session (`service`, M10-D1) ended or a request failed. Carries no peer
 /// text: a malformed reason is a fixed description.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
