@@ -285,7 +285,7 @@ in the release directory.
 ```
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
-    [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--config <CONFIG>]
+    [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--service <SERVICE>] [--config <CONFIG>]
 
 lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runtime <RUNTIME>
     [--ui <UI>] --assemble <DIR> [--config <CONFIG>]
@@ -308,6 +308,13 @@ lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runt
   Required for a `windows-*` target when the config has `[update]`; refused for any other target and
   without `[update]`. The console stub is needed when `install.terminal` is set, the GUI stub
   otherwise. A file over 32 MiB is refused.
+- `--service`: the Windows update service (`lunepack-service.exe`, M10-D7), placed beside the entry as
+  `lunepack-service.exe`. Windows only (`windows-*` targets); needs `--runtime` and `[update]`, and is
+  refused without them. Optional: without it the app installs for the user only and the installer
+  offers no "For all users" choice. The file must be a console-subsystem image of the target that
+  passes the hardening checks of a Windows runtime; a file over 32 MiB is refused. The name
+  `lunepack-service.exe` (any letter case) is reserved for a Windows target at any depth of the input
+  tree, as `lunepack-stub.exe` is, with or without `--service`.
 - `--assemble <dir>`: for a `macos-*` target with `[update]` (below): write the tree `pack` would hash to
   the new directory `<dir>` and stop, so it can be code-signed and then packed. It takes no
   `--release-dir` and no `--sign` (giving either is a usage error), reads no key and writes nothing to a

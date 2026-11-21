@@ -26,8 +26,8 @@ use lunepack_core::update_config::{
 };
 use lunepack_core::{
     CodeSign, Codec, CodecId, Encoder, EntryKind, Hasher, InstallMeta, ManifestDocument,
-    PackedFile, PlanEntry, PlanEntryKind, RelPath, ReleaseLayout, STUB_FILE, Sha256Digest,
-    SignItem, Target, UPDATE_CONFIG_FILE, pack_file, sign_plan, validate_tree,
+    PackedFile, PlanEntry, PlanEntryKind, RelPath, ReleaseLayout, SERVICE_FILE, STUB_FILE,
+    Sha256Digest, SignItem, Target, UPDATE_CONFIG_FILE, pack_file, sign_plan, validate_tree,
 };
 
 /// Fixed per-job allowance on top of the input, output and encoder estimates: 16 MiB of slack for
@@ -152,6 +152,9 @@ pub struct UpdatePlan<'a> {
     /// The stamped Windows launcher stub (M7-D14), placed beside the entry as
     /// [`STUB_FILE`]; `Some` exactly for a `windows-*` target.
     pub stub: Option<&'a [u8]>,
+    /// The update service's bytes (M10-D7), checked against the target and placed beside the
+    /// entry as [`SERVICE_FILE`]; present only with `--service` on a `windows-*` target.
+    pub service: Option<&'a [u8]>,
     /// The update configuration's canonical bytes.
     pub config: &'a [u8],
     /// The helper app's `Info.plist` bytes (M8-D6); `Some` exactly for a `macos-*` target with
@@ -225,6 +228,13 @@ fn placements<'a>(plan: &UpdatePlan<'a>) -> Vec<Placement<'a>> {
             exec: true,
         });
     }
+    if let Some(service) = plan.service {
+        out.push(Placement {
+            path: beside(SERVICE_FILE),
+            bytes: service,
+            exec: true,
+        });
+    }
     out.push(Placement {
         path: config_path(plan.target).to_owned(),
         bytes: plan.config,
@@ -281,6 +291,12 @@ pub fn check_reserved(input: &Path, plan: &UpdatePlan<'_>) -> Result<()> {
         if target.is_windows() && name.eq_ignore_ascii_case(STUB_FILE) {
             bail!(
                 "the input tree holds {text:?}; the name {STUB_FILE} is reserved for the launcher stub of a Windows target"
+            );
+        }
+        // The same rule for the update service's name (M10-D7), with or without `--service`.
+        if target.is_windows() && name.eq_ignore_ascii_case(SERVICE_FILE) {
+            bail!(
+                "the input tree holds {text:?}; the name {SERVICE_FILE} is reserved for the update service of a Windows target"
             );
         }
         if target.is_macos() {

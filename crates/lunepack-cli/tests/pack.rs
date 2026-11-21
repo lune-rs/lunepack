@@ -2063,6 +2063,323 @@ fn windows_stub_refusals() {
     assert!(err.contains("--stub needs [update]"), "{err:?}");
 }
 
+// ---- `--service` for Windows targets (M10 step 13) ----------------------------------------------
+
+/// `pack` with `--runtime`, `--stub` and `--service` as given (each optional).
+#[cfg(unix)]
+fn pack_with_service(
+    w: &World,
+    input: &Path,
+    dir: &Path,
+    runtime: Option<&Path>,
+    stub: Option<&Path>,
+    service: Option<&Path>,
+    target: &'static str,
+) -> Output {
+    let mut extra = Vec::new();
+    if let Some(r) = runtime {
+        extra.extend_from_slice(&["--runtime", s(r)]);
+    }
+    if let Some(p) = stub {
+        extra.extend_from_slice(&["--stub", s(p)]);
+    }
+    if let Some(p) = service {
+        extra.extend_from_slice(&["--service", s(p)]);
+    }
+    w.pack(&Pack {
+        input,
+        version: "1.0.0",
+        target,
+        release_dir: dir,
+        signers: w.all_signers(),
+        epoch: T0,
+        extra,
+    })
+}
+
+/// A service image of `machine` (M10-D7): hardened, with the console subsystem (3).
+#[cfg(unix)]
+fn service_pe(machine: u16) -> Vec<u8> {
+    hardened_pe(machine, 3)
+}
+
+/// M10-D7: `--service` places the image beside the entry as `lunepack-service.exe`, executable and
+/// hashed like the other files; the input tree is not touched.
+#[cfg(unix)]
+#[test]
+fn windows_service_is_placed_beside_the_entry() {
+    let app = win_app(WIN_TOML);
+    let service = app.w.dir.path().join("service.exe");
+    let image = service_pe(0x8664);
+    fs::write(&service, &image).unwrap();
+    let dir = app.w.release_dir("rel", &[]);
+    assert_ok(
+        &pack_with_service(
+            &app.w,
+            app.input.path(),
+            &dir,
+            Some(&app.runtime),
+            Some(&app.stub),
+            Some(&service),
+            "windows-x86_64",
+        ),
+        "pack with --service",
+    );
+    assert!(!app.input.path().join("bin/lunepack-service.exe").exists());
+    let (m, files) = app.w.verify(&dir, "1.0.0", Target::WindowsX86_64);
+    assert_eq!(files["bin/lunepack-service.exe"], image);
+    assert!(exec_of(&m, "bin/lunepack-service.exe"));
+    assert_eq!(
+        sha_of(&m, "bin/lunepack-service.exe"),
+        Sha256Hasher.sha256(&image)
+    );
+    assert!(files.contains_key("bin/lunepack-stub.exe"));
+    assert!(files.contains_key("bin/lunepack-runtime.exe"));
+}
+
+/// C2 with `--service`: the same inputs give identical bytes; the service changes the manifest,
+/// and a different image gives a different pack.
+#[cfg(unix)]
+#[test]
+fn windows_service_pack_is_deterministic() {
+    let app = win_app(WIN_TOML);
+    let service = app.w.dir.path().join("service.exe");
+    fs::write(&service, service_pe(0x8664)).unwrap();
+    let (a, b) = (app.w.release_dir("a", &[]), app.w.release_dir("b", &[]));
+    for dir in [&a, &b] {
+        assert_ok(
+            &pack_with_service(
+                &app.w,
+                app.input.path(),
+                dir,
+                Some(&app.runtime),
+                Some(&app.stub),
+                Some(&service),
+                "windows-x86_64",
+            ),
+            "pack with --service",
+        );
+    }
+    for name in [
+        "1.0.0/windows-x86_64.pack",
+        "1.0.0/windows-x86_64.manifest.json",
+    ] {
+        assert_eq!(
+            fs::read(a.join(name)).unwrap(),
+            fs::read(b.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+    let plain = app.w.release_dir("plain", &[]);
+    assert_ok(
+        &pack_with_service(
+            &app.w,
+            app.input.path(),
+            &plain,
+            Some(&app.runtime),
+            Some(&app.stub),
+            None,
+            "windows-x86_64",
+        ),
+        "pack without --service",
+    );
+    assert_ne!(
+        fs::read(a.join("1.0.0/windows-x86_64.manifest.json")).unwrap(),
+        fs::read(plain.join("1.0.0/windows-x86_64.manifest.json")).unwrap()
+    );
+    let other = app.w.dir.path().join("other-service.exe");
+    let mut spec = exe_headers::PeSpec::hardened(3);
+    spec.code_len = 0x800;
+    fs::write(&other, exe_headers::pe_image(0x8664, &spec)).unwrap();
+    let c = app.w.release_dir("c", &[]);
+    assert_ok(
+        &pack_with_service(
+            &app.w,
+            app.input.path(),
+            &c,
+            Some(&app.runtime),
+            Some(&app.stub),
+            Some(&other),
+            "windows-x86_64",
+        ),
+        "pack with another service",
+    );
+    assert_ne!(
+        fs::read(a.join("1.0.0/windows-x86_64.pack")).unwrap(),
+        fs::read(c.join("1.0.0/windows-x86_64.pack")).unwrap()
+    );
+}
+
+/// `--service` refusals name the option, the target or the field, never a value: without
+/// `[update]`, without `--runtime`, for Linux and macOS targets, a file that is not a service image
+/// of the target, a non-regular file, and an over-size file.
+#[cfg(unix)]
+#[test]
+fn windows_service_refusals() {
+    let app = win_app(WIN_TOML);
+    let service = app.w.dir.path().join("service.exe");
+    fs::write(&service, service_pe(0x8664)).unwrap();
+    let dir = app.w.release_dir("rel", &[]);
+    let fails = |out: Output, what: &str| assert_fails(&out, 1, what);
+
+    // Wrong images: a GUI subsystem, another machine, a C runtime import, not a PE.
+    let mut gui = exe_headers::PeSpec::hardened(2);
+    gui.code_len = 0x800;
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+        ("gui", exe_headers::pe_image(0x8664, &gui), "subsystem"),
+        ("arm64", service_pe(0xAA64), "another architecture"),
+        ("elf", runtime_elf(62, false), "not an executable"),
+    ];
+    for (name, bytes, want) in cases {
+        let path = app.w.dir.path().join(format!("{name}-service.exe"));
+        fs::write(&path, bytes).unwrap();
+        let err = fails(
+            pack_with_service(
+                &app.w,
+                app.input.path(),
+                &dir,
+                Some(&app.runtime),
+                Some(&app.stub),
+                Some(&path),
+                "windows-x86_64",
+            ),
+            name,
+        );
+        assert!(
+            err.contains("--service is not a service image for windows-x86_64"),
+            "{name}: {err:?}"
+        );
+        assert!(err.contains(want), "{name}: {err:?}");
+        assert!(!err.contains(path.to_str().unwrap()), "{name}: {err:?}");
+    }
+    let dir_service = app.w.dir.path().join("service-dir");
+    fs::create_dir(&dir_service).unwrap();
+    let err = fails(
+        pack_with_service(
+            &app.w,
+            app.input.path(),
+            &dir,
+            Some(&app.runtime),
+            Some(&app.stub),
+            Some(&dir_service),
+            "windows-x86_64",
+        ),
+        "a directory",
+    );
+    assert!(err.contains("is not a regular file"), "{err:?}");
+    let big = app.w.dir.path().join("big-service.exe");
+    fs::File::create(&big)
+        .unwrap()
+        .set_len(32 * 1024 * 1024 + 1)
+        .unwrap();
+    let err = fails(
+        pack_with_service(
+            &app.w,
+            app.input.path(),
+            &dir,
+            Some(&app.runtime),
+            Some(&app.stub),
+            Some(&big),
+            "windows-x86_64",
+        ),
+        "an over-size file",
+    );
+    assert!(err.contains("is over"), "{err:?}");
+    assert!(!dir.join("1.0.0").exists());
+    assert_eq!(app.w.work_dirs(), 0, "no work dir is left");
+
+    // Without --runtime, and without [update].
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    let ldir = w.release_dir("rel", &[]);
+    let linput = tempfile::tempdir().unwrap();
+    app_tree(linput.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let err = fails(
+        pack_with_service(
+            &w,
+            linput.path(),
+            &ldir,
+            None,
+            None,
+            Some(&service),
+            "windows-x86_64",
+        ),
+        "--service without --runtime",
+    );
+    assert!(err.contains("--service needs --runtime"), "{err:?}");
+
+    // For Linux and macOS targets, refused before the file is read.
+    for target in ["linux-x86_64", "macos-aarch64"] {
+        let err = fails(
+            pack_with_service(
+                &w,
+                linput.path(),
+                &ldir,
+                Some(&runtime),
+                None,
+                Some(&service),
+                target,
+            ),
+            target,
+        );
+        assert!(
+            err.contains("--service is only for windows-* targets"),
+            "{target}: {err:?}"
+        );
+    }
+
+    let w = World::new(1, 1);
+    let wdir = w.release_dir("rel", &[]);
+    let out = pack_with_service(
+        &w,
+        linput.path(),
+        &wdir,
+        None,
+        None,
+        Some(&service),
+        "windows-x86_64",
+    );
+    let err = fails(out, "--service without [update]");
+    assert!(err.contains("--service needs [update]"), "{err:?}");
+}
+
+/// The update service's name is reserved for a Windows target at any depth, ignoring case, as the
+/// stub's is, with or without `--service`; the input is not touched.
+#[cfg(unix)]
+#[test]
+fn windows_service_name_is_reserved() {
+    for at in ["bin/lunepack-service.exe", "other/Lunepack-Service.EXE"] {
+        let app = win_app(WIN_TOML);
+        let service = app.w.dir.path().join("service.exe");
+        fs::write(&service, service_pe(0x8664)).unwrap();
+        write(app.input.path(), at, b"x");
+        let dir = app.w.release_dir("rel", &[]);
+        let with = pack_with_service(
+            &app.w,
+            app.input.path(),
+            &dir,
+            Some(&app.runtime),
+            Some(&app.stub),
+            Some(&service),
+            "windows-x86_64",
+        );
+        let err = assert_fails(&with, 1, at);
+        assert!(
+            err.contains("reserved for the update service"),
+            "{at}: {err:?}"
+        );
+        let without = app.pack(&dir, "1.0.0", Some(&app.stub));
+        let err = assert_fails(&without, 1, at);
+        assert!(
+            err.contains("reserved for the update service"),
+            "{at} without --service: {err:?}"
+        );
+        assert!(app.input.path().join(at).exists());
+    }
+}
+
 /// The Windows rules on the config and the input: every clause of M7-D15's `name` rule, the `.exe`
 /// entry, the numeric version, and the reserved stub name.
 #[cfg(unix)]

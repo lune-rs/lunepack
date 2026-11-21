@@ -916,6 +916,64 @@ mod fake {
         assert_ok(&out, "linux pack");
         assert_eq!(tools.log().len(), 4, "no tool ran for linux");
     }
+
+    /// M10-D7: the placed update service is an unsigned PE of the tree, so the OS sign stage signs
+    /// it and verifies it like the runtime, the stub and the entry; the sign stage runs after the
+    /// placement and before the hash.
+    #[test]
+    fn windows_service_is_signed_like_the_other_pes() {
+        let w = World::new();
+        let tools = Tools::new(&w);
+        let sign = tools.template(
+            "sign",
+            "echo \"sign|$1\" >> \"$LOG\"; cp \"$TOOLS/signed.pe\" \"$1\"",
+            &["{path}"],
+        );
+        let verify = tools.template("verify", "echo \"verify|$1\" >> \"$LOG\"", &["{path}"]);
+        w.set_config(&format!(
+            "\n[update]\nfeed = \"https://updates.example.com/hello\"\n\n\
+             [install]\nentry = \"bin/app.exe\"\nname = \"Hello\"\n\n\
+             [codesign.windows]\nsign = {sign}\nverify = {verify}\n"
+        ));
+        let input = tempfile::tempdir().unwrap();
+        write(input.path(), "bin/app.exe", &unsigned_pe());
+        let runtime = w.dir.path().join("runtime.exe");
+        fs::write(&runtime, unsigned_pe()).unwrap();
+        let stub = w.dir.path().join("stub.exe");
+        fs::write(&stub, unsigned_pe()).unwrap();
+        let service = w.dir.path().join("service.exe");
+        fs::write(
+            &service,
+            exe_headers::pe_image(0x8664, &PeSpec::hardened(3)),
+        )
+        .unwrap();
+        let dir = w.release_dir("rel");
+        let out = w.pack(
+            input.path(),
+            &dir,
+            "windows-x86_64",
+            &[
+                "--runtime",
+                s(&runtime),
+                "--stub",
+                s(&stub),
+                "--service",
+                s(&service),
+            ],
+            &[],
+        );
+        assert_ok(&out, "windows pack with --service and fake signers");
+        let got = tools.log();
+        for key in ["sign", "verify"] {
+            assert!(
+                got.iter()
+                    .any(|(k, p)| k == key && p == "bin/lunepack-service.exe"),
+                "{key} of the service: {got:?}"
+            );
+        }
+        let (_, files) = w.verify(&dir, Target::WindowsX86_64);
+        assert_eq!(files["bin/lunepack-service.exe"], signed_pe());
+    }
 }
 
 #[cfg(target_os = "macos")]
