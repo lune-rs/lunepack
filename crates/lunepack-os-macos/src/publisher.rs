@@ -64,14 +64,14 @@ unsafe extern "C" {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MacPublisherCheck;
 
-/// What looking at one bundle found.
+/// What looking at the installed bundle found.
 enum Ident {
     /// Not signed, or signed ad hoc: no publisher.
     Unsigned,
     Invalid,
     Os,
-    /// Valid and signed by an identity: the code and its designated requirement.
-    Signed(SecStaticCode, SecRequirement),
+    /// Valid and signed by an identity: its designated requirement.
+    Signed(SecRequirement),
 }
 
 /// The flags every validity check uses (M9-D7). `NO_NETWORK_ACCESS` keeps the check offline.
@@ -83,50 +83,66 @@ fn strict() -> Flags {
         | Flags::NO_NETWORK_ACCESS
 }
 
-fn identity(root: &Path) -> Ident {
+/// Why a bundle is not a signed one, from [`open_signed`].
+enum NotSigned {
+    Unsigned,
+    Invalid,
+    Os,
+}
+
+/// The status of `SecStaticCodeCheckValidity(code, flags, requirement)`, `requirement` absent when
+/// null.
+fn validity(code: &SecStaticCode, flags: Flags) -> i32 {
+    // SAFETY: `code` is a live SecStaticCode for the whole call; a null requirement is the
+    // documented way to ask for validity alone.
+    unsafe {
+        SecStaticCodeCheckValidity(
+            code.as_concrete_TypeRef().cast::<c_void>(),
+            flags.bits(),
+            std::ptr::null(),
+        )
+    }
+}
+
+/// The static code at `root` once its own signature is known to be there: a cheap check of the
+/// signature alone, with no requirement and no nested code, which is what tells an unsigned bundle
+/// from a signed one with a missing part.
+fn open_signed(root: &Path) -> Result<SecStaticCode, NotSigned> {
     let Some(url) = CFURL::from_path(root, true) else {
-        return Ident::Os;
+        return Err(NotSigned::Os);
     };
     let code = match SecStaticCode::from_path(&url, Flags::NONE) {
         Ok(code) => code,
         Err(e) => {
-            return match classify(e.code()) {
-                Verdict::Unsigned => Ident::Unsigned,
+            return Err(match classify(e.code()) {
+                Verdict::Unsigned => NotSigned::Unsigned,
                 // Anything else at this point (not found, not readable) says nothing about the
                 // code's signature.
-                _ => Ident::Os,
-            };
+                _ => NotSigned::Os,
+            });
         }
     };
-    // Is the bundle itself signed? A cheap check of the signature alone, with no requirement: it
-    // is what tells an unsigned bundle from a signed one with a missing part.
-    // SAFETY: `code` is a live SecStaticCode for the whole call; a null requirement is the
-    // documented way to ask for validity alone.
-    let status = unsafe {
-        SecStaticCodeCheckValidity(
-            code.as_concrete_TypeRef().cast::<c_void>(),
-            Flags::BASIC_VALIDATE_ONLY.bits(),
-            std::ptr::null(),
-        )
-    };
-    match classify(status) {
-        Verdict::Ok => {}
-        Verdict::Unsigned => return Ident::Unsigned,
-        Verdict::Invalid => return Ident::Invalid,
-        Verdict::ReqFailed | Verdict::Os => return Ident::Os,
+    match classify(validity(&code, Flags::BASIC_VALIDATE_ONLY)) {
+        Verdict::Ok => Ok(code),
+        Verdict::Unsigned => Err(NotSigned::Unsigned),
+        Verdict::Invalid => Err(NotSigned::Invalid),
+        Verdict::ReqFailed | Verdict::Os => Err(NotSigned::Os),
     }
-    // Then the whole tree: strict, nested, every architecture. This is what tells an invalid
-    // signature from a different publisher, and, now that the bundle is known to be signed, an
-    // unsigned part inside it (`errSecCSUnsigned` again) is an invalid bundle, not an unsigned one.
-    // SAFETY: as above.
-    let status = unsafe {
-        SecStaticCodeCheckValidity(
-            code.as_concrete_TypeRef().cast::<c_void>(),
-            strict().bits(),
-            std::ptr::null(),
-        )
+}
+
+/// The installed bundle: the whole tree is validated (strict, nested, every architecture), and its
+/// designated requirement is copied out.
+fn installed_identity(root: &Path) -> Ident {
+    let code = match open_signed(root) {
+        Ok(code) => code,
+        Err(NotSigned::Unsigned) => return Ident::Unsigned,
+        Err(NotSigned::Invalid) => return Ident::Invalid,
+        Err(NotSigned::Os) => return Ident::Os,
     };
-    match classify(status) {
+    // This is what tells an invalid signature from a different publisher, and, now that the bundle
+    // is known to be signed, an unsigned part inside it (`errSecCSUnsigned` again) is an invalid
+    // bundle, not an unsigned one.
+    match classify(validity(&code, strict())) {
         Verdict::Ok => {}
         Verdict::Unsigned | Verdict::Invalid => return Ident::Invalid,
         // A requirement was not asked for, so a failed requirement is not a verdict here.
@@ -138,8 +154,50 @@ fn identity(root: &Path) -> Ident {
         None => return Ident::Os,
     }
     match designated_requirement(&code) {
-        Some(requirement) => Ident::Signed(code, requirement),
+        Some(requirement) => Ident::Signed(requirement),
         None => Ident::Os,
+    }
+}
+
+/// Whether the candidate bundle at `root` satisfies `requirement`. The tree is validated (strict,
+/// nested, every architecture) once, without the requirement, which is what tells a damaged tree
+/// from a different publisher; the requirement is then checked alone (`BASIC_VALIDATE_ONLY` skips
+/// the validation already done, not the requirement), and no designated requirement is copied out
+/// of the candidate.
+fn candidate_satisfies(root: &Path, requirement: &SecRequirement) -> Result<bool, PublisherError> {
+    let code = match open_signed(root) {
+        Ok(code) => code,
+        Err(NotSigned::Unsigned) => return Err(PublisherError::CandidateUnsigned),
+        Err(NotSigned::Invalid) => return Err(PublisherError::CandidateInvalid),
+        Err(NotSigned::Os) => return Err(PublisherError::Os),
+    };
+    // Now that the bundle is known to be signed, an unsigned part inside it (`errSecCSUnsigned`
+    // again) is an invalid bundle, not an unsigned one.
+    match classify(validity(&code, strict())) {
+        Verdict::Ok => {}
+        Verdict::Unsigned | Verdict::Invalid => return Err(PublisherError::CandidateInvalid),
+        // A requirement was not asked for, so a failed requirement is not a verdict here.
+        Verdict::ReqFailed | Verdict::Os => return Err(PublisherError::Os),
+    }
+    match signature_flags(&code) {
+        Some(flags) if flags & SIGNATURE_ADHOC != 0 => {
+            return Err(PublisherError::CandidateUnsigned);
+        }
+        Some(_) => {}
+        None => return Err(PublisherError::Os),
+    }
+    let status = match code.check_validity(
+        Flags::BASIC_VALIDATE_ONLY | Flags::NO_NETWORK_ACCESS,
+        requirement,
+    ) {
+        Ok(()) => 0,
+        Err(e) => e.code(),
+    };
+    match classify(status) {
+        Verdict::Ok => Ok(true),
+        Verdict::ReqFailed => Ok(false),
+        Verdict::Invalid | Verdict::Unsigned => Err(PublisherError::CandidateInvalid),
+        Verdict::Os => Err(PublisherError::Os),
     }
 }
 
@@ -197,28 +255,12 @@ impl PublisherCheck for MacPublisherCheck {
         installed: &SignedTree,
         candidate: &SignedTree,
     ) -> Result<bool, PublisherError> {
-        let requirement = match identity(&installed.root) {
-            Ident::Signed(_, requirement) => requirement,
+        let requirement = match installed_identity(&installed.root) {
+            Ident::Signed(requirement) => requirement,
             Ident::Unsigned => return Err(PublisherError::InstalledUnsigned),
             Ident::Invalid => return Err(PublisherError::InstalledInvalid),
             Ident::Os => return Err(PublisherError::Os),
         };
-        let code = match identity(&candidate.root) {
-            Ident::Signed(code, _) => code,
-            Ident::Unsigned => return Err(PublisherError::CandidateUnsigned),
-            Ident::Invalid => return Err(PublisherError::CandidateInvalid),
-            Ident::Os => return Err(PublisherError::Os),
-        };
-        let status = match code.check_validity(strict(), &requirement) {
-            Ok(()) => 0,
-            Err(e) => e.code(),
-        };
-        match classify(status) {
-            Verdict::Ok => Ok(true),
-            Verdict::ReqFailed => Ok(false),
-            Verdict::Invalid => Err(PublisherError::CandidateInvalid),
-            Verdict::Unsigned => Err(PublisherError::CandidateUnsigned),
-            Verdict::Os => Err(PublisherError::Os),
-        }
+        candidate_satisfies(&candidate.root, &requirement)
     }
 }
