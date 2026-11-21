@@ -12,9 +12,16 @@
 #
 # With -Report <file> (a later step of the same job, whatever the suite's outcome) it lists what
 # Defender detected after the control, as names only (the threat name and the leaf name of each
-# resource), into <file>, and exits 1 when there is any detection other than the control's own:
-# a detection of a lunepack binary fails the job, and the answer is code signing (M9), not an
-# exclusion. The runner is disposable; nothing is restored.
+# resource), into <file>, and exits 1 when there is any detection other than the control's own
+# that the suite could have caused: a detection of a lunepack binary fails the job, and the answer
+# is code signing (M9), not an exclusion. A detection is IGNORED (listed as "ignored (outside the
+# suite)", not counted) only when it has at least one resource and EVERY resource is a file path
+# outside all of the suite's roots ($suiteRoots below: the workspace, the runner and user temp
+# folders, the per-user install folder and the user's Start-menu Programs folder), because the
+# hosted runner's own tooling can trigger detections the suite has nothing to do with. A resource
+# of another kind than `file`, a path that does not parse or is not drive-rooted, a path under a
+# root, and a detection with no resource all count. No filter by threat, process or file name.
+# The runner is disposable; nothing is restored.
 param([string]$Report = '')
 $ErrorActionPreference = 'Stop'
 
@@ -28,6 +35,35 @@ function Test-ControlName([string]$name) {
     return $name -match 'EICAR'
 }
 
+# The suite's own roots (one list; a detection touching any of them is counted). Empty values are
+# dropped; each root is made absolute and ends with one separator, so C:\a never matches C:\ab.
+$suiteRoots = @(
+    $env:GITHUB_WORKSPACE,
+    $env:RUNNER_TEMP,
+    [IO.Path]::GetTempPath(),
+    $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Programs' }),
+    $(if ($env:APPDATA) { Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs' })
+) | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\', '/') + '\' }
+
+function Get-Leaf([string]$path) {
+    try { return (Split-Path $path -Leaf) } catch { return '?' }
+}
+
+# True only for a `file` resource whose path parses, is drive-rooted and lies outside every root.
+# Everything else (another kind, an unparsable or relative path, a path under a root) is false.
+function Test-OutsideSuite([string]$resource) {
+    if (-not ($resource -match '^([^:]+):_(.*)$')) { return $false }
+    if ($Matches[1] -ne 'file') { return $false }
+    $path = $Matches[2]
+    if ($path -match '^\\\\\?\\[A-Za-z]:\\') { $path = $path.Substring(4) }
+    if (-not ($path -match '^[A-Za-z]:\\')) { return $false }
+    try { $full = [IO.Path]::GetFullPath($path).TrimEnd('\', '/') + '\' } catch { return $false }
+    foreach ($root in $suiteRoots) {
+        if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    return $true
+}
+
 if ($Report -ne '') {
     if (-not (Test-Path -LiteralPath $sinceFile)) {
         Set-Content -LiteralPath $Report -Value 'no control point: the Defender step did not finish'
@@ -37,6 +73,8 @@ if ($Report -ne '') {
     $since = [datetime]::Parse((Get-Content -LiteralPath $sinceFile -Raw).Trim(), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
     $lines = New-Object System.Collections.Generic.List[string]
     $hits = 0
+    $ignored = 0
+    $control = 0
     $all = @()
     try { $all = @(Get-MpThreatDetection | Where-Object { $_.InitialDetectionTime -ge $since }) } catch { $lines.Add('Get-MpThreatDetection failed') }
     $threats = @{}
@@ -44,11 +82,20 @@ if ($Report -ne '') {
     foreach ($d in $all) {
         $name = $threats[[string]$d.ThreatID]
         if (-not $name) { $name = "threat $($d.ThreatID)" }
-        $leaves = @(@($d.Resources) | ForEach-Object { ($_ -replace '^[^:]+:_', '') } | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
-        $lines.Add("$name :: $leaves")
-        if (-not (Test-ControlName $name)) { $hits++ }
+        $resources = @(@($d.Resources) | Where-Object { $_ })
+        $leaves = @($resources | ForEach-Object { Get-Leaf ($_ -replace '^[^:]+:_', '') }) -join ', '
+        if (Test-ControlName $name) {
+            $control++
+            $lines.Add("$name :: $leaves")
+        } elseif ($resources.Count -gt 0 -and @($resources | Where-Object { -not (Test-OutsideSuite $_) }).Count -eq 0) {
+            $ignored++
+            $lines.Add("ignored (outside the suite): $name :: $leaves")
+        } else {
+            $hits++
+            $lines.Add("$name :: $leaves")
+        }
     }
-    $lines.Insert(0, "detections after the control: $($all.Count) (not the control's own: $hits)")
+    $lines.Insert(0, "detections after the control: $($all.Count) (not the control's own and not ignored: $hits; ignored, outside the suite: $ignored; the control's own: $control)")
     Set-Content -LiteralPath $Report -Value $lines
     $lines | ForEach-Object { Write-Output $_ }
     if ($hits -gt 0) { Write-Output 'FAIL: Defender detected something during the run (the answer is code signing, M9)'; exit 1 }

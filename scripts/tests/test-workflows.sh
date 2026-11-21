@@ -315,4 +315,19 @@ if [ "$(uname -s)" = Darwin ]; then
   t_check "macos-selfsigned.sh delete left that directory alone" test -d "$T_TMP/guard-tmp"
 fi
 
+# Every tracked shell script that a workflow or another script runs by path must be executable
+# (git mode 100755): a 100644 one fails with "Permission denied" only in CI. Only the
+# scripts/tests/test-*.sh files are exempt, because run.sh runs them through bash.
+# modes_not_executable reads `git ls-files -s` lines on stdin and prints the paths that are not 100755.
+modes_not_executable() {
+  awk '$1 != "100755" { sub(/^[^\t]*\t/, ""); print }' | grep -E '^scripts/.*\.sh$' | grep -Ev '^scripts/tests/test-[^/]*\.sh$' || true
+}
+mode_fixture=$(printf '100644 0000000000000000000000000000000000000000 0\tscripts/ci/fixture.sh\n100755 0000000000000000000000000000000000000000 0\tscripts/ci/ok.sh\n100644 0000000000000000000000000000000000000000 0\tscripts/tests/test-fixture.sh\n')
+t_check "mode check flags a 100644 script and only that" test "$(printf '%s\n' "$mode_fixture" | modes_not_executable)" = "scripts/ci/fixture.sh"
+if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  not_exec=$(git -C "$repo" ls-files -s scripts | modes_not_executable)
+  [ -z "$not_exec" ] || echo "  not executable (git mode is not 100755): $not_exec" >&2
+  t_check "every tracked scripts/**/*.sh (except tests/test-*.sh) has git mode 100755" test -z "$not_exec"
+fi
+
 t_finish
