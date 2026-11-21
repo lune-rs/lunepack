@@ -224,6 +224,37 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  windows-machine-adapter:
+    # the per-machine Windows adapters with a real standard user (M10 step 11,
+    # scripts/ci/windows-machine-adapter-test.ps1): the script creates one local standard user (a
+    # random password made at run time, never printed), builds the acceptance probe
+    # (crates/lunepack-os-windows/examples/machine_probe.rs) and runs it as the administrator and
+    # as that user: protected folders under the real Program Files, the update service's pipe (owner
+    # LocalSystem, no instance for a standard user, a squatter refused by the client), a service
+    # registered and started by a standard user, the elevation pipe, the machine integration
+    # under HKLM and the policy key. Everything it made (user, service, keys, folders) is removed
+    # again whatever happens, and a leftover fails the script. No secret. The log is kept as an
+    # artifact when the job fails.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Machine adapters with a standard user
+        shell: pwsh
+        run: |
+          ./scripts/ci/windows-machine-adapter-test.ps1 *>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/windows-machine-adapter.log"
+          exit $LASTEXITCODE
+      # actions/upload-artifact v7.0.2, as in runtime-musl
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: failure()
+        with:
+          name: windows-machine-adapter-log
+          path: ${{ runner.temp }}/windows-machine-adapter.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   e2e-macos:
     # the end-to-end suite of the macOS runtime (M8 step 11, scripts/e2e-macos.sh --ci, rows 1-12):
     # per-user install from a `.dmg`, updates by a bundle swap, rollbacks, adoption of a bundle

@@ -238,6 +238,46 @@ if [ -f "$ci" ]; then
   e2e_windows_jobs_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
   t_check "a file with no Windows e2e jobs fails" rc_nonzero
 fi
+# --- the Windows machine-adapter job (M10 step 11) --------------------------------------------
+# Required (no continue-on-error), time-bounded, on a Windows runner, runs the acceptance script
+# (a created standard user, a service, HKLM keys; removed again by the script) and keeps its log
+# as an artifact when it fails.
+machine_adapter_job_ok() {
+  local block bad=0
+  block=$(job_block "$1" windows-machine-adapter)
+  if [ -z "$block" ]; then echo "no windows-machine-adapter job"; return 1; fi
+  if ! printf '%s\n' "$block" | grep -q 'timeout-minutes:'; then echo "windows-machine-adapter has no timeout-minutes"; bad=1; fi
+  if printf '%s\n' "$block" | grep -q 'continue-on-error'; then echo "windows-machine-adapter must not be continue-on-error"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'runs-on: windows-latest'; then echo "windows-machine-adapter does not run on windows-latest"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'scripts/ci/windows-machine-adapter-test.ps1'; then echo "windows-machine-adapter does not run windows-machine-adapter-test.ps1"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'actions/upload-artifact@'; then echo "windows-machine-adapter does not upload its log"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'if: failure()'; then echo "windows-machine-adapter's log is not kept after a failure"; bad=1; fi
+  return "$bad"
+}
+
+if [ -f "$ci" ]; then
+  RC=0
+  machine_adapter_job_ok "$ci" >"$OUT" 2>&1 || RC=$?
+  t_check "ci.yml has the windows-machine-adapter job, required and time-bounded" rc_is 0
+  if [ "$RC" -ne 0 ]; then sed 's/^/    /' "$OUT" >&2; fi
+  sed 's|^  windows-machine-adapter:|  windows-machine-adapter:\n    continue-on-error: true|' "$ci" >"$T_TMP/ma-coe.yml"
+  RC=0
+  machine_adapter_job_ok "$T_TMP/ma-coe.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded continue-on-error on the machine-adapter job fails" rc_nonzero
+  t_check "seeded continue-on-error on the machine-adapter job reports why" out_has "continue-on-error"
+  grep -v 'windows-machine-adapter-test.ps1' "$ci" >"$T_TMP/ma-noscript.yml" || true
+  RC=0
+  machine_adapter_job_ok "$T_TMP/ma-noscript.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded machine-adapter job without its script fails" rc_nonzero
+  t_check "seeded machine-adapter job without its script reports why" out_has "windows-machine-adapter-test.ps1"
+  sed 's|^        if: failure()$|        if: success()|' "$ci" >"$T_TMP/ma-nolog.yml"
+  RC=0
+  machine_adapter_job_ok "$T_TMP/ma-nolog.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded machine-adapter job that keeps no log after a failure fails" rc_nonzero
+  RC=0
+  machine_adapter_job_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "a file with no machine-adapter job fails" rc_nonzero
+fi
 # --- the macOS end-to-end job (M8 step 11) -----------------------------------------------------
 # Required (no continue-on-error), time-bounded, on a macOS runner, runs the suite with --ci, and
 # uploads the instrument records whatever the suite did.
@@ -278,6 +318,18 @@ if command -v pwsh >/dev/null 2>&1; then
   RC=0
   env -u CI -u GITHUB_ACTIONS pwsh -NoProfile -File "$repo/scripts/ci/defender-on.ps1" >"$OUT" 2>&1 || RC=$?
   t_check "defender-on.ps1 refuses off CI: exit 3" rc_is 3
+fi
+
+# windows-machine-adapter-test.ps1 refuses off CI without -Install (exit 3) before it touches
+# anything; its administrator check and its leftover check are in the text.
+# shellcheck disable=SC2016  # the script's own PowerShell text, searched literally
+t_check "windows-machine-adapter-test.ps1 asks for CI or -Install" grep -q 'if (-not $Install)' "$repo/scripts/ci/windows-machine-adapter-test.ps1"
+t_check "windows-machine-adapter-test.ps1 asks for an administrator" grep -q 'refused: not an administrator' "$repo/scripts/ci/windows-machine-adapter-test.ps1"
+if command -v pwsh >/dev/null 2>&1; then
+  RC=0
+  env -u CI -u GITHUB_ACTIONS pwsh -NoProfile -File "$repo/scripts/ci/windows-machine-adapter-test.ps1" >"$OUT" 2>&1 || RC=$?
+  t_check "windows-machine-adapter-test.ps1 refuses without CI or -Install: exit 3" rc_is 3
+  t_check "windows-machine-adapter-test.ps1 names why" out_has "refused"
 fi
 
 # The scripts refuse off CI (exit 3) before touching anything: no scratch directory appears.
