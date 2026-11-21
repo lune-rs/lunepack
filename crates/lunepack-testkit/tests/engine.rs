@@ -859,6 +859,68 @@ fn the_lock_held_by_another_host_is_busy() {
     drop(lock);
 }
 
+#[test]
+fn check_is_open_without_the_lock_and_without_changes() {
+    let m = Machine::new();
+    let record = m.record();
+    // A good tree passes, with nothing held and while another host holds the lock (where `open`
+    // answers `busy`, which `check` never does: it does not try the lock).
+    assert_eq!(Engine::check(&m.ports(), &m.root), Ok(()));
+    let other = m.fs.process();
+    let lock: Box<dyn LockGuard> = other
+        .try_lock(&m.root.join(".lunepack").join("machine").join("lock"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        Engine::open(m.ports(), &m.root).err().map(|e| e.code),
+        Some(ErrorCode::Busy),
+        "control: open is refused while the lock is held"
+    );
+    assert_eq!(Engine::check(&m.ports(), &m.root), Ok(()));
+    drop(lock);
+    assert_eq!(m.record(), record, "nothing was changed");
+}
+
+#[test]
+fn check_fails_where_open_fails() {
+    // An unprotected directory, each in turn: the same error as `open`.
+    let m = Machine::new();
+    for (dir, _) in lunepack_core::engine::protected_dirs(&m.root) {
+        m.protect.set_unprotected(&dir, true);
+        let checked = Engine::check(&m.ports(), &m.root).err();
+        let opened = Engine::open(m.ports(), &m.root).err();
+        assert_eq!(checked, opened);
+        assert_eq!(checked.map(|e| e.code), Some(ErrorCode::NotProtected));
+        m.protect.set_unprotected(&dir, false);
+    }
+    assert_eq!(Engine::check(&m.ports(), &m.root), Ok(()));
+}
+
+#[test]
+fn check_fails_on_a_corrupt_or_missing_record() {
+    let state = |m: &Machine| m.root.join(".lunepack").join("state");
+    // Corrupt: every record file holds bytes that are no record.
+    let m = Machine::new();
+    for e in m.fs.list_dir(&state(&m)).unwrap() {
+        let path = state(&m).join(&e.name);
+        m.fs.remove_file(&path).unwrap();
+        let mut w = m.fs.create_new(&path).unwrap();
+        std::io::Write::write_all(&mut w, b"this is not a record").unwrap();
+        w.sync().unwrap();
+    }
+    let checked = Engine::check(&m.ports(), &m.root).err();
+    assert_eq!(checked, Engine::open(m.ports(), &m.root).err());
+    assert_eq!(checked.map(|e| e.code), Some(ErrorCode::NotProtected));
+    // Missing: no record at all.
+    let m = Machine::new();
+    for e in m.fs.list_dir(&state(&m)).unwrap() {
+        m.fs.remove_file(&state(&m).join(&e.name)).unwrap();
+    }
+    let checked = Engine::check(&m.ports(), &m.root).err();
+    assert_eq!(checked, Engine::open(m.ports(), &m.root).err());
+    assert_eq!(checked.map(|e| e.code), Some(ErrorCode::NotProtected));
+}
+
 // ---- the session's end -----------------------------------------------------------------------------
 
 #[test]

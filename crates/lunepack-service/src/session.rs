@@ -1,12 +1,10 @@
 //! The pieces of the service loop that need no operating system: the cap on one connection's
-//! length, the idle rule and what a self-test counts as passing.
+//! length and the idle rule.
 
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 use lunepack_core::Duplex;
-use lunepack_core::engine::EngineError;
-use lunepack_core::service::ErrorCode;
 
 /// A connection is cut after this long, whatever it is doing (M10-D11).
 pub const CONNECTION_LIMIT: Duration = Duration::from_secs(30 * 60);
@@ -74,16 +72,4 @@ impl<D: Duplex> Duplex for Capped<D> {
 /// window, and a later `attempt` or `confirm` will need the same engine memory).
 pub fn idle_exit(idle_for: Duration, lease_running: bool) -> bool {
     idle_for >= IDLE_EXIT && !lease_running
-}
-
-/// Whether opening the engine in a self-test counts as passing. The registrar starts the new
-/// binary while the engine that is switching the service holds the engine's lock, so the new
-/// binary's own `open` answers `busy` after it passed the tree's protection check (which runs
-/// before the lock is tried): that is the expected answer, not a failure. Every other refusal is
-/// one.
-pub fn self_test_passes(opened: &Result<(), EngineError>) -> bool {
-    match opened {
-        Ok(()) => true,
-        Err(e) => e.code == ErrorCode::Busy,
-    }
 }

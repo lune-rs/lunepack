@@ -7,8 +7,8 @@ use std::ffi::OsString;
 pub enum Mode {
     /// No argument: the update service, started by the service control manager.
     Service,
-    /// `--self-test`: everything up to and including opening the engine, then exit 0 (the
-    /// registrar's check of a new binary before the registration points at it).
+    /// `--self-test`: what opening the engine verifies, without its lock (`Engine::check`), then
+    /// exit 0 (the registrar's check of a new binary before the registration points at it).
     SelfTest,
 }
 

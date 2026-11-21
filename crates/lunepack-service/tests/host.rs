@@ -1,5 +1,5 @@
 //! The service binary's pieces that need no operating system (arguments, the location rule, the
-//! log, the connection cap, the idle rule, what a self-test counts), the binary's behaviour when
+//! log, the connection cap, the idle rule), the binary's behaviour when
 //! it is run outside an install, and, on Windows, its PE hardening (the runtime's pattern).
 
 use std::ffi::OsString;
@@ -9,12 +9,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use lunepack_core::Duplex;
-use lunepack_core::engine::EngineError;
-use lunepack_core::service::ErrorCode;
 use lunepack_service::args::{Mode, UsageError, parse};
 use lunepack_service::location::{LocationError, display_name, locate, log_path};
 use lunepack_service::logfile::{CAP, Level, Log};
-use lunepack_service::session::{Capped, IDLE_EXIT, idle_exit, self_test_passes};
+use lunepack_service::session::{Capped, IDLE_EXIT, idle_exit};
 use lunepack_testkit::mem_duplex;
 
 fn os(args: &[&str]) -> Vec<OsString> {
@@ -305,31 +303,6 @@ fn the_service_is_idle_after_sixty_seconds_without_a_lease() {
         "a running lease keeps the service up"
     );
     assert!(!idle_exit(Duration::ZERO, false));
-}
-
-// ---- the self-test -------------------------------------------------------------------------------
-
-fn refused(code: ErrorCode) -> Result<(), EngineError> {
-    // An engine error as the engine makes it: through its answer, since its constructor is private.
-    let answer = lunepack_core::service::Response::error(code);
-    match answer {
-        lunepack_core::service::Response::Error { code, class } => Err(EngineError { code, class }),
-        other => panic!("{other:?}"),
-    }
-}
-
-#[test]
-fn a_self_test_passes_when_the_engine_opens_or_the_parent_holds_its_lock() {
-    assert!(self_test_passes(&Ok(())));
-    assert!(
-        self_test_passes(&refused(ErrorCode::Busy)),
-        "the registrar starts the binary while the engine that switches the service holds the lock"
-    );
-    for code in ErrorCode::ALL {
-        if *code != ErrorCode::Busy {
-            assert!(!self_test_passes(&refused(*code)), "{code:?}");
-        }
-    }
 }
 
 // ---- the binary ----------------------------------------------------------------------------------

@@ -330,12 +330,7 @@ impl<'a> Engine<'a> {
         let root = root.to_path_buf();
         check_protection(&ports, &root)?;
         let _guard = take_lock(ports.fs, &lock_path(&root))?;
-        let record = load_any::<InstallState>(ports.fs, &state_dir(&root), ports.hasher)
-            .map_err(|_| EngineError::of(ErrorCode::NotProtected))?
-            .ok_or(EngineError::of(ErrorCode::NotProtected))?;
-        if record.scope != Scope::Machine || record.floors.root.is_none() {
-            return Err(EngineError::of(ErrorCode::NotProtected));
-        }
+        let record = read_machine_record(&ports, &root)?;
         let app_id = record.app_id.clone();
         let engine = Engine {
             p: ports,
@@ -351,6 +346,16 @@ impl<'a> Engine<'a> {
         engine.remove_leftover_uploads();
         engine.reconcile(&record);
         Ok(engine)
+    }
+
+    /// What [`Engine::open`] verifies before it would change anything, without taking the lock and
+    /// without changing anything: the tree's protection, and a readable machine record with a
+    /// trust root. It answers with the errors `open` would (never `busy`: it does not try the
+    /// lock), so a new service binary can prove, while the engine that is switching to it holds
+    /// the lock, that it finds its root and its tree (`--self-test`).
+    pub fn check(ports: &Ports<'_>, root: &Path) -> Result<(), EngineError> {
+        check_protection(ports, root)?;
+        read_machine_record(ports, root).map(drop)
     }
 
     /// The same engine reporting `version` as the running service's own version in `status`
@@ -1102,6 +1107,19 @@ fn incoming_dir(root: &Path) -> PathBuf {
 
 fn lock_path(root: &Path) -> PathBuf {
     machine_dir(root).join(LOCK_FILE)
+}
+
+/// The machine record of the install at `root`: it must load, be of scope `machine` and hold a
+/// trust root. Any other state is `not_protected` (the tree is not an install this engine may
+/// serve).
+fn read_machine_record(ports: &Ports<'_>, root: &Path) -> Result<InstallState, EngineError> {
+    let record = load_any::<InstallState>(ports.fs, &state_dir(root), ports.hasher)
+        .map_err(|_| EngineError::of(ErrorCode::NotProtected))?
+        .ok_or(EngineError::of(ErrorCode::NotProtected))?;
+    if record.scope != Scope::Machine || record.floors.root.is_none() {
+        return Err(EngineError::of(ErrorCode::NotProtected));
+    }
+    Ok(record)
 }
 
 fn take_lock(fs: &dyn Fs, path: &Path) -> Result<Box<dyn LockGuard>, EngineError> {

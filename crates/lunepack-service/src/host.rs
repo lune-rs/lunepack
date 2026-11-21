@@ -26,7 +26,7 @@ use crate::args::Mode;
 use crate::exit;
 use crate::location::{self, Located};
 use crate::logfile::Log;
-use crate::session::{CONNECTION_LIMIT, Capped, idle_exit, self_test_passes};
+use crate::session::{CONNECTION_LIMIT, Capped, idle_exit};
 
 /// The name handed to the control manager's dispatcher. The service is registered as an own-process
 /// service, for which the manager ignores the name; the app's own name is read from the machine
@@ -126,17 +126,17 @@ pub fn run(mode: Mode) -> u8 {
     }
 }
 
-/// Everything up to and including opening the engine, then done.
+/// What the engine's `open` verifies before it would change anything (`Engine::check`: the tree's
+/// protection and the machine record), without the engine's lock: the registrar starts this check
+/// from inside the engine that is switching the service, which holds that lock.
 fn self_test(located: &Located) -> u8 {
     let name = location::display_name(&located.layout).unwrap_or_default();
     let Some(adapters) = Adapters::new(&name) else {
         return exit::FAILED;
     };
-    let opened = Engine::open(adapters.ports(), located.layout.root()).map(drop);
-    if self_test_passes(&opened) {
-        exit::OK
-    } else {
-        exit::ENGINE
+    match Engine::check(&adapters.ports(), located.layout.root()) {
+        Ok(()) => exit::OK,
+        Err(_) => exit::ENGINE,
     }
 }
 
