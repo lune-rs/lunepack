@@ -553,6 +553,41 @@ fn make_tree(h: &Host, version: &str) {
     h.write(&dir.join("app.exe"), b"old");
 }
 
+/// The names in `dir`, in listing order.
+fn names_in(h: &Host, dir: &Path) -> Vec<String> {
+    h.mem
+        .list_dir(dir)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The paths `tree_in_use_strict` was asked about from call `from` on; the engine never asks the
+/// weaker `tree_in_use`.
+fn strict_from(h: &Host, from: usize) -> Vec<PathBuf> {
+    assert!(
+        h.process.in_use_calls().is_empty(),
+        "the engine asked tree_in_use"
+    );
+    h.process
+        .strict_calls()
+        .into_iter()
+        .skip(from)
+        .map(|(p, exclude)| {
+            assert!(exclude.is_empty(), "the engine excludes nothing");
+            p
+        })
+        .collect()
+}
+
+fn is_gc_name(p: &Path, app_dir: &Path) -> bool {
+    p.parent() == Some(app_dir)
+        && p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".gc-") && n.len() == 4 + 16)
+}
+
 #[test]
 fn gc_keeps_current_previous_and_pending_and_skips_busy_trees() {
     let h = Host::new();
@@ -567,33 +602,78 @@ fn gc_keeps_current_previous_and_pending_and_skips_busy_trees() {
         make_tree(&h, t);
     }
     let l = h.layout();
+    let app_dir = l.app_dir();
     // Listing order: 0.7.0, 0.8.0, 0.9.0, 1.0.0 (the old current, not kept).
-    h.process.script_in_use(false);
-    h.process.script_in_use(true);
-    h.process.script_in_use(false);
-    h.process.script_in_use(false);
-    h.fs.fail_rename_from(&l.app_dir().join("0.9.0"));
-    let _engine = h.engine();
-    let names: Vec<String> = h
-        .mem
-        .list_dir(&l.app_dir())
-        .unwrap()
-        .into_iter()
-        .map(|e| e.name.to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(names, ["0.8.0", "0.9.0", "1.1.0", "1.2.0"]);
-    let asked: Vec<PathBuf> = h
-        .process
-        .in_use_calls()
-        .into_iter()
-        .map(|(p, _)| p)
-        .collect();
-    assert!(asked.ends_with(&[
-        l.app_dir().join("0.7.0"),
-        l.app_dir().join("0.8.0"),
-        l.app_dir().join("0.9.0"),
-        l.app_dir().join("1.0.0"),
-    ]));
+    // 0.7.0: free, renamed, free again: removed.
+    h.process.script_in_use_strict(false);
+    h.process.script_in_use_strict(false);
+    // 0.8.0: in use at the first check: kept, not renamed.
+    h.process.script_in_use_strict(true);
+    // 0.9.0: free, but its rename fails: kept.
+    h.process.script_in_use_strict(false);
+    h.fs.fail_rename_from(&app_dir.join("0.9.0"));
+    // 1.0.0: free, renamed, in use at the second check: its `.gc-` folder stays.
+    h.process.script_in_use_strict(false);
+    h.process.script_in_use_strict(true);
+    let from = h.process.strict_calls().len();
+    drop(h.engine());
+    let names = names_in(&h, &app_dir);
+    assert_eq!(names.len(), 5, "{names:?}");
+    assert!(names[0].starts_with(".gc-"), "{names:?}");
+    assert_eq!(names[1..], ["0.8.0", "0.9.0", "1.1.0", "1.2.0"]);
+    let busy = app_dir.join(&names[0]);
+    assert!(
+        h.exists(&busy.join("app.exe")),
+        "the busy tree is whole under its new name"
+    );
+    let asked = strict_from(&h, from);
+    assert_eq!(asked.len(), 6, "{asked:?}");
+    assert_eq!(asked[0], app_dir.join("0.7.0"));
+    assert!(is_gc_name(&asked[1], &app_dir), "{asked:?}");
+    assert_ne!(asked[1], busy);
+    assert_eq!(
+        asked[2..],
+        [
+            app_dir.join("0.8.0"),
+            app_dir.join("0.9.0"),
+            app_dir.join("1.0.0"),
+            busy.clone(),
+        ]
+    );
+    // The next open removes the `.gc-` folder once the check says free; 0.8.0 and 0.9.0 are
+    // busy this time.
+    h.process.script_in_use_strict(false);
+    h.process.script_in_use_strict(true);
+    h.process.script_in_use_strict(true);
+    let from = h.process.strict_calls().len();
+    drop(h.engine());
+    assert_eq!(names_in(&h, &app_dir), ["0.8.0", "0.9.0", "1.1.0", "1.2.0"]);
+    assert_eq!(
+        strict_from(&h, from),
+        [busy, app_dir.join("0.8.0"), app_dir.join("0.9.0")]
+    );
+}
+
+#[test]
+fn gc_leaves_a_tree_whose_removal_fails() {
+    let h = Host::new();
+    h.install("1.0.0").unwrap();
+    let mut engine = h.engine();
+    update_to(&mut engine, "1.1.0", 2);
+    drop(engine);
+    make_tree(&h, "0.9.0");
+    let app_dir = h.layout().app_dir();
+    h.fs.fail_remove_in(&app_dir);
+    let from = h.process.strict_calls().len();
+    drop(h.engine());
+    let names = names_in(&h, &app_dir);
+    assert_eq!(names.len(), 3, "{names:?}");
+    assert!(names[0].starts_with(".gc-"), "{names:?}");
+    assert_eq!(names[1..], ["1.0.0", "1.1.0"]);
+    let asked = strict_from(&h, from);
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert_eq!(asked[0], app_dir.join("0.9.0"));
+    assert_eq!(asked[1], app_dir.join(&names[0]));
 }
 
 #[test]
@@ -616,21 +696,72 @@ fn reconcile_removes_partial_trees_and_gc_leftovers() {
     let h = Host::new();
     h.install("1.0.0").unwrap();
     let l = h.layout();
-    h.mem
-        .create_dir_all(&l.app_dir().join("1.1.0.partial"))
-        .unwrap();
-    h.mem
-        .create_dir_all(&l.app_dir().join(".gc-0011223344556677"))
-        .unwrap();
+    let partial = l.app_dir().join("1.1.0.partial");
+    let leftover = l.app_dir().join(".gc-0011223344556677");
+    h.mem.create_dir_all(&partial).unwrap();
+    h.mem.create_dir_all(&leftover).unwrap();
+    let from = h.process.strict_calls().len();
     let _engine = h.engine();
-    let names: Vec<String> = h
-        .mem
-        .list_dir(&l.app_dir())
-        .unwrap()
-        .into_iter()
-        .map(|e| e.name.to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(names, ["1.0.0"]);
+    assert_eq!(names_in(&h, &l.app_dir()), ["1.0.0"]);
+    // A `.partial` tree is exempt from the guard; the leftover is checked.
+    assert_eq!(strict_from(&h, from), [leftover]);
+}
+
+#[test]
+fn the_leftover_sweep_keeps_a_busy_gc_folder() {
+    let h = Host::new();
+    h.install("1.0.0").unwrap();
+    let l = h.layout();
+    let leftover = l.app_dir().join(".gc-0011223344556677");
+    h.mem.create_dir_all(&leftover).unwrap();
+    h.process.script_in_use_strict(true);
+    let from = h.process.strict_calls().len();
+    drop(h.engine());
+    assert!(h.exists(&leftover), "a busy leftover stays");
+    assert_eq!(strict_from(&h, from), std::slice::from_ref(&leftover));
+    drop(h.engine());
+    assert!(!h.exists(&leftover), "removed once the check says free");
+    assert_eq!(strict_from(&h, from), [leftover.clone(), leftover]);
+}
+
+#[test]
+fn prune_keeps_a_busy_service_folder_at_the_switch_and_at_repair() {
+    let h = Host::new();
+    h.install("1.0.0").unwrap();
+    let l = h.layout();
+    let mut engine = h.engine();
+    update_to(&mut engine, "1.1.0", 2);
+    // The switch to 1.2.0 prunes service\1.0.0: in use, so it stays.
+    stage(&mut engine, &update("1.2.0", 3));
+    let token = engine.apply(&v("1.2.0"), Duration::from_secs(1)).unwrap();
+    h.process.script_in_use_strict(true);
+    let from = h.process.strict_calls().len();
+    assert_eq!(
+        engine.confirm(&v("1.2.0"), &token).unwrap(),
+        ConfirmAnswer::Confirmed
+    );
+    assert_eq!(h.registered(), Some(l.service_image(&v("1.2.0"))));
+    assert!(h.exists(&l.service_version_dir(&v("1.0.0"))), "busy: kept");
+    let asked = strict_from(&h, from);
+    assert_eq!(asked[0], l.service_version_dir(&v("1.0.0")));
+    // Repair prunes the folders other than the registered one: 1.0.0 is free now, 1.1.0 busy.
+    h.process.script_in_use_strict(false);
+    h.process.script_in_use_strict(true);
+    let from = h.process.strict_calls().len();
+    assert_eq!(engine.repair(), Ok(v("1.2.0")));
+    assert!(
+        !h.exists(&l.service_version_dir(&v("1.0.0"))),
+        "free: removed"
+    );
+    assert!(h.exists(&l.service_version_dir(&v("1.1.0"))), "busy: kept");
+    assert!(h.exists(&l.service_version_dir(&v("1.2.0"))));
+    assert_eq!(
+        strict_from(&h, from),
+        [
+            l.service_version_dir(&v("1.0.0")),
+            l.service_version_dir(&v("1.1.0")),
+        ]
+    );
 }
 
 // ---- repair and uninstall -------------------------------------------------------------------------
@@ -658,14 +789,157 @@ fn repair_targets_the_previous_version_while_one_is_pending() {
     assert_eq!(h.registered(), Some(h.layout().service_image(&v("1.0.0"))));
 }
 
-#[test]
-fn uninstall_is_refused_in_use_and_complete_otherwise() {
+/// The tombstone `uninstall` renamed `R` to, from the strict log.
+fn tombstone_asked(h: &Host, asked: &[PathBuf]) -> PathBuf {
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert_eq!(asked[0], h.root());
+    let tomb = asked[1].clone();
+    assert_eq!(tomb.parent(), Some(h.home.as_path()));
+    assert_ne!(tomb, h.root());
+    tomb
+}
+
+/// The integration calls from call `from` on, by operation.
+fn integration_ops(h: &Host, from: usize) -> Vec<&'static str> {
+    h.integration
+        .calls()
+        .into_iter()
+        .skip(from)
+        .map(|(op, scope, version)| {
+            assert_eq!(scope, Scope::Machine);
+            assert_eq!(version, v("1.0.0"));
+            op
+        })
+        .collect()
+}
+
+/// An installed 1.0.0 with the counters of the strict log and the integration calls so far.
+fn installed() -> (Host, usize, usize) {
     let h = Host::new();
     h.install("1.0.0").unwrap();
-    h.process.script_in_use(true);
-    assert_eq!(h.engine().uninstall(), Err(MachineOpError::InUse));
+    assert!(h.integration.is_applied());
+    let image = h.layout().service_image(&v("1.0.0"));
+    assert_eq!(h.registered(), Some(image));
+    let strict = h.process.strict_calls().len();
+    let calls = h.integration.calls().len();
+    (h, strict, calls)
+}
+
+/// The install is as it was before a refused uninstall.
+fn assert_intact(h: &Host) {
     assert!(h.exists(&h.root()));
-    assert!(h.registered().is_some());
+    assert!(h.exists(&h.layout().version_dir(&v("1.0.0")).join("app.exe")));
+    assert_eq!(names_in(h, &h.home), ["Hello"], "no tombstone is left");
+    assert_eq!(
+        h.registered(),
+        Some(h.layout().service_image(&v("1.0.0"))),
+        "the service is registered again"
+    );
+    assert!(h.integration.is_applied());
+}
+
+#[test]
+fn uninstall_is_refused_in_use_before_the_integration_goes() {
+    let (h, strict, calls) = installed();
+    h.process.script_in_use_strict(true);
+    assert_eq!(h.engine().uninstall(), Err(MachineOpError::InUse));
+    assert_intact(&h);
+    assert_eq!(strict_from(&h, strict), [h.root()]);
+    assert!(
+        integration_ops(&h, calls).is_empty(),
+        "the integration is not touched"
+    );
+    // The service was removed (it stops) and registered again with the image read at (1).
+    assert_eq!(
+        h.registrar.registers().last(),
+        Some(&h.layout().service_image(&v("1.0.0")))
+    );
+}
+
+#[test]
+fn uninstall_undoes_an_integration_error() {
+    let (h, strict, calls) = installed();
+    h.integration.fail("remove");
+    assert_eq!(h.engine().uninstall(), Err(MachineOpError::Integration));
+    assert_intact(&h);
+    assert_eq!(strict_from(&h, strict), [h.root()]);
+    assert_eq!(integration_ops(&h, calls), ["remove", "apply"]);
+}
+
+#[test]
+fn uninstall_undoes_a_failed_rename() {
+    let (h, strict, calls) = installed();
+    h.fs.fail_rename_from(&h.root());
+    assert_eq!(h.engine().uninstall(), Err(MachineOpError::InUse));
+    assert_intact(&h);
+    assert_eq!(strict_from(&h, strict), [h.root()]);
+    assert_eq!(integration_ops(&h, calls), ["remove", "apply"]);
+}
+
+#[test]
+fn uninstall_undoes_a_busy_tombstone() {
+    let (h, strict, calls) = installed();
+    h.process.script_in_use_strict(false);
+    h.process.script_in_use_strict(true);
+    assert_eq!(h.engine().uninstall(), Err(MachineOpError::InUse));
+    assert_intact(&h);
+    let tomb = tombstone_asked(&h, &strict_from(&h, strict));
+    assert!(!h.exists(&tomb), "renamed back");
+    assert_eq!(integration_ops(&h, calls), ["remove", "apply"]);
+}
+
+#[test]
+fn a_failed_reregistration_during_an_undo_is_failed() {
+    let (h, strict, _) = installed();
+    h.process.script_in_use_strict(true);
+    h.registrar.fail_register(true);
+    assert_eq!(
+        h.engine().uninstall(),
+        Err(MachineOpError::Failed("restore the service"))
+    );
+    assert!(h.exists(&h.root()));
+    assert_eq!(h.registered(), None);
+    assert_eq!(strict_from(&h, strict), [h.root()]);
+}
+
+#[test]
+fn the_undo_registers_only_an_image_under_this_root() {
+    let (h, strict, _) = installed();
+    // Registered after `open`, whose switch would point it back into the tree.
+    let engine = h.engine();
+    let foreign = abs_path("/elsewhere/service/lunepack-service.exe");
+    lunepack_core::ServiceRegistrar::register(&h.registrar, &app(), &foreign).unwrap();
+    h.process.script_in_use_strict(true);
+    assert_eq!(engine.uninstall(), Err(MachineOpError::InUse));
+    assert_eq!(
+        h.registered(),
+        None,
+        "a foreign image is not registered again"
+    );
+    assert_eq!(h.registrar.registers().last(), Some(&foreign));
+    assert!(h.exists(&h.root()));
+    assert_eq!(strict_from(&h, strict), [h.root()]);
+}
+
+#[test]
+fn a_failed_removal_leaves_the_tombstone() {
+    let (h, strict, calls) = installed();
+    h.fs.fail_remove_in(&h.home);
+    assert_eq!(
+        h.engine().uninstall(),
+        Err(MachineOpError::Failed("remove the install"))
+    );
+    let tomb = tombstone_asked(&h, &strict_from(&h, strict));
+    assert!(!h.exists(&h.root()));
+    assert!(h.exists(&tomb.join("app")), "the tombstone stays whole");
+    assert_eq!(h.registered(), None);
+    assert!(!h.integration.is_applied());
+    assert_eq!(integration_ops(&h, calls), ["remove"]);
+}
+
+#[test]
+fn uninstall_is_complete_when_nothing_uses_the_install() {
+    let (h, strict, calls) = installed();
     h.engine().uninstall().unwrap();
     assert!(!h.exists(&h.root()));
     assert!(
@@ -673,7 +947,10 @@ fn uninstall_is_refused_in_use_and_complete_otherwise() {
         "no tombstone is left"
     );
     assert_eq!(h.registered(), None);
-    assert_eq!(h.integration.calls().last().unwrap().0, "remove");
+    assert!(!h.integration.is_applied());
+    assert_eq!(integration_ops(&h, calls), ["remove"]);
+    let tomb = tombstone_asked(&h, &strict_from(&h, strict));
+    assert!(!h.exists(&tomb));
     // A new install goes again.
     h.install("1.0.0").unwrap();
 }

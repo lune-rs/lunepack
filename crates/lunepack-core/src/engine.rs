@@ -1476,6 +1476,8 @@ fn place_service_binary(
     Ok(image)
 }
 
+/// Removes only what this run of the first install created. Exempt from the removal guard
+/// (M10-D20): nothing has been given a path into it yet.
 fn undo_install(ports: Ports<'_>, req: &InstallRequest<'_>, made: &Made) {
     let app_id = &req.setup.config.app_id;
     if made.registered {
@@ -1509,6 +1511,8 @@ impl<'a> Engine<'a> {
     /// is switched to the current version when nothing is pending, and versions nobody keeps are
     /// collected. Nothing here is an error of `open`.
     fn reconcile(&self, record: &InstallState) {
+        // `.partial` trees are exempt from the removal guard (M10-D20): half-written staging
+        // that nobody is given a path to, so nothing can run from it.
         if let Ok(entries) = self.p.fs.list_dir(&self.versions_dir()) {
             for e in entries {
                 let partial = e.name.to_str().is_some_and(|n| n.ends_with(PARTIAL_SUFFIX));
@@ -1581,7 +1585,14 @@ impl<'a> Engine<'a> {
         Ok(image)
     }
 
-    /// Removes the service folders other than those of `keep`.
+    /// Whether the removal guard (M10-D20) lets the engine delete `path`: only an answer of
+    /// `Ok(false)` from [`Process::tree_in_use_strict`] does; `Ok(true)` and `Err` keep it.
+    fn free_to_remove(&self, path: &Path) -> bool {
+        matches!(self.p.process.tree_in_use_strict(path, &[]), Ok(false))
+    }
+
+    /// Removes the service folders other than those of `keep`, each only when the removal guard
+    /// says no process uses it (a service still running from it keeps it for a later prune).
     fn prune_service_dirs(&self, keep: &[PathBuf]) {
         let dir = self.layout().service_dir();
         let Ok(entries) = self.p.fs.list_dir(&dir) else {
@@ -1589,16 +1600,22 @@ impl<'a> Engine<'a> {
         };
         for e in entries {
             let path = dir.join(&e.name);
-            if !keep.iter().any(|k| k.parent() == Some(path.as_path())) {
+            if !keep.iter().any(|k| k.parent() == Some(path.as_path()))
+                && self.free_to_remove(&path)
+            {
                 let _ = self.p.fs.remove_dir_all_nofollow(&path);
             }
         }
     }
 
-    /// The machine GC (M5-D9 over the machine tree): every version tree `gc_keep` does not keep
-    /// and no process uses is renamed to `R\app\.gc-<16 hex>` and only then removed; a tree whose
-    /// in-use check says yes or fails, or whose rename fails, is kept for the next GC (on Windows
-    /// the rename is the authoritative in-use check, A2). Leftover `.gc-` folders are removed.
+    /// The machine GC (M5-D9 over the machine tree, M10-D20): every version tree `gc_keep` does
+    /// not keep is checked by the removal guard, renamed to `R\app\.gc-<16 hex>` (which takes the
+    /// path away from new launches), checked again under its new name and only then removed. A
+    /// tree the first check keeps, or whose rename fails, stays as it is; a `.gc-` folder the
+    /// second check keeps stays for a later GC. The rename is not an in-use check: on Windows a
+    /// folder can be renamed while a program runs from it (Revision 2). Leftover `.gc-` folders
+    /// are removed only when the guard says nobody uses them. A failed removal leaves the folder
+    /// and is recorded nowhere.
     fn gc(&self, record: &InstallState) {
         let keep = gc_keep(record);
         let versions = self.versions_dir();
@@ -1614,7 +1631,9 @@ impl<'a> Engine<'a> {
             };
             let path = versions.join(name);
             if name.starts_with(GC_PREFIX) {
-                let _ = self.p.fs.remove_dir_all_nofollow(&path);
+                if self.free_to_remove(&path) {
+                    let _ = self.p.fs.remove_dir_all_nofollow(&path);
+                }
                 continue;
             }
             let Ok(version) = Version::parse(name) else {
@@ -1623,7 +1642,7 @@ impl<'a> Engine<'a> {
             if version.to_string() != name || keep.contains(&version) {
                 continue;
             }
-            if !matches!(self.p.process.tree_in_use(&path, &[]), Ok(false)) {
+            if !self.free_to_remove(&path) {
                 continue;
             }
             let mut random = [0u8; 8];
@@ -1631,7 +1650,7 @@ impl<'a> Engine<'a> {
                 return;
             }
             let renamed = versions.join(format!("{GC_PREFIX}{}", hex_encode(&random)));
-            if self.p.fs.rename(&path, &renamed).is_ok() {
+            if self.p.fs.rename(&path, &renamed).is_ok() && self.free_to_remove(&renamed) {
                 let _ = self.p.fs.remove_dir_all_nofollow(&renamed);
             }
         }
@@ -1676,38 +1695,47 @@ impl<'a> Engine<'a> {
         Ok(version)
     }
 
-    /// `uninstall` (M10-D19): refused while a process runs from `R`; then the service
-    /// registration, the machine integration, and `R` itself, renamed to a tombstone inside the
-    /// machine home and removed without following links. `R` is the engine's own, given by the
-    /// host from its own image path.
+    /// `uninstall` (M10-D19 as restated, M10-D20). `R` is the engine's own, given by the host
+    /// from its own image path. In order: (1) under the lock, load the record (nothing installed
+    /// is `Failed`), build the integration request from the current tree and read the registered
+    /// service image; (2) remove the service (it stops: its image lives under `R`); (3) release
+    /// the lock (its file is under `R`); (4) the removal guard over `R`; (5) remove the machine
+    /// integration (it deletes the stub under `R`, so `R` must still be at its path); (6) rename
+    /// `R` to its tombstone in the machine home; (7) the removal guard over the tombstone; (8)
+    /// remove the tombstone without following links.
+    ///
+    /// A refusal at (4), (6) or (7), or an integration error at (5), undoes what came before it
+    /// (the tombstone renamed back, the integration re-applied, the service image read at (1)
+    /// registered again when it lies under this `R`) and returns `InUse` (or `Integration`), so a
+    /// refused uninstall leaves the install as it was. When the undo itself fails the result is
+    /// `Failed("restore ...")` naming what was not restored (an administrator then runs
+    /// `repair`). An error at (8) leaves the tombstone (admin-only, referenced by nothing) and
+    /// returns `Failed("remove the install")`.
     pub fn uninstall(self) -> Result<(), MachineOpError> {
+        // (1) Everything the undo needs is read before anything changes.
         let guard = self.guard()?;
         let (_, record) = self.load()?;
-        if !matches!(self.p.process.tree_in_use(&self.root, &[]), Ok(false)) {
-            return Err(MachineOpError::InUse);
-        }
-        self.p
-            .registrar
-            .remove(&self.app_id)
-            .map_err(|_| MachineOpError::Failed("remove the service"))?;
         let current = record
             .current
             .as_ref()
             .ok_or(MachineOpError::Failed("nothing installed"))?;
-        if let Ok(config) = self.tree_config(&current.version) {
-            let request = IntegrationRequest {
+        let request = self
+            .tree_config(&current.version)
+            .ok()
+            .map(|config| IntegrationRequest {
                 app_id: self.app_id.clone(),
                 install_root: self.root.clone(),
                 version: current.version.clone(),
                 meta: config.install,
                 previous: None,
                 stale_bins: Vec::new(),
-            };
-            match self.p.integration.remove(Scope::Machine, &request) {
-                Ok(_) | Err(IntegrationError::Conflict(_)) => {}
-                Err(_) => return Err(MachineOpError::Integration),
-            }
-        }
+            });
+        let registered = self
+            .p
+            .registrar
+            .image(&self.app_id)
+            .map_err(|_| MachineOpError::Failed("read the registration"))?
+            .filter(|image| image.starts_with(&self.root));
         let home = self
             .root
             .parent()
@@ -1719,17 +1747,96 @@ impl<'a> Engine<'a> {
             .fill(&mut random)
             .map_err(|_| MachineOpError::Failed("randomness"))?;
         let tomb = home.join(tombstone_name(&self.app_id, &random));
-        // The lock file lives inside `R`: release it before `R` moves.
-        drop(guard);
+        let undo = Undo {
+            engine: &self,
+            request: request.as_ref(),
+            image: registered.as_deref(),
+            tomb: &tomb,
+        };
+
+        // (2) The service: stopped and deleted.
         self.p
-            .fs
-            .rename(&self.root, &tomb)
-            .map_err(|_| MachineOpError::InUse)?;
+            .registrar
+            .remove(&self.app_id)
+            .map_err(|_| MachineOpError::Failed("remove the service"))?;
+        // (3) The lock file lives inside `R`: release it before anything under `R` goes.
+        drop(guard);
+        // (4) The removal guard over `R`, with the service gone.
+        if !self.free_to_remove(&self.root) {
+            return undo.run(UndoFrom::Service, MachineOpError::InUse);
+        }
+        // (5) The machine integration, while `R` (and the stub in it) is at its path. An error
+        // may have removed part of it: the undo applies it again.
+        if let Some(request) = &request {
+            match self.p.integration.remove(Scope::Machine, request) {
+                Ok(_) | Err(IntegrationError::Conflict(_)) => {}
+                Err(_) => {
+                    return undo.run(UndoFrom::Integration, MachineOpError::Integration);
+                }
+            }
+        }
+        // (6) The rename takes `R` away from new launches; it is not an in-use check.
+        if self.p.fs.rename(&self.root, &tomb).is_err() {
+            return undo.run(UndoFrom::Integration, MachineOpError::InUse);
+        }
+        // (7) The removal guard again, on the tombstone, right before deleting.
+        if !self.free_to_remove(&tomb) {
+            return undo.run(UndoFrom::Rename, MachineOpError::InUse);
+        }
+        // (8) The tombstone, without following links.
         self.p
             .fs
             .remove_dir_all_nofollow(&tomb)
             .map_err(|_| MachineOpError::Failed("remove the install"))?;
         Ok(())
+    }
+}
+
+/// How far a refused `uninstall` got: its undo reverses that and everything before it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum UndoFrom {
+    /// The service was removed.
+    Service,
+    /// The integration was removed (or its removal failed part-way).
+    Integration,
+    /// `R` was renamed to its tombstone.
+    Rename,
+}
+
+/// What a refused `uninstall` restores, read at its step (1).
+struct Undo<'e, 'a> {
+    engine: &'e Engine<'a>,
+    request: Option<&'e IntegrationRequest>,
+    /// The registered service image, only when it lies under this `R`.
+    image: Option<&'e Path>,
+    tomb: &'e Path,
+}
+
+impl Undo<'_, '_> {
+    /// Renames the tombstone back, re-applies the integration and registers the service image
+    /// again, as far as `from` says; returns `refusal`, or `Failed("restore ...")` naming what
+    /// could not be restored.
+    fn run(&self, from: UndoFrom, refusal: MachineOpError) -> Result<(), MachineOpError> {
+        let e = self.engine;
+        if from >= UndoFrom::Rename && e.p.fs.rename(self.tomb, &e.root).is_err() {
+            // Without `R` at its path neither the integration nor the service can point into it.
+            return Err(MachineOpError::Failed("restore the install folder"));
+        }
+        let integration = from < UndoFrom::Integration
+            || self
+                .request
+                .is_none_or(|r| e.p.integration.apply(Scope::Machine, r).is_ok());
+        let service = self
+            .image
+            .is_none_or(|image| e.p.registrar.register(&e.app_id, image).is_ok());
+        match (integration, service) {
+            (true, true) => Err(refusal),
+            (false, true) => Err(MachineOpError::Failed("restore the integration")),
+            (true, false) => Err(MachineOpError::Failed("restore the service")),
+            (false, false) => Err(MachineOpError::Failed(
+                "restore the integration and the service",
+            )),
+        }
     }
 }
 

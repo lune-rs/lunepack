@@ -1,7 +1,8 @@
 //! A scripted [`Process`] and the contract suite for the real ones.
 //!
 //! [`FakeProcess`] spawns nothing. It records every spawn, hands out [`Child`]s whose exits a test
-//! scripts, answers `wait_exit` and `tree_in_use` from queues a test fills, and never touches the
+//! scripts, answers `wait_exit`, `tree_in_use` and `tree_in_use_strict` from queues a test fills
+//! (one queue each), and never touches the
 //! host. Clones share one state, so a test keeps a handle while the code under test owns another.
 
 use core::time::Duration;
@@ -241,6 +242,8 @@ struct Inner {
     running: BTreeSet<ProcessId>,
     in_use: VecDeque<bool>,
     in_use_log: Vec<(PathBuf, Vec<ProcessId>)>,
+    strict: VecDeque<bool>,
+    strict_log: Vec<(PathBuf, Vec<ProcessId>)>,
     terminated: Vec<ProcessId>,
     pipe_capacity: usize,
     child_pipes: BTreeMap<ProcessId, FakeChildPipes>,
@@ -280,6 +283,8 @@ impl FakeProcess {
                 running: BTreeSet::new(),
                 in_use: VecDeque::new(),
                 in_use_log: Vec::new(),
+                strict: VecDeque::new(),
+                strict_log: Vec::new(),
                 terminated: Vec::new(),
                 pipe_capacity: DEFAULT_PIPE_CAPACITY,
                 child_pipes: BTreeMap::new(),
@@ -319,6 +324,13 @@ impl FakeProcess {
         lock(&self.inner).in_use.push_back(answer);
     }
 
+    /// Queues the answer of the next `tree_in_use_strict` (`false` when nothing is queued). The
+    /// strict check has its own queue: `script_in_use` does not feed it, and it does not consume
+    /// `script_in_use` answers.
+    pub fn script_in_use_strict(&self, answer: bool) {
+        lock(&self.inner).strict.push_back(answer);
+    }
+
     /// Marks `id` as running, so an unscripted `wait_exit` on it times out.
     pub fn mark_running(&self, id: ProcessId) {
         lock(&self.inner).running.insert(id);
@@ -356,6 +368,11 @@ impl FakeProcess {
     /// Every `tree_in_use` call so far: the tree and the excluded ids.
     pub fn in_use_calls(&self) -> Vec<(PathBuf, Vec<ProcessId>)> {
         lock(&self.inner).in_use_log.clone()
+    }
+
+    /// Every `tree_in_use_strict` call so far: the tree and the excluded ids.
+    pub fn strict_calls(&self) -> Vec<(PathBuf, Vec<ProcessId>)> {
+        lock(&self.inner).strict_log.clone()
     }
 
     /// The children that were terminated, in order.
@@ -514,6 +531,12 @@ impl Process for FakeProcess {
     fn tree_in_use(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
         self.in_use(tree, exclude)
     }
+
+    fn tree_in_use_strict(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
+        let mut inner = lock(&self.inner);
+        inner.strict_log.push((tree.to_owned(), exclude.to_vec()));
+        Ok(inner.strict.pop_front().unwrap_or(false))
+    }
 }
 
 impl FakeProcess {
@@ -608,7 +631,7 @@ impl FakeProcess {
 /// directions at once, the end of file when the input is dropped, the error stream still null, the
 /// pipe ends handed out once, and a child that ends while its pipes are held); refusals (a
 /// relative program, a missing program, a detached spawn with pipes) that leak no argument,
-/// environment value or directory; and `tree_in_use`.
+/// environment value or directory; and `tree_in_use` and `tree_in_use_strict`.
 pub fn run_process_suite(process: &dyn Process, helper: &Path) {
     let scratch = std::env::temp_dir().join(format!(
         "lunepack-process-suite-{}-{}",
@@ -1149,6 +1172,12 @@ fn in_use_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
         "a process runs from the tree"
     );
     assert!(
+        process
+            .tree_in_use_strict(&tree, &[])
+            .expect("tree_in_use_strict"),
+        "strict: a process runs from the tree"
+    );
+    assert!(
         !process.tree_in_use(&tree, &[id]).expect("tree_in_use"),
         "an excluded process does not count"
     );
@@ -1160,5 +1189,11 @@ fn in_use_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
     assert!(
         !process.tree_in_use(&tree, &[]).expect("tree_in_use"),
         "the process ended"
+    );
+    assert!(
+        !process
+            .tree_in_use_strict(&tree, &[])
+            .expect("tree_in_use_strict"),
+        "strict: the process ended"
     );
 }

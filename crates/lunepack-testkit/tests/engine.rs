@@ -943,6 +943,55 @@ fn the_engine_source_names_no_user_state() {
     }
 }
 
+/// M10-D20: every deletion under `R` asks the strict check; the rename is not called a guard.
+#[test]
+fn the_engine_asks_only_the_strict_in_use_check() {
+    let src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../lunepack-core/src/engine.rs"),
+    )
+    .unwrap();
+    assert!(
+        !src.contains(".tree_in_use("),
+        "engine.rs calls tree_in_use instead of tree_in_use_strict"
+    );
+    assert!(src.contains(".tree_in_use_strict("));
+    let flat = src
+        .lines()
+        .map(|l| {
+            l.trim()
+                .trim_start_matches("///")
+                .trim_start_matches("//")
+                .trim()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !flat.contains("the rename is the authoritative in-use check"),
+        "a comment still calls the rename the guard"
+    );
+}
+
+/// The fake's strict check has its own queue and log, apart from `tree_in_use`'s.
+#[test]
+fn the_fake_strict_check_has_its_own_queue() {
+    use lunepack_core::Process;
+    let fake = FakeProcess::new(abs_path("/pf/Hello/app/1.0.0/app.exe"));
+    let tree = abs_path("/pf/Hello/app/0.9.0");
+    fake.script_in_use(true);
+    fake.script_in_use_strict(true);
+    assert!(fake.tree_in_use_strict(&tree, &[]).unwrap());
+    assert!(
+        !fake.tree_in_use_strict(&tree, &[]).unwrap(),
+        "empty: false"
+    );
+    assert!(
+        fake.tree_in_use(&tree, &[]).unwrap(),
+        "its queue is untouched"
+    );
+    assert_eq!(fake.strict_calls(), vec![(tree.clone(), Vec::new()); 2]);
+    assert_eq!(fake.in_use_calls(), vec![(tree, Vec::new())]);
+}
+
 // ---- the fakes against their suites -------------------------------------------------------------
 
 #[test]

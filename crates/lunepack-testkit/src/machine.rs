@@ -506,9 +506,10 @@ impl lunepack_core::OsIntegration for FakeMachineIntegration {
 
 // ---- a filesystem with injected faults -----------------------------------------------------------
 
-/// A [`MemFs`] whose `rename` fails for the sources a test names (as a rename of a directory a
-/// process runs from fails on Windows) and whose `create_new` fails under the directories a test
-/// names; everything else is the `MemFs`'s.
+/// A [`MemFs`] whose `rename` fails for the sources a test names (as a rename of a directory
+/// fails on Windows while a process has its working directory or an open file in it), whose
+/// `remove_dir_all_nofollow` fails for anything directly in the directories a test names, and whose `create_new` fails under
+/// the directories a test names; everything else is the `MemFs`'s.
 #[derive(Clone)]
 pub struct FaultFs {
     fs: MemFs,
@@ -518,6 +519,7 @@ pub struct FaultFs {
 #[derive(Default)]
 struct FaultState {
     rename_from: BTreeSet<PathBuf>,
+    remove_under: BTreeSet<PathBuf>,
     create_under: BTreeSet<PathBuf>,
 }
 
@@ -533,6 +535,11 @@ impl FaultFs {
     /// Makes `rename` of `from` fail.
     pub fn fail_rename_from(&self, from: &Path) {
         lock(&self.inner).rename_from.insert(from.to_path_buf());
+    }
+
+    /// Makes `remove_dir_all_nofollow` of anything directly in `dir` fail, leaving it as it is.
+    pub fn fail_remove_in(&self, dir: &Path) {
+        lock(&self.inner).remove_under.insert(dir.to_path_buf());
     }
 
     /// Makes `create_new` of any file directly in `dir` fail.
@@ -586,6 +593,12 @@ impl Fs for FaultFs {
         self.fs.remove_file(path)
     }
     fn remove_dir_all_nofollow(&self, path: &Path) -> Result<(), lunepack_core::FsError> {
+        if path
+            .parent()
+            .is_some_and(|p| lock(&self.inner).remove_under.contains(p))
+        {
+            return Err(FaultFs::fault(path, "remove"));
+        }
         self.fs.remove_dir_all_nofollow(path)
     }
     fn create_dir_all(&self, path: &Path) -> Result<(), lunepack_core::FsError> {
