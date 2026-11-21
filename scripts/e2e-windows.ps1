@@ -302,10 +302,13 @@ function Reset-Ui { foreach ($n in 'ui-spawns', 'ui-hello', 'ui-prompts') { Remo
 # ---- the publisher ------------------------------------------------------------------------------------
 
 # Native stderr is not an error here (`keys gen` reports on it), so the preference is relaxed per call.
+# `$cli` is read through the call stack, never as `$script:cli`: the signed-setup row calls this from
+# a script block that scripts/ci/windows-sign-test.ps1 runs, where `script:` is that script's scope.
+# (`$script:cliExit` is written and read in the same call, so it agrees with itself either way.)
 function Invoke-Lunepack([string]$config, [string[]]$cliArgs) {
     $old = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    try { $out = @(& $script:cli --config $config @cliArgs 2>&1 | ForEach-Object { "$_" }) } finally { $ErrorActionPreference = $old }
+    try { $out = @(& $cli --config $config @cliArgs 2>&1 | ForEach-Object { "$_" }) } finally { $ErrorActionPreference = $old }
     $script:cliExit = $LASTEXITCODE
     return $out
 }
