@@ -14,6 +14,8 @@
 //! [`WindowsProtect`] (M10 step 7) is the core's `Protect` over explicit security descriptors, with
 //! the descriptor reader, the token queries ([`standing`], [`current_user_sid`]) and the per-machine
 //! known folders ([`program_files`], [`common_start_menu_programs`], [`local_app_data`]).
+//! [`PipeServer`] and [`PipeClient`] (M10 step 8) are the named pipe's two ends, each a
+//! `service::Duplex` with read deadlines; the client checks the pipe's owner before it sends.
 //! The public API is safe and builds on every OS; off Windows the helpers are no-ops or
 //! `Unsupported`.
 
@@ -23,6 +25,8 @@ mod harden;
 #[cfg(windows)]
 mod integration;
 mod launcher;
+#[cfg(any(windows, test))]
+mod pipe;
 #[cfg(windows)]
 mod process;
 #[cfg(windows)]
@@ -43,6 +47,13 @@ pub use harden::harden_dll_search;
 #[cfg(windows)]
 pub use integration::{MARKER_VALUE, UNINSTALL_KEY, WinScope, WindowsIntegration};
 pub use launcher::{ignore_console_interrupts, raw_command_line};
+#[cfg(any(windows, test))]
+pub use pipe::{
+    ExpectedOwner, FILE_CREATE_PIPE_INSTANCE, PEER_MASK, PipeAccess, PipeError,
+    SERVER_WRITE_TIMEOUT,
+};
+#[cfg(windows)]
+pub use pipe::{PipeCanceller, PipeClient, PipeServer, pipe_descriptor};
 #[cfg(windows)]
 pub use process::WindowsProcess;
 #[cfg(windows)]

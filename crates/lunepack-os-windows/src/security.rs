@@ -193,6 +193,10 @@ pub fn judge(descriptor: &Descriptor, class: DirClass) -> Result<(), CheckError>
 }
 
 #[cfg(windows)]
+pub(crate) use ffi::{
+    HandleGuard, LocalGuard, handle_descriptor, handle_owner, sd_descriptor, wide,
+};
+#[cfg(windows)]
 pub use ffi::{WindowsProtect, check_dir, current_user_sid, read_descriptor, standing};
 
 #[cfg(windows)]
@@ -212,12 +216,13 @@ mod ffi {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+        GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_OBJECT_TYPE,
     };
     use windows_sys::Win32::Security::{
         ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CheckTokenMembership, CreateWellKnownSid,
-        DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetLengthSid, GetTokenInformation,
-        IsValidSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+        DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetLengthSid,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation, IsValidSid,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
         SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TokenElevationType, TokenElevationTypeFull, TokenUser,
         WinBuiltinAdministratorsSid,
     };
@@ -235,7 +240,7 @@ mod ffi {
     const ELEVATION_DEFAULT: i32 = 1;
 
     /// Closes a handle when dropped.
-    struct HandleGuard(HANDLE);
+    pub(crate) struct HandleGuard(pub(crate) HANDLE);
 
     impl Drop for HandleGuard {
         fn drop(&mut self) {
@@ -246,7 +251,7 @@ mod ffi {
     }
 
     /// Frees a `LocalAlloc` buffer the system allocated for us when dropped.
-    struct LocalGuard(*mut c_void);
+    pub(crate) struct LocalGuard(pub(crate) *mut c_void);
 
     impl Drop for LocalGuard {
         fn drop(&mut self) {
@@ -272,7 +277,7 @@ mod ffi {
         Ok(units)
     }
 
-    fn wide(text: &str) -> Vec<u16> {
+    pub(crate) fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
@@ -339,16 +344,26 @@ mod ffi {
             return Err(CheckError::NotDirectory);
         }
 
+        handle_descriptor(handle.0, SE_FILE_OBJECT)
+    }
+
+    /// Reads the owner and the DACL of the object behind `handle` (opened with read-control
+    /// access) as an object of type `object`.
+    pub(crate) fn handle_descriptor(
+        handle: HANDLE,
+        object: SE_OBJECT_TYPE,
+    ) -> Result<Descriptor, CheckError> {
         let mut owner: PSID = null_mut();
         let mut dacl: *mut ACL = null_mut();
         let mut sd: PSECURITY_DESCRIPTOR = null_mut();
-        // SAFETY: `handle` is an open handle with read-control access; the three out pointers are
-        // valid and the others null, as the call allows for the requested information. On success
-        // `owner` and `dacl` point into the descriptor `sd`, which the guard below releases.
+        // SAFETY: `handle` is an open handle with read-control access (the caller's contract); the
+        // three out pointers are valid and the others null, as the call allows for the requested
+        // information. On success `owner` and `dacl` point into the descriptor `sd`, which the
+        // guard below releases.
         let code = unsafe {
             GetSecurityInfo(
-                handle.0,
-                SE_FILE_OBJECT,
+                handle,
+                object,
                 OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                 &mut owner,
                 null_mut(),
@@ -365,17 +380,85 @@ mod ffi {
             return Err(CheckError::Owner);
         }
         let owner = sid_to_string(owner)?;
-        if dacl.is_null() {
+        Ok(Descriptor {
+            owner,
+            entries: dacl_entries(dacl)?,
+        })
+    }
+
+    /// The owner of the object behind `handle` (opened with read-control access) as SID text.
+    /// Reads only the owner, nothing else of the descriptor.
+    pub(crate) fn handle_owner(
+        handle: HANDLE,
+        object: SE_OBJECT_TYPE,
+    ) -> Result<String, CheckError> {
+        let mut owner: PSID = null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: as in `handle_descriptor`, with only the owner asked for and its out pointer
+        // given; `owner` points into `sd`, which the guard releases after the conversion.
+        let code = unsafe {
+            GetSecurityInfo(
+                handle,
+                object,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut sd,
+            )
+        };
+        let _sd = LocalGuard(sd);
+        if code != 0 {
+            return Err(CheckError::Os("security info"));
+        }
+        if owner.is_null() {
+            return Err(CheckError::Owner);
+        }
+        sid_to_string(owner)
+    }
+
+    /// Reads the owner and the DACL of the in-memory descriptor `sd` (self-relative or absolute,
+    /// valid for the duration of the call).
+    pub(crate) fn sd_descriptor(sd: PSECURITY_DESCRIPTOR) -> Result<Descriptor, CheckError> {
+        let mut owner: PSID = null_mut();
+        let mut defaulted = 0;
+        // SAFETY: `sd` is a valid security descriptor (the caller's contract); the out pointers
+        // are valid. `owner` points into `sd`.
+        if unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) } == 0 {
+            return Err(CheckError::Os("descriptor owner"));
+        }
+        if owner.is_null() {
+            return Err(CheckError::Owner);
+        }
+        let owner = sid_to_string(owner)?;
+        let mut present = 0;
+        let mut dacl: *mut ACL = null_mut();
+        // SAFETY: as above; `dacl` points into `sd` when present.
+        if unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) } == 0 {
+            return Err(CheckError::Os("descriptor dacl"));
+        }
+        if present == 0 {
             return Ok(Descriptor {
                 owner,
                 entries: None,
             });
         }
+        Ok(Descriptor {
+            owner,
+            entries: dacl_entries(dacl)?,
+        })
+    }
 
+    /// The entries of `dacl` (a valid ACL kept alive by the caller); `None` for a null DACL.
+    fn dacl_entries(dacl: *mut ACL) -> Result<Option<Vec<Ace>>, CheckError> {
+        if dacl.is_null() {
+            return Ok(None);
+        }
         // SAFETY: an all-zero `ACL_SIZE_INFORMATION` is a valid value (plain integers).
         let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: `dacl` is the valid ACL the previous call returned (kept alive by `_sd`);
-        // `size` is a valid buffer of exactly the length passed, for the class asked.
+        // SAFETY: `dacl` is a valid ACL kept alive by the caller; `size` is a valid buffer of
+        // exactly the length passed, for the class asked.
         let ok = unsafe {
             GetAclInformation(
                 dacl,
@@ -391,10 +474,7 @@ mod ffi {
         for index in 0..size.AceCount {
             entries.push(read_ace(dacl, index)?);
         }
-        Ok(Descriptor {
-            owner,
-            entries: Some(entries),
-        })
+        Ok(Some(entries))
     }
 
     /// Reads entry `index` of `dacl`. A type whose layout is not the plain allow or deny one is
