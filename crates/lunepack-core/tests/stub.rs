@@ -1,4 +1,4 @@
-//! The Windows stub launch contract v1 (M7-D7): `launch_target`'s read path over a fake `Fs`.
+//! The Windows stub launch contract v2 (M7-D7, M10-D6): `launch_target`'s read path over a fake `Fs`.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -87,7 +87,7 @@ fn target(fs: &dyn Fs, root: &Path) -> Result<LaunchTarget, StubError> {
 #[test]
 fn the_constants_and_exit_codes_are_fixed() {
     assert_eq!(STUB_FILE, "lunepack-stub.exe");
-    assert_eq!(STUB_CONTRACT_VERSION, 1);
+    assert_eq!(STUB_CONTRACT_VERSION, 2);
     let all = [
         StubError::NotInstalled,
         StubError::State,
@@ -203,7 +203,75 @@ fn an_xdg_layout_is_not_found_under_the_windows_contract() {
 }
 
 #[test]
-fn an_unreadable_newer_or_machine_record_is_a_state_error() {
+fn a_machine_record_launches_its_current_version() {
+    // Version 2 (M10-D6): a per-machine install starts like a per-user one, and only `current`
+    // counts, never `pending` or `previous`.
+    let root = abs_path("/Program Files/Hello App");
+    let fs = MemFs::new();
+    put_tree(&fs, &root, "1.0.0");
+    put_tree(&fs, &root, "2.0.0");
+    let mut r = record(Some("2.0.0"));
+    r.scope = Scope::Machine;
+    r.pending = Some(PendingRef {
+        version: v("2.0.0"),
+        attempts: 1,
+    });
+    r.previous = Some(PreviousRef {
+        version: v("1.0.0"),
+    });
+    put_record(&fs, &root, &r);
+    let tree = layout(&root).version_dir(&v("2.0.0"));
+    assert_eq!(
+        target(&fs, &root).unwrap(),
+        LaunchTarget {
+            version: v("2.0.0"),
+            entry_path: tree.join("bin").join("hello.exe"),
+            runtime_path: tree.join("bin").join("lunepack-runtime.exe"),
+        }
+    );
+    // A machine record with no current version is not installed, as for a user one.
+    let fs = MemFs::new();
+    let mut r = record(None);
+    r.scope = Scope::Machine;
+    put_record(&fs, &root, &r);
+    assert_eq!(target(&fs, &root), Err(StubError::NotInstalled));
+}
+
+#[test]
+fn a_record_with_an_unknown_scope_is_a_state_error() {
+    let dir = layout(&root()).state_dir();
+    // The same edit with a known scope text launches: only the scope text decides.
+    for (scope, ok) in [
+        ("machine", true),
+        ("user", true),
+        ("system", false),
+        ("Machine", false),
+        ("USER", false),
+        ("", false),
+    ] {
+        let fs = installed(&root());
+        let file = fs
+            .read_capped(&dir.join(format!("{:020}.rec", 1)), 1 << 20)
+            .unwrap();
+        let len = u32::from_be_bytes([file[5], file[6], file[7], file[8]]) as usize;
+        let mut p: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&file[9..9 + len]).unwrap();
+        p.insert("seq".into(), serde_json::json!(2));
+        p.insert("scope".into(), serde_json::json!(scope));
+        let bytes = serde_json::to_vec(&p).unwrap();
+        commit_raw_payload(&fs, &dir, 2, &bytes, &FakeHasher).unwrap();
+        let got = target(&fs, &root());
+        if ok {
+            assert_eq!(got.map(|t| t.version), Ok(v("1.0.0")), "{scope:?}");
+        } else {
+            assert_eq!(got, Err(StubError::State), "{scope:?}");
+        }
+    }
+    assert_eq!(StubError::State.code(), 91);
+}
+
+#[test]
+fn an_unreadable_or_newer_record_is_a_state_error() {
     // Whole (checksum passes) but invalid.
     let fs = installed(&root());
     commit_raw_payload(
@@ -225,13 +293,6 @@ fn an_unreadable_newer_or_machine_record_is_a_state_error() {
         &FakeHasher,
     )
     .unwrap();
-    assert_eq!(target(&fs, &root()), Err(StubError::State));
-    // A per-machine record.
-    let fs = MemFs::new();
-    put_tree(&fs, &root(), "1.0.0");
-    let mut r = record(Some("1.0.0"));
-    r.scope = Scope::Machine;
-    put_record(&fs, &root(), &r);
     assert_eq!(target(&fs, &root()), Err(StubError::State));
 }
 

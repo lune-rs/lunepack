@@ -1,4 +1,4 @@
-//! The built stubs run for real against a fake install (M7-D7, launch contract v1).
+//! The built stubs run for real against a fake install (M7-D7, launch contract v2).
 //!
 //! Own `main` (see Cargo.toml): this test binary is also the app (when it runs as `app.exe`) and
 //! the runtime (as `lunepack-runtime.exe`) the stub starts. The app writes a report to the file

@@ -1393,7 +1393,7 @@ starts the runtime beside it as the engine, so a double-click opens the window.
 
 The image is built by `lunepack setup`; the installer app carries no signature in this revision.
 
-## 15. Windows stub launch contract, version 1
+## 15. Windows stub launch contract, version 2
 
 The launcher stub is a small Windows executable that the packager stamps with the app's icon and version
 information and places beside the entry as `lunepack-stub.exe`; the runtime copies it to the install
@@ -1407,8 +1407,8 @@ nothing else: no argument, environment variable, registry value or folder name. 
 
 1. Reads the newest whole install record under `R\.lunepack\state` (12; read only, no lock; each
    directory on the way is a real directory) and takes `current.version` from it. No record, or one with no
-   current version, is exit 90; a record that cannot be read, is of a newer format or is not a per-user one
-   is exit 91.
+   current version, is exit 90; a record that cannot be read or is of a newer format is exit 91. A record of
+   either scope, `user` or `machine`, is read the same way; any other scope text makes the record unreadable.
 2. Reads `R\app\<current>\lunepack-update.json` (13) and takes `install.entry`. A missing, unreadable or
    invalid configuration, or one that does not name that version and the record's app, is exit 92.
 3. Checks that `R\app\<current>\<entry>` is a regular file (else exit 93) and that no directory or file on
@@ -1426,6 +1426,10 @@ Reserved: a command line of exactly `--lunepack-uninstall`, optionally followed 
 `/S` or `--silent`, makes the stub start the current version's `lunepack-runtime.exe` (beside the entry) as
 `uninstall`, with `--silent` for the optional argument, and exit 0. Any other command line, including the
 same words in another position or case, goes to the app.
+
+Changes from version 1: step 1 accepts a per-machine record (scope `machine`) as well as a per-user one;
+version 1 refused it. Every other rule is unchanged. A version 1 stub answers exit 91 on a machine record,
+which never happens in practice: a machine install is written only by a build whose stub is version 2.
 
 ## 16. Windows per-user layout
 

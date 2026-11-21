@@ -1,4 +1,4 @@
-//! The Windows launcher stub (M7-D7, launch contract v1).
+//! The Windows launcher stub (M7-D7, launch contract v2: per-user and per-machine installs).
 //!
 //! The stub sits at `R\<entry file name>` and starts the installed app's current version:
 //! it takes `R` from its own resolved path and from nothing else, reads the install through
