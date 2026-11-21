@@ -17,9 +17,10 @@ use lunepack_core::{
     Sha256Digest, Target, UPDATE_CONFIG_FILE, UpdateConfig, Version,
 };
 use lunepack_testkit::{
-    ChainFixture, FakeClock, FakeCodec, FakeHasher, FakeIntegration, FakePolicy, FakeProtect,
-    FakePublisherCheck, FakeRng, FakeVerifier, IntegrationOp, MemDuplex, MemFs, PackBuilder,
-    SUITE_APP_ID, SUITE_T0, abs_path, mem_duplex, run_protect_suite, run_service_channel_suite,
+    ChainFixture, FakeClock, FakeCodec, FakeHasher, FakeIntegration, FakePolicy, FakeProcess,
+    FakeProtect, FakePublisherCheck, FakeRegistrar, FakeRng, FakeVerifier, IntegrationOp,
+    MemDuplex, MemFs, PackBuilder, SUITE_APP_ID, SUITE_T0, abs_path, mem_duplex, run_protect_suite,
+    run_service_channel_suite,
 };
 
 const TARGET: Target = Target::WindowsX86_64;
@@ -200,6 +201,8 @@ struct Machine {
     policy: FakePolicy,
     integration: FakeIntegration,
     publisher: FakePublisherCheck,
+    registrar: FakeRegistrar,
+    process: FakeProcess,
     rng: FakeRng,
     clock: FakeClock,
     codec: FakeCodec,
@@ -221,6 +224,8 @@ impl Machine {
             policy: FakePolicy::new(),
             integration: FakeIntegration::new(),
             publisher: FakePublisherCheck::new([]),
+            registrar: FakeRegistrar::new(),
+            process: FakeProcess::new(abs_path("/pf/Hello/app/1.0.0/app.exe")),
             rng: FakeRng::new(7),
             clock: FakeClock::new(SUITE_T0 + 3600),
             codec: FakeCodec::new(),
@@ -290,6 +295,8 @@ impl Machine {
             publisher: &self.publisher,
             protect: &self.protect,
             policy: &self.policy,
+            registrar: &self.registrar,
+            process: &self.process,
         }
     }
 

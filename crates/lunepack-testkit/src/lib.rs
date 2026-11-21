@@ -38,8 +38,8 @@ pub use integration::{
     run_integration_suite_with,
 };
 pub use machine::{
-    ElevationScript, FakeConnector, FakeElevation, FakePolicy, FakeProtect, FakeRegistrar,
-    MemDuplex, mem_duplex,
+    ElevationScript, FakeConnector, FakeElevation, FakeMachineIntegration, FakePolicy, FakeProtect,
+    FakeRegistrar, FaultFs, MachineIntegrationCall, MemDuplex, mem_duplex,
 };
 pub use memfs::{MemFs, MemPlace, RecoverMode};
 pub use process::{

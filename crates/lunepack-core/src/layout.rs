@@ -737,6 +737,7 @@ fn holds(
     dir: &Path,
     app_id: &AppId,
     scheme: LayoutScheme,
+    scope: Scope,
 ) -> Holds {
     let mut at = dir.to_path_buf();
     if !is_real_dir(fs, &at) {
@@ -749,7 +750,7 @@ fn holds(
         }
     }
     match load_any::<InstallState>(fs, &at, hasher) {
-        Ok(Some(record)) if record.app_id == *app_id && record.scope == Scope::User => Holds::Ours,
+        Ok(Some(record)) if record.app_id == *app_id && record.scope == scope => Holds::Ours,
         Ok(Some(record)) if record.app_id == *app_id => Holds::Unreadable,
         Ok(_) => Holds::Other,
         Err(_) => Holds::Unreadable,
@@ -838,6 +839,22 @@ pub fn resolve_root(
     name: &str,
     scheme: LayoutScheme,
 ) -> Result<RootChoice, LayoutError> {
+    resolve_root_scoped(fs, hasher, data_home, app_id, name, scheme, Scope::User)
+}
+
+/// [`resolve_root`] for the install of `scope`: a folder matches when its record is this app's
+/// and of `scope` (a record of the app in the other scope counts as unreadable). The privileged
+/// engine resolves a per-machine install's root with [`Scope::Machine`] over the machine home
+/// (M10-D8) and [`LayoutScheme::WINDOWS`], whose directory names the machine tree shares.
+pub fn resolve_root_scoped(
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    data_home: &Path,
+    app_id: &AppId,
+    name: &str,
+    scheme: LayoutScheme,
+    scope: Scope,
+) -> Result<RootChoice, LayoutError> {
     if scheme.root == RootNaming::AppId {
         let root = data_home.join(app_id.as_str());
         return Ok(if is_real_dir(fs, &root) {
@@ -862,7 +879,7 @@ pub fn resolve_root(
             continue;
         }
         let dir = data_home.join(&entry.name);
-        match holds(fs, hasher, &dir, app_id, scheme) {
+        match holds(fs, hasher, &dir, app_id, scheme, scope) {
             Holds::Ours if found.is_some() => return Err(LayoutError::InstallAmbiguous),
             Holds::Ours => found = Some(dir),
             Holds::Unreadable
@@ -1706,4 +1723,129 @@ pub fn reconcile_bundle(
     }
     // Every move takes the disk closer to the end state; this many means it changed under us.
     Err(LayoutError::BundleMissing)
+}
+
+// ---- the machine layout (M10-D8) ------------------------------------------------------------------
+
+/// The update service's binary name (M10-D7), placed beside the entry in a release tree and in
+/// `R\.lunepack\machine\service\<version>\`.
+pub const SERVICE_FILE: &str = "lunepack-service.exe";
+/// The machine tree's private directory under `R`.
+pub const MACHINE_LUNEPACK_DIR: &str = ".lunepack";
+/// The admin-only directory under `R\.lunepack`.
+pub const MACHINE_ADMIN_DIR: &str = "machine";
+/// The upload staging directory under `R\.lunepack\machine`.
+pub const MACHINE_INCOMING_DIR: &str = "incoming";
+/// The service binaries' directory under `R\.lunepack\machine`.
+pub const MACHINE_SERVICE_DIR: &str = "service";
+/// Prefix of a version tree renamed for removal by the machine GC (`.gc-<16 hex>`).
+pub const GC_PREFIX: &str = ".gc-";
+
+/// The directories of a per-machine install `R = <machine home>\<display name>` (M10-D8):
+/// `app\<ver>`, `.lunepack\state` (the machine record), `.lunepack\logs` and the admin-only
+/// `.lunepack\machine` with the engine's lock, `incoming\` and `service\<ver>\`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineLayout {
+    root: PathBuf,
+}
+
+impl MachineLayout {
+    /// The layout of the install root `root`.
+    pub fn new(root: &Path) -> MachineLayout {
+        MachineLayout {
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// `R`.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// `R\app`.
+    pub fn app_dir(&self) -> PathBuf {
+        join_names(&self.root, LayoutScheme::WINDOWS.versions)
+    }
+
+    /// `R\app\<version>`.
+    pub fn version_dir(&self, version: &Version) -> PathBuf {
+        self.app_dir().join(version.to_string())
+    }
+
+    /// `R\.lunepack`.
+    pub fn lunepack_dir(&self) -> PathBuf {
+        self.root.join(MACHINE_LUNEPACK_DIR)
+    }
+
+    /// `R\.lunepack\state`, the machine record's directory.
+    pub fn state_dir(&self) -> PathBuf {
+        join_names(&self.root, LayoutScheme::WINDOWS.state)
+    }
+
+    /// `R\.lunepack\logs`.
+    pub fn logs_dir(&self) -> PathBuf {
+        join_names(&self.root, LayoutScheme::WINDOWS.logs)
+    }
+
+    /// `R\.lunepack\machine`, admin-only.
+    pub fn machine_dir(&self) -> PathBuf {
+        self.lunepack_dir().join(MACHINE_ADMIN_DIR)
+    }
+
+    /// The engine's lock file.
+    pub fn lock_path(&self) -> PathBuf {
+        self.machine_dir().join(LOCK_FILE)
+    }
+
+    /// `R\.lunepack\machine\incoming`.
+    pub fn incoming_dir(&self) -> PathBuf {
+        self.machine_dir().join(MACHINE_INCOMING_DIR)
+    }
+
+    /// `R\.lunepack\machine\service`.
+    pub fn service_dir(&self) -> PathBuf {
+        self.machine_dir().join(MACHINE_SERVICE_DIR)
+    }
+
+    /// `R\.lunepack\machine\service\<version>`.
+    pub fn service_version_dir(&self, version: &Version) -> PathBuf {
+        self.service_dir().join(version.to_string())
+    }
+
+    /// The service binary of `version`: `service\<version>\lunepack-service.exe`.
+    pub fn service_image(&self, version: &Version) -> PathBuf {
+        self.service_version_dir(version).join(SERVICE_FILE)
+    }
+
+    /// The inverse of [`MachineLayout::service_image`]: the root and version of an image path of
+    /// that exact shape (the version directory named by its canonical version text), else `None`.
+    pub fn of_service_image(image: &Path) -> Option<(MachineLayout, Version)> {
+        let name = |p: &Path| p.file_name().and_then(OsStr::to_str).map(str::to_owned);
+        if name(image)? != SERVICE_FILE {
+            return None;
+        }
+        let ver_dir = image.parent()?;
+        let text = name(ver_dir)?;
+        let version = Version::parse(&text).ok()?;
+        if version.to_string() != text {
+            return None;
+        }
+        let service = ver_dir.parent()?;
+        let machine = service.parent()?;
+        let lunepack = machine.parent()?;
+        let root = lunepack.parent()?;
+        let shape = name(service)? == MACHINE_SERVICE_DIR
+            && name(machine)? == MACHINE_ADMIN_DIR
+            && name(lunepack)? == MACHINE_LUNEPACK_DIR;
+        shape.then(|| (MachineLayout::new(root), version))
+    }
+}
+
+/// The service binary's path in a release tree whose entry is `entry`: beside the entry.
+pub fn service_path_in_tree(entry: &crate::path::RelPath) -> Option<crate::path::RelPath> {
+    let path = match entry.as_str().rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{SERVICE_FILE}"),
+        None => SERVICE_FILE.to_owned(),
+    };
+    crate::path::RelPath::parse(&path).ok()
 }
