@@ -851,8 +851,11 @@ mod native {
 
     /// macOS: a pipe has one inode per end, so the UI's own two ends say nothing about the
     /// runtime's ends of the same pipes. The app is started with no stdio, so it must hold no pipe
-    /// at all; the instrument is that the UI noted two pipes (its stdin and stdout) and that the
-    /// listing finds a pipe this process holds.
+    /// but those every child of this test inherits anyway (descriptors this process was handed
+    /// without close-on-exec: GitHub's macOS runner hands down two, at the same numbers in every
+    /// process of the chain; a pipe the runtime opened cannot share a number with one it holds).
+    /// The instruments: the UI noted two pipes (its stdin and stdout), the listing finds a pipe
+    /// this process holds, and the control listing finds a pipe its shell was given.
     #[cfg(target_os = "macos")]
     fn assert_app_holds_no_ui_pipe(out: &Path, app_fds: &str) {
         let pipes = ui_pipes(out);
@@ -861,7 +864,51 @@ mod native {
         let (reader, _writer) = std::io::pipe().expect("a pipe");
         assert!(all_fds().contains("fifo:"), "the listing misses a pipe");
         drop(reader);
-        assert!(app_fds.trim().is_empty(), "the app holds a pipe: {app_fds}");
+        let control = inherited_pipes(out, true);
+        assert!(
+            control.iter().any(|p| p == "fifo:0"),
+            "the control misses its stdin pipe: {control:?}"
+        );
+        let inherited = inherited_pipes(out, false);
+        let own: Vec<&str> = app_fds
+            .split_whitespace()
+            .filter(|p| !inherited.iter().any(|i| i == p))
+            .collect();
+        assert!(
+            own.is_empty(),
+            "the app holds a pipe no other child inherits: {own:?} (every child: {inherited:?})"
+        );
+    }
+
+    /// The pipes a child of this test holds without the runtime in between: a shell started with
+    /// no stdio (with `stdin_pipe`, a pipe as its stdin) lists them the way the app does.
+    #[cfg(target_os = "macos")]
+    fn inherited_pipes(out: &Path, stdin_pipe: bool) -> Vec<String> {
+        let file = out.join(format!("control-fds-{stdin_pipe}"));
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "fds=''\nfor f in /dev/fd/*; do if [ -p \"$f\" ]; then fds=\"$fds fifo:${f#/dev/fd/}\"; fi; done\n\
+                 printf '%s' \"$fds\" > \"$1\"\n",
+            )
+            .arg("sh")
+            .arg(&file)
+            .stdin(if stdin_pipe {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the control shell");
+        drop(child.stdin.take());
+        assert!(child.wait().expect("the control shell").success());
+        std::fs::read_to_string(&file)
+            .expect("the control's listing")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
     }
 
     #[cfg(target_os = "linux")]
