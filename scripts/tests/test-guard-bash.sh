@@ -15,6 +15,12 @@ HOOK=$here/../../.claude/hooks/guard-bash.sh
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 
+# The hook is local agent tooling, linked into a developer checkout and never tracked, so a
+# clean clone (CI) has no hook to test. A link that is present but dangling still fails below.
+if [ ! -e "$HOOK" ] && [ ! -L "$HOOK" ] && [ ! -L "$here/../../.claude/hooks" ]; then
+  t_skip "no .claude/hooks/guard-bash.sh in this checkout (agent tooling, not tracked)"
+fi
+
 t_init
 
 hook_json() { # command -> JSON on stdout

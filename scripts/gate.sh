@@ -44,7 +44,10 @@ bash scripts/tests/run.sh
 
 stage "shellcheck scripts/**/*.sh .claude/hooks/*.sh"
 if command -v shellcheck >/dev/null 2>&1; then
-  find scripts .claude/hooks -name '*.sh' -type f -print0 | xargs -0 shellcheck
+  # .claude/hooks is local agent tooling (a link, never tracked): absent in a clean clone (CI).
+  sc_roots=(scripts)
+  if [ -d .claude/hooks ]; then sc_roots+=(.claude/hooks/); fi
+  find "${sc_roots[@]}" -name '*.sh' -type f -print0 | xargs -0 shellcheck
 elif [ "${LUNEPACK_REQUIRE_SHELLCHECK:-}" = 1 ]; then
   echo "gate: shellcheck not found and LUNEPACK_REQUIRE_SHELLCHECK=1" >&2
   exit 1
