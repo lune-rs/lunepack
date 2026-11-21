@@ -723,6 +723,23 @@ fn attempts_under_and_after_the_lease() {
 }
 
 #[test]
+fn the_host_can_ask_whether_a_lease_runs() {
+    let m = Machine::new();
+    let mut engine = m.engine();
+    let now = || Duration::from_secs(m.monotonic.load(Ordering::SeqCst));
+    assert!(!engine.lease_running(now()), "nothing applied: no lease");
+    staged_and_applied(&m, &mut engine);
+    assert!(engine.lease_running(now()), "apply starts the lease");
+    m.advance(60);
+    assert!(
+        engine.lease_running(now()),
+        "inside the health window plus 15 s"
+    );
+    m.advance(16);
+    assert!(!engine.lease_running(now()), "the lease has run out");
+}
+
+#[test]
 fn the_fourth_attempt_rolls_back() {
     let m = Machine::new();
     let mut engine = m.engine();

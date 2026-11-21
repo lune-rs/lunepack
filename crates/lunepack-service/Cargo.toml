@@ -1,0 +1,36 @@
+[package]
+name = "lunepack-service"
+description = "The per-machine update service (Windows, LocalSystem): the privileged engine behind a named pipe."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# The third composition root (M10-D7): the privileged engine of a per-machine install, started by
+# the service control manager as LocalSystem and fed by any local user through one named pipe. It
+# links the core, the filesystem, the hash and signature adapters, the frame decoder and the
+# Windows adapters; no facade, no network stack, no UI. The boundary check holds this list
+# (DEPENDS_ONLY_ON). `tracing` and `anyhow` are allowed there but not used: the service logs its
+# own fixed lines to a capped file (src/logfile.rs), which cannot carry a value an attacker chose.
+# The binary has no unit tests (its logic is in the library): without this cargo links a test
+# harness of it with the same linker flags, and the linker warns that nothing imports advapi32.
+[[bin]]
+name = "lunepack-service"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+lunepack-core.workspace = true
+lunepack-fs.workspace = true
+lunepack-crypto.workspace = true
+lunepack-codec-lzma.workspace = true
+lunepack-os-windows.workspace = true
+
+[dev-dependencies]
+lunepack-testkit.workspace = true
+tempfile = { workspace = true }

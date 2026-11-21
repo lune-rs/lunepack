@@ -99,7 +99,7 @@ pub use manifest::{
 };
 pub use pack::{
     FileClass, PackedFile, ReleaseLayout, RuntimeImageError, candidates, check_pe_stub,
-    check_runtime_image, check_ui_image, classify, pack_file,
+    check_runtime_image, check_service_image, check_ui_image, classify, pack_file,
 };
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};

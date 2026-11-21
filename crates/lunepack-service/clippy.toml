@@ -1,0 +1,13 @@
+# The service reads no ambient input (M10-D7): a LocalSystem process fed by any local user takes
+# its root from its own image path and everything else from the machine record. Clippy fails on a
+# use of these; `std::env::args_os` is read once, in `main`.
+disallowed-methods = [
+    { path = "std::env::var", reason = "the service reads no environment variable" },
+    { path = "std::env::var_os", reason = "the service reads no environment variable" },
+    { path = "std::env::vars", reason = "the service reads no environment variable" },
+    { path = "std::env::vars_os", reason = "the service reads no environment variable" },
+    { path = "std::env::temp_dir", reason = "the temporary directory comes from the environment" },
+    { path = "std::env::current_dir", reason = "the working directory is not the service's input" },
+    { path = "std::env::set_current_dir", reason = "the service does not change its working directory" },
+    { path = "std::env::home_dir", reason = "the service has no user home" },
+]

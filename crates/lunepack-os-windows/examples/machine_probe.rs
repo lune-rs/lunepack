@@ -60,7 +60,7 @@ mod probe {
     use lunepack_os_windows::{
         ExpectedOwner, PipeAccess, PipeClient, PipeError, PipeServer, RegistryPolicy, WinScope,
         WindowsConnector, WindowsIntegration, WindowsProtect, WindowsRegistrar,
-        common_start_menu_programs, pipe_name, run_service, service_name, standing,
+        common_start_menu_programs, pipe_name, run_service, standing,
     };
 
     const USAGE: i32 = 2;
@@ -388,8 +388,10 @@ mod probe {
             );
             return 2;
         };
-        let name = service_name(&app);
-        let result = run_service(&name, move |control| {
+        // The dispatcher gets the fixed name the real service host gives it (`lunepack-service`):
+        // the control manager ignores the name of an own-process service, and this proves it on
+        // every run of the acceptance script (the service is registered as `lunepack-<app id>`).
+        let result = run_service("lunepack-service", move |control| {
             let marker = exe
                 .file_name()
                 .map(|n| format!("started-{}.txt", n.to_string_lossy()))

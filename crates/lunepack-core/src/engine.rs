@@ -360,6 +360,13 @@ impl<'a> Engine<'a> {
         self
     }
 
+    /// Whether a supervision lease is running at `now` (the host's monotonic time): an applying
+    /// runtime or a counted start is still inside its health window. The host does not exit as
+    /// idle while this is true (M10-D11).
+    pub fn lease_running(&self, now: Duration) -> bool {
+        self.lease.as_ref().is_some_and(|l| now < l.until)
+    }
+
     /// The app this engine serves.
     pub fn app_id(&self) -> &AppId {
         &self.app_id

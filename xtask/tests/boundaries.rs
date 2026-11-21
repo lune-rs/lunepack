@@ -1481,7 +1481,7 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         );
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            "boundaries: ok (16 packages)"
+            "boundaries: ok (17 packages)"
         );
     }
 
@@ -1895,6 +1895,69 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         assert!(
             !has(&fx.run().1, "lunepack-cli", "depends-only-on"),
             "the list is the stub's only"
+        );
+    }
+
+    /// The clean fixture plus the update service on its allowed list (two of its five crates exist
+    /// in the fixture).
+    fn with_service() -> Fx {
+        let mut fx = Fx::clean();
+        fx.crates.insert(
+            "lunepack-service".into(),
+            manifest(
+                "lunepack-service",
+                INHERIT,
+                "lunepack-core = { path = \"../lunepack-core\" }\n\
+                 lunepack-fs = { path = \"../lunepack-fs\" }",
+            ),
+        );
+        fx
+    }
+
+    #[test]
+    fn x2_the_service_depends_only_on_its_closed_list() {
+        assert_clean(&with_service().run().1);
+        // The facade and the HTTP stack are allowed for a binary by role, but not for the service.
+        for dep in [
+            r#"lunepack = { path = "../lunepack" }"#,
+            r#"lunepack-http = { path = "../lunepack-http" }"#,
+            r#"lunepack-cli = { path = "../lunepack-cli" }"#,
+        ] {
+            let mut fx = with_service();
+            fx.add_dep("lunepack-service", dep);
+            assert_has(&fx.run().1, "lunepack-service", "depends-only-on");
+        }
+        // Build dependencies count; dev-dependencies do not.
+        let mut fx = with_service();
+        fx.append(
+            "lunepack-service",
+            "[build-dependencies]\nlunepack-http = { path = \"../lunepack-http\" }",
+        );
+        assert_has(&fx.run().1, "lunepack-service", "depends-only-on");
+        let mut fx = with_service();
+        fx.append(
+            "lunepack-service",
+            "[dev-dependencies]\nlunepack-testkit = { path = \"../lunepack-testkit\" }",
+        );
+        assert_clean(&fx.run().1);
+        // `unsafe` stays forbidden: the service is not on the allowlist that may lift it.
+        let mut fx = with_service();
+        fx.edit("lunepack-service", |m| {
+            *m = m.replace(
+                "[lints]\nworkspace = true",
+                "[lints.rust]\nunsafe_code = \"deny\"",
+            );
+        });
+        assert!(
+            !fx.run().1.is_empty(),
+            "a service that lifts the unsafe ban is refused"
+        );
+        // Another binary is not held by the service's list.
+        let mut fx = with_service();
+        fx.add_dep("lunepack-cli", r#"lunepack = { path = "../lunepack" }"#);
+        assert!(
+            !has(&fx.run().1, "lunepack-cli", "depends-only-on"),
+            "the list is the service's only"
         );
     }
 

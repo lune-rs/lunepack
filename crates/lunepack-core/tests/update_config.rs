@@ -12,7 +12,7 @@ use lunepack_core::update_config::{
     DENIED_URL_SCHEMES, MACOS_CODE_SIGNATURE_DIR, MACOS_ENTRY_DIR, MACOS_HELPER_APP,
     MACOS_HELPER_ICON, MACOS_HELPER_INFO_PLIST, MACOS_HELPER_UI, MACOS_INFO_PLIST,
     MACOS_INSTALLER_PAYLOAD, MAX_UPDATE_CONFIG_BYTES, RUNTIME_FILE, RUNTIME_FILE_WINDOWS, UI_FILE,
-    UPDATE_CONFIG_PATH_MACOS, config_path, runtime_file,
+    UPDATE_CONFIG_PATH_MACOS, config_path, runtime_file, service_file,
 };
 use lunepack_core::{
     AppId, DesktopPathError, FeedKind, FeedRule, FileType, Target, TrustedRoot, UPDATE_CONFIG_FILE,
@@ -86,6 +86,17 @@ fn the_location_is_fixed() {
     assert_eq!(runtime_file(Target::LinuxAarch64), RUNTIME_FILE);
     assert_eq!(runtime_file(Target::WindowsX86_64), RUNTIME_FILE_WINDOWS);
     assert_eq!(runtime_file(Target::MacosX86_64), "lunepack-runtime");
+    // Only Windows has an update service (M10-D7).
+    assert_eq!(
+        service_file(Target::WindowsX86_64),
+        Some("lunepack-service.exe")
+    );
+    assert_eq!(
+        service_file(Target::WindowsAarch64),
+        Some(lunepack_core::SERVICE_FILE)
+    );
+    assert_eq!(service_file(Target::LinuxX86_64), None);
+    assert_eq!(service_file(Target::MacosUniversal), None);
 }
 
 #[test]

@@ -2271,6 +2271,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lunepack-service"
+version = "0.0.0"
+dependencies = [
+ "lunepack-codec-lzma",
+ "lunepack-core",
+ "lunepack-crypto",
+ "lunepack-fs",
+ "lunepack-os-windows",
+ "lunepack-testkit",
+ "tempfile",
+]
+
+[[package]]
 name = "lunepack-stub"
 version = "0.0.0"
 dependencies = [
