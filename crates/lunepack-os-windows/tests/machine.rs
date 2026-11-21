@@ -1,7 +1,8 @@
 //! The per-machine pieces of the Windows adapter against the real system (M10 step 10): the
 //! all-users scope of `WindowsIntegration` (under a registry prefix and a temporary Start-menu
 //! folder, and, as an administrator who opts in, the real `HKLM`), the policy reader, the
-//! elevation hand-off for a process that cannot be prompted.
+//! elevation hand-off for a process that cannot be prompted, and assumption A2 (a directory
+//! cannot be renamed while a program runs from a file inside it).
 //!
 //! Registry state is read with `reg.exe`, an instrument independent of the adapter's own registry
 //! code. The rows that write the real `HKLM` need an administrator and say so when they do not
@@ -10,7 +11,8 @@
 #[cfg(windows)]
 mod windows {
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
 
     use lunepack_core::{
         AppId, Elevated, Elevation, ElevationError, FileType, InstallMeta, IntegrationError,
@@ -379,6 +381,66 @@ mod windows {
             e.run_elevated(missing, &[]),
             Err(ElevationError::Failed(_))
         ));
+    }
+
+    /// Assumption A2: renaming a directory fails while a program runs from a file inside it, and
+    /// works once the program has ended. (The core's `Fs::rename` is `std::fs::rename` with a
+    /// bounded retry on transient errors, so a rename that fails here fails there too.)
+    #[test]
+    fn a_folder_cannot_be_renamed_while_a_program_runs_from_it() {
+        let t = tag();
+        let base = std::env::temp_dir().join(format!("lp-a2-{t}"));
+        let cleanup = Cleanup {
+            keys: Vec::new(),
+            dir: base.clone(),
+        };
+        let from = base.join("tree");
+        let to = base.join("tree-renamed");
+        std::fs::create_dir_all(&from).expect("tree");
+        let exe = from.join("cmd.exe");
+        std::fs::copy(r"C:\Windows\System32\cmd.exe", &exe).expect("copy a system executable");
+        // A long-lived child: the copy waits for input on a pipe this test keeps open.
+        let mut child = Command::new(&exe)
+            .arg("/q")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start the copy");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            child.try_wait().expect("poll").is_none(),
+            "INVALID: the program ended early, so the test proves nothing"
+        );
+        assert!(
+            std::fs::remove_file(&exe).is_err(),
+            "INVALID: a running image could be deleted"
+        );
+        let while_running = std::fs::rename(&from, &to);
+        assert!(
+            while_running.is_err(),
+            "A2 IS FALSE: the folder was renamed while a program ran from it; the engine's GC \
+             contract depends on this (stop and report)"
+        );
+        assert!(
+            from.exists() && !to.exists(),
+            "a failed rename changed nothing"
+        );
+        // End the child (closing its input ends cmd), then the rename works.
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut renamed = false;
+        for _ in 0..50 {
+            if std::fs::rename(&from, &to).is_ok() {
+                renamed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(renamed, "the folder can be renamed after the program ended");
+        assert!(to.join("cmd.exe").exists());
+        drop(cleanup);
     }
 }
 
