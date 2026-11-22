@@ -442,7 +442,9 @@ impl Process for MacProcess {
 
     /// Every user's processes (M11-D13 as restated): the per-user scan without its skips of other
     /// users; M8-D19's rules hold for every uid, and an identity the kernel refuses is a failed
-    /// read, read again, then in use.
+    /// read, read again, then in use. The kernel refuses a caller that is not root every other
+    /// user's identity, so for such a caller this answers in use whenever another user runs
+    /// anything (Q128: fail closed; the engine's removal guard runs as root).
     fn tree_in_use_strict(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
         let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
         let tree = libproc::kernel_path(&tree).map_err(|e| ProcessError::from_io("in use", e))?;

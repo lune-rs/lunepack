@@ -1190,10 +1190,35 @@ fn in_use_cases(process: &dyn Process, helper: &Path, scratch: &Path) {
         !process.tree_in_use(&tree, &[]).expect("tree_in_use"),
         "the process ended"
     );
-    assert!(
-        !process
-            .tree_in_use_strict(&tree, &[])
-            .expect("tree_in_use_strict"),
-        "strict: the process ended"
-    );
+    // M11-D13 (Q128 B): on macOS the strict all-users scan fails closed, and a caller that is not
+    // root is refused every other user's process details (PROC_PIDTBSDINFO), so it answers "in use"
+    // even once the process ended. Every other OS, and root on macOS, see "not in use". The root
+    // case is proven by the macOS machine suite on the Mac VM (M11 step 14).
+    let strict_after_end = process
+        .tree_in_use_strict(&tree, &[])
+        .expect("tree_in_use_strict");
+    if strict_fails_closed_here(&tree) {
+        assert!(
+            strict_after_end,
+            "strict, not root on macOS: other users' processes are unreadable, so in use"
+        );
+    } else {
+        assert!(!strict_after_end, "strict: the process ended");
+    }
+}
+
+/// True when the strict scan cannot read other users' processes and so answers "in use":
+/// macOS run by a user other than root. The caller's uid is the owner of a directory it just made.
+#[cfg(target_os = "macos")]
+fn strict_fails_closed_here(made_by_caller: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(made_by_caller)
+        .expect("stat a directory the suite made")
+        .uid()
+        != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn strict_fails_closed_here(_made_by_caller: &Path) -> bool {
+    false
 }
