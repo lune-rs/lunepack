@@ -235,14 +235,48 @@ impl LayoutScheme {
         config: UPDATE_CONFIG_PATH_MACOS,
     };
 
+    /// The Linux machine view (M11-D6): `R = /opt/<app id>` with the machine tree's names
+    /// (`app/<ver>`, `.lunepack/state`, `.lunepack/logs`) and the projection `R/current` →
+    /// `app/<ver>`. Not in the per-user recognition list: a machine tree is never recognised from
+    /// its directories.
+    pub const MACHINE_LINUX: LayoutScheme = LayoutScheme {
+        root: RootNaming::AppId,
+        versions: "app",
+        state: ".lunepack/state",
+        cache: ".lunepack/cache",
+        logs: ".lunepack/logs",
+        projection: Projection::CurrentLink,
+        config: UPDATE_CONFIG_FILE,
+    };
+
+    /// The macOS machine view (M11-D6): `R = /Library/Application Support/lunepack/<app id>`
+    /// with the machine tree's names and the bundle projection (`R/bundle`, `R/bundle.id`, the
+    /// slots `R/app/.swap` and `R/app/.out`); the trees are bundles. Not in the per-user
+    /// recognition list.
+    pub const MACHINE_MACOS: LayoutScheme = LayoutScheme {
+        root: RootNaming::AppId,
+        versions: "app",
+        state: ".lunepack/state",
+        cache: ".lunepack/cache",
+        logs: ".lunepack/logs",
+        projection: Projection::Bundle,
+        config: UPDATE_CONFIG_PATH_MACOS,
+    };
+
     /// Every scheme this build knows, for recognising a layout from its directories. XDG and MACOS
     /// name the same directories, so [`UserLayout::from_dirs`] finds XDG for both; a caller that
-    /// knows its scheme uses [`UserLayout::from_dirs_as`].
+    /// knows its scheme uses [`UserLayout::from_dirs_as`]. The machine views are left out.
     const ALL: [LayoutScheme; 3] = [
         LayoutScheme::XDG,
         LayoutScheme::WINDOWS,
         LayoutScheme::MACOS,
     ];
+
+    /// The text a [`Projection::CurrentLink`] link holds for `version` under this scheme:
+    /// `<versions>/<version>` (`versions/<v>` under XDG, `app/<v>` under the Linux machine view).
+    pub fn current_target(&self, version: &Version) -> String {
+        format!("{}/{version}", self.versions)
+    }
 }
 
 /// `base` joined with each `/`-separated name of `rel`.
@@ -556,7 +590,7 @@ pub fn version_config_path(root: &Path, version: &Version) -> PathBuf {
 
 /// The text `R/current` holds for `version` under [`LayoutScheme::XDG`]: `versions/<version>`.
 pub fn current_target(version: &Version) -> String {
-    format!("{VERSIONS_DIR}/{version}")
+    LayoutScheme::XDG.current_target(version)
 }
 
 /// [`LayoutScheme::XDG`]'s projection: makes `root/current` a symlink to `versions/<current>` of
@@ -1795,9 +1829,17 @@ pub fn reconcile_bundle(
 
 // ---- the machine layout (M10-D8) ------------------------------------------------------------------
 
-/// The update service's binary name (M10-D7), placed beside the entry in a release tree and in
-/// `R\.lunepack\machine\service\<version>\`.
+/// The update service's binary name on Windows (M10-D7), placed beside the entry in a release tree
+/// and in `R\.lunepack\machine\service\<version>\`.
 pub const SERVICE_FILE: &str = "lunepack-service.exe";
+/// The update service's binary name on Linux and macOS (M11-D6).
+pub const SERVICE_FILE_UNIX: &str = "lunepack-service";
+/// The machine home on Linux (M11-D6): `R = /opt/<app id>`.
+pub const MACHINE_HOME_LINUX: &str = "/opt";
+/// The machine home on macOS (M11-D6): `R = /Library/Application Support/lunepack/<app id>`.
+pub const MACHINE_HOME_MACOS: &str = "/Library/Application Support/lunepack";
+/// The directory under a data home that holds the per-user homes of machine installs (M11-D10).
+pub const MACHINE_USER_HOME_DIR: &str = ".lunepack";
 /// The machine tree's private directory under `R`.
 pub const MACHINE_LUNEPACK_DIR: &str = ".lunepack";
 /// The admin-only directory under `R\.lunepack`.
@@ -1809,19 +1851,162 @@ pub const MACHINE_SERVICE_DIR: &str = "service";
 /// Prefix of a version tree renamed for removal by the machine GC (`.gc-<16 hex>`).
 pub const GC_PREFIX: &str = ".gc-";
 
-/// The directories of a per-machine install `R = <machine home>\<display name>` (M10-D8):
-/// `app\<ver>`, `.lunepack\state` (the machine record), `.lunepack\logs` and the admin-only
-/// `.lunepack\machine` with the engine's lock, `incoming\` and `service\<ver>\`.
+/// The operating system a machine install's names are for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MachineOs {
+    /// Windows (M10).
+    Windows,
+    /// Linux (M11).
+    Linux,
+    /// macOS (M11).
+    Macos,
+}
+
+/// A unix [`MachineOs`]: the endpoint names and the protection rule differ only between these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnixOs {
+    /// Linux.
+    Linux,
+    /// macOS.
+    Macos,
+}
+
+impl MachineOs {
+    /// The unix OS this is; `None` on Windows.
+    pub const fn unix(self) -> Option<UnixOs> {
+        match self {
+            MachineOs::Windows => None,
+            MachineOs::Linux => Some(UnixOs::Linux),
+            MachineOs::Macos => Some(UnixOs::Macos),
+        }
+    }
+
+    /// The OS of `target`'s machine installs.
+    pub const fn of_target(target: crate::target::Target) -> MachineOs {
+        if target.is_windows() {
+            MachineOs::Windows
+        } else if target.is_macos() {
+            MachineOs::Macos
+        } else {
+            MachineOs::Linux
+        }
+    }
+}
+
+/// The update service's binary name on `os`: [`SERVICE_FILE`] on Windows, [`SERVICE_FILE_UNIX`]
+/// elsewhere (M11-D6).
+pub const fn service_file(os: MachineOs) -> &'static str {
+    match os {
+        MachineOs::Windows => SERVICE_FILE,
+        MachineOs::Linux | MachineOs::Macos => SERVICE_FILE_UNIX,
+    }
+}
+
+/// The names of a per-machine install on one OS (M10-D8, M11-D6): one directory layout on every
+/// OS, three projections. The composition root picks one; the core holds no platform switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineScheme {
+    /// The OS the names are for.
+    pub os: MachineOs,
+    /// The machine view: how `R` is named in the machine home, the directories under `R`, the
+    /// projection and the update config's path in a tree.
+    pub view: LayoutScheme,
+    /// The service binary's file name.
+    pub service_file: &'static str,
+    /// The fixed machine home (`R`'s parent) on unix; `None` on Windows, where the composition
+    /// root resolves Program Files.
+    pub home: Option<&'static str>,
+}
+
+impl MachineScheme {
+    /// Windows (M10-D8): `R = <Program Files>\<display name>`, no projection,
+    /// `lunepack-service.exe`.
+    pub const WINDOWS: MachineScheme = MachineScheme {
+        os: MachineOs::Windows,
+        view: LayoutScheme::WINDOWS,
+        service_file: SERVICE_FILE,
+        home: None,
+    };
+
+    /// Linux (M11-D6): `R = /opt/<app id>`, the projection `R/current` → `app/<ver>`,
+    /// `lunepack-service` with the stable link.
+    pub const LINUX: MachineScheme = MachineScheme {
+        os: MachineOs::Linux,
+        view: LayoutScheme::MACHINE_LINUX,
+        service_file: SERVICE_FILE_UNIX,
+        home: Some(MACHINE_HOME_LINUX),
+    };
+
+    /// macOS (M11-D6): `R = /Library/Application Support/lunepack/<app id>`, the bundle
+    /// projection, `lunepack-service` with the stable link.
+    pub const MACOS: MachineScheme = MachineScheme {
+        os: MachineOs::Macos,
+        view: LayoutScheme::MACHINE_MACOS,
+        service_file: SERVICE_FILE_UNIX,
+        home: Some(MACHINE_HOME_MACOS),
+    };
+
+    /// The scheme of `os`.
+    pub const fn of_os(os: MachineOs) -> MachineScheme {
+        match os {
+            MachineOs::Windows => MachineScheme::WINDOWS,
+            MachineOs::Linux => MachineScheme::LINUX,
+            MachineOs::Macos => MachineScheme::MACOS,
+        }
+    }
+
+    /// What is projected from the machine record.
+    pub const fn projection(&self) -> Projection {
+        self.view.projection
+    }
+
+    /// How `R` is named in the machine home.
+    pub const fn root_naming(&self) -> RootNaming {
+        self.view.root
+    }
+
+    /// The update config's path inside a version tree (`/`-separated).
+    pub const fn config(&self) -> &'static str {
+        self.view.config
+    }
+
+    /// Whether the service is started through the stable link
+    /// `R/.lunepack/machine/lunepack-service` (unix, M11-D6).
+    pub const fn has_stable_link(&self) -> bool {
+        !matches!(self.os, MachineOs::Windows)
+    }
+}
+
+/// The per-user home of a machine install of `app_id` (M11-D10):
+/// `<data home>/.lunepack/<app id>`, holding that user's `state`, `cache` and `logs`. The data
+/// home is the caller's (`$XDG_DATA_HOME` or `~/.local/share` on Linux,
+/// `~/Library/Application Support` on macOS); the core looks nothing up. An app id never starts
+/// with `.`, so this never meets a per-user `R = <data home>/<app id>`.
+pub fn machine_user_home(data_home: &Path, app_id: &AppId) -> PathBuf {
+    data_home.join(MACHINE_USER_HOME_DIR).join(app_id.as_str())
+}
+
+/// The directories of a per-machine install (M10-D8, M11-D6): `app/<ver>`, `.lunepack/state`
+/// (the machine record), `.lunepack/logs` and the admin-only `.lunepack/machine` with the
+/// engine's lock, `incoming/`, `service/<ver>/` and, on unix, the stable service link. The names
+/// are the same on every OS; the [`MachineScheme`] adds the service file name and the projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineLayout {
     root: PathBuf,
+    scheme: MachineScheme,
 }
 
 impl MachineLayout {
-    /// The layout of the install root `root`.
+    /// The Windows layout of the install root `root` ([`MachineScheme::WINDOWS`]).
     pub fn new(root: &Path) -> MachineLayout {
+        MachineLayout::with_scheme(root, MachineScheme::WINDOWS)
+    }
+
+    /// The layout of the install root `root` under `scheme`.
+    pub fn with_scheme(root: &Path, scheme: MachineScheme) -> MachineLayout {
         MachineLayout {
             root: root.to_path_buf(),
+            scheme,
         }
     }
 
@@ -1830,9 +2015,20 @@ impl MachineLayout {
         &self.root
     }
 
+    /// The scheme the layout names its files with.
+    pub fn scheme(&self) -> MachineScheme {
+        self.scheme
+    }
+
+    /// The machine view of `R` as a [`UserLayout`] under the scheme's view, for the projection
+    /// (`R/current` on Linux, the bundle on macOS) and the version trees' config paths.
+    pub fn view(&self) -> UserLayout {
+        UserLayout::from_root(self.root.clone(), self.scheme.view)
+    }
+
     /// `R\app`.
     pub fn app_dir(&self) -> PathBuf {
-        join_names(&self.root, LayoutScheme::WINDOWS.versions)
+        join_names(&self.root, self.scheme.view.versions)
     }
 
     /// `R\app\<version>`.
@@ -1847,12 +2043,12 @@ impl MachineLayout {
 
     /// `R\.lunepack\state`, the machine record's directory.
     pub fn state_dir(&self) -> PathBuf {
-        join_names(&self.root, LayoutScheme::WINDOWS.state)
+        join_names(&self.root, self.scheme.view.state)
     }
 
     /// `R\.lunepack\logs`.
     pub fn logs_dir(&self) -> PathBuf {
-        join_names(&self.root, LayoutScheme::WINDOWS.logs)
+        join_names(&self.root, self.scheme.view.logs)
     }
 
     /// `R\.lunepack\machine`, admin-only.
@@ -1880,16 +2076,39 @@ impl MachineLayout {
         self.service_dir().join(version.to_string())
     }
 
-    /// The service binary of `version`: `service\<version>\lunepack-service.exe`.
+    /// The service binary of `version`: `service\<version>\lunepack-service.exe` on Windows,
+    /// `service/<version>/lunepack-service` on unix.
     pub fn service_image(&self, version: &Version) -> PathBuf {
-        self.service_version_dir(version).join(SERVICE_FILE)
+        self.service_version_dir(version)
+            .join(self.scheme.service_file)
     }
 
-    /// The inverse of [`MachineLayout::service_image`]: the root and version of an image path of
-    /// that exact shape (the version directory named by its canonical version text), else `None`.
+    /// The stable service link `R/.lunepack/machine/lunepack-service` (unix, M11-D6): the path
+    /// the init system starts, a symlink to `service/<ver>/lunepack-service` switched by an
+    /// atomic rename of a new link over it. `None` on Windows, where the registration names the
+    /// image itself.
+    pub fn stable_service_link(&self) -> Option<PathBuf> {
+        self.scheme
+            .has_stable_link()
+            .then(|| self.machine_dir().join(self.scheme.service_file))
+    }
+
+    /// The inverse of [`MachineLayout::service_image`] under [`MachineScheme::WINDOWS`]: the root
+    /// and version of an image path of that exact shape (the version directory named by its
+    /// canonical version text), else `None`.
     pub fn of_service_image(image: &Path) -> Option<(MachineLayout, Version)> {
+        MachineLayout::of_service_image_as(image, MachineScheme::WINDOWS)
+    }
+
+    /// The inverse of [`MachineLayout::service_image`] under `scheme`: the layout (with `scheme`)
+    /// and version of an image path of exactly `R/.lunepack/machine/service/<v>/<service file>`
+    /// with `<v>` the canonical version text, else `None`.
+    pub fn of_service_image_as(
+        image: &Path,
+        scheme: MachineScheme,
+    ) -> Option<(MachineLayout, Version)> {
         let name = |p: &Path| p.file_name().and_then(OsStr::to_str).map(str::to_owned);
-        if name(image)? != SERVICE_FILE {
+        if name(image)? != scheme.service_file {
             return None;
         }
         let ver_dir = image.parent()?;
@@ -1905,15 +2124,26 @@ impl MachineLayout {
         let shape = name(service)? == MACHINE_SERVICE_DIR
             && name(machine)? == MACHINE_ADMIN_DIR
             && name(lunepack)? == MACHINE_LUNEPACK_DIR;
-        shape.then(|| (MachineLayout::new(root), version))
+        shape.then(|| (MachineLayout::with_scheme(root, scheme), version))
     }
 }
 
-/// The service binary's path in a release tree whose entry is `entry`: beside the entry.
+/// The Windows service binary's path in a release tree whose entry is `entry`: beside the entry
+/// ([`service_path_in_tree_for`] with [`MachineOs::Windows`]).
 pub fn service_path_in_tree(entry: &crate::path::RelPath) -> Option<crate::path::RelPath> {
+    service_path_in_tree_for(entry, MachineOs::Windows)
+}
+
+/// The service binary's path ([`service_file`] of `os`) in a release tree whose entry is `entry`:
+/// beside the entry.
+pub fn service_path_in_tree_for(
+    entry: &crate::path::RelPath,
+    os: MachineOs,
+) -> Option<crate::path::RelPath> {
+    let file = service_file(os);
     let path = match entry.as_str().rsplit_once('/') {
-        Some((dir, _)) => format!("{dir}/{SERVICE_FILE}"),
-        None => SERVICE_FILE.to_owned(),
+        Some((dir, _)) => format!("{dir}/{file}"),
+        None => file.to_owned(),
     };
     crate::path::RelPath::parse(&path).ok()
 }

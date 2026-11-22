@@ -273,30 +273,39 @@ pub trait PublisherCheck: Send + Sync {
 
 // ---- the machine-install ports (M10) -------------------------------------------------------------
 
-/// The protection class of a directory the privileged engine creates or checks (M10-D9).
+/// The protection class of a directory the privileged engine creates or checks (M10-D9,
+/// M11-D7): who may change it and who may read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DirClass {
-    /// A directory of the machine tree (`R`, `R\app`, `R\.lunepack`, `R\.lunepack\state`):
-    /// owner Administrators, full control for LocalSystem and Administrators, read and execute
-    /// for Users and app packages, nothing else.
+    /// A directory of the machine tree (`R`, `R/app`, `R/.lunepack`, `R/.lunepack/state`):
+    /// only the administrators may change it, every local user may read it.
+    ///
+    /// Windows (M10-D9): owner Administrators, full control for LocalSystem and Administrators,
+    /// read and execute for Users and app packages, nothing else. Unix (M11-D7): owner uid 0, no
+    /// write for other, group write only for gid 0 (or 80 `admin` on macOS), no ACL
+    /// ([`crate::unix_protect`]).
     MachineTree,
-    /// An admin-only directory (`R\.lunepack\machine` and below): owner Administrators, full
-    /// control for LocalSystem and Administrators, nothing for anyone else.
+    /// An admin-only directory (`R/.lunepack/machine` and below): only the administrators may
+    /// read or change it.
+    ///
+    /// Windows (M10-D9): owner Administrators, full control for LocalSystem and Administrators,
+    /// nothing for anyone else. Unix (M11-D7): owner uid 0, no bits for group or other, no ACL.
     AdminOnly,
 }
 
-/// Protected directories (M10-D9): creates a directory with an explicit protected descriptor of
-/// its class, and checks that an existing one is protected as its class says. Object-safe and
-/// `Send + Sync`.
+/// Protected directories (M10-D9, M11-D7): creates a directory protected as its class says, and
+/// checks that an existing one is. Object-safe and `Send + Sync`.
 pub trait Protect: Send + Sync {
-    /// Creates the directory `path` (its parent must exist) with the descriptor of `class`. An
+    /// Creates the directory `path` (its parent must exist) protected as `class` says (Windows:
+    /// an explicit protected descriptor; unix: owner 0:0 and the exact mode, then checked). An
     /// existing entry at `path` is [`ProtectError::Exists`] and is left unchanged.
     fn create_dir(&self, path: &Path, class: DirClass) -> std::result::Result<(), ProtectError>;
 
     /// `Ok(())` when `path` is a real directory (not a link) protected as `class` says: nobody
-    /// outside the class's writers holds a write-class right and the owner is Administrators,
-    /// LocalSystem or TrustedInstaller. A missing directory is [`ProtectError::NotFound`]; any
-    /// other shape is [`ProtectError::NotProtected`].
+    /// outside the class's writers may change it and the owner is an administrator (Windows:
+    /// Administrators, LocalSystem or TrustedInstaller; unix: uid 0, and every ancestor of the
+    /// install root passes [`DirClass::MachineTree`]'s rule). A missing directory is
+    /// [`ProtectError::NotFound`]; any other shape is [`ProtectError::NotProtected`].
     fn check(&self, path: &Path, class: DirClass) -> std::result::Result<(), ProtectError>;
 }
 

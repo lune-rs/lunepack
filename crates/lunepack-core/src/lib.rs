@@ -5,6 +5,7 @@ pub mod chain;
 pub mod codesign;
 pub mod digest;
 pub mod encoding;
+pub mod endpoint;
 pub mod engine;
 pub mod envelope;
 pub mod error;
@@ -39,6 +40,7 @@ pub mod traits;
 pub mod transport;
 pub mod trust;
 pub mod ui;
+pub mod unix_protect;
 pub mod update_config;
 pub mod version;
 pub mod write;
@@ -80,10 +82,11 @@ pub use integration::{
 };
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use layout::{
-    BundleDiscovery, BundleProbe, Discovery, LayoutScheme, LocationReason, MachineLayout, NameRule,
-    Projection, RootChoice, RootNaming, SERVICE_FILE, UserLayout, bundle_orphaned, bundle_replaced,
-    check_place, discover, discover_bundle, ensure_no_foreign_record, is_tombstone_of,
-    macos_name_ok, read_bundle_identity, reconcile_bundle, reconcile_current, remove_tombstones,
+    BundleDiscovery, BundleProbe, Discovery, LayoutScheme, LocationReason, MachineLayout,
+    MachineOs, MachineScheme, NameRule, Projection, RootChoice, RootNaming, SERVICE_FILE,
+    SERVICE_FILE_UNIX, UnixOs, UserLayout, bundle_orphaned, bundle_replaced, check_place, discover,
+    discover_bundle, ensure_no_foreign_record, is_tombstone_of, machine_user_home, macos_name_ok,
+    read_bundle_identity, reconcile_bundle, reconcile_current, remove_tombstones,
     resolve_bundle_target, resolve_root, resolve_root_scoped, root_valid_for_uninstall,
     set_bundle_pointer, tombstone_name, tree_candidates, version_config_path, windows_name_ok,
     write_bundle_identity,
