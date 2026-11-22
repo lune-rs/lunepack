@@ -54,6 +54,9 @@ pub const ACCEPT_WAIT: Duration = Duration::from_secs(30);
 pub const PAYLOAD_PREFIX: &str = ".lunepack-install-";
 /// The copied pack's file name in that folder.
 pub const PACK_FILE: &str = "pack";
+/// The lock file in that folder: held by the run that made the folder for as long as it lives, so
+/// a later run can tell a folder whose run is gone (F1).
+pub const PAYLOAD_LOCK: &str = "lock";
 /// The most bytes copied at once.
 const COPY_CHUNK: usize = 1 << 20;
 
@@ -257,16 +260,49 @@ impl<'a> Base<'a> {
     }
 }
 
-/// The folder a payload is copied into; removed when this is dropped (the engine removes it as
-/// well when it runs).
+/// The folder a payload is copied into, with its lock held; removed when this is dropped (the
+/// engine removes it as well when it runs), the lock released first.
 struct PayloadDir<'a> {
     fs: &'a dyn Fs,
     path: PathBuf,
+    lock: Option<Box<dyn lunepack_core::LockGuard>>,
 }
 
 impl Drop for PayloadDir<'_> {
     fn drop(&mut self) {
+        drop(self.lock.take());
         let _ = self.fs.remove_dir_all_nofollow(&self.path);
+    }
+}
+
+/// Removes the payload folders earlier runs left under the machine home when one was cut off (a
+/// crash, a power loss, a reboot, F1): each real directory named `.lunepack-install-<32 lowercase
+/// hex>` whose lock file is a regular file that can be taken, so the run that made it is gone. A
+/// folder whose run is alive, or that has no lock file yet (made a moment ago), is left. Exempt from
+/// the removal guard (M10-D20): the folders are admin-only and no path into one is handed out.
+fn sweep_payload_dirs(base: &Base<'_>) {
+    let Ok(entries) = base.fs.list_dir(base.home) else {
+        return;
+    };
+    for entry in entries {
+        let named = entry
+            .name
+            .to_str()
+            .and_then(|n| n.strip_prefix(PAYLOAD_PREFIX))
+            .is_some_and(crate::modes::is_events_id);
+        if entry.kind != FileKind::Dir || !named {
+            continue;
+        }
+        let dir = base.home.join(&entry.name);
+        let lock = dir.join(PAYLOAD_LOCK);
+        let is = |p: &Path, kind: FileKind| matches!(base.fs.symlink_metadata(p), Ok(Some(m)) if m.kind == kind);
+        if !is(&dir, FileKind::Dir) || !is(&lock, FileKind::File) {
+            continue;
+        }
+        if let Ok(Some(guard)) = base.fs.try_lock(&lock) {
+            drop(guard);
+            let _ = base.fs.remove_dir_all_nofollow(&dir);
+        }
     }
 }
 
@@ -373,16 +409,28 @@ pub fn stage_payload<'a>(
     )?;
     let source = ReadAtWindow::new(&*found.file, trailer.pack).map_err(|_| Kind::Verify)?;
 
+    sweep_payload_dirs(base);
     let mut id = [0u8; 16];
     base.rng.fill(&mut id).map_err(|_| Kind::Internal)?;
     let path = base.home.join(format!("{PAYLOAD_PREFIX}{}", hex(&id)));
     base.protect
         .create_dir(&path, DirClass::AdminOnly)
         .map_err(|_| Kind::NotProtected)?;
-    let dir = PayloadDir {
+    let mut dir = PayloadDir {
         fs: base.fs,
         path: path.clone(),
+        lock: None,
     };
+    // The lock file is made first and held for the folder's life (an adapter need not create it).
+    let lock_path = path.join(PAYLOAD_LOCK);
+    drop(base.fs.create_new(&lock_path).map_err(|_| Kind::Fs)?);
+    dir.lock = Some(
+        base.fs
+            .try_lock(&lock_path)
+            .ok()
+            .flatten()
+            .ok_or(Kind::Fs)?,
+    );
 
     // The pack, chunk by chunk, into a file of the new folder.
     let pack_path = path.join(PACK_FILE);
@@ -1773,6 +1821,47 @@ mod tests {
     }
 
     // ---- the elevated side ------------------------------------------------------------------
+
+    #[test]
+    fn payload_folders_of_runs_that_are_gone_are_swept_before_a_copy() {
+        use lunepack_core::Fs as _;
+        let host = Host::new();
+        let folder = |n: u8| host.home.join(format!("{PAYLOAD_PREFIX}{}", hex(&[n; 16])));
+        // A run cut off (its lock free), a run still copying (its lock held), a folder made a
+        // moment ago (no lock file yet), and a name that is not a payload folder's.
+        for n in [1u8, 2, 3] {
+            host.mem.create_dir_all(&folder(n)).unwrap();
+        }
+        let mut pack = host.mem.create_new(&folder(1).join(PACK_FILE)).unwrap();
+        pack.write_all(b"half a pack").unwrap();
+        drop(pack);
+        for n in [1u8, 2] {
+            drop(host.mem.create_new(&folder(n).join(PAYLOAD_LOCK)).unwrap());
+        }
+        let held = host
+            .mem
+            .try_lock(&folder(2).join(PAYLOAD_LOCK))
+            .unwrap()
+            .unwrap();
+        let other = host.home.join(format!("{PAYLOAD_PREFIX}not-hex"));
+        host.mem.create_dir_all(&other).unwrap();
+
+        let b = Built::new(0, "1.0.0", true);
+        let (events, _) = collecting();
+        let staged = stage_payload(&host.base(), &b.found(), &b.anchor(), &events).expect("staged");
+        let exists = |p: &Path| host.mem.symlink_metadata(p).unwrap().is_some();
+        assert!(!exists(&folder(1)), "the cut-off run's folder is gone");
+        assert!(exists(&folder(2)), "a live run's folder stays");
+        assert!(exists(&folder(3)), "a folder without its lock yet stays");
+        assert!(exists(&other));
+        // This run's own folder holds its lock while it lives: a second sweep leaves it.
+        let mine = staged.dir.path.clone();
+        sweep_payload_dirs(&host.base());
+        assert!(exists(&mine));
+        drop(staged);
+        assert!(!exists(&mine));
+        drop(held);
+    }
 
     #[test]
     fn an_anchored_payload_is_copied_verified_and_installed_and_the_copy_is_gone() {
