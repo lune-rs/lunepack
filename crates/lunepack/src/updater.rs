@@ -2024,7 +2024,7 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
         let app_id = inner.app_id.clone();
         let progress_sink = sink.clone();
         // One job opens the session, uploads and commits; the session lives on between jobs.
-        let (session, mut outcome) = on_job(
+        let (session, mut round) = on_job(
             &inner,
             Some(&lock),
             &cancel,
@@ -2040,14 +2040,26 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
                     return Err(Error::Stale);
                 }
                 stage.upload(&*inner.fs, &first, cancel)?;
+                let rejected = drop_rejected(inner, &mut stage);
                 let outcome = commit(&mut stage, &progress_sink)?;
-                Ok((stage, outcome))
+                Ok((stage, (outcome, rejected)))
             },
         )
         .await?;
         let session = Arc::new(std::sync::Mutex::new(Some(session)));
         let (mut range_tried, mut pack_tried) = (false, false);
         let staged_version = loop {
+            let (outcome, rejected) = round;
+            // What the service refused is gone from the cache; it is not offered again unless it
+            // is fetched anew below.
+            for (kind, sha) in rejected {
+                match kind {
+                    lunepack_core::service::ObjectKind::Frame => {
+                        frames.remove(&sha);
+                    }
+                    lunepack_core::service::ObjectKind::Pack => pack = None,
+                }
+            }
             let paths = match outcome {
                 CommitOutcome::Staged(v) => break v,
                 CommitOutcome::NeedFetch { paths, .. } => paths,
@@ -2109,7 +2121,7 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
             let session = Arc::clone(&session);
             let progress_sink = sink.clone();
             sink.set_phase(Phase::Stage, 0);
-            outcome = on_job(
+            round = on_job(
                 &inner,
                 Some(&lock),
                 &cancel,
@@ -2118,7 +2130,8 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
                     let mut guard = session.lock().map_err(|_| Error::WorkerPanicked)?;
                     let stage = guard.as_mut().ok_or(Error::Cancelled)?;
                     stage.upload(&*inner.fs, &more, cancel)?;
-                    commit(stage, &progress_sink)
+                    let rejected = drop_rejected(inner, stage);
+                    Ok((commit(stage, &progress_sink)?, rejected))
                 },
             )
             .await?;
@@ -2165,6 +2178,26 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
         Ok(staged)
     })
     .await
+}
+
+/// Removes from the user's cache each object the service refused in `stage` as not matching the
+/// manifest (F2): the entry is damaged, and kept it would be offered again on every stage. The
+/// objects are returned so the caller stops offering them. A removal that fails leaves the entry;
+/// the cache re-checks it before the next use.
+fn drop_rejected(
+    inner: &Inner,
+    stage: &mut StageSession,
+) -> Vec<(lunepack_core::service::ObjectKind, Sha256Digest)> {
+    let rejected = stage.take_rejected();
+    let cache = inner.cache();
+    for (kind, sha) in &rejected {
+        let kind = match kind {
+            lunepack_core::service::ObjectKind::Frame => CacheKind::Frame,
+            lunepack_core::service::ObjectKind::Pack => CacheKind::Pack,
+        };
+        let _ = cache.remove_entry(kind, sha);
+    }
+    rejected
 }
 
 /// `stage_commit` with the service's progress forwarded as the stage phase's.

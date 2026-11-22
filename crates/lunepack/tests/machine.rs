@@ -749,6 +749,141 @@ fn a_file_the_service_cannot_place_is_fetched_and_the_stage_commits_again() {
     rig.assert_read_only();
 }
 
+/// The frame entries of the user's download cache under `dir` (files named by a SHA-256 in a
+/// `frames` directory), found by walking it.
+fn cached_frames(fs: &MemFs, dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(at) = stack.pop() {
+        let Ok(entries) = fs.list_dir(&at) else {
+            continue;
+        };
+        for e in entries {
+            let path = at.join(&e.name);
+            match e.kind {
+                lunepack_core::FileKind::Dir => stack.push(path),
+                lunepack_core::FileKind::File
+                    if at.file_name().is_some_and(|n| n == "frames")
+                        && e.name.to_str().is_some_and(|n| {
+                            n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit())
+                        }) =>
+                {
+                    found.push(path);
+                }
+                _ => {}
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// F2: a frame in the user's cache that is damaged (the right size, other bytes) is refused by the
+/// service; the facade drops it from the cache, fetches it again and the stage commits.
+#[test]
+fn a_damaged_frame_in_the_cache_is_dropped_and_fetched_again() {
+    let rig = Rig::new();
+    rig.publish(2, V110);
+    let inst = rig.open(V100, None);
+    // Range requests only: the changed files come as frames.
+    let updater = rig.updater_with(
+        &inst,
+        lunepack::FetchPolicy {
+            gap: 0,
+            full_ratio: 100,
+            max_runs: 64,
+        },
+    );
+    let (_, downloaded) = check_and_download(&rig, &updater);
+    let frames = cached_frames(&rig.world.fs, &rig.local.join("alice"));
+    let damaged = frames.first().expect("a cached frame").clone();
+    let mut bytes = rig
+        .world
+        .fs
+        .read_capped(&damaged, 1 << 20)
+        .expect("read the frame");
+    bytes[0] ^= 0xff;
+    rig.world.fs.remove_file(&damaged).expect("remove");
+    let mut w = rig.world.fs.create_new(&damaged).expect("create");
+    w.write_all(&bytes).expect("write");
+    drop(w);
+
+    let before = rig.world.origin.requests().len();
+    let staged = block_on(updater.stage(downloaded)).expect("stage after the refusal");
+    assert_eq!(staged.version(), &version(V110));
+    assert!(
+        rig.world.origin.requests().len() > before,
+        "the refused frame was fetched again from the feed's origin"
+    );
+    assert_eq!(
+        rig.host.record().staged.as_ref().map(|s| s.version.clone()),
+        Some(version(V110))
+    );
+    rig.assert_read_only();
+}
+
+/// F2's bound: a service that refuses every object as damaged and always answers `need_fetch` is
+/// committed to at most three times, then the stage fails as exhausted.
+#[test]
+fn a_service_that_refuses_every_object_ends_within_three_commits() {
+    use lunepack_core::service::{ErrorCode, Request, Response};
+    let rig = Rig::new();
+    rig.publish(2, V110);
+    let commits = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&commits);
+    let refusing = Arc::new(FakeConnector::new(move |app| {
+        let (client, server) = mem_duplex();
+        let (app, counted) = (app.clone(), Arc::clone(&counted));
+        thread::spawn(move || {
+            let Ok(mut session) = ServerSession::accept(server, app) else {
+                return;
+            };
+            while let Ok(Some(request)) = session.next_request() {
+                let answer = match request {
+                    Request::StageBegin { documents, .. } => {
+                        let size = documents.iter().map(|d| d.bytes).sum();
+                        if session.read_data(size, &mut std::io::sink()).is_err() {
+                            return;
+                        }
+                        Response::StageReady {
+                            version: version(V110),
+                        }
+                    }
+                    Request::Put { size, .. } => {
+                        if session.read_data(size, &mut std::io::sink()).is_err() {
+                            return;
+                        }
+                        Response::error(ErrorCode::HashMismatch)
+                    }
+                    Request::StageCommit => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        Response::NeedFetch {
+                            paths: vec![RelPath::parse("app.exe").expect("path")],
+                            more: false,
+                        }
+                    }
+                    _ => return,
+                };
+                if session.reply(&answer).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Box::new(client))
+    }));
+    let platform = rig.platform_for("alice", None, refusing);
+    let inst = rig.open_with(V100, platform);
+    let updater = rig.updater(&inst);
+    let (_, downloaded) = check_and_download(&rig, &updater);
+    let result = block_on(updater.stage(downloaded));
+    assert!(
+        matches!(result, Err(Error::NeedFetchExhausted(_))),
+        "{result:?}"
+    );
+    assert_eq!(commits.load(Ordering::SeqCst), 3);
+    rig.assert_read_only();
+}
+
 // ---- policy --------------------------------------------------------------------------------------
 
 #[test]

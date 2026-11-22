@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use lunepack_core::service::{
     AttemptAnswer, ClientSession, ClientTimeouts, CommitOutcome, ConfirmAnswer, DocumentKind,
-    Duplex, ObjectKind, OutgoingDocument, StageBegun, Token,
+    Duplex, ErrorCode, ObjectKind, OutgoingDocument, StageBegun, Token,
 };
 use lunepack_core::state::{InstallCounters, InstallState, MachineScope};
 use lunepack_core::{
@@ -236,11 +236,13 @@ pub(crate) struct Offer {
     pub path: PathBuf,
 }
 
-/// A stage session in progress: the connection and the objects already accepted (each is accepted
-/// once).
+/// A stage session in progress: the connection, the objects already accepted (each is accepted
+/// once) and those the service refused as not matching the manifest since the last
+/// [`StageSession::take_rejected`].
 pub(crate) struct StageSession {
     session: Session,
     sent: HashSet<Sha256Digest>,
+    rejected: Vec<(ObjectKind, Sha256Digest)>,
 }
 
 impl StageSession {
@@ -274,13 +276,17 @@ impl StageSession {
             StageSession {
                 session,
                 sent: HashSet::new(),
+                rejected: Vec::new(),
             },
             version,
         ))
     }
 
     /// Uploads each of `offers` the session has not taken yet, reading the files through `fs`; a
-    /// cancelled `cancel` stops between reads, which ends the session.
+    /// cancelled `cancel` stops between reads, which ends the session. An object the service
+    /// answers `hash_mismatch` or `size_mismatch` for (a damaged file in the user's cache, F2) is
+    /// not an error: it is noted for [`StageSession::take_rejected`] and the upload goes on; the
+    /// commit then names what it lacked as `need_fetch`, and the refetch ladder replaces it.
     pub(crate) fn upload(
         &mut self,
         fs: &dyn Fs,
@@ -306,6 +312,12 @@ impl StageSession {
                 Ok(()) => {
                     self.sent.insert(offer.sha256);
                 }
+                Err(ServiceError::Answered {
+                    code: ErrorCode::HashMismatch | ErrorCode::SizeMismatch,
+                    ..
+                }) if reader.failure.is_none() => {
+                    self.rejected.push((offer.kind, offer.sha256));
+                }
                 Err(e) => {
                     // The read that failed says why better than the session does.
                     return Err(reader.failure.take().unwrap_or_else(|| service_error(e)));
@@ -313,6 +325,11 @@ impl StageSession {
             }
         }
         Ok(())
+    }
+
+    /// The objects refused since the last call, in upload order.
+    pub(crate) fn take_rejected(&mut self) -> Vec<(ObjectKind, Sha256Digest)> {
+        std::mem::take(&mut self.rejected)
     }
 
     /// `stage_commit`, forwarding the service's progress.
@@ -607,7 +624,7 @@ pub(crate) fn confirm(
         match session.confirm(own, &token) {
             Ok(answer) => return Ok(confirmed(answer)),
             Err(ServiceError::Answered {
-                code: lunepack_core::service::ErrorCode::TokenMismatch,
+                code: ErrorCode::TokenMismatch,
                 ..
             }) => {}
             Err(e) => return Err(service_error(e)),
