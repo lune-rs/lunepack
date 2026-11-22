@@ -440,6 +440,15 @@ with the `sign_installer` template after it is built ("Code signing"); without i
 with Authenticode. The runtime finds the trailer in a signed file (FORMAT.md 14.3), and a byte added after
 the signature makes it refuse to run.
 
+A Windows setup file also carries the **anchor** (FORMAT.md 14.5): one resource of the runtime image holding
+SHA-256 digests of the trailer, the key-set part and the manifest part. `setup` stamps a placeholder, writes
+the payload and the trailer, patches the digests in place and reads the file back against them; the file's
+length and offsets do not change. An installer for all users checks its payload against the anchor of its own
+running image. The anchor binds the payload after an administrator consented to the prompt; before consent
+only an Authenticode signature lets the administrator tell a genuine setup file from a swapped one, so sign
+the installer of an app that installs for all users. A release packed with `--service` offers the "For all
+users" choice (RUNTIME.md, "Per-machine installs").
+
 ### macOS targets (M8)
 
 A `macos-*` pack with `[update]` packs an app bundle (`<Name>.app`'s contents) and adds files inside it,

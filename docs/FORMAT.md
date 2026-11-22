@@ -756,7 +756,7 @@ A record file is at most 1 MiB (1048576 bytes) in all, and its length is exactly
 
 The payload follows 3.1 with one difference: `null` is the value of a field the tables mark "or
 null", and every field in the tables is required (a nullable field is written as `null`, never
-omitted). Integers follow 3.1 (`0 ..= 2^53 − 1`).
+omitted), except `last_run` of an `install-counters` record. Integers follow 3.1 (`0 ..= 2^53 − 1`).
 
 Every record has:
 
@@ -785,8 +785,12 @@ An `install-state` record also has:
 | `lifecycle` | object or null | `{events}`: lifecycle events not yet delivered (12.9), at most 16, oldest first; `null` when there are none |
 | `staged_issued` | object or null | `{version, manifest_sha256, issued}`: the `issued` of the staged manifest (12.9) |
 
-An `install-counters` record (12.6) has, besides the common fields, only `install_id` and
-`floors`.
+An `install-counters` record (12.6) has, besides the common fields, only `install_id`, `floors` and
+`last_run`:
+
+| Field | Type | Rule |
+|---|---|---|
+| `last_run` | version | the version this user last ran on a per-machine install (12.9); **optional**: the member is left out, never written as `null`, until the first run, and a record written before it existed lacks it. It is the one field of the tables above that may be absent |
 
 `floors` is `{root, keyset_version, feed_seq}`:
 
@@ -928,13 +932,19 @@ step 3 completed.
 - **Per-user install** (`scope: user`): one store in the install's state directory, read and written
   by the library.
 - **Per-machine install** (`scope: machine`): the `install-state` store in the machine state
-  directory is written only by the privileged engine; the library reads it and never writes it.
-  Each user keeps the floors they have verified for that install as `install-counters` records in
-  `<user state dir>/<install_id as 32 hex>/`. A counters record whose `install_id` differs from the
-  machine record's is invalid (the load stops). A check starts from the **effective floors**, the
-  field-wise higher of the machine record's and the user's: the higher key-set version, per channel
-  the higher feed `seq`, and the higher root, ordered by `version`, then `threshold`, then the key
-  bytes in order (so a lower root version never replaces a higher one).
+  directory, `R\.lunepack\state` (18.1; world-readable, writable by administrators only), is written
+  only by the privileged engine; the library reads it and never writes it. Each user keeps the floors
+  they have verified for that install as `install-counters` records in
+  `<user home>\state\<install_id as 32 hex>\` (18.5). A counters record whose `install_id` differs from
+  the machine record's is invalid (the load stops). A check starts from the **effective floors**: the
+  key-set version and, per channel, the feed `seq` are the field-wise higher of the machine record's and
+  the user's. The **root is never taken from a user's record** (M4-SEC-obs1, M10-D17): it is the machine
+  record's `floors.root`, or, when that is `null`, the root of the installed tree's own update
+  configuration (13.2), and a check walks any rotations again (5.2) each time, so a record a user can
+  write never names a trust root. The engine reads the floors and the root from the machine record alone
+  and has no parameter that names a user's directory. The machine record's root moves only when the
+  engine stages an update (the machine learns a root rotation then); a user's check walks forward from the
+  machine's root through the rotation documents the feed's host offers.
 
 ### 12.7 Trees on disk
 
@@ -1003,6 +1013,12 @@ step 3 completed.
 - **Events.** `installed` and `first_run` are queued by a first install, `updated` and `first_run`
   by an apply. Each is for one version (`version`, or `to` for `updated`) and is delivered at most
   once, by that version's first start, which removes it in the same record.
+- **Events on a per-machine install** (M10-D16). The machine record queues none: the library cannot mark
+  them delivered, and they would be one user's. It derives them per user from `last_run` in that user's
+  `install-counters` record when this version starts: no `last_run` gives `first_run`; a lower one
+  gives `updated` (from it) and `first_run`; an equal or higher one (after a rollback) gives nothing;
+  `installed` is not delivered. The record is committed with `last_run` set to this version before the
+  events are returned, so each is delivered at most once per user.
 
 ## 13. Update configuration
 
@@ -1393,6 +1409,32 @@ starts the runtime beside it as the engine, so a double-click opens the window.
 
 The image is built by `lunepack setup`; the installer app carries no signature in this revision.
 
+### 14.5 The anchor of a Windows setup file (M10-D4)
+
+A `windows-*` setup file carries, in the runtime image that precedes the payload, one `RT_RCDATA` resource
+(id 1) of exactly 104 bytes, the **anchor**: the eight bytes `89 4C 50 41 4E 43 0D 0A` (`\x89LPANC\r\n`),
+then three SHA-256 digests of 32 bytes each: of the 4096-byte trailer block (14.1) as written, of the
+key-set part, and of the manifest part (the pack is bound by the manifest, 14.2). `lunepack setup` stamps
+the resource with the eight magic bytes and 96 zero bytes (the placeholder) when it builds the image,
+writes the payload and the trailer, patches the 96 bytes in place with the real digests, and reads the
+file back against them; the file's length and the offsets of 14 do not change. An Authenticode signature
+added afterwards covers the resource, as it covers the rest of the image.
+
+A reader that installs for all users (the elevated engine; the unelevated run checks the same) reads the
+anchor from the **mapped image of its own process**, not from the file, and refuses the payload before
+anything is written unless, in this order: (1) the anchor is not the placeholder; (2) the SHA-256 of the
+trailer block is the anchor's, before the trailer is parsed; (3) the trailer parses (14.1); (4) the key-set
+part and then the manifest part, each read once within its cap, hash to the anchor's digests; (5) the
+payload verifies as in 14.2 over exactly those bytes. The trailer's root is trusted because the anchor
+names the trailer that carries it, never on its own.
+
+What this binds: the payload to the image that was started and, after a User Account Control prompt, to the
+image the administrator consented to, whatever happens to the file in a user-writable folder afterwards.
+What it does not: a whole file swapped *before* the prompt. Only an Authenticode signature (CLI.md "Code
+signing") lets the administrator tell a genuine `Setup.exe` from a swapped one, because then the prompt
+names the publisher; an unsigned file shows "Unknown publisher" alike for both. `Setup.exe` is read only by
+the runtime inside it, so the anchor is not a cross-version format and may change with the build.
+
 ## 15. Windows stub launch contract, version 2
 
 The launcher stub is a small Windows executable that the packager stamps with the app's icon and version
@@ -1674,3 +1716,268 @@ the new install id and the `installed` and `first_run` events.
   folder and then deleted; `R`, renamed to its tombstone in the data home (as 16) and then deleted; and the
   LaunchAgent entry when its `Label` is the app's. Each leaves its path in one rename, so a cut-off uninstall
   leaves `B` and `R` whole or gone, `B` first.
+
+## 18. Windows per-machine layout
+
+A per-machine ("all users") install on Windows has an install root `R` under the Program Files known
+folder and the names below. They are a **cross-version contract** with sections 12, 15 and 19: the stub
+(15), the library, the runtime, the update service and every later build of each find the install by
+them. A per-machine install exists only for a release packed with the update service
+(`lunepack-service.exe`, CLI.md `pack --service`); without it an app installs per user only (16).
+
+### 18.1 Directories
+
+`R` is `<FOLDERID_ProgramFiles>\<name>`, with `<name>` the app's display name `install.name` at its first
+install (it must pass the Windows name rule of 13.4); the folder is found and placed by the rule of 16 (the
+programs folder there is the Program Files known folder here, and a record counts only when it is of scope
+`machine`). The known folder is taken from the operating system's API, never from an environment variable.
+
+| Path under `R` | Holds | Class (18.2) |
+|---|---|---|
+| `<entry file name>` | the launcher stub (15) | `R` |
+| `app\<version>\` | the version's tree (12.7) | machine tree |
+| `app\.gc-<16 hex>\` | a version tree being removed (transient; the engine removes it, or a later pass does) | machine tree |
+| `.lunepack\state\` | the machine `install-state` records (12; scope `machine`), world-readable | machine tree |
+| `.lunepack\logs\` | the update service's log | machine tree |
+| `.lunepack\machine\` | the engine's private area: | admin only |
+| `.lunepack\machine\lock` | the engine's lock file (held by the service, or by the one elevated mode that runs) | admin only |
+| `.lunepack\machine\incoming\<random>\` | one folder per upload session: the documents and objects a client sent, before they are verified | admin only |
+| `.lunepack\machine\service\<version>\lunepack-service.exe` | the service binary of a version, the file the service registration names (18.3) | admin only |
+
+Directly under the Program Files folder, and only while an elevated first install or an uninstall runs, one
+folder named `.lunepack-install-<32 hex>` (the payload copied out of the consented `Setup.exe`, 14.5) or
+`.lunepack-uninstall-<32 hex>` (the uninstaller's copy of the runtime, deleted at the next restart). Both
+are admin-only and carry nothing a later version reads. At uninstall `R` is renamed to the tombstone `.<app id>.removing-<16 hex>` in the Program Files folder
+before it is deleted (an admin-only folder nothing refers to; a failed deletion leaves it).
+
+### 18.2 Protection
+
+Every directory the engine creates under Program Files is created with an explicit protected descriptor
+(the owner and the entries are never inherited from Program Files, which carries an inheritable CREATOR
+OWNER entry). Two classes:
+
+- **machine tree** (`R`, `R\app` and the version trees, `R\.lunepack` and its `state` and `logs`): owner
+  Administrators; full control for LocalSystem and Administrators; read and execute for Users and all
+  application packages; every entry inheritable; no CREATOR OWNER or CREATOR GROUP entry;
+- **admin only** (`R\.lunepack\machine` and below): the same without the entry for Users and application
+  packages.
+
+The engine checks `R`, `R\app`, `R\.lunepack`, `R\.lunepack\state` and `R\.lunepack\machine`, through a
+handle opened without following a link, at the start of every operation, and refuses to act
+(`not_protected`) unless: the owner is LocalSystem, Administrators or TrustedInstaller; a DACL is present;
+no allow entry for any other account holds more than read, read-attributes, execute and synchronize rights
+(an unknown right bit, a generic write and `MAXIMUM_ALLOWED` count as more); and, for the admin-only class,
+no allow entry for any other account exists. Deny entries only remove rights and are not judged; an entry
+type that is neither allow nor deny fails the check.
+
+### 18.3 The service registration and the pipe
+
+| Item | Value |
+|---|---|
+| service name | `lunepack-<app id>` |
+| account, start type, process | LocalSystem, start on demand, its own process |
+| image path | the absolute path `R\.lunepack\machine\service\<version>\lunepack-service.exe` in double quotes, no arguments |
+| descriptor | Windows's default for a new service, owner Administrators, plus one allow entry for Users with exactly start, query-status and read-control; read back and judged after it is set (anyone outside LocalSystem, Administrators and TrustedInstaller may hold only reads, status, interrogate, start and a user-defined control), else the registration is deleted again |
+| pipe name | `\\.\pipe\lunepack-<app id>` |
+| pipe | one instance for the service's life, created first (a name that exists is an error), remote clients rejected, byte mode; owner LocalSystem; LocalSystem and Administrators full control; Users read data, write data, read extended attributes, read attributes, read control and synchronize: never the right to create an instance, write the descriptor or take ownership |
+
+A client connects with the impersonation level set to identification (the service can identify the caller
+and never act as it), reads the pipe's owner from the handle and, unless it is LocalSystem, closes it
+without sending a byte. The service finds `R` from its own image path and from nothing else.
+
+The service updates its own binary: after version N is confirmed healthy the running service copies N's
+`lunepack-service.exe` from N's verified tree into `service\<N>\`, runs it once with `--self-test` (it must
+check its own location and exit 0 within ten seconds), and only then points the registration at it; a
+failed self-test leaves the old registration. The previous binary stays until the switch after that.
+
+### 18.4 Registry, shortcut, policy
+
+The per-machine integration writes what 16 lists for a per-user install, to the machine hive and the
+all-users locations: the uninstall entry `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\<app id>`
+(`UninstallString` and `QuietUninstallString` target the stub as in 16; `InstallLocation` is `R`), the
+declarations under `HKLM\SOFTWARE\Classes` and the `Run` value under HKLM when the app declares them, and
+the shortcut `<FOLDERID_CommonPrograms>\<name>.lnk` with the app id as its application user model id. The
+marker rules of 16 apply: an entry that is not lunepack's is left alone and reported.
+
+The administrator's policy is read, never written, from `HKLM\SOFTWARE\Policies\lunepack\<app id>`: two
+`REG_DWORD` values, `DisableSelfUpdate` and `NoUpdateUi`. A missing key or value is off; a number other
+than 0 is on; a value of another type is on; any read error other than "not found" is on.
+`DisableSelfUpdate` makes the engine refuse `stage_begin` and `apply` (`disabled_by_policy`) and the
+library report it before a download; `NoUpdateUi` makes the runtime show no update window.
+
+### 18.5 The per-user home
+
+Each user of a per-machine install keeps what the library needs in `<FOLDERID_LocalAppData>\lunepack\<app id>\`
+(the same place a per-user install keeps its data, for the same app id):
+
+| Path | Holds |
+|---|---|
+| `state\` | this user's lock, and `state\<install_id as 32 hex>\` with the `install-counters` records (12.6) |
+| `cache\` | the download cache |
+| `logs\` | the library's and the runtime's log for this user |
+
+This location is a **cross-version contract**: every later library version must find the counters (12.6,
+including `last_run`, 12.9) there. Another user's home is never read or written, and an uninstall removes
+only the uninstalling user's.
+
+## 19. Privileged service protocol, version 1
+
+The update service of a per-machine install (18.3) and the copies of the library and the runtime that talk
+to it share this protocol. It is a **cross-version contract** (D28): an app of any version may meet a
+service of any other, and once an app ships, version 1 can only be extended. A new request, answer, member
+or error code arrives only with a new protocol version; `status`, `confirm` and `rollback` stay in every
+later version. The service never trusts what a client sends: it copies every byte into an admin-only
+folder and verifies it there against the machine record (THREAT-MODEL, "Windows per-machine").
+
+### 19.1 Frames
+
+A frame is a `u32` little-endian length `n` (`n ≥ 1`), then `n` bytes, the first of which is the **kind**:
+
+| Kind | Name | Body |
+|---|---|---|
+| 1 | message | at most 65,536 bytes: strict JSON (3.1), one object, duplicate keys refused, integers `0 ..= 2^53 − 1` |
+| 2 | data | 1 to 262,144 bytes of raw data |
+
+A length that exceeds the kind's cap, another kind, an empty body, or a message that is not exactly one
+JSON object is refused before anything is allocated for it. Data follows the message that announces it
+(`stage_begin`, `put`), may be split into any number of data frames, and is read in full before the request
+is answered.
+
+The writer emits every message with its members in a fixed order: `type`; then `app` on requests; then the
+members in the order of 19.3. A reader does not depend on the order. Every message has a closed member set:
+an unknown or missing member, a wrong type or an out-of-range value is `malformed`.
+
+### 19.2 Hello
+
+The first message, in every version, has exactly these members: the client sends
+`{"type":"hello","min":a,"max":b}` (the lowest and the highest version it speaks); the server answers
+`{"type":"hello","version":v}` with the highest version both speak, or `{"type":"unsupported","min":a,"max":b}`
+with its own range and closes. A hello that is not a well-formed message, or that does not arrive within
+five seconds, is answered by closing the connection with no message.
+
+### 19.3 Requests and answers
+
+Every request carries `app` (the app id). A request for another app is answered `error{wrong_app}` and ends
+the connection. After an answer the client may send another request on the same connection.
+
+| Request (members after `type`, `app`) | Answer | Meaning |
+|---|---|---|
+| `status` | `status{current, previous, pending, staged, service, self_update_disabled}` | Reports the machine record: `previous`, `pending` (`{version, attempts}`) and `staged` are `null` when there is none; `service` is the running service binary's version. No secrets. |
+| `stage_begin{channel, documents}` + data | `stage_ready{version}`, `no_update`, or an error | `documents` is the array of `{kind, bytes}` the data frames carry, concatenated in that order: `root` documents first (ascending, at most 16), then exactly one `keys`, one `feed` and one `manifest`; every size from 1 to FORMAT 4's cap for its kind. The service verifies the chain against the machine record's root and floors, raises the stored floors, and selects the update the feed offers this machine itself (11.4); the client's choice is never trusted. `channel` must be the installed tree's. |
+| `put{kind, sha256, size}` + data | `put_ok` | Uploads one object (`kind` is `pack` or `frame`) of exactly `size` bytes (at least 1). Accepted only if the verified manifest lists exactly that hash and size; each object at most once; valid only after `stage_ready`. |
+| `stage_commit` | zero or more `progress{done, total}`, then `staged{version}` or `need_fetch{paths, more}` | Builds the candidate's tree from the verified bytes, runs the publisher check (RUNTIME.md), records it as staged. `need_fetch` names (at most 64) release paths still missing; the client uploads them and commits again. At most three commits per connection. |
+| `apply{version}` | `applied{version, token}` | Makes the staged version current and pending its health check and refreshes the launcher, the uninstall entry and the shortcuts. |
+| `attempt{version}` | `attempt{outcome, ...}` | A start of the pending version without a token: `supervised`, or `counted{attempts, token}`, or `rolled_back{current}`, or `not_pending` (19.5). |
+| `confirm{version, token}` | `confirmed` or `nothing_pending` | Marks the pending version healthy, then switches the service to that version's own binary and removes old versions nobody uses. |
+| `rollback{version, token}` | `rolled_back{current}` | Goes back to the previous version and marks the pending one bad. |
+
+In an `attempt` answer the members are `type` (`attempt`), `outcome`, then `attempts` and `token`
+(`counted`) or `current` (`rolled_back`). A token is 64 lowercase hex characters (32 bytes); a version is
+its text (10.3); `sha256` is 64 lowercase hex characters.
+
+Closing the connection discards the session's upload folder and any partial tree.
+
+### 19.4 Errors
+
+`error{code}` carries one code of this closed set; `verify_failed` adds `class`. An error changes nothing
+on the machine. `malformed`, `wrong_app` and `timeout` end the connection; every other error leaves it open.
+
+```text service-v1-codes
+malformed
+wrong_app
+busy
+disabled_by_policy
+not_protected
+verify_failed
+channel_not_allowed
+not_in_manifest
+size_mismatch
+hash_mismatch
+publisher_mismatch
+pending_exists
+nothing_staged
+version_mismatch
+not_pending
+token_mismatch
+bad_full
+too_large
+timeout
+internal
+```
+
+```text service-v1-classes
+signature
+expired
+rollback
+hash
+format
+app_mismatch
+```
+
+`busy` is the engine's answer when another host (an elevated mode of the runtime) holds its lock; a second
+client of the service itself waits for the pipe, which serves one connection at a time. No message carries
+a path of the file system, an operating-system error text, an install id, a token digest or key material;
+`need_fetch` carries release paths, which are the manifest's relative entry paths.
+
+### 19.5 The token and the supervision lease
+
+At `apply` the service draws 32 random bytes, stores only their SHA-256 in the machine record (`health`,
+12.9) and returns the bytes to the caller, the user's own applier. The applier starts the new version with
+the token in its environment (never on a command line); the new version's first act when it is healthy is
+`confirm`, and if it crashes or the time runs out the applier calls `rollback`. Comparison is constant
+time; without the token nobody confirms or rolls back, so another user cannot interfere in someone else's
+health window.
+
+When the applier dies before the answer, the version stays pending and any start of it by any user calls
+`attempt`. The service keeps a lease in memory for the version (the health timeout of that version's signed
+configuration, clamped to 5 to 3600 seconds, plus 15 seconds, from the `apply` or the last counted
+`attempt`). While it runs, `attempt` answers `supervised` and changes nothing. Otherwise the service counts
+one attempt in `pending.attempts` (12.9), issues a fresh token so an instance that turns out healthy can
+`confirm`, and starts a new lease; the call that would make the fourth attempt rolls the version back and
+marks it bad (`rolled_back`). A restart of the service forgets the lease, which errs toward counting.
+
+### 19.6 Deadlines and limits
+
+The service waits at most five seconds for the hello, 30 seconds for each later frame, and ends a
+connection after 30 minutes; it exits after 60 seconds with no connection and no lease. It serves one
+connection at a time. Write waits are bounded as well, so a client that never reads cannot hold it.
+
+### 19.7 Examples
+
+One encoded frame per line: `<name> | <the frame's first five bytes in hex: the length, little-endian,
+then the kind> | <the body>` (a data frame's body is shown in hex). The lines are generated by the
+protocol's own encoder, and a test (`format_doc`) checks that this block equals the golden file
+`crates/lunepack-core/tests/golden/service-v1.txt`, line for line.
+
+```text service-v1
+hello client | 2100000001 | {"type":"hello","min":1,"max":1}
+hello server | 1d00000001 | {"type":"hello","version":1}
+hello unsupported | 2700000001 | {"type":"unsupported","min":1,"max":1}
+request status | 2c00000001 | {"type":"status","app":"org.example.hello"}
+request stage_begin | c600000001 | {"type":"stage_begin","app":"org.example.hello","channel":"stable","documents":[{"kind":"root","bytes":300},{"kind":"keys","bytes":400},{"kind":"feed","bytes":500},{"kind":"manifest","bytes":600}]}
+request put | 9200000001 | {"type":"put","app":"org.example.hello","kind":"pack","sha256":"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a","size":1048576}
+request stage_commit | 3200000001 | {"type":"stage_commit","app":"org.example.hello"}
+request apply | 3d00000001 | {"type":"apply","app":"org.example.hello","version":"1.1.0"}
+request attempt | 3f00000001 | {"type":"attempt","app":"org.example.hello","version":"1.1.0"}
+request confirm | 8a00000001 | {"type":"confirm","app":"org.example.hello","version":"1.1.0","token":"abababababababababababababababababababababababababababababababab"}
+request rollback | 8b00000001 | {"type":"rollback","app":"org.example.hello","version":"1.1.0","token":"abababababababababababababababababababababababababababababababab"}
+answer status | a900000001 | {"type":"status","current":"1.1.0","previous":"1.0.0","pending":{"version":"1.1.0","attempts":1},"staged":"1.2.0-beta.1","service":"1.0.0","self_update_disabled":false}
+answer status (nothing optional) | 7f00000001 | {"type":"status","current":"1.0.0","previous":null,"pending":null,"staged":null,"service":"1.0.0","self_update_disabled":true}
+answer stage_ready | 2900000001 | {"type":"stage_ready","version":"1.1.0"}
+answer no_update | 1500000001 | {"type":"no_update"}
+answer put_ok | 1200000001 | {"type":"put_ok"}
+answer progress | 2800000001 | {"type":"progress","done":3,"total":10}
+answer staged | 2400000001 | {"type":"staged","version":"1.1.0"}
+answer need_fetch | 4a00000001 | {"type":"need_fetch","paths":["bin/app.exe","lib/data.bin"],"more":false}
+answer applied | 7000000001 | {"type":"applied","version":"1.1.0","token":"abababababababababababababababababababababababababababababababab"}
+answer attempt supervised | 2a00000001 | {"type":"attempt","outcome":"supervised"}
+answer attempt counted | 7f00000001 | {"type":"attempt","outcome":"counted","attempts":2,"token":"abababababababababababababababababababababababababababababababab"}
+answer attempt rolled_back | 3d00000001 | {"type":"attempt","outcome":"rolled_back","current":"1.0.0"}
+answer attempt not_pending | 2b00000001 | {"type":"attempt","outcome":"not_pending"}
+answer confirmed | 1500000001 | {"type":"confirmed"}
+answer nothing_pending | 1b00000001 | {"type":"nothing_pending"}
+answer rolled_back | 2900000001 | {"type":"rolled_back","current":"1.0.0"}
+answer error | 2900000001 | {"type":"error","code":"token_mismatch"}
+answer error verify_failed | 3b00000001 | {"type":"error","code":"verify_failed","class":"rollback"}
+data | 0500000002 | 0001feff
+```

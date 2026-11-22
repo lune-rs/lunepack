@@ -128,17 +128,19 @@ the download cache and the version trees are writable by that user, so such a pr
 
 Stopped:
 - Per-user installs live in the user's own profile, which other users cannot write.
-- Per-machine installs: the privileged engine takes only an app id and payload handles the caller
-  opened itself, copies the payload into an admin-only staging directory, and only then verifies
-  the whole chain (copy, then verify: no time-of-check/time-of-use window). It never follows a
-  caller-supplied path or URL, never runs payload code before verification, and never acts for an
-  app id without a protected install record. Machine-scope floors are kept by the engine; the
-  non-elevated library also keeps its own floors and enforces the higher of the two.
+- Per-machine installs: the privileged engine (on Windows, the update service, "Windows per-machine (M10)"
+  below) takes only the bytes a client streams over its pipe, copies them into an admin-only staging
+  directory, and only then verifies the whole chain (copy, then verify: no time-of-check/time-of-use
+  window). It never opens a file in a user's namespace, never calls an impersonation API, never follows a
+  caller-supplied path or URL, never runs payload code before verification, and never acts for an app id
+  other than its own install's.
 - The library never writes the machine install's state (M4, FORMAT.md 12.6): it reads the machine
   record and the tree through the layout, and writes only this user's `install-counters` records,
   cache and lock in the user's own directories. Another user cannot lower this user's floors, and
-  this user's counters cannot lower the machine record's: a check uses the field-wise higher of the
-  two. A counters record whose install id differs from the machine record's stops the load.
+  this user's counters cannot lower the machine record's: the key-set version and the feed `seq` of a
+  check are the higher of the two. The **root** is never taken from a user's record (M4-SEC-obs1,
+  M10-D17): it is the machine record's, or the installed tree's own configuration's. A counters record
+  whose install id differs from the machine record's stops the load.
 
 Not stopped: denying service to other users' updates by holding resources, within OS limits.
 
@@ -403,8 +405,8 @@ token; the command line's planted-secrets test checks every stream, M5 step 14).
 is compared in constant time. Same-user processes can read another process's environment, so the
 token is not a defence against class 4. It tells the record that this start was the supervised one:
 a per-user install also lets a start with no token confirm the pending version (M5-D5), so the token
-protects nothing a local process could not do anyway. Per-machine installs, which arrive later,
-always need it (C8).
+protects nothing a local process could not do anyway. Per-machine installs always need it (C8): there the
+token is what keeps another user from confirming or rolling back someone else's pending update.
 
 **The attempt counter (M5-D5).** An unsupervised start of the pending version counts one attempt in
 the record and the fourth rolls back, so an app that never confirms (a crash on start, or a program
@@ -678,7 +680,7 @@ rather than deletes, and fails toward keeping the app.
   volume than `R/versions`, is not owned by the user or whose folder the user cannot write, is refused with
   exit 28 and a reason from a closed set before anything is read, written or fetched, so such a copy
   can neither fail halfway nor be updated from an image. A root-owned `B` is a machine install by ownership
-  (D10) and is refused `machine_scope`, exit 17; a per-machine install is a later milestone. The facts come from `statfs`, `stat` and
+  (D10) and is refused `machine_scope`, exit 17; a per-machine install on macOS is a later milestone. The facts come from `statfs`, `stat` and
   `faccessat` through `Fs::place`; the translocation test is the mount type and the path component, which are
   what the system uses. A real translocated app needs a notarized one; `scripts/macos-sign-check.sh` runs
   that row with the developer's own identity (it is not part of the gate or of CI), so until it has been
@@ -885,6 +887,125 @@ app offline.
 runtime on the runtime and UI, stapling, translocation of a notarized app, Gatekeeper's verdicts) is shown
 only by a person running `scripts/macos-sign-check.sh` with their own identity; CI proves the mechanics with
 ad-hoc and throwaway self-signed identities. Windows install rows with real signatures run on CI runners.
+
+## Windows per-machine (M10)
+
+An app installed for all users lives in `Program Files`, where a standard user cannot write. To update it
+with no prompt per update, the install registers one small Windows service per app, running as LocalSystem,
+that any local user's copy of the app may start and talk to over a named pipe (FORMAT.md 18 and 19; D12,
+M10-D1 to M10-D20). The service is therefore a local-privilege boundary: it is fed by every user of the
+machine and holds the rights of the machine. This section says what it trusts, what a local user can and
+cannot do through it, and what is not covered.
+
+**What the service trusts.** Its own image path (from which it finds the install root), the files and the
+machine record under `Program Files\<App>` (writable by administrators only; it checks the owner and every
+entry of `R`, `R\app`, `R\.lunepack`, `R\.lunepack\state` and `R\.lunepack\machine` at the start of every
+operation and refuses with `not_protected` when anyone else holds a write-class right), and the publisher's
+root key and the floors in the machine record. It reads no environment variable and no current directory,
+and takes no path, URL or app id from a caller.
+
+**What it does not trust.** Anything a user sends. The client streams the signed documents and the update's
+bytes; the service writes them into a folder only administrators can reach (`R\.lunepack\machine\incoming`),
+hashes them as they are written, and verifies the whole chain there (root, key set, feed, manifest, every
+file's hash) before it builds anything. It checks that the update is newer than what is installed, not marked
+bad, for this app and this channel (the channel named in the installed tree's own signed configuration, never
+one a caller names, M10-D18), and selects the candidate itself from the feed it verified, with the same core
+functions the library uses, so there is no second parser to differ from the first. It never runs code from an
+update before that update is verified, never downloads anything, and keeps no secret a user could read.
+
+**The service never impersonates and opens no user file** (M10-D2). The client sends bytes; the service
+never opens a path in a user's namespace and calls no impersonation API, so a file or library opened by
+mistake cannot resolve through a caller's device map. The client connects at identification level (the
+service can learn who the caller is and cannot act as it), and, before it sends a byte, checks that the pipe
+is owned by LocalSystem, so a process that created the pipe name first cannot receive the update or answer
+for the service.
+
+**What a local user can do** through the service: trigger any update the publisher signed for this app and
+channel that is newer than what is installed (anyone who can run the app can); report a version healthy or
+broken while they are the one applying it (they hold its token); make the update fail, or roll it back, by
+being the one who applies it and then exiting or crashing the app, the same power the user has over their own
+install; deny service to other users by holding the pipe for the length of one connection (the service serves one
+connection at a time, with 5 s, 30 s and 30 min deadlines), by holding the engine's lock during an operation,
+or by being first to apply and then rolling back; and read the machine record, which is world-readable and
+holds no secret (the token is stored only as its SHA-256). **What they cannot do**: install anything not
+signed by the publisher's keys, install an older or a bad-marked version, write or read anything as
+LocalSystem, confirm or roll back someone else's pending update during its health window (they lack the
+token), change the service's configuration, the descriptors or the policy (an administrator's HKLM key), or
+add a second instance of the pipe and receive its clients (no entry for a non-administrator holds the right
+to create an instance; the first instance is created with the first-instance flag, and a name that exists
+is an error). The token and the supervision lease keep **bystanders** out of someone else's health window;
+they do not keep the user who applies a version from making it roll back or stick, and are not meant to.
+
+**The pipe is untrusted input.** Frames and messages are length-prefixed and capped before any allocation;
+a message is one strict JSON object with a closed member set; anything malformed ends the connection; the
+codec is pure core code with a fuzz harness (`fuzz/fuzz_targets/service.rs`, seeds replayed by the gate) and
+a golden file that pins the wire bytes (FORMAT.md 19.7). No message carries a path, an operating-system
+error text, an install id, a token digest or key material. A flaw in this parser or in the staging code
+reached through it would be a local privilege escalation, which is why the security review of M10 tests
+parser differentials against the golden file.
+
+**Root rotations.** The machine learns a root rotation only when an update is staged by the engine (its own
+check verifies the chain from the machine's root forward). Until then the machine record keeps the older
+root, and a user's check walks forward from it; a user's counters can never move the machine's root
+(M4-SEC-obs1).
+
+**The first install and the anchor.** `Setup.exe` sits in a folder the installing user can write, and the
+elevated engine reads its payload after an administrator consented to a User Account Control prompt. The
+setup file carries digests of its own payload in a resource of its runtime image (FORMAT.md 14.5); the
+elevated copy reads them from its own mapped image, which the administrator consented to and a process
+cannot change afterwards, copies the payload into an administrator-only folder and verifies it there, so a
+payload swapped **after** the prompt fails the check before anything is written. It does not help against a
+whole file swapped **before** the prompt: only an Authenticode signature (M9) lets the administrator tell a
+genuine `Setup.exe` from a swapped one, because the prompt then names the publisher. **An unsigned
+`Setup.exe` shows "Unknown publisher" at the prompt, for the genuine file and a swapped one alike.** Sign
+the installer of an app that installs for all users.
+
+**The elevated modes** (`machine-install`, `machine-repair`, `machine-uninstall`) run as an administrator
+after consent, started by the same build's unelevated side. They read no environment variable, make no
+temporary directory, look at no current directory, start no window and open no network connection, take no
+path from their command line (only a progress-pipe id and the SID of the one account that may read it), and
+derive the install root from their own image's path or from the setup file's own image. The hand-off pipe is
+owned by Administrators, readable by that one account and outbound only: the elevated side reads nothing from
+the unelevated one. The unelevated side decides success from the machine record and the exit code, never
+from a line that came through the pipe. The UI never runs elevated (D35, M10-D15). The packaged binaries are
+hardened against DLL planting as the runtime is (the loader searches System32 only), and the end-to-end suite
+starts the service, its self-test and Setup's elevated mode beside files named like DLLs.
+
+**Where the boundary is the platform's.** With UAC switched off, or when the administrator's account is the
+built-in Administrator, an administrator's process holds the full token, so there is no elevation boundary
+to defend between that user's processes and the machine: such a process can do what the service does. The
+boundary this section describes is between standard users, and an administrator's own unelevated processes,
+and the machine.
+
+**The policy** (`HKLM\SOFTWARE\Policies\lunepack\<app id>`, FORMAT.md 18.4) is read only; only an
+administrator can write it. An unreadable, mistyped or unknown value counts as "on", so a damaged policy
+errs toward no update. A service an administrator disabled stops updates for standard users until `repair` or
+re-enabling; that is an administrator's deliberate choice on that machine and not something a standard user
+routes around (M10-D13).
+
+**The removal guard on Windows** (M10-D20). Every deletion the engine makes under `R` (a version tree, a
+leftover `.gc-` folder, a service folder, `R` itself at uninstall) is decided by one question asked twice: once before the
+rename that takes the path away from new launches, once on the renamed path right before the deletion. On
+Windows the answer is the process scan **or** a file-system probe that opens every file of the tree for
+write and delete and every directory and reparse point for delete, all with full sharing and each closed at
+once; an open that fails for any reason means "in use", and only a clean "not in use" lets the engine delete.
+The probe sees what the rename does not (a running executable, a DLL loaded by any process, whether the scan could
+inspect that process or not) and what the scan does not (a working directory, a held file). **A rename is not
+an in-use check on Windows** (measured on Windows 11): a folder can be renamed while a program runs from an
+executable inside it and while a process outside it has a DLL from it loaded; it fails only when a working
+directory is inside or a file is held without delete sharing. So the engine's rename only keeps new
+launches out; the probe is the guard. Known gaps, each failing toward leaving a folder: a file mapped as data
+after its handle was closed is not seen (its deletion then fails and the folder stays, though files deleted
+before that one are gone); a process that maps a tree file through a handle it opened with full sharing
+before the rename, after the second check; and a file with the read-only attribute makes its tree count as in
+use for good (lunepack never sets it). The per-user in-use scan of `Process::tree_in_use` on Windows still
+skips a process it cannot open (a parked follow-up that this milestone does not change), so the per-machine guard, which does not depend on
+opening other processes, is stricter than the per-user one; the two differ. A refused machine uninstall puts
+back what it had done before the refusal and leaves the install as it was.
+
+**What survives an uninstall.** Other users' per-user homes (`<LocalAppData>\lunepack\<app id>`, FORMAT.md
+18.5: their counters, cache and logs) are left in place; the uninstalling user's home is removed. They hold
+no secret and no root, and a later reinstall reads the counters again.
 
 ## Denial-of-service bounds
 
