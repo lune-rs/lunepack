@@ -204,6 +204,28 @@ jobs:
           path: probe-results/P-M2.json
           if-no-files-found: error
 
+  p-m3:
+    # macOS root premises of the per-machine install: .pkg postinstall, system-domain LaunchDaemon with
+    # a socket, bundle swap, signed copy, folder modes Installer leaves (M11 step 0)
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        # a step timeout (not the job's) so the artifact upload below still runs
+        timeout-minutes: 20
+        shell: bash
+        run: ./probes/macos/p-m3-pkg-daemon.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-M3
+          path: probe-results/P-M3.json
+          if-no-files-found: error
+
   p-l1:
     # a non-root user can trigger a socket-activated root service (D12 Linux)
     continue-on-error: true
