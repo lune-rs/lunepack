@@ -33,8 +33,9 @@
 #   5   the supervisor killed after the apply: starts inside the lease are not counted, three more
 #       starts past it count, the fourth rolls back in the service; a wrong token confirms and rolls
 #       back nothing; a healthy version whose first run did not confirm confirms through `attempt`
-#   6   negatives as the standard user: a flipped byte in the upload, documents signed by another
-#       root, an older feed, garbage and an oversize frame, `sc.exe config`, a write under R
+#   6   negatives as the standard user: a flipped byte in the upload (the service refuses it, the
+#       library drops it from the cache; its refetch is cut off), documents signed by another root,
+#       an older feed, garbage and an oversize frame, `sc.exe config`, a write under R
 #   7   a pipe taken first by the standard user while the service is stopped is refused; updates
 #       work again when it is gone
 #   8   the policy: DisableSelfUpdate (33; the service refuses stage_begin), NoUpdateUi
@@ -696,6 +697,10 @@ function Write-Diagnostics {
             Write-Output "     record: current $($r.current.version) pending $p bad [$(@($r.bad) -join ',')]"
         }
     }
+    # Once per run: whether the standard user can open the service manager at all (F12).
+    if ($user -and $probeCopy -and $apps.Count -gt 0 -and (Test-Path -LiteralPath $probeCopy)) {
+        Write-ScmOpenDiagnostics -User $user -Probe $probeCopy -AppId $apps[0].Id -WorkDir $workDir -OutDir $outDir -WithProfile
+    }
 }
 
 function Remove-Everything {
@@ -1032,10 +1037,17 @@ try {
         Row '6 (negatives as the standard user: a flipped byte, another root, an older feed, garbage, an oversize frame, sc.exe, writes under R)' {
             $app16 = Join-Path $M.Root "app\1.6.0\$($M.EntryFile)"
             $recBefore = Get-Record $M.Root
-            # (a) one byte of the upload flipped between the download and the stage: refused, nothing staged,
-            # no session folder left under the staging directory.
+            # (a) one byte of the upload flipped between the download and the stage: the service refuses
+            # the object, nothing is staged, no session folder is left under the staging directory. The
+            # library drops a refused object from the user's cache and fetches it again (F2), so the
+            # release's pack is moved aside for the stage: the refetch fails and the stage ends with an
+            # error. The damaged entry gone from the cache is the trace of the service's refusal (only a
+            # put answered hash_mismatch or size_mismatch removes it).
             Publish-Version $M '1.7.0' @{ Files = @{ 'payload.bin' = $payloadB } }
             Save-Docs $M '1.7.0' (Join-Path $outDir 'docs-1.7.0')
+            $pack17 = Join-Path $M.Rel '1.7.0\windows-x86_64.pack'
+            $packAway = "$pack17.away"
+            Require (Test-Path -LiteralPath $pack17) 'the release of 1.7.0 holds its pack'
             $go = Join-Path $outDir 'go-flip'
             Remove-Item -LiteralPath $go -Force -ErrorAction SilentlyContinue
             $o = New-Out 'row6a'
@@ -1047,15 +1059,20 @@ try {
             $bytes = [IO.File]::ReadAllBytes($big[0].FullName)
             $bytes[[int]($bytes.Length / 2)] = $bytes[[int]($bytes.Length / 2)] -bxor 0xFF
             [IO.File]::WriteAllBytes($big[0].FullName, $bytes)
-            New-Item -ItemType File $go | Out-Null
-            Expect-Lines $o @('1.6.0 start', '1.6.0 nothing-pending', '1.6.0 check 1.7.0', '1.6.0 downloaded', '1.6.0 error stage')
+            Move-Item -LiteralPath $pack17 -Destination $packAway
+            try {
+                New-Item -ItemType File $go | Out-Null
+                Expect-Lines $o @('1.6.0 start', '1.6.0 nothing-pending', '1.6.0 check 1.7.0', '1.6.0 downloaded', '1.6.0 error stage')
+            } finally {
+                Move-Item -LiteralPath $packAway -Destination $pack17
+            }
+            Require (-not (Test-Path -LiteralPath $big[0].FullName)) 'the object the service refused is gone from the user''s cache'
             $r = Get-Record $M.Root
             Require ($null -eq $r.staged) 'nothing is staged after the flipped byte'
             Assert-Record $M '1.6.0' '1.2.0' @('1.3.0', '1.4.0', '1.5.0')
             $incoming = Join-Path $M.Root '.lunepack\machine\incoming'
             SameV 'session folders under incoming' @(Get-ChildItem -LiteralPath $incoming -Force -ErrorAction SilentlyContinue).Count 0
-            # The user's cache still holds the changed file (the library trusts what it verified once at
-            # the download); the harness puts back what it broke, so the later rows start from a clean cache.
+            # The later rows start from a clean cache.
             Remove-Item -LiteralPath $cache -Recurse -Force
 
             # (b) documents of another publisher (another root) for this app: refused as a signature failure.
