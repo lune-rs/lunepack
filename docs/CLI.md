@@ -523,7 +523,7 @@ staple = ["/usr/bin/xcrun", "stapler", "staple", "{path}"]
 | `sign` | required: signs a Windows PE file or a loose macOS Mach-O file |
 | `sign_bundle` | macOS, optional, default `sign`: nested bundles and, by default, the outer bundle |
 | `sign_outer` | macOS, optional, default `sign_bundle`: the app bundle only, where its entitlements go |
-| `sign_installer` | optional, default `sign`: what `setup` signs (`Setup.exe`, the installer app's items and the app, the `.dmg`) |
+| `sign_installer` | optional, default `sign`: what `setup` signs (`Setup.exe`, the installer app's items and the app, the `.dmg`, the all-users `.pkg`) |
 | `verify` | optional: run after a signature. Windows: on every PE file just signed; macOS: once, on the signed outer bundle |
 | `notarize`, `staple` | macOS, both or neither: after `sign_outer` and `verify`, `notarize` (with `{zip}` or `{bundle}`), then `staple` on the bundle |
 | `timeout_secs` | sign and verify, default 300, `1..=86400` |
@@ -577,7 +577,13 @@ and verified, `notarize` runs with `{zip}` or `{bundle}`, then `staple` on the b
 that `Contents/CodeResources`, the ticket stapler writes, is a regular file in the tree. All of it happens
 before hashing, so the ticket is a file of the signed release (a `staple` that writes none fails the pack).
 `setup` signs the installer app's items and the app, notarizes and staples the app, builds the image, then
-signs, notarizes and staples the `.dmg`: two notarizations. The `.zip` installer holds the bundle as
+signs, notarizes and staples the `.dmg`: two notarizations. A release with the update service has a third
+object, the all-users `.pkg` (below): it is built, signed, notarized and stapled first, then embedded in the
+installer app, so the app's own seal and notarization cover it. `sign_installer` signs the `.pkg` in place
+(`productsign` writes a second file, so call it from a small script that signs to a new file and renames it
+over `{path}`), and `notarize` and `staple` take the package as `{path}`, `{bundle}` and `{zip}` alike, as for
+the image. `setup` checks that the `xar` table of contents of the package holds a signature after
+`sign_installer`; `pkgutil --check-signature` is the real verification. The `.zip` installer holds the bundle as
 released.
 
 **Publisher continuity (M9-D6).** The pack also writes the update configuration's `publisher_check` member
@@ -763,6 +769,21 @@ same checks as above, taking every file out of the pack through its signed frame
   then the app), notarized and stapled when the section has `notarize` and `staple`, and only then is the
   image built, signed, notarized and stapled ("Code signing"); without the section neither is signed.
   `hdiutil` decides the image's bytes, so two runs need not give the same image.
+- **The all-users `.pkg`** (M11-D8; with the `.dmg`, for a release packed with `--service`, which holds
+  `Contents/MacOS/lunepack-service` beside the entry): a product archive built with the system's `pkgbuild` and
+  `productbuild` (a macOS host only, as the image is), named like the image with the extension `.pkg`
+  (`<app_id>-<VERSION>-<TARGET>.pkg`, beside `--out`; an existing file is not replaced, and nothing is written
+  when it exists). Its payload is the release's `lunepack-runtime` and the payload file of FORMAT.md 14.4
+  (the runtime and the key set, manifest and pack through their signed frames), installed below
+  `/Library/Application Support/lunepack/.installer/<app id>/`: every folder above `.installer` is recorded as
+  root 0755, `.installer` and the app's folder as root 0700, the runtime 0700 and the payload 0600, so nobody but
+  root can read or change them between Installer's copy and the script. The package has one script, a
+  `postinstall` whose only command is `exec "<that folder>/lunepack-runtime" machine-install --pkg`: it reads no
+  argument and no environment variable. Its distribution (identifier `<app id, with _ as ->.lunepack-machine`,
+  the installer's title the app's display name, macOS 10.15 or later) allows the local system domain only, no
+  per-user or anywhere install. The same file is embedded as `Contents/Resources/lunepack-all-users.pkg` in the
+  installer app, so that the installer window's "For all users" can hand over to Installer. A release
+  without the service gets neither, and `--zip` never builds one.
 - **The `.zip`** (`--zip`; any host, no image tool): the bundle `<bundle name>.app` exactly as released, with
   every file's data and exec bit and every symlink as the manifest has them. It is written by lunepack's own
   writer over `flate2` (deflate, level 9 when that is smaller, else stored; names in UTF-8; times fixed at

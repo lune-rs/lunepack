@@ -27,7 +27,9 @@
 //! own frames: its UI and its runtime (each read through its signed frame), a generated
 //! `Info.plist`, the optional icon, and `lunepack-setup.payload` (the payload and trailer of a
 //! setup file without the runtime part); `hdiutil` then writes it into an LZMA `.dmg` (macOS host
-//! only). `--zip` instead writes the bundle exactly as released into a `.zip` (any host, M8-D9):
+//! only). A release that holds the update service also gets the all-users `.pkg` (M11-D8,
+//! [`crate::pkg`]): built, signed, notarized and stapled first, embedded in the app before the
+//! app is signed, and written beside the image. `--zip` instead writes the bundle exactly as released into a `.zip` (any host, M8-D9):
 //! every file is read through its signed frame, so nothing comes from an unverified byte.
 
 use std::collections::BTreeMap;
@@ -38,6 +40,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use lunepack_codec_lzma::LzmaCodec;
+use lunepack_core::layout::{MachineOs, service_path_in_tree_for};
 use lunepack_core::pe;
 use lunepack_core::setup::{
     ANCHOR_RESOURCE_ID, ANCHOR_SIZE, Located, MAX_SETUP_RUNTIME_BYTES, PART_ALIGN, SetupAnchor,
@@ -54,6 +57,7 @@ use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 use crate::codesign::{InstallerFile, OsCodeSign, installer_app_plan};
 use crate::config::{CodeSignSection, Config, FixedClock};
 use crate::dmg::{self, Hdiutil, InstallerApp};
+use crate::pkg::{PkgSpec, PkgTools};
 use crate::place;
 use crate::plist;
 use crate::release_dir::{self, read_capped};
@@ -76,7 +80,9 @@ pub struct SetupArgs {
     target: String,
     /// Where to write the output (default: `<app_id>-<version>-<target>-setup`, with `.exe` for a
     /// Windows target, or `<app_id>-<version>-<target>.dmg` or `.zip` for a macOS target, in the
-    /// current directory). An existing file is not replaced.
+    /// current directory). An existing file is not replaced. A macOS `.dmg` of a release with the
+    /// update service is accompanied by its all-users `.pkg`, written beside it with the same name
+    /// and the extension `.pkg`.
     #[arg(long)]
     out: Option<PathBuf>,
     /// For a `macos-*` target: write the bundle as a `.zip` (any host) instead of the installer
@@ -615,12 +621,73 @@ fn installer_parts(loaded: &Loaded) -> Result<InstallerParts> {
     })
 }
 
+/// Whether the release holds the update service (M11-D6): a non-empty file of the target's service
+/// name beside the entry, as the engine looks for it at an all-users install.
+fn has_service(loaded: &Loaded) -> bool {
+    let Some(at) = service_path_in_tree_for(
+        &loaded.update.install.entry,
+        MachineOs::of_target(loaded.target),
+    ) else {
+        return false;
+    };
+    loaded
+        .manifest
+        .entries()
+        .iter()
+        .any(|e| matches!(e, VerifiedEntry::File { path, size, .. } if *path == at && *size > 0))
+}
+
+/// What `setup` wrote for a macOS installer: the image, and the all-users package beside it.
+struct Written {
+    image_size: u64,
+    pkg: Option<(PathBuf, u64)>,
+}
+
+/// Builds the all-users `.pkg` (M11-D8) in `scratch` and returns its bytes. In the order M11
+/// step 7 fixes: built, then signed, notarized and stapled (when configured), all before the
+/// caller embeds it. `shown` names the finished file in signing lines and errors.
+fn build_pkg(
+    loaded: &Loaded,
+    parts: &InstallerParts,
+    payload: &[u8],
+    scratch: &Path,
+    signer: Option<&OsCodeSign>,
+    shown: &str,
+) -> Result<(PathBuf, Vec<u8>)> {
+    let version = loaded.version.to_string();
+    let spec = PkgSpec {
+        app_id: &loaded.update.app_id,
+        version: &version,
+        title: &loaded.update.install.name,
+        min_os: plist::MIN_SYSTEM_VERSION,
+        runtime: &parts.runtime,
+        payload,
+    };
+    let work = scratch.join("pkg-work");
+    fs::create_dir(&work).with_context(|| format!("cannot create {}", work.display()))?;
+    let at = scratch.join("installer.pkg");
+    PkgTools::system().build(&spec, &work, &at)?;
+    if let Some(signer) = signer {
+        signer.sign_installer_file(&at, InstallerFile::Pkg, shown)?;
+    }
+    let bytes = fs::read(&at).with_context(|| format!("cannot read {}", at.display()))?;
+    Ok((at, bytes))
+}
+
 /// Writes the installer `.dmg` of the release to `out` (M8-D7, M8-D9): the installer app built in a
 /// scratch directory next to `out`, `hdiutil create` and `hdiutil verify`, then the image moved to
-/// `out` without replacing anything. Returns the image's size.
-fn write_dmg(loaded: &Loaded, out: &Path, section: Option<&CodeSignSection>) -> Result<u64> {
+/// `out` without replacing anything. A release that holds the update service also gets its
+/// all-users `.pkg` (M11-D8), embedded in the app and written beside `out`. Returns what was
+/// written.
+fn write_dmg(loaded: &Loaded, out: &Path, section: Option<&CodeSignSection>) -> Result<Written> {
     if fs::symlink_metadata(out).is_ok() {
         bail!("{} already exists", out.display());
+    }
+    let pkg_out = has_service(loaded).then(|| out.with_extension("pkg"));
+    if let Some(at) = &pkg_out
+        && fs::symlink_metadata(at).is_ok()
+    {
+        bail!("{} already exists", at.display());
     }
     let payload = macos_payload(loaded)?;
     let parts = installer_parts(loaded)?;
@@ -635,6 +702,33 @@ fn write_dmg(loaded: &Loaded, out: &Path, section: Option<&CodeSignSection>) -> 
         .with_context(|| format!("cannot create a scratch directory in {}", parent.display()))?;
     let src = scratch.path().join("src");
     fs::create_dir(&src).with_context(|| format!("cannot create {}", src.display()))?;
+    let signer = section.map(|section| {
+        OsCodeSign::for_installer(
+            section.clone(),
+            parts.dir_name.clone(),
+            scratch.path().to_owned(),
+        )
+    });
+    // M11 step 7, in this order: the package built, signed, notarized and stapled; embedded in the
+    // app; then M9-D5's order: the app's items, the app, then (when configured) its notarization
+    // and staple; only then is the image built, signed, notarized and stapled.
+    let pkg = match &pkg_out {
+        Some(at) => {
+            let shown = at.file_name().map_or_else(
+                || "installer.pkg".to_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            Some(build_pkg(
+                loaded,
+                &parts,
+                &payload,
+                scratch.path(),
+                signer.as_ref(),
+                &shown,
+            )?)
+        }
+        None => None,
+    };
     dmg::write_app(
         &src,
         &InstallerApp {
@@ -644,17 +738,9 @@ fn write_dmg(loaded: &Loaded, out: &Path, section: Option<&CodeSignSection>) -> 
             plist: &parts.plist,
             payload: &payload,
             icon: parts.icon.as_deref(),
+            all_users_pkg: pkg.as_ref().map(|(_, bytes)| bytes.as_slice()),
         },
     )?;
-    // M9-D5, in this order: the app's items, the app, then (when configured) its notarization and
-    // staple; only then is the image built, signed, notarized and stapled.
-    let signer = section.map(|section| {
-        OsCodeSign::for_installer(
-            section.clone(),
-            parts.dir_name.clone(),
-            scratch.path().to_owned(),
-        )
-    });
     if let Some(signer) = &signer {
         signer.run(&src.join(&parts.dir_name), &installer_app_plan())?;
     }
@@ -670,11 +756,23 @@ fn write_dmg(loaded: &Loaded, out: &Path, section: Option<&CodeSignSection>) -> 
         );
         signer.sign_installer_file(&image, InstallerFile::Dmg, &shown)?;
     }
-    let size = fs::metadata(&image)
+    let image_size = fs::metadata(&image)
         .with_context(|| format!("cannot read {}", image.display()))?
         .len();
     place::move_new(&image, out)?;
-    Ok(size)
+    // The standalone package is the file that was embedded. If it cannot be placed, the image just
+    // placed (this run's own file) is removed so that a failed run leaves nothing.
+    let pkg = match (pkg, pkg_out) {
+        (Some((built, bytes)), Some(at)) => {
+            if let Err(e) = place::move_new(&built, &at) {
+                let _ = fs::remove_file(out);
+                return Err(e);
+            }
+            Some((at, bytes.len() as u64))
+        }
+        _ => None,
+    };
+    Ok(Written { image_size, pkg })
 }
 
 /// Writes the bundle of the release to `out` as a `.zip` (M8-D9) and returns its size. Every
@@ -800,12 +898,19 @@ pub fn setup(config_path: &Path, args: &SetupArgs) -> Result<()> {
             }
         }
         let loaded = load(&args.dir, &config, &args.version, &args.target, &*clock)?;
-        let size = if args.zip {
-            write_zip(&loaded, &out)?
+        if args.zip {
+            let size = write_zip(&loaded, &out)?;
+            println!("setup: {file_name} ({size} bytes)");
         } else {
-            write_dmg(&loaded, &out, config.codesign_for(loaded.target))?
-        };
-        println!("setup: {file_name} ({size} bytes)");
+            let written = write_dmg(&loaded, &out, config.codesign_for(loaded.target))?;
+            println!("setup: {file_name} ({} bytes)", written.image_size);
+            if let Some((at, size)) = written.pkg {
+                let name = at
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                println!("setup: {name} ({size} bytes)");
+            }
+        }
         return Ok(());
     }
     let bytes = build(

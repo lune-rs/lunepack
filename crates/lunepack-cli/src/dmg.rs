@@ -21,6 +21,9 @@ pub const UI_NAME: &str = "lunepack-ui";
 pub const RUNTIME_NAME: &str = "lunepack-runtime";
 /// The payload file's name in `Contents/Resources`.
 pub const PAYLOAD_NAME: &str = "lunepack-setup.payload";
+/// The all-users `.pkg`'s file name in `Contents/Resources` (M11-D8), present when the release holds
+/// the update service.
+pub const ALL_USERS_PKG_NAME: &str = "lunepack-all-users.pkg";
 /// The icon's file name in `Contents/Resources`, without the extension (`CFBundleIconFile`).
 pub const ICON_NAME: &str = "lunepack-installer";
 
@@ -53,6 +56,9 @@ pub struct InstallerApp<'a> {
     pub payload: &'a [u8],
     /// The `.icns` file, when the release has one.
     pub icon: Option<&'a [u8]>,
+    /// The finished all-users `.pkg` (M11-D8), when the release holds the update service: embedded
+    /// before the app is signed, so the app's seal covers it.
+    pub all_users_pkg: Option<&'a [u8]>,
 }
 
 fn make_dir(path: &Path) -> Result<()> {
@@ -103,6 +109,9 @@ pub fn write_app(parent: &Path, app: &InstallerApp<'_>) -> Result<PathBuf> {
     make_file(&resources.join(PAYLOAD_NAME), app.payload, false)?;
     if let Some(icon) = app.icon {
         make_file(&resources.join(format!("{ICON_NAME}.icns")), icon, false)?;
+    }
+    if let Some(pkg) = app.all_users_pkg {
+        make_file(&resources.join(ALL_USERS_PKG_NAME), pkg, false)?;
     }
     Ok(root)
 }
@@ -568,6 +577,7 @@ mod tests {
             plist: b"plist",
             payload: b"payload!",
             icon: Some(b"icns"),
+            all_users_pkg: Some(b"pkg"),
         };
         let root = write_app(tmp.path(), &app).unwrap();
         let mode = |p: &str| fs::metadata(root.join(p)).unwrap().permissions().mode() & 0o777;
@@ -580,6 +590,11 @@ mod tests {
         assert_eq!(mode("Contents/Info.plist"), 0o644);
         assert_eq!(mode("Contents/Resources/lunepack-setup.payload"), 0o644);
         assert_eq!(mode("Contents/Resources/lunepack-installer.icns"), 0o644);
+        assert_eq!(
+            fs::read(root.join("Contents/Resources/lunepack-all-users.pkg")).unwrap(),
+            b"pkg"
+        );
+        assert_eq!(mode("Contents/Resources/lunepack-all-users.pkg"), 0o644);
         assert_eq!(mode("Contents"), 0o755);
         assert!(write_app(tmp.path(), &app).is_err());
     }

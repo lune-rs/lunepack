@@ -204,7 +204,8 @@ pub struct CodeSignSection {
     pub sign_bundle: ArgvTemplate,
     /// `sign_outer`: the app bundle (macOS); defaults to `sign_bundle`.
     pub sign_outer: ArgvTemplate,
-    /// `sign_installer`: `Setup.exe`, the installer app's items and the `.dmg`; defaults to `sign`.
+    /// `sign_installer`: `Setup.exe`, the installer app's items, the `.dmg` and the all-users `.pkg`
+    /// (M11-D8); defaults to `sign`.
     pub sign_installer: ArgvTemplate,
     /// `verify`: run on the signed outer object.
     pub verify: Option<ArgvTemplate>,

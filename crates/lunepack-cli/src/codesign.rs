@@ -282,7 +282,8 @@ impl OsCodeSign {
     }
 }
 
-/// What a single installer file is (M9-D5): a Windows `Setup.exe`, or the macOS `.dmg`.
+/// What a single installer file is (M9-D5): a Windows `Setup.exe`, the macOS `.dmg`, or the macOS
+/// all-users `.pkg` (M11-D8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallerFile {
     /// `Setup.exe`: signed with `sign_installer`, then `verify`.
@@ -291,6 +292,10 @@ pub enum InstallerFile {
     /// `{path}`, `{bundle}` and `{zip}` are all the image (`notarytool` takes an image as it
     /// takes a zip).
     Dmg,
+    /// The all-users installer package: signed with `sign_installer` (which must sign the file in
+    /// place; `productsign` writes a second file, so wrap it), then notarized and stapled when
+    /// configured, as the image is.
+    Pkg,
 }
 
 impl OsCodeSign {
@@ -308,7 +313,7 @@ impl OsCodeSign {
             vec![("sign_installer", &section.sign_installer)];
         match kind {
             InstallerFile::SetupExe => used.extend(section.verify.as_ref().map(|t| ("verify", t))),
-            InstallerFile::Dmg => {
+            InstallerFile::Dmg | InstallerFile::Pkg => {
                 used.extend(section.notarize.as_ref().map(|t| ("notarize", t)));
                 used.extend(section.staple.as_ref().map(|t| ("staple", t)));
             }
@@ -338,6 +343,9 @@ impl OsCodeSign {
                 pe_is_signed(&head, len)
             }
             InstallerFile::Dmg => dmg_is_signed_file(&path).map_err(|e| read_error(shown, &e))?,
+            InstallerFile::Pkg => {
+                crate::pkg::pkg_is_signed_file(&path).map_err(|e| read_error(shown, &e))?
+            }
         };
         if !signed {
             return fail(format!(
@@ -350,9 +358,9 @@ impl OsCodeSign {
                     self.run_template("verify", shown, verify, &ctx, section.timeout)?;
                 }
             }
-            InstallerFile::Dmg => {
+            InstallerFile::Dmg | InstallerFile::Pkg => {
                 if let (Some(notarize), Some(staple)) = (&section.notarize, &section.staple) {
-                    // An image is submitted as it is: it stands for the bundle and the zip too.
+                    // An image or a package is submitted as it is: it stands for the bundle and the zip too.
                     let ctx = ExpandCtx {
                         path: &path,
                         bundle: Some(&path),

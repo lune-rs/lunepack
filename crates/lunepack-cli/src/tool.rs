@@ -1,5 +1,5 @@
 //! The bounded runner for every external tool the packager starts (M9-D3): the developer's signing
-//! templates, notarization, stapling and `hdiutil`.
+//! templates, notarization, stapling, `hdiutil` and the `.pkg` builders `pkgbuild` and `productbuild`.
 //!
 //! One rule set for all of them: the program is started directly with an argv (never a shell; on
 //! Windows a `.bat` or `.cmd` program is refused, because `cmd.exe` would re-parse the arguments),

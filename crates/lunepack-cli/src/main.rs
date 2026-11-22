@@ -13,6 +13,7 @@ mod codesign;
 mod config;
 mod dmg;
 mod pipeline;
+mod pkg;
 mod place;
 mod plist;
 mod release_dir;
