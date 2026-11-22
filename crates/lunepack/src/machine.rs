@@ -393,21 +393,23 @@ fn keep(inst: &Installation, token: Token) {
     }
 }
 
-/// The token a process-wide convenience call ([`crate::startup`]) hands on to the next one
-/// ([`crate::confirm_healthy`]), which builds its own installation.
-static PROCESS_TOKEN: std::sync::Mutex<Option<Kept>> = std::sync::Mutex::new(None);
+/// The slot a process-wide convenience call ([`crate::startup`]) hands on to the next one
+/// ([`crate::confirm_healthy`]), which builds its own installation. It is the startup's own slot,
+/// shared, not a copy: a token an `attempt` answers after `startup` returned (F3) still reaches it.
+type KeptSlot = std::sync::Arc<std::sync::Mutex<Option<Kept>>>;
+static PROCESS_TOKEN: std::sync::Mutex<Option<KeptSlot>> = std::sync::Mutex::new(None);
 
-/// Moves the token `inst` kept into the process-wide slot.
+/// Hands `inst`'s token slot to the process.
 pub(crate) fn export_kept(inst: &Installation) {
-    let kept = inst.platform.kept.lock().ok().and_then(|g| g.clone());
-    if let (Some(kept), Ok(mut slot)) = (kept, PROCESS_TOKEN.lock()) {
-        *slot = Some(kept);
+    if let Ok(mut slot) = PROCESS_TOKEN.lock() {
+        *slot = Some(std::sync::Arc::clone(&inst.platform.kept));
     }
 }
 
-/// Moves the process-wide token into `inst`.
+/// Moves the token in the process's slot into `inst`.
 pub(crate) fn import_kept(inst: &Installation) {
-    let kept = PROCESS_TOKEN.lock().ok().and_then(|g| g.clone());
+    let shared = PROCESS_TOKEN.lock().ok().and_then(|g| g.clone());
+    let kept = shared.and_then(|s| s.lock().ok().and_then(|g| g.clone()));
     if let (Some(kept), Ok(mut mine)) = (kept, inst.platform.kept.lock()) {
         *mine = Some(kept);
     }
@@ -477,8 +479,18 @@ pub(crate) fn startup(
         || kept_for(inst).is_some();
     if pending && !has_token {
         let (probe, own_version) = (inst.clone(), own.clone());
-        match within(p.service_wait, move || attempt(&probe, &own_version)) {
-            Some(Ok(Attempted::Counted(token))) => keep(inst, token),
+        // The token is kept by the helper thread itself (the slot is shared by the clones of the
+        // platform), so an answer that comes after the bounded wait is not lost (F3): the service
+        // counted that start and leased it to this token, and `confirm_healthy` needs it.
+        let counted = move || {
+            let answer = attempt(&probe, &own_version);
+            if let Ok(Attempted::Counted(token)) = &answer {
+                keep(&probe, token.clone());
+            }
+            answer
+        };
+        match within(p.service_wait, counted) {
+            Some(Ok(Attempted::Counted(_))) => {}
             Some(Ok(Attempted::Nothing)) => {}
             Some(Ok(Attempted::RolledBack)) => {
                 relaunch_stub(inst, machine, args);

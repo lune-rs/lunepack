@@ -1086,6 +1086,50 @@ fn a_service_that_never_answers_delays_the_start_by_the_bounded_wait_only() {
     rig.assert_read_only();
 }
 
+/// F3: an `attempt` the service answers only after the bounded wait still gives this process its
+/// token. The start goes on without it; the token that comes later confirms, and no further start
+/// is counted for it.
+#[test]
+fn an_attempt_answered_after_the_wait_still_gives_the_process_its_token() {
+    let rig = Rig::new();
+    let _lost = applied(&rig);
+    rig.host.advance(10_000);
+    let inner = rig.connector();
+    let slow = Arc::new(FakeConnector::new(move |app| {
+        thread::sleep(Duration::from_millis(600));
+        lunepack_core::ServiceConnector::connect(&inner, app)
+    }));
+    let platform = rig
+        .platform_for("alice", None, slow)
+        .with_service_wait(Duration::from_millis(100));
+    let inst = rig.open_with(V110, platform);
+    let started = startup_for(&inst, Vec::new()).expect("startup");
+    assert_eq!(started.action, StartupAction::Continue);
+    assert!(
+        started.pending,
+        "the start did not wait for the late answer"
+    );
+    // The late answer arrives: the start is counted once and its token confirms. Until the
+    // helper thread has kept it, `confirm` finds the start's lease (supervised) and does nothing.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let outcome = confirm_for(&inst).expect("confirm");
+        if outcome == ConfirmOutcome::Confirmed {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the late token never reached the process"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let record = rig.host.record();
+    assert!(record.pending.is_none());
+    assert_eq!(record.current.expect("current").version, version(V110));
+    assert!(!record.bad.contains(&version(V110)));
+    rig.assert_read_only();
+}
+
 // ---- confirm -------------------------------------------------------------------------------------
 
 #[test]
