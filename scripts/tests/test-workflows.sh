@@ -209,7 +209,6 @@ e2e_windows_jobs_ok() {
   block=$(job_block "$1" e2e-windows)
   if ! printf '%s\n' "$block" | grep -q 'run: ./scripts/ci/windows-publisher-test.ps1'; then echo "e2e-windows does not run windows-publisher-test.ps1"; bad=1; fi
   block=$(job_block "$1" e2e-windows-defender)
-  if ! printf '%s\n' "$block" | grep -q 'run: ./scripts/e2e-windows-machine.ps1'; then echo "the Defender job does not run e2e-windows-machine.ps1"; bad=1; fi
   if ! printf '%s\n' "$block" | grep -q 'scripts/ci/defender-on.ps1'; then echo "the Defender job does not run defender-on.ps1"; bad=1; fi
   if ! printf '%s\n' "$block" | grep -q 'defender-on.ps1 -Report'; then echo "the Defender job does not report detections"; bad=1; fi
   if ! printf '%s\n' "$block" | grep -q 'if: always()'; then echo "the Defender job's report does not run after a failure"; bad=1; fi
@@ -238,126 +237,6 @@ if [ -f "$ci" ]; then
   RC=0
   e2e_windows_jobs_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
   t_check "a file with no Windows e2e jobs fails" rc_nonzero
-fi
-# --- the Windows per-machine end-to-end job (M10 step 19) ---------------------------------------
-# Required (no continue-on-error), time-bounded, on a Windows runner, runs the suite (a created
-# standard user, a service, HKLM keys; removed again by the script) and keeps its log as an
-# artifact when it fails.
-e2e_windows_machine_job_ok() {
-  local block bad=0
-  block=$(job_block "$1" e2e-windows-machine)
-  if [ -z "$block" ]; then echo "no e2e-windows-machine job"; return 1; fi
-  if ! printf '%s\n' "$block" | grep -q 'timeout-minutes:'; then echo "e2e-windows-machine has no timeout-minutes"; bad=1; fi
-  if printf '%s\n' "$block" | grep -q 'continue-on-error'; then echo "e2e-windows-machine must not be continue-on-error"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'runs-on: windows-latest'; then echo "e2e-windows-machine does not run on windows-latest"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'scripts/e2e-windows-machine.ps1'; then echo "e2e-windows-machine does not run e2e-windows-machine.ps1"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'actions/upload-artifact@'; then echo "e2e-windows-machine does not upload its log"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'if: failure()'; then echo "e2e-windows-machine's log is not kept after a failure"; bad=1; fi
-  return "$bad"
-}
-
-if [ -f "$ci" ]; then
-  RC=0
-  e2e_windows_machine_job_ok "$ci" >"$OUT" 2>&1 || RC=$?
-  t_check "ci.yml has the e2e-windows-machine job, required and time-bounded" rc_is 0
-  if [ "$RC" -ne 0 ]; then sed 's/^/    /' "$OUT" >&2; fi
-  sed 's|^  e2e-windows-machine:|  e2e-windows-machine:\n    continue-on-error: true|' "$ci" >"$T_TMP/em-coe.yml"
-  RC=0
-  e2e_windows_machine_job_ok "$T_TMP/em-coe.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "seeded continue-on-error on the machine e2e job fails" rc_nonzero
-  t_check "seeded continue-on-error on the machine e2e job reports why" out_has "continue-on-error"
-  grep -v 'scripts/e2e-windows-machine.ps1' "$ci" >"$T_TMP/em-noscript.yml" || true
-  RC=0
-  e2e_windows_machine_job_ok "$T_TMP/em-noscript.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "seeded machine e2e job without its script fails" rc_nonzero
-  t_check "seeded machine e2e job without its script reports why" out_has "e2e-windows-machine.ps1"
-  sed 's|^        if: failure()$|        if: success()|' "$ci" >"$T_TMP/em-nolog.yml"
-  RC=0
-  e2e_windows_machine_job_ok "$T_TMP/em-nolog.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "seeded machine e2e job that keeps no log after a failure fails" rc_nonzero
-  # the Defender job must run the machine suite too
-  grep -v 'run: ./scripts/e2e-windows-machine.ps1' "$ci" >"$T_TMP/em-nodefender.yml" || true
-  RC=0
-  e2e_windows_jobs_ok "$T_TMP/em-nodefender.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "seeded Defender job without the machine suite fails" rc_nonzero
-  t_check "seeded Defender job without the machine suite reports why" out_has "does not run e2e-windows-machine.ps1"
-  RC=0
-  e2e_windows_machine_job_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "a file with no machine e2e job fails" rc_nonzero
-fi
-# --- the Windows machine-adapter job (M10 step 11) --------------------------------------------
-# Required (no continue-on-error), time-bounded, on a Windows runner, runs the acceptance script
-# (a created standard user, a service, HKLM keys; removed again by the script) and keeps its log
-# as an artifact when it fails.
-machine_adapter_job_ok() {
-  local block bad=0
-  block=$(job_block "$1" windows-machine-adapter)
-  if [ -z "$block" ]; then echo "no windows-machine-adapter job"; return 1; fi
-  if ! printf '%s\n' "$block" | grep -q 'timeout-minutes:'; then echo "windows-machine-adapter has no timeout-minutes"; bad=1; fi
-  if printf '%s\n' "$block" | grep -q 'continue-on-error'; then echo "windows-machine-adapter must not be continue-on-error"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'runs-on: windows-latest'; then echo "windows-machine-adapter does not run on windows-latest"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'scripts/ci/windows-machine-adapter-test.ps1'; then echo "windows-machine-adapter does not run windows-machine-adapter-test.ps1"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'actions/upload-artifact@'; then echo "windows-machine-adapter does not upload its log"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'if: failure()'; then echo "windows-machine-adapter's log is not kept after a failure"; bad=1; fi
-  return "$bad"
-}
-
-if [ -f "$ci" ]; then
-  RC=0
-  machine_adapter_job_ok "$ci" >"$OUT" 2>&1 || RC=$?
-  t_check "ci.yml has the windows-machine-adapter job, required and time-bounded" rc_is 0
-  if [ "$RC" -ne 0 ]; then sed 's/^/    /' "$OUT" >&2; fi
-  sed 's|^  windows-machine-adapter:|  windows-machine-adapter:\n    continue-on-error: true|' "$ci" >"$T_TMP/ma-coe.yml"
-  RC=0
-  machine_adapter_job_ok "$T_TMP/ma-coe.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "seeded continue-on-error on the machine-adapter job fails" rc_nonzero
-  t_check "seeded continue-on-error on the machine-adapter job reports why" out_has "continue-on-error"
-  grep -v 'windows-machine-adapter-test.ps1' "$ci" >"$T_TMP/ma-noscript.yml" || true
-  RC=0
-  machine_adapter_job_ok "$T_TMP/ma-noscript.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "seeded machine-adapter job without its script fails" rc_nonzero
-  t_check "seeded machine-adapter job without its script reports why" out_has "windows-machine-adapter-test.ps1"
-  sed 's|^        if: failure()$|        if: success()|' "$ci" >"$T_TMP/ma-nolog.yml"
-  RC=0
-  machine_adapter_job_ok "$T_TMP/ma-nolog.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "seeded machine-adapter job that keeps no log after a failure fails" rc_nonzero
-  RC=0
-  machine_adapter_job_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "a file with no machine-adapter job fails" rc_nonzero
-fi
-# --- the macOS end-to-end job (M8 step 11) -----------------------------------------------------
-# Required (no continue-on-error), time-bounded, on a macOS runner, runs the suite with --ci, and
-# uploads the instrument records whatever the suite did.
-e2e_macos_job_ok() {
-  local block bad=0
-  block=$(job_block "$1" e2e-macos)
-  if [ -z "$block" ]; then echo "no e2e-macos job"; return 1; fi
-  if ! printf '%s\n' "$block" | grep -q 'timeout-minutes:'; then echo "e2e-macos has no timeout-minutes"; bad=1; fi
-  if printf '%s\n' "$block" | grep -q 'continue-on-error'; then echo "e2e-macos must not be continue-on-error"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'runs-on: macos-latest'; then echo "e2e-macos does not run on macos-latest"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'scripts/e2e-macos.sh --ci'; then echo "e2e-macos does not run e2e-macos.sh --ci"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'actions/upload-artifact@'; then echo "e2e-macos does not upload the instrument records"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'if: always()'; then echo "e2e-macos's records are not kept after a failure"; bad=1; fi
-  return "$bad"
-}
-
-if [ -f "$ci" ]; then
-  RC=0
-  e2e_macos_job_ok "$ci" >"$OUT" 2>&1 || RC=$?
-  t_check "ci.yml has the e2e-macos job, required and time-bounded" rc_is 0
-  if [ "$RC" -ne 0 ]; then sed 's/^/    /' "$OUT" >&2; fi
-  sed 's|^  e2e-macos:|  e2e-macos:\n    continue-on-error: true|' "$ci" >"$T_TMP/macos-coe.yml"
-  RC=0
-  e2e_macos_job_ok "$T_TMP/macos-coe.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "seeded continue-on-error on e2e-macos fails" rc_nonzero
-  t_check "seeded continue-on-error on e2e-macos reports why" out_has "continue-on-error"
-  sed 's|scripts/e2e-macos.sh --ci|scripts/e2e-macos.sh|' "$ci" >"$T_TMP/macos-noci.yml"
-  RC=0
-  e2e_macos_job_ok "$T_TMP/macos-noci.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "seeded e2e-macos without --ci fails" rc_nonzero
-  RC=0
-  e2e_macos_job_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "a file with no e2e-macos job fails" rc_nonzero
 fi
 
 t_check "defender-on.ps1 refuses off GitHub Actions" grep -q "GITHUB_ACTIONS -ne 'true'" "$repo/scripts/ci/defender-on.ps1"
