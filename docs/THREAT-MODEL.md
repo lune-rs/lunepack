@@ -967,7 +967,10 @@ path from their command line (only a progress-pipe id and the SID of the one acc
 derive the install root from their own image's path or from the setup file's own image. The hand-off pipe is
 owned by Administrators, readable by that one account and outbound only: the elevated side reads nothing from
 the unelevated one. The unelevated side decides success from the machine record and the exit code, never
-from a line that came through the pipe. The UI never runs elevated (D35, M10-D15). The packaged binaries are
+from a line that came through the pipe. The UI never runs elevated (D35, M10-D15): the runtime starts no UI
+from a process holding a UAC elevation's full token, and an uninstall started from such a process (or with UAC
+off) skips the copy in the user's temporary directory, which that user's unelevated processes could replace,
+and runs its first phase from the runtime under Program Files. The packaged binaries are
 hardened against DLL planting as the runtime is (the loader searches System32 only), and the end-to-end suite
 starts the service, its self-test and Setup's elevated mode beside files named like DLLs.
 

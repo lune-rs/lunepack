@@ -606,9 +606,11 @@ function Assert-Installed($app, [string]$version) {
 # ---- machine uninstall -----------------------------------------------------------------------------------------------
 
 # The administrator's uninstall through the Uninstall entry's own quiet command, split by the
-# documented rule. The stub starts the runtime detached and exits 0; the runtime hands off to a copy
-# of itself under the temp folder (the unelevated side of M10-D19), and that copy's exit code is the
-# result: it is read from the copy's process, found while it runs. Returns the copy's exit code.
+# documented rule. The stub starts the runtime detached and exits 0; the runtime, holding the
+# administrator's token, makes no copy under the temp folder (S1): it runs phase 1 itself, which
+# starts phase 2 from a copy in an admin-only `.lunepack-uninstall-<32 hex>` folder under Program
+# Files, and that copy's exit code is the result: it is read from the copy's process, found while it
+# runs. Returns the copy's exit code.
 function Invoke-MachineUninstall($app) {
     $key = Join-Path $uninstallKeyRoot $app.Id
     $quiet = (Get-ItemProperty $key).QuietUninstallString
@@ -627,7 +629,7 @@ function Invoke-MachineUninstall($app) {
         foreach ($p in @(Get-Process -Name 'lunepack-runtime' -ErrorAction SilentlyContinue)) {
             $path = $null
             try { $path = $p.Path } catch { }
-            if ($path -and $path -match '\\lunepack-uninstall-[0-9a-f]{16}\\lunepack-runtime\.exe$') { $copy = $p; $null = $copy.Handle; break }
+            if ($path -and $path -match '\\\.lunepack-uninstall-[0-9a-f]{32}\\lunepack-runtime\.exe$') { $copy = $p; $null = $copy.Handle; break }
         }
         if ($null -eq $copy) { Start-Sleep -Milliseconds 50 }
     }

@@ -165,6 +165,25 @@ fn uninstall_mode(
     data_home: &std::path::Path,
     silent: bool,
 ) -> Kind {
+    // An administrator's process never hands off through the user's temp folder, whose unelevated
+    // processes could replace the copy or the UI beside it before it runs with the full token (S1,
+    // M10-D19): it runs phase 1 itself, headless.
+    if inst.is_machine() {
+        use lunepack_core::Elevation as _;
+        let standing = lunepack_os_windows::WindowsElevation.standing();
+        if machine::uninstall_route(standing) == machine::UninstallRoute::InPlace {
+            let Ok(sid) = lunepack_os_windows::current_user_sid() else {
+                return headless_fail(uninstall::COMMAND, Kind::Process);
+            };
+            let kind = with_machine_base(|base, ops, process, exe| {
+                machine::uninstall_in_place(base, ops, process, standing, &sid, exe)
+            });
+            return match kind {
+                Kind::Ok => Kind::Ok,
+                kind => headless_fail(uninstall::COMMAND, kind),
+            };
+        }
+    }
     let Some(temp) = tempdirs::temp_home() else {
         return headless_fail(uninstall::COMMAND, Kind::Fs);
     };
@@ -626,8 +645,40 @@ fn machine_repair_mode(_args: &modes::MachineArgs) -> Kind {
 /// The hidden `machine-uninstall` mode, either phase.
 #[cfg(windows)]
 fn machine_uninstall_mode(phase: &modes::MachineUninstall) -> Kind {
-    use lunepack::Process as _;
     use lunepack_core::Elevation as _;
+
+    let standing = lunepack_os_windows::WindowsElevation.standing();
+    with_machine_base(|base, ops, process, exe| match phase {
+        modes::MachineUninstall::Start(args) => {
+            machine::run_uninstall_start(base, ops, process, standing, args, exe)
+        }
+        modes::MachineUninstall::Second { wait } => machine::run_uninstall_second(
+            base,
+            ops,
+            process,
+            &machine::native::NativePipes,
+            standing,
+            wait,
+            exe,
+            machine::ACCEPT_WAIT,
+        ),
+    })
+}
+
+/// Runs `f` over the native adapters of the machine uninstall's phases: the machine home (the
+/// Program Files known folder), this process's resolved executable, the filesystem, codec, hasher,
+/// verifier, randomness and protection, and the operations that enter a folder. No environment
+/// variable is read.
+#[cfg(windows)]
+fn with_machine_base(
+    f: impl FnOnce(
+        &machine::Base<'_>,
+        &machine::native::NativeOps,
+        &lunepack_os_windows::WindowsProcess,
+        &std::path::Path,
+    ) -> Kind,
+) -> Kind {
+    use lunepack::Process as _;
 
     let process = lunepack_os_windows::WindowsProcess::new();
     let (Some(home), Ok(exe)) = (machine::native::machine_home(), process.current_exe()) else {
@@ -652,22 +703,7 @@ fn machine_uninstall_mode(phase: &modes::MachineUninstall) -> Kind {
         home: &home,
     };
     let ops = machine::native::NativeOps { enter: enter_dir };
-    let standing = lunepack_os_windows::WindowsElevation.standing();
-    match phase {
-        modes::MachineUninstall::Start(args) => {
-            machine::run_uninstall_start(&base, &ops, &process, standing, args, &exe)
-        }
-        modes::MachineUninstall::Second { wait } => machine::run_uninstall_second(
-            &base,
-            &ops,
-            &process,
-            &machine::native::NativePipes,
-            standing,
-            wait,
-            &exe,
-            machine::ACCEPT_WAIT,
-        ),
-    }
+    f(&base, &ops, &process, &exe)
 }
 
 /// The hidden modes exist on Windows only; the grammar refuses them elsewhere.
@@ -703,6 +739,19 @@ fn events_for(
     }
 }
 
+/// Whether this process holds the full token of a UAC elevation (M10-D15): such a process never
+/// starts the UI (S1). Windows only; elsewhere there is no such token.
+#[cfg(windows)]
+fn uac_elevated() -> bool {
+    use lunepack_core::Elevation as _;
+    lunepack_os_windows::WindowsElevation.standing() == lunepack_core::Standing::UacElevated
+}
+
+#[cfg(not(windows))]
+fn uac_elevated() -> bool {
+    false
+}
+
 /// The UI of a mode: started from beside this runtime's resolved executable when it may be
 /// (never under `--silent` or `--no-ui`, `LUNEPACK_NO_UI`, or without a display), else headless.
 /// `location` is the install root shown, when its text fits.
@@ -732,6 +781,7 @@ fn ui_for(
             runtime_exe: &exe,
             env: &env,
             quiet,
+            elevated: uac_elevated(),
         },
         flow,
         app,
@@ -833,6 +883,7 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
                     runtime_exe: &dir.join("lunepack-runtime"),
                     env: &env,
                     quiet: silent,
+                    elevated: uac_elevated(),
                 },
                 Flow::Install,
                 app,
@@ -1085,6 +1136,7 @@ fn windows_setup(
                 runtime_exe: &dir.join("lunepack-runtime"),
                 env: &env,
                 quiet: silent,
+                elevated,
             },
             Flow::Install,
             app,
@@ -1238,6 +1290,7 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
                     runtime_exe: &exe,
                     env: &env,
                     quiet: false,
+                    elevated: uac_elevated(),
                 },
                 Flow::Install,
                 app,

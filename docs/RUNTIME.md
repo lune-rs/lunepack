@@ -481,6 +481,11 @@ released, the whole tree checked for use, the integration removed, the root rena
 checked once more, then deleted. A refusal at any step puts back what came before and exits 25 `in_use` (or 24
 `integration`): a refused uninstall leaves the install as it was. The copy's folder is registered for deletion
 at the next restart. The uninstalling user's per-user home is removed; other users' homes are left.
+A process that already holds an administrator's token (run as administrator, or UAC off) never makes the
+temporary copy, which its own unelevated processes could replace, and shows no window: the runtime inside
+`<name>\app\<current>\` runs phase 1 itself, headless, and exits 0 once phase 2 is started; phase 2 waits for it
+to end, then runs as above (after waiting up to 30 seconds for a progress reader that does not come), and its
+exit code is the result. That administrator's own per-user home is left.
 
 **Events.** A per-machine install queues none; each user's `first_run` and `updated` events come from that user's
 own counters (`docs/FORMAT.md` 12.9). `installed` is not delivered.

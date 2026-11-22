@@ -515,6 +515,10 @@ pub struct Start<'a> {
     pub env: &'a dyn Fn(&str) -> Option<OsString>,
     /// `--silent` or `--no-ui`.
     pub quiet: bool,
+    /// The process holds the full token of a UAC elevation (`Standing::UacElevated`): no UI is
+    /// ever started from it (M10-D15, S1). The UI binary sits in a folder this process did not
+    /// necessarily make admin-only, and the UI would run with the administrator's full token.
+    pub elevated: bool,
 }
 
 impl UiHost {
@@ -545,7 +549,7 @@ impl UiHost {
         details: Details,
     ) -> UiHost {
         let mut host = UiHost::headless(flow);
-        if !ui_wanted(start.quiet, start.env) {
+        if start.elevated || !ui_wanted(start.quiet, start.env) {
             return host;
         }
         let Some(program) = ui_program(start.fs, start.runtime_exe) else {
@@ -1109,6 +1113,7 @@ mod tests {
                 runtime_exe: &w.exe,
                 env,
                 quiet,
+                elevated: false,
             },
             Flow::Install,
             card("App", "1.0.0", None),
@@ -1142,6 +1147,33 @@ mod tests {
         let bare = world(false);
         assert!(start(&bare, false, &display).child_id().is_none());
         assert_eq!(bare.process.spawns().len(), 0);
+    }
+
+    #[test]
+    fn a_process_with_a_uac_full_token_starts_no_ui() {
+        let w = world(true);
+        w.process.script_child(ChildScript::runs());
+        let display = env_of(&[("DISPLAY", ":0")]);
+        let process: Arc<dyn Process> = Arc::new(w.process.clone());
+        let host = UiHost::start(
+            &Start {
+                process,
+                fs: &w.fs,
+                runtime_exe: &w.exe,
+                env: &display,
+                quiet: false,
+                elevated: true,
+            },
+            Flow::Uninstall,
+            card("App", "1.0.0", None),
+            Details {
+                location: None,
+                size_bytes: None,
+                all_users_location: None,
+            },
+        );
+        assert!(host.child_id().is_none());
+        assert_eq!(w.process.spawns().len(), 0, "a UI was started");
     }
 
     #[test]
@@ -1267,6 +1299,7 @@ mod tests {
                 runtime_exe: &w.exe,
                 env: &display,
                 quiet: false,
+                elevated: false,
             },
             Flow::Update,
             card("App", "2.0.0", Some("1.0.0")),

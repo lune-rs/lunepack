@@ -598,7 +598,10 @@ pub fn hand_off(
 
 /// Phase 1 for a machine install (M10 step 18): the same hand-off, with `R` validated against the
 /// machine home `home` and the machine record (the install is `inst`, found as one). Nothing is
-/// deleted, and nothing elevated is started: the copy asks first.
+/// deleted, and nothing elevated is started: the copy asks first. Only a standard user's process
+/// comes here: one holding an administrator's token would run the copy, and its UI, with that token
+/// from a folder its own unelevated processes can write, so it runs phase 1 in place instead
+/// ([`crate::machine::uninstall_in_place`], S1).
 #[cfg(windows)]
 pub fn machine_hand_off(
     ad: &Adapters,

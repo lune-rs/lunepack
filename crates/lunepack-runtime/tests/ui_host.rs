@@ -999,6 +999,7 @@ mod native {
                     runtime_exe: &self.dir.join("lunepack-runtime"),
                     env: &env,
                     quiet: false,
+                    elevated: false,
                 },
                 flow,
                 app,

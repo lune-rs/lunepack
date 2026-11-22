@@ -1064,6 +1064,54 @@ pub fn run_uninstall_start(
     }
 }
 
+/// How `uninstall` of a machine install leaves `R` (M10-D19, S1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UninstallRoute {
+    /// A standard user's process: the hand-off through a copy in the user's temp folder, which
+    /// asks, then has the system's elevation run the runtime inside `R`. Nothing elevated runs
+    /// from that copy's folder.
+    TempHandOff,
+    /// A process with an administrator's token (`Admin`, `UacElevated`): no copy in the user's
+    /// temp folder, which the administrator's unelevated processes can write, and no UI. This
+    /// process runs phase 1 itself ([`uninstall_in_place`]), headless, and ends.
+    InPlace,
+}
+
+/// The route of `uninstall` of a machine install for a process of `standing`.
+pub fn uninstall_route(standing: Standing) -> UninstallRoute {
+    match standing {
+        Standing::Standard => UninstallRoute::TempHandOff,
+        Standing::Admin | Standing::UacElevated => UninstallRoute::InPlace,
+    }
+}
+
+/// The machine uninstall of an administrator's process, from the runtime inside `R` (`exe`): phase
+/// 1 ([`run_uninstall_start`]) in this process, with a fresh pipe id and this account's SID
+/// (`sid`), so its copy goes into an admin-only folder under the machine home and phase 2 waits
+/// for this process to end before anything is removed. Headless: no prompt and no UI (S1). A
+/// standard user's process is refused (usage) before any effect.
+pub fn uninstall_in_place(
+    base: &Base<'_>,
+    ops: &dyn Ops,
+    process: &dyn Process,
+    standing: Standing,
+    sid: &str,
+    exe: &Path,
+) -> Kind {
+    if uninstall_route(standing) != UninstallRoute::InPlace {
+        return Kind::Usage;
+    }
+    let mut raw = [0u8; 16];
+    if base.rng.fill(&mut raw).is_err() {
+        return Kind::Internal;
+    }
+    let args = MachineArgs {
+        events: hex(&raw),
+        for_sid: sid.to_owned(),
+    };
+    run_uninstall_start(base, ops, process, standing, &args, exe)
+}
+
 /// Phase 2's own-folder rule: `exe` is the runtime copy directly inside a real, admin-only folder
 /// `.lunepack-uninstall-<32 lowercase hex>` directly under the machine home, which holds a
 /// marker. The folder, or `None` anywhere else (a usage error before any action).
@@ -3074,6 +3122,74 @@ mod tests {
 
     fn args_() -> MachineArgs {
         args()
+    }
+
+    /// S1: an administrator's process never takes the temp-folder hand-off; it runs phase 1 in
+    /// place from the runtime inside `R` (its copy in an admin-only folder under the machine home,
+    /// waiting for this process), with no UI. A standard user's process is refused in place.
+    #[test]
+    fn an_administrators_uninstall_runs_phase_one_in_place_and_never_hands_off_through_temp() {
+        assert_eq!(
+            uninstall_route(Standing::Standard),
+            UninstallRoute::TempHandOff
+        );
+        for standing in [Standing::Admin, Standing::UacElevated] {
+            assert_eq!(uninstall_route(standing), UninstallRoute::InPlace);
+            let host = Host::new();
+            let exe = installed(&host);
+            let ops = EngineOps::new(&host);
+            assert_eq!(
+                uninstall_in_place(&host.base(), &ops, &host.process, standing, SID, &exe),
+                Kind::Ok,
+                "{standing:?}"
+            );
+            let folders = uninstall_folders(&host);
+            assert_eq!(folders.len(), 1, "{folders:?}");
+            let dir = host.home.join(&folders[0]);
+            assert_eq!(host.protect.class_of(&dir), Some(DirClass::AdminOnly));
+            // The only process started is the copy in that folder, waiting for this one.
+            let spawns = host.process.spawns();
+            assert_eq!(spawns.len(), 1);
+            assert_eq!(spawns[0].program, dir.join(UNINSTALL_COPY));
+            let me = host.process.current().expect("me");
+            assert_eq!(
+                spawns[0].args,
+                [
+                    "machine-uninstall",
+                    "--wait-pid",
+                    &me.pid.to_string(),
+                    "--wait-start",
+                    &me.start_ticks.to_string()
+                ]
+                .map(std::ffi::OsString::from)
+                .to_vec()
+            );
+            let marker = host
+                .mem
+                .read_capped(&dir.join(UNINSTALL_MARKER), 4096)
+                .unwrap();
+            let marker = Marker::parse(&String::from_utf8(marker).unwrap()).expect("marker");
+            assert_eq!(marker.root, host.home.join("Hello"));
+            assert!(crate::modes::is_events_id(&marker.events));
+            assert_eq!(marker.sid, SID);
+            assert!(ops.engine_calls.lock().unwrap().is_empty());
+        }
+        let host = Host::new();
+        let exe = installed(&host);
+        let ops = EngineOps::new(&host);
+        assert_eq!(
+            uninstall_in_place(
+                &host.base(),
+                &ops,
+                &host.process,
+                Standing::Standard,
+                SID,
+                &exe
+            ),
+            Kind::Usage
+        );
+        assert!(uninstall_folders(&host).is_empty());
+        assert!(host.process.spawns().is_empty());
     }
 
     /// Runs phase 2 from the folder phase 1 made, with the pipe's reader kept.
