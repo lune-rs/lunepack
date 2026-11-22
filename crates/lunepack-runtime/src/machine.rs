@@ -518,6 +518,7 @@ pub fn install_staged(
             keyset_version: staged.keyset_version,
             payload_dir: &staged.dir.path,
             pack: &staged.pack,
+            apps_dir: None,
         },
     )
     .map_err(kind_of)
@@ -1359,6 +1360,7 @@ pub mod native {
                 policy: &self.policy,
                 registrar: &self.registrar,
                 process: &self.process,
+                scheme: lunepack_core::MachineScheme::WINDOWS,
             }
         }
     }
@@ -1705,6 +1707,7 @@ mod tests {
                 policy: &self.policy,
                 registrar: &self.registrar,
                 process: &self.process,
+                scheme: lunepack_core::MachineScheme::WINDOWS,
             }
         }
 

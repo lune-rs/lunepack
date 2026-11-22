@@ -297,6 +297,7 @@ impl Machine {
             policy: &self.policy,
             registrar: &self.registrar,
             process: &self.process,
+            scheme: lunepack_core::MachineScheme::WINDOWS,
         }
     }
 

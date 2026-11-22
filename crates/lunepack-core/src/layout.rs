@@ -951,6 +951,9 @@ pub fn resolve_root_scoped(
 ) -> Result<RootChoice, LayoutError> {
     if scheme.root == RootNaming::AppId {
         let root = data_home.join(app_id.as_str());
+        if scope == Scope::Machine {
+            return resolve_machine_app_id_root(fs, hasher, root, app_id, scheme);
+        }
         return Ok(if is_real_dir(fs, &root) {
             RootChoice::Existing(root)
         } else {
@@ -1022,6 +1025,41 @@ pub fn resolve_root_scoped(
             }
             Some(_) => {}
         }
+    }
+    Err(LayoutError::FolderTaken)
+}
+
+/// [`resolve_root_scoped`] for a per-machine root named by the app id (`/opt/<app id>`, M11-D6):
+/// nothing there is `New`; a real directory holding this app's machine record is `Existing`; one
+/// holding an unreadable record of the app, or its record of the other scope, is
+/// [`LayoutError::InstallUnreadable`]; an empty real directory, or one holding only what a
+/// per-machine first install cut off before its first record leaves (F1), is `New` (adopted or
+/// resumed); anything else at that name (a file, a link, another app's tree) is taken and never
+/// touched, [`LayoutError::FolderTaken`].
+fn resolve_machine_app_id_root(
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    root: PathBuf,
+    app_id: &AppId,
+    scheme: LayoutScheme,
+) -> Result<RootChoice, LayoutError> {
+    let meta = match fs.symlink_metadata(&root) {
+        Ok(meta) => meta,
+        Err(e) if e.kind == FsErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    match meta {
+        None => return Ok(RootChoice::New(root)),
+        Some(meta) if meta.kind == FileKind::Dir => {}
+        Some(_) => return Err(LayoutError::FolderTaken),
+    }
+    match holds(fs, hasher, &root, app_id, scheme, Scope::Machine) {
+        Holds::Ours => return Ok(RootChoice::Existing(root)),
+        Holds::Unreadable => return Err(LayoutError::InstallUnreadable),
+        Holds::Other => {}
+    }
+    if fs.list_dir(&root)?.is_empty() || is_unfinished_machine_install(fs, hasher, &root) {
+        return Ok(RootChoice::New(root));
     }
     Err(LayoutError::FolderTaken)
 }
@@ -1353,15 +1391,37 @@ pub fn resolve_bundle_target(
     name: &str,
     app_id: &AppId,
 ) -> Result<PathBuf, LayoutError> {
+    bundle_target(fs, apps_dir, name, app_id, true)
+}
+
+/// [`resolve_bundle_target`] for a per-machine install (M11-D6): the same names in `apps_dir`
+/// (`/Applications`), which must exist as a real directory and is never created or changed
+/// ([`LayoutError::NotCanonical`] otherwise).
+pub fn resolve_machine_bundle_target(
+    fs: &dyn Fs,
+    apps_dir: &Path,
+    name: &str,
+    app_id: &AppId,
+) -> Result<PathBuf, LayoutError> {
+    bundle_target(fs, apps_dir, name, app_id, false)
+}
+
+fn bundle_target(
+    fs: &dyn Fs,
+    apps_dir: &Path,
+    name: &str,
+    app_id: &AppId,
+    create: bool,
+) -> Result<PathBuf, LayoutError> {
     ensure_canonical(fs, apps_dir)?;
     let parent = apps_dir.parent().ok_or(LayoutError::NotCanonical)?;
     match lstat(fs, apps_dir)? {
-        None => {
+        None if create => {
             fs.create_dir_private(apps_dir)?;
             fs.sync_dir(parent)?;
         }
         Some(meta) if meta.kind == FileKind::Dir => {}
-        Some(_) => return Err(LayoutError::NotCanonical),
+        _ => return Err(LayoutError::NotCanonical),
     }
     let stem = if macos_name_ok(name).is_ok() {
         name
@@ -1671,6 +1731,16 @@ fn tree_of(fs: &dyn Fs, scheme: LayoutScheme, path: &Path) -> Result<Option<Tree
         version: config.version,
         app_id: config.app_id,
     }))
+}
+
+/// The app id and version of the tree at `path` by its own config under `scheme` (nothing
+/// followed): `None` when nothing is there, an error when anything but a readable tree is.
+pub fn tree_identity(
+    fs: &dyn Fs,
+    scheme: LayoutScheme,
+    path: &Path,
+) -> Result<Option<(AppId, Version)>, LayoutError> {
+    Ok(tree_of(fs, scheme, path)?.map(|t| (t.app_id, t.version)))
 }
 
 /// One move of [`reconcile_bundle`].

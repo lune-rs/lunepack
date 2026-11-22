@@ -14,7 +14,8 @@
 //!
 //! Every operation goes: take the engine's lock (`R\.lunepack\machine\lock`), check the tree's
 //! protection, load the machine record, make one pure transition, commit it, then the side
-//! effects (integration), then answer. A refusal changes nothing.
+//! effects (the projection of [`Ports::scheme`], then the integration), then answer. A refusal
+//! changes nothing.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -34,8 +35,9 @@ use crate::fs::{FileKind, FileWrite, Fs, FsErrorKind, LockGuard};
 use crate::ident::{AppId, Channel};
 use crate::integration::{IntegrationError, IntegrationRequest, OsIntegration};
 use crate::layout::{
-    GC_PREFIX, LayoutScheme, MachineLayout, RootChoice, TOMBSTONE_RANDOM_BYTES, is_tombstone_of,
-    resolve_root_scoped, service_path_in_tree, tombstone_name,
+    GC_PREFIX, MachineLayout, MachineScheme, OUT_SLOT, Projection, RootChoice, SWAP_SLOT,
+    TOMBSTONE_RANDOM_BYTES, is_tombstone_of, resolve_machine_bundle_target, resolve_root_scoped,
+    service_path_in_tree_for, set_bundle_pointer, tombstone_name, tree_identity,
 };
 use crate::lifecycle::{AttemptOutcome, ConfirmOutcome, gc_keep, machine};
 use crate::manifest::{VerifiedEntry, VerifiedManifest, verify_manifest};
@@ -57,9 +59,7 @@ use crate::traits::{
     ServiceRegistrar, SignedTree, Verifier,
 };
 use crate::trust::ClockReading;
-use crate::update_config::{
-    MAX_UPDATE_CONFIG_BYTES, PublisherPolicy, UPDATE_CONFIG_FILE, UpdateConfig,
-};
+use crate::update_config::{MAX_UPDATE_CONFIG_BYTES, PublisherPolicy, UpdateConfig};
 use crate::version::Version;
 
 /// The version trees' directory under `R`.
@@ -195,6 +195,9 @@ pub struct Ports<'a> {
     pub registrar: &'a dyn ServiceRegistrar,
     /// The in-use probe (GC and uninstall).
     pub process: &'a dyn Process,
+    /// The names of the machine install on this OS (M11-D6): the service file and the projection
+    /// the engine runs after every commit that changes the current version.
+    pub scheme: MachineScheme,
 }
 
 /// A running supervision lease (M10-D3): only in memory, lost on restart.
@@ -436,12 +439,15 @@ impl<'a> Engine<'a> {
         self.root.join(APP_DIR)
     }
 
+    /// The tree of `version`: `R/app/<version>`, or under the bundle projection the live bundle
+    /// when that is where the version is ([`locate_tree`]).
     fn tree(&self, version: &Version) -> PathBuf {
-        self.versions_dir().join(version.to_string())
+        locate_tree(self.p.fs, &self.layout(), version)
     }
 
     /// The update configuration of the installed tree of `version` (admin-only, so trusted): a
-    /// real directory holding a regular config file for this app and that version.
+    /// real directory holding a regular config file (at the scheme's config path, every directory
+    /// on the way a real one) for this app and that version.
     fn tree_config(&self, version: &Version) -> Result<UpdateConfig, EngineError> {
         let tree = self.tree(version);
         let fs = self.p.fs;
@@ -449,15 +455,7 @@ impl<'a> Engine<'a> {
             Ok(Some(m)) if m.kind == FileKind::Dir => {}
             _ => return Err(EngineError::of(ErrorCode::Internal)),
         }
-        let path = tree.join(UPDATE_CONFIG_FILE);
-        match fs.symlink_metadata(&path) {
-            Ok(Some(m)) if m.kind == FileKind::File => {}
-            _ => return Err(EngineError::of(ErrorCode::Internal)),
-        }
-        let bytes = fs
-            .read_capped(&path, MAX_UPDATE_CONFIG_BYTES)
-            .map_err(internal)?;
-        let config = UpdateConfig::parse(&bytes).map_err(internal)?;
+        let config = read_tree_config(fs, self.p.scheme, &tree)?;
         if config.app_id != self.app_id || !same(&config.version, version) {
             return Err(EngineError::of(ErrorCode::Internal));
         }
@@ -471,6 +469,12 @@ impl<'a> Engine<'a> {
             .tree_config(version)
             .map_or(hi, |c| c.health_timeout_secs.clamp(lo, hi));
         Duration::from_secs(secs) + LEASE_GRACE
+    }
+
+    /// Projects the committed `record` (M11-D6, [`project_record`]). An error is `internal`: the
+    /// record stays committed and the next `open` finishes the projection.
+    fn project(&self, record: &InstallState) -> Result<(), EngineError> {
+        project_record(self.p.fs, &self.layout(), record).map_err(internal)
     }
 
     /// Refreshes the machine integration after a committed change from `from` to `to` (the
@@ -846,7 +850,7 @@ impl<'a> Engine<'a> {
         if installed.publisher_check == PublisherPolicy::Off {
             return Ok(Decision::Proceed(None));
         }
-        let candidate_config = read_config_at(self.p.fs, &candidate.join(UPDATE_CONFIG_FILE))?;
+        let candidate_config = read_tree_config(self.p.fs, self.p.scheme, candidate)?;
         if candidate_config.app_id != self.app_id {
             return Err(EngineError::of(ErrorCode::Internal));
         }
@@ -936,8 +940,11 @@ impl<'a> Engine<'a> {
         let token = Token::from_bytes(raw);
         let next =
             machine::apply(&record, version, self.p.hasher.sha256(&raw)).map_err(lifecycle_code)?;
-        self.commit(&loaded, &next)?;
+        let committed = self.commit(&loaded, &next)?;
+        // The disk follows the record as committed, before the integration that points into it.
+        let projected = self.project(&committed);
         self.refresh_integration(outgoing.as_ref(), &incoming);
+        projected?;
         self.lease = Some(Lease {
             version: version.clone(),
             until: now + self.lease_length(version),
@@ -989,8 +996,10 @@ impl<'a> Engine<'a> {
                 let (from, to) = self.rollback_configs(&record, version)?;
                 let next = machine::rollback_at_limit(&record, version).map_err(lifecycle_code)?;
                 let committed = self.commit(&loaded, &next)?;
+                let projected = self.project(&committed);
                 self.refresh_integration(from.as_ref(), &to);
                 self.lease = None;
+                projected?;
                 Ok(AttemptAnswer::RolledBack {
                     current: committed
                         .current
@@ -1053,8 +1062,10 @@ impl<'a> Engine<'a> {
         let next = machine::rollback(&record, version, presented).map_err(lifecycle_code)?;
         let (from, to) = self.rollback_configs(&record, version)?;
         let committed = self.commit(&loaded, &next)?;
+        let projected = self.project(&committed);
         self.refresh_integration(from.as_ref(), &to);
         self.lease = None;
+        projected?;
         committed
             .current
             .map(|c| c.version)
@@ -1083,6 +1094,59 @@ fn need_fetch(paths: Vec<crate::path::RelPath>) -> CommitOutcome {
     }
     let more = kept.len() < total;
     CommitOutcome::NeedFetch { paths: kept, more }
+}
+
+/// The update config of `tree` under `scheme`: every directory on the way to the scheme's config
+/// path a real directory and the config a regular file (nothing followed).
+fn read_tree_config(
+    fs: &dyn Fs,
+    scheme: MachineScheme,
+    tree: &Path,
+) -> Result<UpdateConfig, EngineError> {
+    let mut at = tree.to_path_buf();
+    let mut names = scheme.config().split('/').peekable();
+    while let Some(name) = names.next() {
+        at.push(name);
+        if names.peek().is_some() {
+            match fs.symlink_metadata(&at) {
+                Ok(Some(m)) if m.kind == FileKind::Dir => {}
+                _ => return Err(EngineError::of(ErrorCode::Internal)),
+            }
+        }
+    }
+    read_config_at(fs, &at)
+}
+
+/// Where the tree of `version` is under `layout`: `R/app/<version>`, except under the bundle
+/// projection (macOS) when nothing is there and `R/bundle` names a bundle: then that bundle
+/// (the current version lives in it, M8-D1). The caller checks the tree's own config before it
+/// trusts it ([`Engine::tree_config`]); nothing here follows a link.
+fn locate_tree(fs: &dyn Fs, layout: &MachineLayout, version: &Version) -> PathBuf {
+    let parked = layout.version_dir(version);
+    if layout.scheme().projection() != Projection::Bundle
+        || !matches!(fs.symlink_metadata(&parked), Ok(None))
+    {
+        return parked;
+    }
+    match layout.view().bundle_path(fs) {
+        Ok(Some(bundle)) => bundle,
+        _ => parked,
+    }
+}
+
+/// Projects `record` onto the disk as `layout`'s scheme says (M11-D6): nothing on Windows,
+/// `R/current` → `app/<current>` on Linux, the bundle reconcile of FORMAT 17 on macOS. Run under
+/// the engine's lock with the record as committed, after every commit that changes the current
+/// version and at every `open`; idempotent, so a crash at any point is finished by the next run.
+fn project_record(
+    fs: &dyn Fs,
+    layout: &MachineLayout,
+    record: &InstallState,
+) -> Result<(), LayoutError> {
+    match layout.scheme().projection() {
+        Projection::None => Ok(()),
+        Projection::CurrentLink | Projection::Bundle => layout.view().reconcile(fs, record),
+    }
 }
 
 fn read_config_at(fs: &dyn Fs, path: &Path) -> Result<UpdateConfig, EngineError> {
@@ -1226,6 +1290,9 @@ pub struct InstallRequest<'r> {
     pub payload_dir: &'r Path,
     /// The copied pack in `payload_dir`.
     pub pack: &'r Path,
+    /// The apps folder the live bundle goes in (`/Applications`), under the bundle projection
+    /// (macOS) only: it must exist and is never created or changed. `None` elsewhere.
+    pub apps_dir: Option<&'r Path>,
 }
 
 /// What a successful first install made.
@@ -1246,6 +1313,11 @@ struct Made {
     registered: bool,
     /// `root_created` is this app's own first install that an earlier run left cut off (F1).
     resumed: bool,
+    /// The live bundle this run placed (macOS), holding this app's tree.
+    bundle: Option<PathBuf>,
+    /// The install was committed and only its projection failed: nothing is undone, the next
+    /// `open` finishes the projection.
+    keep: bool,
 }
 
 /// The first install of a per-machine release (M10 step 6), in the per-user install's order:
@@ -1267,12 +1339,21 @@ struct Made {
 /// removes the root only when the removal guard (M10-D20) says no process runs from it, else it
 /// leaves it for the next run.
 ///
+/// Under the projection of [`Ports::scheme`] (M11-D6) the root is named by the app id on unix;
+/// on macOS the live bundle is chosen in `req.apps_dir` before anything is created
+/// ([`MachineOpError::FolderTaken`] when both names are taken), `R/bundle` is written with the
+/// first record, and after the install record's commit the record is projected (`R/current` on
+/// Linux, the tree moved into the bundle on macOS) before the service binary is placed from
+/// wherever the tree then is. A failure of that projection keeps the committed install (nothing
+/// is undone): the service is still registered, the result is `Failed`, and the next `open`
+/// finishes the projection. A later failure that undoes the install removes the bundle too.
+///
 /// The engine looks only at the machine home: it never looks for, or names, a per-user install
 /// (M10-D14; that check is the unelevated bootstrap's).
 pub fn install(ports: Ports<'_>, req: &InstallRequest<'_>) -> Result<Installed, MachineOpError> {
     let mut made = Made::default();
     let result = install_steps(ports, req, &mut made);
-    if result.is_err() {
+    if result.is_err() && !made.keep {
         undo_install(ports, req, &made);
     }
     let _ = ports.fs.remove_dir_all_nofollow(req.payload_dir);
@@ -1289,8 +1370,8 @@ fn install_steps(
     let app_id = config.app_id.clone();
     let version = setup.manifest.version().clone();
     // A release without the service binary installs per user only (M10-D7), before anything.
-    let service_rel =
-        service_path_in_tree(&config.install.entry).ok_or(MachineOpError::PerMachineUnavailable)?;
+    let service_rel = service_path_in_tree_for(&config.install.entry, ports.scheme.os)
+        .ok_or(MachineOpError::PerMachineUnavailable)?;
     let has_service = setup.manifest.entries().iter().any(|e| {
         matches!(e, VerifiedEntry::File { path, size, .. } if *path == service_rel && *size > 0)
     });
@@ -1298,6 +1379,12 @@ fn install_steps(
         return Err(MachineOpError::PerMachineUnavailable);
     }
     remove_free_tombstones(ports, req.machine_home, &app_id);
+    if ports.scheme.projection() == Projection::Bundle
+        && let Some(apps) = req.apps_dir
+    {
+        // A bundle tombstone an uninstall cut off before its end left beside the live bundles.
+        remove_free_tombstones(ports, apps, &app_id);
+    }
 
     // (2) The root, over the machine home only. An install of this app there is refused under its
     // lock below unless it never got a current version.
@@ -1307,14 +1394,14 @@ fn install_steps(
         req.machine_home,
         &app_id,
         req.display_name,
-        LayoutScheme::WINDOWS,
+        ports.scheme.view,
         Scope::Machine,
     ) {
         Ok(RootChoice::New(root)) => root,
         // Read before anything is touched: an install with a current version is refused at once.
         Ok(RootChoice::Existing(root)) => {
             let finished = MachineStore {
-                dir: MachineLayout::new(&root).state_dir(),
+                dir: MachineLayout::with_scheme(&root, ports.scheme).state_dir(),
                 app_id: app_id.clone(),
             }
             .load(ports.fs, ports.hasher)
@@ -1332,7 +1419,12 @@ fn install_steps(
         Err(LayoutError::NameNotAllowed(_)) => return Err(MachineOpError::NameNotAllowed),
         Err(_) => return Err(MachineOpError::Failed("resolve the install root")),
     };
-    let layout = MachineLayout::new(&root);
+    let layout = MachineLayout::with_scheme(&root, ports.scheme);
+    // The live bundle's path (macOS), chosen before anything is created.
+    let bundle = match ports.scheme.projection() {
+        Projection::Bundle => Some(machine_bundle_target(ports, req, &layout, &app_id)?),
+        Projection::None | Projection::CurrentLink => None,
+    };
 
     // (3) The protected directories. A folder that was there before (empty, or this app's install)
     // is used only when it is protected already, and so is each directory in it.
@@ -1448,6 +1540,11 @@ fn install_steps(
     store
         .commit(ports.fs, &loaded, &first, ports.hasher)
         .map_err(|_| MachineOpError::Failed("write the first record"))?;
+    if let Some(bundle) = &bundle {
+        // Before the install record: the projection after its commit reads the pointer.
+        set_bundle_pointer(ports.fs, &layout.view(), bundle)
+            .map_err(|_| MachineOpError::Failed("write the bundle pointer"))?;
+    }
 
     // (5) The tree, from the copied pack.
     let sources = setup
@@ -1476,7 +1573,7 @@ fn install_steps(
         _ => MachineOpError::Failed("stage"),
     })?;
     // The staged tree's own config: this app, this version, exactly the payload's root.
-    let tree_config = read_config_at(ports.fs, &staged.tree.join(UPDATE_CONFIG_FILE))
+    let tree_config = read_tree_config(ports.fs, ports.scheme, &staged.tree)
         .map_err(|_| MachineOpError::Verify)?;
     if tree_config.app_id != app_id
         || !same(&tree_config.version, &version)
@@ -1517,12 +1614,27 @@ fn install_steps(
         .integration
         .apply(Scope::Machine, &request)
         .map_err(|_| MachineOpError::Integration)?;
-    store
+    let committed = store
         .commit(ports.fs, &loaded, &next, ports.hasher)
         .map_err(|_| MachineOpError::Failed("write the install record"))?;
 
-    // (7) The service binary: copied, self-tested, registered.
-    let image = place_service_binary(ports, &layout, &version, &staged.tree, &service_rel)?;
+    // (6b) The projection of the committed record (`R/current`, or the tree moved into the live
+    // bundle). A failure keeps the install: the record is committed and the next `open` finishes
+    // the projection; the service is still placed and registered so that `open` comes.
+    let projected = project_record(ports.fs, &layout, &committed);
+    if let Some(bundle) = &bundle
+        && matches!(
+            tree_identity(ports.fs, layout.scheme().view, bundle),
+            Ok(Some((id, v))) if id == app_id && same(&v, &version)
+        )
+    {
+        made.bundle = Some(bundle.clone());
+    }
+
+    // (7) The service binary: copied (from wherever the projection left the tree), self-tested,
+    // registered.
+    let tree = locate_tree(ports.fs, &layout, &version);
+    let image = place_service_binary(ports, &layout, &version, &tree, &service_rel)?;
     ports
         .registrar
         .self_test(&image)
@@ -1533,7 +1645,37 @@ fn install_steps(
         .register(&app_id, &image)
         .map_err(|_| MachineOpError::Failed("register the service"))?;
     drop(guard);
+    if projected.is_err() {
+        made.keep = true;
+        return Err(MachineOpError::Failed("project the install"));
+    }
     Ok(Installed { root, version })
+}
+
+/// The live bundle a macOS first install places (FORMAT 17.1): `R/bundle`'s target when a cut-off
+/// run of this install wrote it in `req.apps_dir` and nothing is there yet, else
+/// `<apps>/<display name>.app` (the app id when the name is not a bundle name), else
+/// `<apps>/<name> (<app id>).app`; both taken is [`MachineOpError::FolderTaken`]. The apps
+/// folder must exist and is never created or changed.
+fn machine_bundle_target(
+    ports: Ports<'_>,
+    req: &InstallRequest<'_>,
+    layout: &MachineLayout,
+    app_id: &AppId,
+) -> Result<PathBuf, MachineOpError> {
+    let apps = req
+        .apps_dir
+        .ok_or(MachineOpError::Failed("no apps folder"))?;
+    if let Ok(Some(earlier)) = layout.view().bundle_path(ports.fs)
+        && earlier.parent() == Some(apps)
+        && matches!(ports.fs.symlink_metadata(&earlier), Ok(None))
+    {
+        return Ok(earlier);
+    }
+    resolve_machine_bundle_target(ports.fs, apps, req.display_name, app_id).map_err(|e| match e {
+        LayoutError::BundleNameTaken => MachineOpError::FolderTaken,
+        _ => MachineOpError::Failed("resolve the bundle"),
+    })
 }
 
 /// Whether the removal guard (M10-D20) lets the engine delete `path`: only an answer of `Ok(false)`
@@ -1618,17 +1760,29 @@ fn undo_install(ports: Ports<'_>, req: &InstallRequest<'_>, made: &Made) {
         let Some(root) = &made.root_created else {
             return;
         };
-        if !free_to_remove(ports, root) {
+        if !free_to_remove(ports, root)
+            || made
+                .bundle
+                .as_ref()
+                .is_some_and(|b| !free_to_remove(ports, b))
+        {
             return;
         }
         if let Some(request) = &made.integration {
             let _ = ports.integration.remove(Scope::Machine, request);
+        }
+        if let Some(bundle) = &made.bundle {
+            let _ = ports.fs.remove_dir_all_nofollow(bundle);
         }
         let _ = ports.fs.remove_dir_all_nofollow(root);
         return;
     }
     if let Some(request) = &made.integration {
         let _ = ports.integration.remove(Scope::Machine, request);
+    }
+    // The tree this run moved out of `R` into the live bundle (macOS).
+    if let Some(bundle) = &made.bundle {
+        let _ = ports.fs.remove_dir_all_nofollow(bundle);
     }
     if let Some(root) = &made.root_created {
         let _ = ports.fs.remove_dir_all_nofollow(root);
@@ -1641,18 +1795,19 @@ fn undo_install(ports: Ports<'_>, req: &InstallRequest<'_>, made: &Made) {
 
 impl<'a> Engine<'a> {
     fn layout(&self) -> MachineLayout {
-        MachineLayout::new(&self.root)
+        MachineLayout::with_scheme(&self.root, self.p.scheme)
     }
 
     /// The version of the registered service binary, when it is one of this root's.
     fn registered_service_version(&self) -> Option<Version> {
         let image = self.p.registrar.image(&self.app_id).ok()??;
-        let (layout, version) = MachineLayout::of_service_image(&image)?;
+        let (layout, version) = MachineLayout::of_service_image_as(&image, self.p.scheme)?;
         (layout.root() == self.root).then_some(version)
     }
 
-    /// Run at every `open`, under the lock: `.partial` trees and `.gc-` leftovers go, the service
-    /// is switched to the current version when nothing is pending, and versions nobody keeps are
+    /// Run at every `open`, under the lock: `.partial` trees and `.gc-` leftovers go, the record
+    /// is projected (M11-D6: `R/current` on Linux, the live bundle on macOS), the service is
+    /// switched to the current version when nothing is pending, and versions nobody keeps are
     /// collected. Nothing here is an error of `open`.
     fn reconcile(&self, record: &InstallState) {
         // `.partial` trees are exempt from the removal guard (M10-D20): half-written staging
@@ -1668,6 +1823,9 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        // The disk follows the record before anything reads a tree from it (a crash after a
+        // commit, or a projection that failed, is finished here).
+        let _ = self.project(record);
         if record.pending.is_none() {
             let _ = self.switch_service(record);
         }
@@ -1718,7 +1876,7 @@ impl<'a> Engine<'a> {
         let config = self
             .tree_config(version)
             .map_err(|_| MachineOpError::PerMachineUnavailable)?;
-        let rel = service_path_in_tree(&config.install.entry)
+        let rel = service_path_in_tree_for(&config.install.entry, self.p.scheme.os)
             .ok_or(MachineOpError::PerMachineUnavailable)?;
         let image =
             place_service_binary(self.p, &self.layout(), version, &self.tree(version), &rel)?;
@@ -1772,6 +1930,10 @@ impl<'a> Engine<'a> {
             let Some(name) = entry.name.to_str() else {
                 continue;
             };
+            // The bundle projection's slots are never versions: the reconcile owns them.
+            if name == SWAP_SLOT || name == OUT_SLOT {
+                continue;
+            }
             let path = versions.join(name);
             if name.starts_with(GC_PREFIX) {
                 if self.free_to_remove(&path) {
@@ -1814,7 +1976,10 @@ impl<'a> Engine<'a> {
             Err(e) => {
                 let fallback = registered
                     .clone()
-                    .and_then(|r| MachineLayout::of_service_image(&r).map(|(l, v)| (r, l, v)))
+                    .and_then(|r| {
+                        MachineLayout::of_service_image_as(&r, self.p.scheme)
+                            .map(|(l, v)| (r, l, v))
+                    })
                     .filter(|(r, l, _)| {
                         l.root() == self.root
                             && matches!(
@@ -1847,8 +2012,14 @@ impl<'a> Engine<'a> {
     /// `R` to its tombstone in the machine home; (7) the removal guard over the tombstone; (8)
     /// remove the tombstone without following links.
     ///
+    /// Under the bundle projection (macOS) the live bundle `B` goes with `R` when it holds this
+    /// app's tree (nothing at `B` is followed; another app's tree there is left alone): (4) the
+    /// removal guard covers `B` too; after (5) `B` is renamed to its tombstone in its own folder
+    /// (before `R`'s rename); (7) the guard runs on both tombstones; (8) `B`'s tombstone is
+    /// removed after `R`'s.
+    ///
     /// A refusal at (4), (6) or (7), or an integration error at (5), undoes what came before it
-    /// (the tombstone renamed back, the integration re-applied, the service image read at (1)
+    /// (the tombstones renamed back, the integration re-applied, the service image read at (1)
     /// registered again when it lies under this `R`) and returns `InUse` (or `Integration`), so a
     /// refused uninstall leaves the install as it was. When the undo itself fails the result is
     /// `Failed("restore ...")` naming what was not restored (an administrator then runs
@@ -1890,11 +2061,28 @@ impl<'a> Engine<'a> {
             .fill(&mut random)
             .map_err(|_| MachineOpError::Failed("randomness"))?;
         let tomb = home.join(tombstone_name(&self.app_id, &random));
+        let bundle = self.own_bundle();
+        let bundle_tomb = match &bundle {
+            Some(b) => {
+                let mut random = [0u8; TOMBSTONE_RANDOM_BYTES];
+                self.p
+                    .rng
+                    .fill(&mut random)
+                    .map_err(|_| MachineOpError::Failed("randomness"))?;
+                let folder = b
+                    .parent()
+                    .ok_or(MachineOpError::Failed("the bundle has no folder"))?;
+                Some(folder.join(tombstone_name(&self.app_id, &random)))
+            }
+            None => None,
+        };
+        let bundle_pair = bundle.as_deref().zip(bundle_tomb.as_deref());
         let undo = Undo {
             engine: &self,
             request: request.as_ref(),
             image: registered.as_deref(),
             tomb: &tomb,
+            bundle: bundle_pair,
         };
 
         // (2) The service: stopped and deleted.
@@ -1905,7 +2093,9 @@ impl<'a> Engine<'a> {
         // (3) The lock file lives inside `R`: release it before anything under `R` goes.
         drop(guard);
         // (4) The removal guard over `R`, with the service gone.
-        if !self.free_to_remove(&self.root) {
+        if !self.free_to_remove(&self.root)
+            || bundle.as_ref().is_some_and(|b| !self.free_to_remove(b))
+        {
             return undo.run(UndoFrom::Service, MachineOpError::InUse);
         }
         // (5) The machine integration, while `R` (and the stub in it) is at its path. An error
@@ -1918,20 +2108,54 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        // (6) The rename takes `R` away from new launches; it is not an in-use check.
-        if self.p.fs.rename(&self.root, &tomb).is_err() {
+        // (5b) The live bundle to its tombstone in its own folder (macOS), before `R`'s rename.
+        if let Some((b, t)) = bundle_pair
+            && self.p.fs.rename(b, t).is_err()
+        {
             return undo.run(UndoFrom::Integration, MachineOpError::InUse);
         }
-        // (7) The removal guard again, on the tombstone, right before deleting.
-        if !self.free_to_remove(&tomb) {
+        // (6) The rename takes `R` away from new launches; it is not an in-use check.
+        if self.p.fs.rename(&self.root, &tomb).is_err() {
+            return undo.run(UndoFrom::Bundle, MachineOpError::InUse);
+        }
+        // (7) The removal guard again, on the tombstones, right before deleting.
+        if !self.free_to_remove(&tomb)
+            || bundle_tomb
+                .as_ref()
+                .is_some_and(|t| !self.free_to_remove(t))
+        {
             return undo.run(UndoFrom::Rename, MachineOpError::InUse);
         }
-        // (8) The tombstone, without following links.
+        // (8) The tombstones, without following links.
         self.p
             .fs
             .remove_dir_all_nofollow(&tomb)
             .map_err(|_| MachineOpError::Failed("remove the install"))?;
+        if let Some(t) = &bundle_tomb {
+            self.p
+                .fs
+                .remove_dir_all_nofollow(t)
+                .map_err(|_| MachineOpError::Failed("remove the bundle"))?;
+        }
         Ok(())
+    }
+
+    /// The live bundle uninstall removes (macOS): `R/bundle`'s target when it is a real directory
+    /// holding this app's tree by its own config. Nothing there, a pointer that is missing or not
+    /// canonical, a link, or another app's or an unreadable tree: `None` (left alone).
+    fn own_bundle(&self) -> Option<PathBuf> {
+        let layout = self.layout();
+        if layout.scheme().projection() != Projection::Bundle {
+            return None;
+        }
+        let Ok(Some(bundle)) = layout.view().bundle_path(self.p.fs) else {
+            return None;
+        };
+        let ours = matches!(
+            tree_identity(self.p.fs, layout.scheme().view, &bundle),
+            Ok(Some((id, _))) if id == self.app_id
+        );
+        ours.then_some(bundle)
     }
 }
 
@@ -1942,6 +2166,8 @@ enum UndoFrom {
     Service,
     /// The integration was removed (or its removal failed part-way).
     Integration,
+    /// The live bundle was renamed to its tombstone (macOS).
+    Bundle,
     /// `R` was renamed to its tombstone.
     Rename,
 }
@@ -1953,6 +2179,8 @@ struct Undo<'e, 'a> {
     /// The registered service image, only when it lies under this `R`.
     image: Option<&'e Path>,
     tomb: &'e Path,
+    /// The live bundle and its tombstone (macOS), when uninstall removes it.
+    bundle: Option<(&'e Path, &'e Path)>,
 }
 
 impl Undo<'_, '_> {
@@ -1964,6 +2192,12 @@ impl Undo<'_, '_> {
         if from >= UndoFrom::Rename && e.p.fs.rename(self.tomb, &e.root).is_err() {
             // Without `R` at its path neither the integration nor the service can point into it.
             return Err(MachineOpError::Failed("restore the install folder"));
+        }
+        if from >= UndoFrom::Bundle
+            && let Some((bundle, tomb)) = self.bundle
+            && e.p.fs.rename(tomb, bundle).is_err()
+        {
+            return Err(MachineOpError::Failed("restore the bundle"));
         }
         let integration = from < UndoFrom::Integration
             || self

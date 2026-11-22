@@ -206,6 +206,7 @@ impl Host {
             policy: &self.policy,
             registrar: &self.registrar,
             process: &self.process,
+            scheme: lunepack_core::MachineScheme::WINDOWS,
         }
     }
 
@@ -262,6 +263,7 @@ impl Host {
                 keyset_version: 1,
                 payload_dir: &self.payload_dir(),
                 pack: &pack_path,
+                apps_dir: None,
             },
         )
         .map(|i| i.root)
@@ -492,6 +494,7 @@ fn every_failure_point_cleans_up() {
             keyset_version: 1,
             payload_dir: &h.payload_dir(),
             pack: &pack_path,
+            apps_dir: None,
         },
     );
     assert_eq!(r.err(), Some(MachineOpError::Verify));

@@ -24,7 +24,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 // ---- Protect -------------------------------------------------------------------------------------
 
-/// A [`Protect`] over a [`MemFs`]: it creates real directories in the fake filesystem and
+/// A [`Protect`] over a [`MemFs`]: it creates real directories in the fake filesystem (synced, with
+/// their entry in the parent, so a crash never takes one away) and
 /// remembers the class of each directory it created or was told about ([`FakeProtect::mark`]). A
 /// check passes only for a directory of the requested class that is not marked unprotected.
 /// Clones share one state.
@@ -48,6 +49,15 @@ impl FakeProtect {
         FakeProtect {
             fs: fs.clone(),
             inner: Arc::default(),
+        }
+    }
+
+    /// The same fake (its classes and scripted failures shared) over another filesystem: the disk
+    /// a restart finds after a crash ([`MemFs::recover`]).
+    pub fn with_fs(&self, fs: &MemFs) -> FakeProtect {
+        FakeProtect {
+            fs: fs.clone(),
+            inner: self.inner.clone(),
         }
     }
 
@@ -96,9 +106,15 @@ impl Protect for FakeProtect {
             _ => return Err(ProtectError::NotFound),
         }
         self.fs.create_dir_all(path)?;
-        let mut st = lock(&self.inner);
-        st.classes.insert(path.to_path_buf(), class);
-        st.created.push((path.to_path_buf(), class));
+        {
+            // The class comes with the directory, as a real descriptor does.
+            let mut st = lock(&self.inner);
+            st.classes.insert(path.to_path_buf(), class);
+            st.created.push((path.to_path_buf(), class));
+        }
+        // Durable, as a real adapter makes it: the new directory and its entry in the parent.
+        self.fs.sync_dir(path)?;
+        self.fs.sync_dir(parent)?;
         Ok(())
     }
 
@@ -506,7 +522,7 @@ impl lunepack_core::OsIntegration for FakeMachineIntegration {
 
 // ---- a filesystem with injected faults -----------------------------------------------------------
 
-/// A [`MemFs`] whose `rename` fails for the sources a test names (as a rename of a directory
+/// A [`MemFs`] whose `rename` (and `exchange`) fails for the sources a test names (as a rename of a directory
 /// fails on Windows while a process has its working directory or an open file in it), whose
 /// `remove_dir_all_nofollow` fails for anything directly in the directories a test names, and whose `create_new` fails under
 /// the directories a test names; everything else is the `MemFs`'s.
@@ -639,5 +655,14 @@ impl Fs for FaultFs {
         path: &Path,
     ) -> Result<Option<Box<dyn lunepack_core::LockGuard>>, lunepack_core::FsError> {
         self.fs.try_lock(path)
+    }
+    fn exchange(&self, a: &Path, b: &Path) -> Result<(), lunepack_core::FsError> {
+        if lock(&self.inner).rename_from.contains(a) {
+            return Err(FaultFs::fault(a, "exchange"));
+        }
+        self.fs.exchange(a, b)
+    }
+    fn place(&self, path: &Path) -> Result<lunepack_core::PlaceFacts, lunepack_core::FsError> {
+        self.fs.place(path)
     }
 }
