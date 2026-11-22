@@ -128,3 +128,33 @@ function Invoke-AsUser {
     Remove-Item -Force -ErrorAction SilentlyContinue $bat
     @{ Method = $method; ExitCode = $rc; Output = $out; TimedOut = $timedOut }
 }
+
+# When a run fails: checks once whether the standard user can open the service manager with connect
+# rights (`Probe` is machine_probe.exe at a path the user may run; its `service-image <AppId>` opens
+# the manager with connect rights only before it looks at the service). When it cannot, prints what
+# decides it: the manager's own descriptor (`sc sdshow scmanager`) and the groups of the user's token
+# as the same launch makes it (names, SIDs and attributes; no environment). Fixed lines otherwise.
+function Write-ScmOpenDiagnostics {
+    param($User, [string]$Probe, [string]$AppId, [string]$WorkDir, [string]$OutDir, [switch]$WithProfile)
+    if ($script:scmOpenChecked -or -not $User -or -not $Probe) { return }
+    $script:scmOpenChecked = $true
+    try {
+        $r = Invoke-AsUser -User $User -Lines @("call `"$Probe`" service-image $AppId >> `"%OUT%`" 2>&1") -WorkDir $WorkDir -OutDir $OutDir -Tag 'scm-open' -TimeoutSec 60 -WithProfile:$WithProfile
+        $seen = ("$($r.Output)" -replace '\s+', ' ').Trim()
+        if ($seen -notmatch 'open the service manager') {
+            Write-Output "     the standard user opens the service manager (service-image: $($seen.Substring(0, [Math]::Min(120, $seen.Length))))"
+            return
+        }
+        Write-Output "     the standard user cannot open the service manager: $($seen.Substring(0, [Math]::Min(200, $seen.Length)))"
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { $sd = (@(& sc.exe sdshow scmanager 2>&1 | ForEach-Object { "$_" }) -join ' ').Trim() } finally { $ErrorActionPreference = $prev }
+        Write-Output "     sc sdshow scmanager: $sd"
+        $g = Invoke-AsUser -User $User -Lines @('whoami /groups /fo csv /nh >> "%OUT%" 2>&1') -WorkDir $WorkDir -OutDir $OutDir -Tag 'scm-groups' -TimeoutSec 60 -WithProfile:$WithProfile
+        Write-Output "     the standard user's token groups (launch: $($g.Method)):"
+        foreach ($line in @("$($g.Output)" -split "`r?`n")) {
+            if ($line.Trim()) { Write-Output "       $($line.Trim())" }
+        }
+    }
+    catch { Write-Output "     the service-manager check failed: $($_.Exception.Message)" }
+}

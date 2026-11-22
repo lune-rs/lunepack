@@ -743,6 +743,10 @@ pub enum ServiceRegError {
     /// The service control manager refused (a fixed description).
     #[error("service registration failed: {0}")]
     Os(&'static str),
+    /// The service control manager refused, with the operating system's error code (a fixed
+    /// description and a number).
+    #[error("service registration failed: {0} (os error {1})")]
+    OsCode(&'static str, u32),
 }
 
 /// Why a [`crate::traits::ServiceConnector`] could not connect.
@@ -764,6 +768,10 @@ pub enum ConnectError {
     /// Anything else (a fixed description).
     #[error("connecting to the update service failed: {0}")]
     Failed(&'static str),
+    /// Anything else the operating system refused, with its error code (a fixed description and
+    /// a number).
+    #[error("connecting to the update service failed: {0} (os error {1})")]
+    FailedCode(&'static str, u32),
 }
 
 /// Why an elevation hand-off failed.

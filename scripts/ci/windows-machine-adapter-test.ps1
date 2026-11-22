@@ -73,6 +73,10 @@ function Row([string]$id, [scriptblock]$body) {
     } catch {
         $failures.Add("row $id")
         Write-Output "FAIL row ${id}: $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))"
+        # Once per run: whether the standard user can open the service manager at all (F12).
+        if ($user -and $userExe -and (Test-Path -LiteralPath $userExe)) {
+            Write-ScmOpenDiagnostics -User $user -Probe $userExe -AppId $appSvc -WorkDir $workDir -OutDir $outDir
+        }
     }
 }
 

@@ -430,7 +430,7 @@ mod windows {
 
         // A start that fails (the file is not there) and a disabled service.
         match WindowsConnector::with_timeout(Duration::from_secs(5)).connect(&id) {
-            Err(ConnectError::Failed(_)) => {}
+            Err(ConnectError::Failed(_) | ConnectError::FailedCode(..)) => {}
             Err(other) => panic!("expected Failed, got {other:?}"),
             Ok(_) => panic!("a connection to a service that cannot start"),
         }

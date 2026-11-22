@@ -370,7 +370,7 @@ mod ffi {
             app_id: &AppId,
         ) -> Result<crate::security::Descriptor, ServiceRegError> {
             let manager = open_manager(SC_MANAGER_CONNECT)
-                .map_err(|_| ServiceRegError::Os("open the service manager"))?;
+                .map_err(|code| ServiceRegError::OsCode("open the service manager", code))?;
             let service = open_service(&manager, &service_name(app_id), READ_CONTROL)
                 .map_err(not_registered)?;
             read_descriptor(&service)
@@ -380,8 +380,10 @@ mod ffi {
             let quoted = wide(&quote_image(image).map_err(CreateError::Other)?);
             let name = wide(&service_name(app_id));
             let display = wide(&self.display_name);
-            let manager = open_manager(SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE)
-                .map_err(|_| CreateError::Other(ServiceRegError::Os("open the service manager")))?;
+            let manager =
+                open_manager(SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE).map_err(|code| {
+                    CreateError::Other(ServiceRegError::OsCode("open the service manager", code))
+                })?;
             // SAFETY: `manager` is an open SCM handle; every string is a NUL-terminated `u16`
             // buffer that outlives the call; the load-order group, tag, dependencies, account
             // (LocalSystem) and password are null.
@@ -597,12 +599,12 @@ mod ffi {
 
         fn image(&self, app_id: &AppId) -> Result<Option<PathBuf>, ServiceRegError> {
             let manager = open_manager(SC_MANAGER_CONNECT)
-                .map_err(|_| ServiceRegError::Os("open the service manager"))?;
+                .map_err(|code| ServiceRegError::OsCode("open the service manager", code))?;
             let service =
                 match open_service(&manager, &service_name(app_id), SC_SERVICE_QUERY_CONFIG) {
                     Ok(service) => service,
                     Err(ERROR_SERVICE_DOES_NOT_EXIST) => return Ok(None),
-                    Err(_) => return Err(ServiceRegError::Os("open the service")),
+                    Err(code) => return Err(ServiceRegError::OsCode("open the service", code)),
                 };
             const FAIL: ServiceRegError = ServiceRegError::Os("read the service's configuration");
             let mut needed = 0u32;
@@ -639,7 +641,7 @@ mod ffi {
         fn set_image(&self, app_id: &AppId, image: &Path) -> Result<(), ServiceRegError> {
             let quoted = wide(&quote_image(image)?);
             let manager = open_manager(SC_MANAGER_CONNECT)
-                .map_err(|_| ServiceRegError::Os("open the service manager"))?;
+                .map_err(|code| ServiceRegError::OsCode("open the service manager", code))?;
             let service = open_service(&manager, &service_name(app_id), SERVICE_CHANGE_CONFIG)
                 .map_err(not_registered)?;
             // SAFETY: `service` has change-config access; every unchanged setting is
@@ -672,7 +674,7 @@ mod ffi {
 
         fn remove(&self, app_id: &AppId) -> Result<(), ServiceRegError> {
             let manager = open_manager(SC_MANAGER_CONNECT)
-                .map_err(|_| ServiceRegError::Os("open the service manager"))?;
+                .map_err(|code| ServiceRegError::OsCode("open the service manager", code))?;
             let service = match open_service(
                 &manager,
                 &service_name(app_id),
@@ -680,7 +682,7 @@ mod ffi {
             ) {
                 Ok(service) => service,
                 Err(ERROR_SERVICE_DOES_NOT_EXIST) => return Ok(()),
-                Err(_) => return Err(ServiceRegError::Os("open the service")),
+                Err(code) => return Err(ServiceRegError::OsCode("open the service", code)),
             };
             stop_and_wait(&service, STOP_WAIT)?;
             // SAFETY: `service` is an open service handle with delete access.
@@ -835,7 +837,7 @@ mod ffi {
                             Err(ConnectError::NotInstalled)
                         }
                         ERROR_ACCESS_DENIED => Err(ConnectError::Failed("not allowed to start")),
-                        _ => Err(ConnectError::Failed("start the service")),
+                        code => Err(ConnectError::FailedCode("start the service", code)),
                     };
                 }
             }
@@ -846,7 +848,7 @@ mod ffi {
         fn connect(&self, app_id: &AppId) -> Result<Box<dyn Duplex>, ConnectError> {
             let end = Instant::now() + self.timeout;
             let manager = open_manager(SC_MANAGER_CONNECT)
-                .map_err(|_| ConnectError::Failed("open the service manager"))?;
+                .map_err(|code| ConnectError::FailedCode("open the service manager", code))?;
             let service = match open_service(
                 &manager,
                 &service_name(app_id),
@@ -857,7 +859,7 @@ mod ffi {
                 Err(ERROR_ACCESS_DENIED) => {
                     return Err(ConnectError::Failed("not allowed to start"));
                 }
-                Err(_) => return Err(ConnectError::Failed("open the service")),
+                Err(code) => return Err(ConnectError::FailedCode("open the service", code)),
             };
             let pipe = pipe_name(app_id);
             let mut starts = 0u32;
