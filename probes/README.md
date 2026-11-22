@@ -64,3 +64,12 @@ half) and whether `sfltool dumpbtm` lists the label, the postinstall's umask, wo
 environment size and whether `HOME` was set, every folder's owner, group, mode and ACL after V1, after
 V1 again over a home set to 0711, and after V2, the `lsbom` rows of the staged folders in both
 packages, and the number of daemon starts. Result: `probe-results/P-M3.json`.
+
+Control: with `SockPathMode` 384 the standard user must get `EACCES` and the refusal must start no
+daemon. The daemon starts are counted only from a settled state: the daemon of the V1 re-install is
+booted out first, and the probe waits (at most 30 s) until no daemon process of the probe runs and its
+start log has been quiet for 3 s, before the count and again before the comparison. A state that never
+settles fails the control (INVALID) instead of passing or failing it by a late start. The V1 re-install
+over a home set to 0711 may fail; the probe records why (`v1_reinstall_error`, the postinstall's status
+lines and bootstrap message, and the new `install.log` lines that name the probe or a failure) and does
+not judge it.

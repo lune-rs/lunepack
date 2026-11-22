@@ -126,6 +126,20 @@ run_installer() { # <pkg> -> sets INST_RC and INST_LAST (last output line, at mo
   INST_RC=0
   out=$(probe_limited 300 sudo -n installer -pkg "$1" -target /) || INST_RC=$?
   INST_LAST=$(printf '%s\n' "$out" | tail -n 1 | cut -c 1-160)
+  INST_HEAD=$(printf '%s' "$out" | tr '\n\t\r' '   ' | cut -c 1-300)
+}
+
+# install_log_since <line count>: names and results only, the lines /var/log/install.log gained since
+# <line count> that mention this probe's label or a failure, at most 12 lines of 200 characters.
+install_log_lines() { # the line count of /var/log/install.log now
+  local n
+  n=$(sudo -n cat /var/log/install.log 2>/dev/null | wc -l | tr -d ' ') || n=0
+  echo "${n:-0}"
+}
+install_log_since() {
+  sudo -n tail -n +"$(($1 + 1))" /var/log/install.log 2>/dev/null |
+    grep -a -E "lunepack-probe-m3|[Ff]ail|[Ee]rror|postinstall|upgrade" |
+    tail -n 12 | cut -c 1-200 | tr '\n\t\r' '   ' || true
 }
 
 record_bom() { # <prefix> <component pkg>: the BOM's own mode, owner and group of the staged folders
@@ -449,9 +463,10 @@ PLISTEOF
 chown root:wheel "$PLIST"
 chmod 0644 "$PLIST"
 launchctl bootout "system/$LABEL" >/dev/null 2>&1
-launchctl bootstrap system "$PLIST" >/dev/null 2>&1
+bmsg=$(launchctl bootstrap system "$PLIST" 2>&1)
 brc=$?
 echo "bootstrap_rc=$brc" >> "$R/.probe/postinstall.txt"
+echo "bootstrap_msg=$(printf '%s' "$bmsg" | tr '\n' ' ' | cut -c 1-120)" >> "$R/.probe/postinstall.txt"
 if [ "$brc" -ne 0 ]; then status=1; fi
 exit $status
 BODY
@@ -566,6 +581,7 @@ probe_detail postinstall_env_lines "$(fld "$pi" env_lines)"
 probe_detail postinstall_home_set "$(fld "$pi" home_set)"
 probe_detail postinstall_swap_rc "$(fld "$pi" swap_rc)"
 probe_detail postinstall_bootstrap_rc "$(fld "$pi" bootstrap_rc)"
+probe_detail postinstall_bootstrap_msg "$(sudo -n sed -n 's/^bootstrap_msg=//p' "$R/.probe/postinstall.txt" 2>/dev/null | head -n 1)"
 markers_pi=$(marker_state)
 probe_detail markers_after_postinstall "$markers_pi"
 
@@ -628,15 +644,51 @@ probe_detail btm_lists_label "$btm"
 # --- V1 again over a home set to 0711 -------------------------------------------------------
 sudo -n chmod 0711 "$H"
 probe_detail reinstall_home_before "$(facts "$H")"
+log_mark=$(install_log_lines)
 run_installer "$work/v1.pkg"
 probe_detail v1_reinstall_installer_rc "$INST_RC"
 probe_detail v1_reinstall_installer_last "$INST_LAST"
+# Why Installer refused (or took) an upgrade over a home whose mode was changed: its own message, the
+# postinstall's own record (its status lines, whether the bootstrap failed and with what) and the log lines.
+probe_detail v1_reinstall_error "$INST_HEAD"
+probe_detail v1_reinstall_postinstall "$(sudo -n sed -n -e '/^bootstrap_msg=/d' -e 'p' "$R/.probe/postinstall.txt" 2>/dev/null | grep -v '^pwd=' | tr '\n' ' ')"
+probe_detail v1_reinstall_bootstrap_msg "$(sudo -n sed -n 's/^bootstrap_msg=//p' "$R/.probe/postinstall.txt" 2>/dev/null | head -n 1)"
+probe_detail v1_reinstall_install_log "$(install_log_since "$log_mark")"
 record_folders v1_reinstall
 
 # --- control: SockPathMode 384 ---------------------------------------------------------------
-act_before=$(activations)
+# The control means: with the socket at 0600 the standard user is refused (EACCES) and the refusal
+# starts no daemon. It counts daemon starts from a settled state only: the daemon of the re-install
+# above is booted out first, and whatever it still had in flight (a late activation, its idle exit) is
+# waited out, bounded, before the count is taken. If the state never settles, the control fails (it
+# cannot tell), so a late activation is never read as the refusal starting a daemon, nor missed.
+settle() { # <detail name>: wait (at most 30 s) until no daemon of this probe runs and its activation log is quiet for 3 s
+  local i=0 quiet=0 prev cur
+  prev=$(activations)
+  while [ "$i" -lt 30 ]; do
+    sleep 1
+    i=$((i + 1))
+    cur=$(activations)
+    if ! pgrep -f "$R/.lunepack/machine/" >/dev/null 2>&1 && [ "$cur" = "$prev" ]; then
+      quiet=$((quiet + 1))
+    else
+      quiet=0
+    fi
+    prev=$cur
+    if [ "$quiet" -ge 3 ]; then
+      probe_detail "$1" "yes after ${i}s"
+      return 0
+    fi
+  done
+  probe_detail "$1" "no after ${i}s"
+  return 1
+}
+
 sudo -n launchctl bootout "system/$label" >/dev/null 2>&1 || true
+settled_before=yes
+settle control_settled_before || settled_before=no
 sudo -n rm -f "$sock"
+act_before=$(activations)
 write_plist 384
 sudo -n launchctl bootstrap system "$plist" >/dev/null 2>&1 || probe_detail control_bootstrap_failed yes
 j=0
@@ -647,12 +699,13 @@ done
 probe_detail control_socket_mode "$(sudo -n stat -f %Lp "$sock" 2>/dev/null || echo missing)"
 cc=$(client id)
 probe_detail control_client_result "$cc"
-sleep 2
+settled_after=yes
+settle control_settled_after || settled_after=no
 act_after=$(activations)
 probe_detail control_new_daemon_pids "$((act_after - act_before))"
 control=failed
 case $cc in
-  *connect=error*errno=13*) if [ "$act_after" = "$act_before" ]; then control=ok; fi ;;
+  *connect=error*errno=13*) if [ "$act_after" = "$act_before" ] && [ "$settled_before" = yes ] && [ "$settled_after" = yes ]; then control=ok; fi ;;
 esac
 
 # --- clean V1, then V2 on a clean state ------------------------------------------------------
