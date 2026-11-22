@@ -141,6 +141,10 @@ function Write-ScmOpenDiagnostics {
     try {
         $r = Invoke-AsUser -User $User -Lines @("call `"$Probe`" service-image $AppId >> `"%OUT%`" 2>&1") -WorkDir $WorkDir -OutDir $OutDir -Tag 'scm-open' -TimeoutSec 60 -WithProfile:$WithProfile
         $seen = ("$($r.Output)" -replace '\s+', ' ').Trim()
+        if ($r.TimedOut -or -not $seen) {
+            Write-Output "     the service-manager check gave no answer (launch: $($r.Method); timed out: $($r.TimedOut))"
+            return
+        }
         if ($seen -notmatch 'open the service manager') {
             Write-Output "     the standard user opens the service manager (service-image: $($seen.Substring(0, [Math]::Min(120, $seen.Length))))"
             return
