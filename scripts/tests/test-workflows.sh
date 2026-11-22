@@ -433,6 +433,29 @@ if [ "$(uname -s)" = Darwin ]; then
   t_check "macos-selfsigned.sh delete left that directory alone" test -d "$T_TMP/guard-tmp"
 fi
 
+# Nothing on a runner answers an authorization prompt, so every call of the identity script that
+# could wait for one (a trust change, codesign, find-identity) goes through its `bounded`, which
+# stops a command that outlives its limit and answers 124 (F13: CI waited 90 minutes in an
+# unbounded add-trusted-cert). Pure bash: runs on every OS.
+bounded_src=$T_TMP/bounded.sh
+sed -n '/^bounded() {/,/^}/p' "$repo/scripts/ci/macos-selfsigned.sh" >"$bounded_src"
+t_check "macos-selfsigned.sh defines bounded" grep -q '^bounded() {' "$bounded_src"
+RC=0
+bounded_start=$SECONDS
+bash -c '. "$1"; bounded 1 sleep 30' _ "$bounded_src" >"$OUT" 2>&1 || RC=$?
+t_check "bounded stops a command that outlives its limit: 124" rc_is 124
+t_check "bounded stopped it within a few seconds" test $((SECONDS - bounded_start)) -lt 10
+RC=0
+bash -c '. "$1"; bounded 5 sh -c "exit 7"' _ "$bounded_src" >"$OUT" 2>&1 || RC=$?
+t_check "bounded passes on the command's own exit status" rc_is 7
+# unbounded_prompt_calls prints the code lines of the identity script that change trust, sign or
+# list identities without going through bounded.
+unbounded_prompt_calls() {
+  grep -nE '(add|remove)-trusted-cert|find-identity -p|--sign ' "$repo/scripts/ci/macos-selfsigned.sh" |
+    grep -vE '^[0-9]+:[[:space:]]*#' | grep -v 'bounded ' || true
+}
+t_check "macos-selfsigned.sh: every trust change, codesign and find-identity call is bounded" test -z "$(unbounded_prompt_calls)"
+
 # Every tracked shell script that a workflow or another script runs by path must be executable
 # (git mode 100755): a 100644 one fails with "Permission denied" only in CI. Only the
 # scripts/tests/test-*.sh files are exempt, because run.sh runs them through bash.
