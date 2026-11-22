@@ -796,6 +796,64 @@ fn is_unfinished_install(
     only_ours && matches!(load_any::<InstallState>(fs, &at, hasher), Ok(None))
 }
 
+/// Whether `dir` is what a per-machine first install cut off before its first record leaves (F1):
+/// a real directory holding at most `app` (empty) and `.lunepack`, which holds at most `state`
+/// (only the lock and record-named files, no whole record) and `machine` (at most the engine's
+/// lock file), each a real directory and each file a regular file. Read only; a read failure is
+/// "no".
+fn is_unfinished_machine_install(fs: &dyn Fs, hasher: &dyn Hasher, dir: &Path) -> bool {
+    // Every entry of `at` is one of `allowed`, of that kind.
+    let only = |at: &Path, allowed: &[(&str, FileKind)]| match fs.list_dir(at) {
+        Ok(listing) => listing.iter().all(|e| {
+            allowed
+                .iter()
+                .any(|(name, kind)| e.name.as_os_str() == OsStr::new(name) && e.kind == *kind)
+        }),
+        Err(_) => false,
+    };
+    let layout = MachineLayout::new(dir);
+    let state_name = LayoutScheme::WINDOWS
+        .state
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    let exists = |p: &Path| matches!(fs.symlink_metadata(p), Ok(Some(_)));
+    let shape = only(
+        dir,
+        &[
+            (LayoutScheme::WINDOWS.versions, FileKind::Dir),
+            (MACHINE_LUNEPACK_DIR, FileKind::Dir),
+        ],
+    ) && (!exists(&layout.app_dir()) || only(&layout.app_dir(), &[]))
+        && (!exists(&layout.lunepack_dir())
+            || only(
+                &layout.lunepack_dir(),
+                &[
+                    (state_name, FileKind::Dir),
+                    (MACHINE_ADMIN_DIR, FileKind::Dir),
+                ],
+            ))
+        && (!exists(&layout.machine_dir())
+            || only(&layout.machine_dir(), &[(LOCK_FILE, FileKind::File)]));
+    if !shape {
+        return false;
+    }
+    let state = layout.state_dir();
+    if !exists(&state) {
+        return true;
+    }
+    let Ok(listing) = fs.list_dir(&state) else {
+        return false;
+    };
+    let only_ours = listing.iter().all(|e| {
+        e.kind == FileKind::File
+            && e.name
+                .to_str()
+                .is_some_and(|n| n == LOCK_FILE || is_record_name(n))
+    });
+    only_ours && matches!(load_any::<InstallState>(fs, &state, hasher), Ok(None))
+}
+
 /// Whether `path` is a real directory (not a symlink or reparse point). A read failure is "no".
 fn is_real_dir(fs: &dyn Fs, path: &Path) -> bool {
     matches!(fs.symlink_metadata(path), Ok(Some(meta)) if meta.kind == FileKind::Dir)
@@ -829,6 +887,8 @@ fn same_folder_name(a: &OsStr, b: &str) -> bool {
 ///    state directory with only the lock and record-named files, no whole record: resumed);
 ///    anything else there (a file, a link or reparse point, a non-empty directory,
 ///    another app's install) is taken and never touched. Both taken: [`LayoutError::FolderTaken`].
+///    With [`Scope::Machine`] a folder holding only what a per-machine first install makes before
+///    its first record is resumed the same way (F1).
 ///
 /// Errors carry no path or name.
 pub fn resolve_root(
@@ -915,6 +975,14 @@ pub fn resolve_root_scoped(
             Some(meta)
                 if meta.kind == FileKind::Dir
                     && is_unfinished_install(fs, hasher, &path, scheme) =>
+            {
+                return Ok(RootChoice::New(path));
+            }
+            // The same for a per-machine first install, whose directories differ (F1).
+            Some(meta)
+                if meta.kind == FileKind::Dir
+                    && scope == Scope::Machine
+                    && is_unfinished_machine_install(fs, hasher, &path) =>
             {
                 return Ok(RootChoice::New(path));
             }

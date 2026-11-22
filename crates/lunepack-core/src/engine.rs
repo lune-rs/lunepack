@@ -29,12 +29,12 @@ use crate::chain::{RootWalk, raised_floors};
 use crate::codesign::{Decision, decide};
 use crate::digest::Sha256Digest;
 use crate::encoding::hex_encode;
-use crate::error::{Error, LayoutError, LifecycleError, ServiceError, StageError};
+use crate::error::{Error, LayoutError, LifecycleError, ProtectError, ServiceError, StageError};
 use crate::fs::{FileKind, FileWrite, Fs, FsErrorKind, LockGuard};
 use crate::ident::{AppId, Channel};
 use crate::integration::{IntegrationError, IntegrationRequest, OsIntegration};
 use crate::layout::{
-    GC_PREFIX, LayoutScheme, MachineLayout, RootChoice, TOMBSTONE_RANDOM_BYTES, remove_tombstones,
+    GC_PREFIX, LayoutScheme, MachineLayout, RootChoice, TOMBSTONE_RANDOM_BYTES, is_tombstone_of,
     resolve_root_scoped, service_path_in_tree, tombstone_name,
 };
 use crate::lifecycle::{AttemptOutcome, ConfirmOutcome, gc_keep, machine};
@@ -377,6 +377,9 @@ impl<'a> Engine<'a> {
         &self.app_id
     }
 
+    /// Removes the session folders a host that ended mid-session left in `incoming\`. Exempt from
+    /// the removal guard (M10-D20): the folders are admin-only and their paths are never handed to
+    /// anyone, so no process can run from one.
     fn remove_leftover_uploads(&self) {
         let incoming = incoming_dir(&self.root);
         if let Ok(entries) = self.p.fs.list_dir(&incoming) {
@@ -1241,6 +1244,8 @@ struct Made {
     children: Vec<PathBuf>,
     integration: Option<IntegrationRequest>,
     registered: bool,
+    /// `root_created` is this app's own first install that an earlier run left cut off (F1).
+    resumed: bool,
 }
 
 /// The first install of a per-machine release (M10 step 6), in the per-user install's order:
@@ -1253,6 +1258,14 @@ struct Made {
 /// copied to `service\<ver>\`, self-tested and registered; (8) the payload copy removed. A failure
 /// removes everything this run made (the registration, the integration, `R` when this run created
 /// it, the payload copy) and leaves a folder that was there before untouched.
+///
+/// A first install cut off by a crash, a power loss or a reboot (F1) is this app's own: under `R`'s
+/// lock, a machine record of this app with no current version, or (before the record) a root
+/// holding only the directories of (3) with nothing in them but the lock, is resumed: the record
+/// is written again (its floors kept when the trust root is the same), the stage reuses what the
+/// earlier run built, and the integration is applied again. A run that fails after resuming
+/// removes the root only when the removal guard (M10-D20) says no process runs from it, else it
+/// leaves it for the next run.
 ///
 /// The engine looks only at the machine home: it never looks for, or names, a per-user install
 /// (M10-D14; that check is the unelevated bootstrap's).
@@ -1284,9 +1297,10 @@ fn install_steps(
     if !has_service {
         return Err(MachineOpError::PerMachineUnavailable);
     }
-    let _ = remove_tombstones(ports.fs, req.machine_home, &app_id);
+    remove_free_tombstones(ports, req.machine_home, &app_id);
 
-    // (2) The root, over the machine home only.
+    // (2) The root, over the machine home only. An install of this app there is refused under its
+    // lock below unless it never got a current version.
     let root = match resolve_root_scoped(
         ports.fs,
         ports.hasher,
@@ -1297,9 +1311,21 @@ fn install_steps(
         Scope::Machine,
     ) {
         Ok(RootChoice::New(root)) => root,
-        Ok(RootChoice::Existing(_)) | Err(LayoutError::InstallUnreadable) => {
-            return Err(MachineOpError::AlreadyInstalled);
+        // Read before anything is touched: an install with a current version is refused at once.
+        Ok(RootChoice::Existing(root)) => {
+            let finished = MachineStore {
+                dir: MachineLayout::new(&root).state_dir(),
+                app_id: app_id.clone(),
+            }
+            .load(ports.fs, ports.hasher)
+            .map(|l| l.record.is_none_or(|r| r.current.is_some()))
+            .unwrap_or(true);
+            if finished {
+                return Err(MachineOpError::AlreadyInstalled);
+            }
+            root
         }
+        Err(LayoutError::InstallUnreadable) => return Err(MachineOpError::AlreadyInstalled),
         Err(LayoutError::FolderTaken) | Err(LayoutError::InstallAmbiguous) => {
             return Err(MachineOpError::FolderTaken);
         }
@@ -1308,39 +1334,64 @@ fn install_steps(
     };
     let layout = MachineLayout::new(&root);
 
-    // (3) The protected directories.
-    match ports.fs.symlink_metadata(&root) {
+    // (3) The protected directories. A folder that was there before (empty, or this app's install)
+    // is used only when it is protected already, and so is each directory in it.
+    let held_something = match ports.fs.symlink_metadata(&root) {
         Ok(None) => {
             ports
                 .protect
                 .create_dir(&root, DirClass::MachineTree)
                 .map_err(|_| MachineOpError::NotProtected)?;
             made.root_created = Some(root.clone());
+            false
         }
-        // An empty folder that was there before: used only when it is protected already.
-        Ok(Some(_)) => ports
-            .protect
-            .check(&root, DirClass::MachineTree)
-            .map_err(|_| MachineOpError::NotProtected)?,
+        Ok(Some(_)) => {
+            ports
+                .protect
+                .check(&root, DirClass::MachineTree)
+                .map_err(|_| MachineOpError::NotProtected)?;
+            !ports
+                .fs
+                .list_dir(&root)
+                .map_err(|_| MachineOpError::Failed("read the install root"))?
+                .is_empty()
+        }
         Err(_) => return Err(MachineOpError::Failed("read the install root")),
-    }
+    };
     for (dir, class) in [
         (layout.app_dir(), DirClass::MachineTree),
         (layout.lunepack_dir(), DirClass::MachineTree),
         (layout.state_dir(), DirClass::MachineTree),
         (layout.machine_dir(), DirClass::AdminOnly),
     ] {
-        ports
-            .protect
-            .create_dir(&dir, class)
-            .map_err(|_| MachineOpError::NotProtected)?;
-        if made.root_created.is_none() {
+        let created = match ports.protect.create_dir(&dir, class) {
+            Ok(()) => true,
+            Err(ProtectError::Exists) => {
+                ports
+                    .protect
+                    .check(&dir, class)
+                    .map_err(|_| MachineOpError::NotProtected)?;
+                false
+            }
+            Err(_) => return Err(MachineOpError::NotProtected),
+        };
+        if created && made.root_created.is_none() {
             made.children.push(dir);
         }
     }
-    let guard = take_lock(ports.fs, &layout.lock_path()).map_err(MachineOpError::from)?;
+    let guard = match take_lock(ports.fs, &layout.lock_path()) {
+        Ok(guard) => guard,
+        Err(e) => {
+            // Another run holds this root: it is that run's, and so is what this one made in it.
+            if e.code == ErrorCode::Busy {
+                *made = Made::default();
+            }
+            return Err(e.into());
+        }
+    };
 
-    // (4) The first record.
+    // (4) The first record. A record of this app with a current version is an install; one
+    // without, or a root that held only what (3) makes, is this app's install cut off (F1).
     let store = MachineStore {
         dir: layout.state_dir(),
         app_id: app_id.clone(),
@@ -1348,20 +1399,39 @@ fn install_steps(
     let loaded = store
         .load(ports.fs, ports.hasher)
         .map_err(|_| MachineOpError::Failed("read the machine record"))?;
-    if loaded.record.is_some() {
-        return Err(MachineOpError::AlreadyInstalled);
+    let resumed = match &loaded.record {
+        Some(r) if r.current.is_some() || r.scope != Scope::Machine || r.app_id != app_id => {
+            return Err(MachineOpError::AlreadyInstalled);
+        }
+        Some(_) => true,
+        None => held_something,
+    };
+    let floors = Floors {
+        root: Some(config.root.clone()),
+        keyset_version: req.keyset_version,
+        feed_seq: BTreeMap::new(),
+    };
+    if resumed {
+        made.root_created = Some(root.clone());
+        made.children.clear();
+        made.resumed = true;
+        // The earlier run may have applied the integration: a failure of this one removes it with
+        // the root.
+        made.integration = Some(IntegrationRequest {
+            app_id: app_id.clone(),
+            install_root: root.clone(),
+            version: version.clone(),
+            meta: config.install.clone(),
+            previous: None,
+            stale_bins: Vec::new(),
+        });
     }
     let mut install_id = [0u8; crate::policy::INSTALL_ID_BYTES];
     ports
         .rng
         .fill(&mut install_id)
         .map_err(|_| MachineOpError::Failed("randomness"))?;
-    let floors = Floors {
-        root: Some(config.root.clone()),
-        keyset_version: req.keyset_version,
-        feed_seq: BTreeMap::new(),
-    };
-    let first = InstallState::new(
+    let mut first = InstallState::new(
         loaded.next_seq,
         app_id.clone(),
         Scope::Machine,
@@ -1369,6 +1439,12 @@ fn install_steps(
         setup.manifest.target(),
     )
     .raise_floors(&floors);
+    // A resumed record's floors stay when they are of the same trust root: never lowered.
+    if let Some(earlier) = &loaded.record
+        && earlier.floors.root == first.floors.root
+    {
+        first = first.raise_floors(&earlier.floors);
+    }
     store
         .commit(ports.fs, &loaded, &first, ports.hasher)
         .map_err(|_| MachineOpError::Failed("write the first record"))?;
@@ -1460,6 +1536,33 @@ fn install_steps(
     Ok(Installed { root, version })
 }
 
+/// Whether the removal guard (M10-D20) lets the engine delete `path`: only an answer of `Ok(false)`
+/// from [`Process::tree_in_use_strict`] does; `Ok(true)` and `Err` keep it.
+fn free_to_remove(ports: Ports<'_>, path: &Path) -> bool {
+    matches!(ports.process.tree_in_use_strict(path, &[]), Ok(false))
+}
+
+/// Removes this app's tombstones in the machine home (uninstalls cut off before the end), each a
+/// real directory checked right before its removal, without following links, and only when the
+/// removal guard says no process runs from it (F6): a tombstone keeps `R`'s descriptor, so a user
+/// may still run a program from one. One in use, or whose removal fails, stays for a later run.
+fn remove_free_tombstones(ports: Ports<'_>, home: &Path, app_id: &AppId) {
+    let Ok(entries) = ports.fs.list_dir(home) else {
+        return;
+    };
+    for entry in entries {
+        if entry.kind != FileKind::Dir || !is_tombstone_of(app_id, &entry.name) {
+            continue;
+        }
+        let path = home.join(&entry.name);
+        let real_dir =
+            matches!(ports.fs.symlink_metadata(&path), Ok(Some(m)) if m.kind == FileKind::Dir);
+        if real_dir && free_to_remove(ports, &path) {
+            let _ = ports.fs.remove_dir_all_nofollow(&path);
+        }
+    }
+}
+
 /// Copies the tree's service binary to `service\<version>\` (created admin-only) unless it is
 /// there; returns the image path.
 fn place_service_binary(
@@ -1502,11 +1605,27 @@ fn place_service_binary(
 }
 
 /// Removes only what this run of the first install created. Exempt from the removal guard
-/// (M10-D20): nothing has been given a path into it yet.
+/// (M10-D20): nothing has been given a path into it yet. A resumed root (F1) is not: the earlier
+/// run may have applied the integration, so a user may run a program from it. It goes, with the
+/// integration, only when the guard says nothing runs from it; else both stay for the next run to
+/// resume.
 fn undo_install(ports: Ports<'_>, req: &InstallRequest<'_>, made: &Made) {
     let app_id = &req.setup.config.app_id;
     if made.registered {
         let _ = ports.registrar.remove(app_id);
+    }
+    if made.resumed {
+        let Some(root) = &made.root_created else {
+            return;
+        };
+        if !free_to_remove(ports, root) {
+            return;
+        }
+        if let Some(request) = &made.integration {
+            let _ = ports.integration.remove(Scope::Machine, request);
+        }
+        let _ = ports.fs.remove_dir_all_nofollow(root);
+        return;
     }
     if let Some(request) = &made.integration {
         let _ = ports.integration.remove(Scope::Machine, request);
@@ -1610,10 +1729,9 @@ impl<'a> Engine<'a> {
         Ok(image)
     }
 
-    /// Whether the removal guard (M10-D20) lets the engine delete `path`: only an answer of
-    /// `Ok(false)` from [`Process::tree_in_use_strict`] does; `Ok(true)` and `Err` keep it.
+    /// [`free_to_remove`] with this engine's ports.
     fn free_to_remove(&self, path: &Path) -> bool {
-        matches!(self.p.process.tree_in_use_strict(path, &[]), Ok(false))
+        free_to_remove(self.p, path)
     }
 
     /// Removes the service folders other than those of `keep`, each only when the removal guard

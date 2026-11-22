@@ -498,6 +498,281 @@ fn every_failure_point_cleans_up() {
     assert_clean(&h, false);
 }
 
+// ---- a first install cut off (F1) ------------------------------------------------------------------
+
+/// Where [`Crashing`] stops the process: the port call it panics in (after delegating, for the
+/// calls named "after").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashAt {
+    /// (3) done, before (4): the install id's randomness.
+    BeforeRecord,
+    /// (4) done, (5) part-way: the second frame decoded.
+    MidStage,
+    /// (5) done: the integration check.
+    BeforeIntegration,
+    /// The integration applied, the install not committed.
+    AfterIntegrationApply,
+    /// (6) committed: the service's self-test.
+    BeforeSelfTest,
+    /// (7) registered, the payload copy not removed.
+    AfterRegister,
+}
+
+/// The host's ports with a crash at one point: a panic that unwinds through `install` without its
+/// undo, as a process killed there would (its lock goes with it).
+struct Crashing<'h> {
+    h: &'h Host,
+    at: CrashAt,
+    decoded: std::sync::atomic::AtomicUsize,
+}
+
+impl Crashing<'_> {
+    fn crash(&self, here: CrashAt) {
+        if self.at == here {
+            panic!("simulated crash at {here:?}");
+        }
+    }
+}
+
+impl lunepack_core::Rng for Crashing<'_> {
+    fn fill(&self, buf: &mut [u8]) -> Result<(), lunepack_core::Error> {
+        self.crash(CrashAt::BeforeRecord);
+        self.h.rng.fill(buf)
+    }
+}
+
+impl lunepack_core::Codec for Crashing<'_> {
+    fn decode(
+        &self,
+        frame: &lunepack_core::FrameView<'_>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<lunepack_core::DecodeReport, lunepack_core::Error> {
+        if self
+            .decoded
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.crash(CrashAt::MidStage);
+        }
+        self.h.codec.decode(frame, out)
+    }
+}
+
+impl lunepack_core::OsIntegration for Crashing<'_> {
+    fn check(
+        &self,
+        scope: Scope,
+        req: &lunepack_core::IntegrationRequest,
+    ) -> Result<(), lunepack_core::IntegrationError> {
+        self.crash(CrashAt::BeforeIntegration);
+        self.h.integration.check(scope, req)
+    }
+
+    fn apply(
+        &self,
+        scope: Scope,
+        req: &lunepack_core::IntegrationRequest,
+    ) -> Result<lunepack_core::IntegrationReport, lunepack_core::IntegrationError> {
+        let report = self.h.integration.apply(scope, req);
+        self.crash(CrashAt::AfterIntegrationApply);
+        report
+    }
+
+    fn remove(
+        &self,
+        scope: Scope,
+        req: &lunepack_core::IntegrationRequest,
+    ) -> Result<lunepack_core::IntegrationReport, lunepack_core::IntegrationError> {
+        self.h.integration.remove(scope, req)
+    }
+}
+
+impl lunepack_core::ServiceRegistrar for Crashing<'_> {
+    fn register(&self, app_id: &AppId, image: &Path) -> Result<(), lunepack_core::ServiceRegError> {
+        let done = self.h.registrar.register(app_id, image);
+        self.crash(CrashAt::AfterRegister);
+        done
+    }
+
+    fn image(&self, app_id: &AppId) -> Result<Option<PathBuf>, lunepack_core::ServiceRegError> {
+        self.h.registrar.image(app_id)
+    }
+
+    fn set_image(
+        &self,
+        app_id: &AppId,
+        image: &Path,
+    ) -> Result<(), lunepack_core::ServiceRegError> {
+        self.h.registrar.set_image(app_id, image)
+    }
+
+    fn self_test(&self, image: &Path) -> Result<(), lunepack_core::ServiceRegError> {
+        self.crash(CrashAt::BeforeSelfTest);
+        self.h.registrar.self_test(image)
+    }
+
+    fn remove(&self, app_id: &AppId) -> Result<(), lunepack_core::ServiceRegError> {
+        self.h.registrar.remove(app_id)
+    }
+}
+
+/// Runs a first install of 1.0.0 that crashes at `at`.
+fn crash_install(h: &Host, at: CrashAt) {
+    let crashing = Crashing {
+        h,
+        at,
+        decoded: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let mut ports = h.ports();
+    ports.rng = &crashing;
+    ports.codec = &crashing;
+    ports.integration = &crashing;
+    ports.registrar = &crashing;
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.install_with(ports, "1.0.0", true)
+    }));
+    assert!(
+        crashed.is_err(),
+        "{at:?}: the install did not reach the crash"
+    );
+}
+
+/// The names in the machine home.
+fn home_names(h: &Host) -> Vec<String> {
+    let mut names: Vec<String> = h
+        .mem
+        .list_dir(&h.home)
+        .unwrap()
+        .iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_first_install_cut_off_before_its_version_is_resumed_by_the_next() {
+    for at in [
+        CrashAt::BeforeRecord,
+        CrashAt::MidStage,
+        CrashAt::BeforeIntegration,
+        CrashAt::AfterIntegrationApply,
+    ] {
+        let h = Host::new();
+        crash_install(&h, at);
+        assert!(h.exists(&h.root()), "{at:?}: the crash left the root");
+        // The next install takes the same folder, not `<name> (<app id>)` beside it.
+        assert_eq!(h.install("1.0.0"), Ok(h.root()), "{at:?}");
+        assert_eq!(home_names(&h), vec!["Hello".to_owned()], "{at:?}");
+        let rec = h.record();
+        assert_eq!(rec.scope, Scope::Machine, "{at:?}");
+        assert_eq!(rec.current.unwrap().version, v("1.0.0"), "{at:?}");
+        assert_eq!(rec.floors.keyset_version, 1, "{at:?}");
+        assert!(h.integration.is_applied(), "{at:?}");
+        assert_eq!(
+            h.registered(),
+            Some(h.layout().service_image(&v("1.0.0"))),
+            "{at:?}"
+        );
+        assert!(
+            h.exists(&h.layout().version_dir(&v("1.0.0")).join("app.exe")),
+            "{at:?}"
+        );
+        assert!(
+            !names_in(&h, &h.layout().app_dir())
+                .iter()
+                .any(|n| n.ends_with(".partial")),
+            "{at:?}"
+        );
+        // The engine opens over it and nothing is left to repair.
+        assert_eq!(h.engine().status().unwrap().service, v("1.0.0"), "{at:?}");
+    }
+}
+
+#[test]
+fn a_first_install_cut_off_after_its_version_is_installed_and_repair_finishes_it() {
+    for at in [CrashAt::BeforeSelfTest, CrashAt::AfterRegister] {
+        let h = Host::new();
+        crash_install(&h, at);
+        assert_eq!(
+            h.install("1.0.0"),
+            Err(MachineOpError::AlreadyInstalled),
+            "{at:?}"
+        );
+        assert_eq!(h.engine().repair(), Ok(v("1.0.0")), "{at:?}");
+        assert_eq!(
+            h.registered(),
+            Some(h.layout().service_image(&v("1.0.0"))),
+            "{at:?}"
+        );
+    }
+}
+
+#[test]
+fn a_resumed_install_that_fails_leaves_nothing_unless_a_process_runs_from_it() {
+    // Nothing runs from it: the root and the earlier run's integration go.
+    let h = Host::new();
+    crash_install(&h, CrashAt::AfterIntegrationApply);
+    assert!(h.integration.is_applied());
+    h.registrar
+        .fail_self_test(&h.layout().service_image(&v("1.0.0")));
+    assert_eq!(h.install("1.0.0"), Err(MachineOpError::SelfTest));
+    assert_clean(&h, false);
+    // The guard says a process runs from it: everything stays for the next run, which resumes.
+    let h = Host::new();
+    crash_install(&h, CrashAt::AfterIntegrationApply);
+    h.integration.fail("check");
+    h.process.script_in_use_strict(true);
+    assert_eq!(h.install("1.0.0"), Err(MachineOpError::Integration));
+    assert!(h.exists(&h.root()));
+    assert!(h.integration.is_applied());
+    assert!(h.record().current.is_none());
+}
+
+#[test]
+fn a_cut_off_root_holding_anything_else_is_not_resumed() {
+    let h = Host::new();
+    crash_install(&h, CrashAt::BeforeRecord);
+    let stray = h.layout().app_dir().join("stray.txt");
+    h.write(&stray, b"x");
+    let other = h.home.join(format!("Hello ({})", app().as_str()));
+    assert_eq!(h.install("1.0.0"), Ok(other));
+    assert!(h.exists(&stray), "the folder was not touched");
+}
+
+#[test]
+fn a_root_another_run_holds_is_busy_and_left_to_it() {
+    let h = Host::new();
+    crash_install(&h, CrashAt::BeforeRecord);
+    let held = h.mem.try_lock(&h.layout().lock_path()).unwrap().unwrap();
+    assert_eq!(h.install("1.0.0"), Err(MachineOpError::Busy));
+    assert!(
+        h.exists(&h.layout().machine_dir()),
+        "nothing of it was removed"
+    );
+    drop(held);
+    assert_eq!(h.install("1.0.0"), Ok(h.root()));
+}
+
+#[test]
+fn a_tombstone_a_process_runs_from_is_kept_by_the_first_install() {
+    let tomb = |h: &Host| {
+        h.home.join(lunepack_core::tombstone_name(
+            &app(),
+            &[7; lunepack_core::layout::TOMBSTONE_RANDOM_BYTES],
+        ))
+    };
+    let h = Host::new();
+    h.mem.create_dir_all(&tomb(&h).join("app")).unwrap();
+    h.process.script_in_use_strict(true);
+    h.install("1.0.0").unwrap();
+    assert!(h.exists(&tomb(&h)), "in use: kept");
+    let h = Host::new();
+    h.mem.create_dir_all(&tomb(&h).join("app")).unwrap();
+    h.install("1.0.0").unwrap();
+    assert!(!h.exists(&tomb(&h)), "not in use: removed");
+}
+
 // ---- the service switch ----------------------------------------------------------------------------
 
 #[test]
