@@ -17,6 +17,7 @@ use std::sync::{Condvar, Mutex, PoisonError};
 
 use anyhow::{Context, Result, anyhow, bail};
 use lunepack_core::codesign::PLAN_HEAD_BYTES;
+use lunepack_core::layout::{MachineOs, service_file};
 use lunepack_core::path::MAX_PATH_DEPTH;
 use lunepack_core::pe::has_pe_signature;
 use lunepack_core::update_config::{
@@ -26,8 +27,8 @@ use lunepack_core::update_config::{
 };
 use lunepack_core::{
     CodeSign, Codec, CodecId, Encoder, EntryKind, Hasher, InstallMeta, ManifestDocument,
-    PackedFile, PlanEntry, PlanEntryKind, RelPath, ReleaseLayout, SERVICE_FILE, STUB_FILE,
-    Sha256Digest, SignItem, Target, UPDATE_CONFIG_FILE, pack_file, sign_plan, validate_tree,
+    PackedFile, PlanEntry, PlanEntryKind, RelPath, ReleaseLayout, STUB_FILE, Sha256Digest,
+    SignItem, Target, UPDATE_CONFIG_FILE, pack_file, sign_plan, validate_tree,
 };
 
 /// Fixed per-job allowance on top of the input, output and encoder estimates: 16 MiB of slack for
@@ -152,8 +153,9 @@ pub struct UpdatePlan<'a> {
     /// The stamped Windows launcher stub (M7-D14), placed beside the entry as
     /// [`STUB_FILE`]; `Some` exactly for a `windows-*` target.
     pub stub: Option<&'a [u8]>,
-    /// The update service's bytes (M10-D7), checked against the target and placed beside the
-    /// entry as [`SERVICE_FILE`]; present only with `--service` on a `windows-*` target.
+    /// The update service's bytes (M10-D7, M11), checked against the target and placed beside the
+    /// entry (for a `macos-*` target in `Contents/MacOS`) under the target's service file name
+    /// ([`service_file`]); present exactly with `--service`.
     pub service: Option<&'a [u8]>,
     /// The update configuration's canonical bytes.
     pub config: &'a [u8],
@@ -188,6 +190,15 @@ fn placements<'a>(plan: &UpdatePlan<'a>) -> Vec<Placement<'a>> {
         exec: true,
     }];
     if plan.target.is_macos() {
+        // The service is nested code beside the runtime; `sign_plan` signs it with the other loose
+        // Mach-O files before the bundle (C7), so `--assemble` places it too.
+        if let Some(service) = plan.service {
+            out.push(Placement {
+                path: beside(service_name(plan.target)),
+                bytes: service,
+                exec: true,
+            });
+        }
         out.push(Placement {
             path: config_path(plan.target).to_owned(),
             bytes: plan.config,
@@ -230,7 +241,7 @@ fn placements<'a>(plan: &UpdatePlan<'a>) -> Vec<Placement<'a>> {
     }
     if let Some(service) = plan.service {
         out.push(Placement {
-            path: beside(SERVICE_FILE),
+            path: beside(service_name(plan.target)),
             bytes: service,
             exec: true,
         });
@@ -241,6 +252,12 @@ fn placements<'a>(plan: &UpdatePlan<'a>) -> Vec<Placement<'a>> {
         exec: false,
     });
     out
+}
+
+/// The update service's file name on `target` (M10-D7, M11-D6): `lunepack-service.exe` on Windows,
+/// `lunepack-service` elsewhere.
+fn service_name(target: Target) -> &'static str {
+    service_file(MachineOs::of_target(target))
 }
 
 /// The directory part of a tree path (`""` for a path at the root).
@@ -293,10 +310,22 @@ pub fn check_reserved(input: &Path, plan: &UpdatePlan<'_>) -> Result<()> {
                 "the input tree holds {text:?}; the name {STUB_FILE} is reserved for the launcher stub of a Windows target"
             );
         }
-        // The same rule for the update service's name (M10-D7), with or without `--service`.
-        if target.is_windows() && name.eq_ignore_ascii_case(SERVICE_FILE) {
+        // The same rule for the update service's name (M10-D7, M11), with or without `--service`:
+        // ignoring ASCII case on Windows and macOS, exact on Linux (as the stub's name on Windows).
+        let service = service_name(target);
+        let same_service = if target.is_windows() || target.is_macos() {
+            name.eq_ignore_ascii_case(service)
+        } else {
+            name == service
+        };
+        if same_service {
+            let of = if target.is_windows() {
+                "a Windows target".to_owned()
+            } else {
+                format!("a {} target", target.as_str())
+            };
             bail!(
-                "the input tree holds {text:?}; the name {SERVICE_FILE} is reserved for the update service of a Windows target"
+                "the input tree holds {text:?}; the name {service} is reserved for the update service of {of}"
             );
         }
         if target.is_macos() {

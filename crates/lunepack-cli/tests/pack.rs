@@ -2310,26 +2310,6 @@ fn windows_service_refusals() {
     );
     assert!(err.contains("--service needs --runtime"), "{err:?}");
 
-    // For Linux and macOS targets, refused before the file is read.
-    for target in ["linux-x86_64", "macos-aarch64"] {
-        let err = fails(
-            pack_with_service(
-                &w,
-                linput.path(),
-                &ldir,
-                Some(&runtime),
-                None,
-                Some(&service),
-                target,
-            ),
-            target,
-        );
-        assert!(
-            err.contains("--service is only for windows-* targets"),
-            "{target}: {err:?}"
-        );
-    }
-
     let w = World::new(1, 1);
     let wdir = w.release_dir("rel", &[]);
     let out = pack_with_service(
@@ -2377,6 +2357,361 @@ fn windows_service_name_is_reserved() {
             "{at} without --service: {err:?}"
         );
         assert!(app.input.path().join(at).exists());
+    }
+}
+
+// ---- `--service` for Linux and macOS targets (M11 step 6) ---------------------------------------
+
+/// `pack` with `--runtime` and, when given, `--service`, for the `[update]` app of `target`.
+#[cfg(unix)]
+fn pack_with_runtime_and_service(
+    w: &World,
+    input: &Path,
+    dir: &Path,
+    runtime: &Path,
+    service: Option<&Path>,
+    target: &'static str,
+) -> Output {
+    let mut extra = vec!["--runtime", s(runtime)];
+    if let Some(p) = service {
+        extra.extend_from_slice(&["--service", s(p)]);
+    }
+    w.pack(&Pack {
+        input,
+        version: "1.0.0",
+        target,
+        release_dir: dir,
+        signers: w.all_signers(),
+        epoch: T0,
+        extra,
+    })
+}
+
+/// A Linux service image: a static ELF of `machine` with a tail, so it differs from a runtime.
+#[cfg(unix)]
+fn linux_service_image(machine: u16) -> Vec<u8> {
+    let mut image = runtime_elf(machine, false);
+    image.extend_from_slice(&[7u8; 100]);
+    image
+}
+
+/// M11 step 6: `--service` on a `linux-x86_64` pack places `lunepack-service` beside the entry,
+/// executable and hashed like the other files; the input tree is not touched.
+#[cfg(unix)]
+#[test]
+fn linux_service_is_placed_beside_the_entry() {
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let service = w.dir.path().join("service");
+    let image = linux_service_image(62);
+    fs::write(&service, &image).unwrap();
+    let dir = w.release_dir("rel", &[]);
+    assert_ok(
+        &pack_with_runtime_and_service(
+            &w,
+            input.path(),
+            &dir,
+            &runtime,
+            Some(&service),
+            "linux-x86_64",
+        ),
+        "linux pack with --service",
+    );
+    assert!(!input.path().join("bin/lunepack-service").exists());
+    let (m, files) = w.verify(&dir, "1.0.0", Target::LinuxX86_64);
+    assert_eq!(files["bin/lunepack-service"], image);
+    assert!(exec_of(&m, "bin/lunepack-service"));
+    assert_eq!(
+        sha_of(&m, "bin/lunepack-service"),
+        Sha256Hasher.sha256(&image)
+    );
+    assert!(files.contains_key("bin/lunepack-runtime"));
+}
+
+/// M11 step 6: a Linux service must be an image of the target as a runtime must (a static ELF of
+/// the target's machine); a Windows PE, another machine and a dynamic ELF are refused, naming the
+/// target and never the path. The service name is reserved at any depth, exactly on Linux, with
+/// or without `--service`.
+#[cfg(unix)]
+#[test]
+fn linux_service_refusals_and_reserved_name() {
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let good = w.dir.path().join("good-service");
+    fs::write(&good, linux_service_image(62)).unwrap();
+    let dir = w.release_dir("rel", &[]);
+
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+        ("pe", service_pe(0x8664), "not an executable"),
+        ("arm64", runtime_elf(183, false), "another architecture"),
+        ("dynamic", runtime_elf(62, true), "dynamically linked"),
+    ];
+    for (name, bytes, want) in cases {
+        let input = tempfile::tempdir().unwrap();
+        app_tree(input.path(), "bin/app");
+        let path = w.dir.path().join(format!("{name}-service"));
+        fs::write(&path, bytes).unwrap();
+        let err = assert_fails(
+            &pack_with_runtime_and_service(
+                &w,
+                input.path(),
+                &dir,
+                &runtime,
+                Some(&path),
+                "linux-x86_64",
+            ),
+            1,
+            name,
+        );
+        assert!(
+            err.contains("--service is not a service image for linux-x86_64"),
+            "{name}: {err:?}"
+        );
+        assert!(err.contains(want), "{name}: {err:?}");
+        assert!(!err.contains(path.to_str().unwrap()), "{name}: {err:?}");
+    }
+
+    for at in ["bin/lunepack-service", "other/lunepack-service"] {
+        let input = tempfile::tempdir().unwrap();
+        app_tree(input.path(), "bin/app");
+        write(input.path(), at, b"x");
+        for service in [Some(good.as_path()), None] {
+            let err = assert_fails(
+                &pack_with_runtime_and_service(
+                    &w,
+                    input.path(),
+                    &dir,
+                    &runtime,
+                    service,
+                    "linux-x86_64",
+                ),
+                1,
+                at,
+            );
+            assert!(
+                err.contains("reserved for the update service"),
+                "{at} (service {}): {err:?}",
+                service.is_some()
+            );
+        }
+        assert!(input.path().join(at).exists());
+    }
+
+    // Exact on Linux: another letter case is an ordinary file.
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    write(input.path(), "other/Lunepack-Service", b"x");
+    assert_ok(
+        &pack_with_runtime_and_service(
+            &w,
+            input.path(),
+            &dir,
+            &runtime,
+            Some(&good),
+            "linux-x86_64",
+        ),
+        "a Linux tree with another letter case",
+    );
+}
+
+/// C2 with `--service` on Linux: the same inputs give identical bytes; the service changes the
+/// manifest, another image gives another pack, and a pack without it differs.
+#[cfg(unix)]
+#[test]
+fn linux_service_pack_is_deterministic() {
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let service = w.dir.path().join("service");
+    fs::write(&service, linux_service_image(62)).unwrap();
+    let (a, b) = (w.release_dir("a", &[]), w.release_dir("b", &[]));
+    for dir in [&a, &b] {
+        assert_ok(
+            &pack_with_runtime_and_service(
+                &w,
+                input.path(),
+                dir,
+                &runtime,
+                Some(&service),
+                "linux-x86_64",
+            ),
+            "linux pack with --service",
+        );
+    }
+    let names = [
+        "1.0.0/linux-x86_64.pack",
+        "1.0.0/linux-x86_64.manifest.json",
+    ];
+    for name in names {
+        assert_eq!(
+            fs::read(a.join(name)).unwrap(),
+            fs::read(b.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+    let plain = w.release_dir("plain", &[]);
+    assert_ok(
+        &pack_with_runtime_and_service(&w, input.path(), &plain, &runtime, None, "linux-x86_64"),
+        "linux pack without --service",
+    );
+    assert_ne!(
+        fs::read(a.join("1.0.0/linux-x86_64.manifest.json")).unwrap(),
+        fs::read(plain.join("1.0.0/linux-x86_64.manifest.json")).unwrap()
+    );
+    let other = w.dir.path().join("other-service");
+    fs::write(&other, linux_service_image(62).repeat(2)).unwrap();
+    let c = w.release_dir("c", &[]);
+    assert_ok(
+        &pack_with_runtime_and_service(
+            &w,
+            input.path(),
+            &c,
+            &runtime,
+            Some(&other),
+            "linux-x86_64",
+        ),
+        "linux pack with another service",
+    );
+    assert_ne!(
+        fs::read(a.join("1.0.0/linux-x86_64.pack")).unwrap(),
+        fs::read(c.join("1.0.0/linux-x86_64.pack")).unwrap()
+    );
+}
+
+/// M11 step 6: on `macos-aarch64` the service is `Contents/MacOS/lunepack-service` beside the
+/// runtime, executable and hashed; `--assemble` writes it too, so the tree a signer signs holds it.
+#[cfg(unix)]
+#[test]
+fn macos_service_is_placed_beside_the_runtime() {
+    let w = World::new(1, 1);
+    w.append_config(MACOS_TOML);
+    let input = tempfile::tempdir().unwrap();
+    mac_app(input.path());
+    let bins = mac_bins(&w);
+    let service = w.dir.path().join("service");
+    let image = macho_image(ARM64);
+    fs::write(&service, &image).unwrap();
+    let dir = w.release_dir("rel", &[]);
+    assert_ok(
+        &pack_with_runtime_and_service(
+            &w,
+            input.path(),
+            &dir,
+            &bins.runtime,
+            Some(&service),
+            "macos-aarch64",
+        ),
+        "macos pack with --service",
+    );
+    let at = "Contents/MacOS/lunepack-service";
+    assert!(!input.path().join(at).exists());
+    let (m, files) = w.verify(&dir, "1.0.0", Target::MacosAarch64);
+    assert_eq!(files[at], image);
+    assert!(exec_of(&m, at));
+    assert_eq!(sha_of(&m, at), Sha256Hasher.sha256(&image));
+    assert!(files.contains_key("Contents/MacOS/lunepack-runtime"));
+
+    let epoch = T0.to_string();
+    let dest = w.dir.path().join("assembled");
+    let out = w.run(
+        &[
+            "pack",
+            "--input",
+            s(input.path()),
+            "--version",
+            "1.0.0",
+            "--target",
+            "macos-aarch64",
+            "--runtime",
+            s(&bins.runtime),
+            "--service",
+            s(&service),
+            "--assemble",
+            s(&dest),
+        ],
+        &[("SOURCE_DATE_EPOCH", &epoch)],
+    );
+    assert_ok(&out, "assemble with --service");
+    assert_eq!(fs::read(dest.join(at)).unwrap(), image);
+}
+
+/// M11 step 6: a macOS service must be a Mach-O of the target (an ELF and another architecture are
+/// refused, naming the target), and its name is reserved at any depth, ignoring case, with or
+/// without `--service`.
+#[cfg(unix)]
+#[test]
+fn macos_service_refusals_and_reserved_name() {
+    let w = World::new(1, 1);
+    w.append_config(MACOS_TOML);
+    let bins = mac_bins(&w);
+    let good = w.dir.path().join("good-service");
+    fs::write(&good, macho_image(ARM64)).unwrap();
+    let dir = w.release_dir("rel", &[]);
+
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+        ("elf", runtime_elf(62, false), "not an executable"),
+        ("x86", macho_image(X86_64), "another architecture"),
+    ];
+    for (name, bytes, want) in cases {
+        let input = tempfile::tempdir().unwrap();
+        mac_app(input.path());
+        let path = w.dir.path().join(format!("{name}-service"));
+        fs::write(&path, bytes).unwrap();
+        let err = assert_fails(
+            &pack_with_runtime_and_service(
+                &w,
+                input.path(),
+                &dir,
+                &bins.runtime,
+                Some(&path),
+                "macos-aarch64",
+            ),
+            1,
+            name,
+        );
+        assert!(
+            err.contains("--service is not a service image for macos-aarch64"),
+            "{name}: {err:?}"
+        );
+        assert!(err.contains(want), "{name}: {err:?}");
+    }
+
+    for at in [
+        "Contents/MacOS/lunepack-service",
+        "Contents/Helpers/Lunepack-Service",
+    ] {
+        let input = tempfile::tempdir().unwrap();
+        mac_app(input.path());
+        write(input.path(), at, b"x");
+        for service in [Some(good.as_path()), None] {
+            let err = assert_fails(
+                &pack_with_runtime_and_service(
+                    &w,
+                    input.path(),
+                    &dir,
+                    &bins.runtime,
+                    service,
+                    "macos-aarch64",
+                ),
+                1,
+                at,
+            );
+            assert!(
+                err.contains("reserved for the update service"),
+                "{at} (service {}): {err:?}",
+                service.is_some()
+            );
+        }
+        assert!(input.path().join(at).exists());
     }
 }
 

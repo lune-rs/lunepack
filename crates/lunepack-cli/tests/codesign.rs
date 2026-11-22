@@ -625,6 +625,45 @@ mod fake {
         );
     }
 
+    /// M11 step 6 (C7): the service is nested code beside the runtime, signed with the other loose
+    /// Mach-O files before the outer bundle, and the hash stage sees its signed bytes.
+    #[test]
+    fn macos_service_is_signed_as_nested_code_before_the_bundle() {
+        let (w, tools, dir, input) = mac_world(false);
+        let bins = mac_bins(&w);
+        let service = w.dir.path().join("service");
+        fs::write(&service, unsigned_macho(4_096)).unwrap();
+        let out = w.pack(
+            input.path(),
+            &dir,
+            "macos-aarch64",
+            &[
+                "--runtime",
+                s(&bins.0),
+                "--ui",
+                s(&bins.1),
+                "--service",
+                s(&service),
+            ],
+            &[],
+        );
+        assert_ok(&out, "macos pack with --service and fake signers");
+        let log = tools.log();
+        let position = |kind: &str, path: &str| {
+            log.iter()
+                .position(|(k, p)| k.as_str() == kind && p.as_str() == path)
+        };
+        let signed = position("sign", "Contents/MacOS/lunepack-service")
+            .expect("the service is signed as a Mach-O file");
+        let outer = position("sign_outer", "").expect("the outer bundle is signed");
+        assert!(
+            signed < outer,
+            "the service is signed before the bundle: {log:?}"
+        );
+        let (_, files) = w.verify(&dir, Target::MacosAarch64);
+        assert_eq!(files["Contents/MacOS/lunepack-service"], signed_macho());
+    }
+
     /// M9-D6 / M9-R1-D1: the policy a pack writes into the update configuration.
     #[test]
     fn the_publisher_policy_is_written_by_the_default_rule() {

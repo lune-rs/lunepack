@@ -308,13 +308,15 @@ lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runt
   Required for a `windows-*` target when the config has `[update]`; refused for any other target and
   without `[update]`. The console stub is needed when `install.terminal` is set, the GUI stub
   otherwise. A file over 32 MiB is refused.
-- `--service`: the Windows update service (`lunepack-service.exe`, M10-D7), placed beside the entry as
-  `lunepack-service.exe`. Windows only (`windows-*` targets); needs `--runtime` and `[update]`, and is
-  refused without them. Optional: without it the app installs for the user only and the installer
-  offers no "For all users" choice. The file must be a console-subsystem image of the target that
-  passes the hardening checks of a Windows runtime; a file over 32 MiB is refused. The name
-  `lunepack-service.exe` (any letter case) is reserved for a Windows target at any depth of the input
-  tree, as `lunepack-stub.exe` is, with or without `--service`.
+- `--service`: the update service (M10-D7, M11), placed beside the entry as `lunepack-service.exe` for a
+  `windows-*` target, and as `lunepack-service` for a `linux-*` target beside the entry or, for a
+  `macos-*` target, at `Contents/MacOS/lunepack-service` (nested code, signed before the bundle).
+  Needs `--runtime` and `[update]`, and is refused without them. Optional: without it the app installs
+  for the user only and the installer offers no "For all users" choice. The file must be an image of
+  the target that passes the checks a runtime passes (for Windows, a console-subsystem image that passes
+  the hardening checks of a Windows runtime); a file over 32 MiB is refused. The target's service name
+  (any letter case on Windows and macOS, exact on Linux) is reserved at any depth of the input tree, as
+  `lunepack-stub.exe` is for Windows, with or without `--service`.
 - `--assemble <dir>`: for a `macos-*` target with `[update]` (below): write the tree `pack` would hash to
   the new directory `<dir>` and stop, so it can be code-signed and then packed. It takes no
   `--release-dir` and no `--sign` (giving either is a usage error), reads no key and writes nothing to a

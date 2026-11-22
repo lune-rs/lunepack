@@ -100,8 +100,9 @@ pub struct PackArgs {
     /// refused for any other target. The console stub for a terminal app, the GUI stub otherwise.
     #[arg(long)]
     stub: Option<PathBuf>,
-    /// The Windows update service, placed beside the entry as `lunepack-service.exe`. Windows
-    /// only, optional: it enables per-machine installs. Needs `--runtime` and `[update]`.
+    /// The update service, placed beside the entry as `lunepack-service.exe` (Windows) or
+    /// `lunepack-service` (Linux and macOS; in `Contents/MacOS` for macOS). Optional: it enables
+    /// per-machine installs. Needs `--runtime` and `[update]`.
     #[arg(long)]
     service: Option<PathBuf>,
     /// For a `macos-*` target with `[update]` (M8-D8): write the tree `pack` would hash to this
@@ -275,7 +276,7 @@ struct Prepared {
     ui: Option<Vec<u8>>,
     /// The stamped Windows stub (M7-D14); `Some` exactly for a `windows-*` target.
     stub: Option<Vec<u8>>,
-    /// The update service's bytes (M10-D7); `Some` exactly with `--service`, on a `windows-*` target.
+    /// The update service's bytes (M10-D7, M11); `Some` exactly with `--service`, for any target.
     service: Option<Vec<u8>>,
     /// The helper app's `Info.plist` (M8-D6); `Some` for a `macos-*` target with `--ui`.
     helper_plist: Option<Vec<u8>>,
@@ -481,9 +482,6 @@ fn prepare_update(
     if inputs.stub.is_some() && !target.is_windows() {
         bail!("--stub is only for windows-* targets");
     }
-    if inputs.service.is_some() && !target.is_windows() {
-        bail!("--service is only for windows-* targets");
-    }
     if target.is_windows() {
         if inputs.stub.is_none() {
             bail!("--stub is required for a windows-* target when the config has [update]");
@@ -529,7 +527,14 @@ fn prepare_update(
         .service
         .map(|path| {
             let bytes = read_capped(path, "--service", MAX_SERVICE_BYTES)?;
-            check_service_image(&bytes, target).map_err(|e| {
+            // A Windows service is a hardened console PE (M10-D7); a Linux or macOS one is checked
+            // as a runtime is (static, the target's format and architecture).
+            let checked = if target.is_windows() {
+                check_service_image(&bytes, target)
+            } else {
+                check_runtime_image(&bytes, target)
+            };
+            checked.map_err(|e| {
                 anyhow!(
                     "--service is not a service image for {}: {e}",
                     target.as_str()
