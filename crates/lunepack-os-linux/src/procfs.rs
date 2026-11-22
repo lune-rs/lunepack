@@ -6,7 +6,7 @@
 //! still running. A zombie holds no files and only waits for a reaper that may never come (a
 //! container whose pid 1 does not reap), so it counts as exited.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -91,9 +91,46 @@ pub(crate) enum Probe {
     Running(Stat),
 }
 
-fn proc_path(pid: u32, leaf: &str) -> PathBuf {
-    PathBuf::from(format!("/proc/{pid}/{leaf}"))
+/// The reads of `/proc` the scan makes. [`RealProc`] reads the kernel's; the tests script the
+/// answers (another uid's process, a refused read, a process that vanishes) under a made-up root.
+pub(crate) trait ProcFs {
+    /// The names in the directory `path`; an entry that fails to read is an error.
+    fn names(&self, path: &Path) -> io::Result<Vec<OsString>>;
+    /// The bytes of the file `path`.
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+    /// The target of the link `path`.
+    fn read_link(&self, path: &Path) -> io::Result<PathBuf>;
+    /// The owner of `path`, not following a final link.
+    fn owner(&self, path: &Path) -> io::Result<u32>;
+    /// The owner of `path`, following links (`/proc/self`).
+    fn owner_followed(&self, path: &Path) -> io::Result<u32>;
 }
+
+/// The kernel's `/proc`.
+pub(crate) struct RealProc;
+
+impl ProcFs for RealProc {
+    fn names(&self, path: &Path) -> io::Result<Vec<OsString>> {
+        fs::read_dir(path)?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect()
+    }
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        fs::read(path)
+    }
+    fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+        fs::read_link(path)
+    }
+    fn owner(&self, path: &Path) -> io::Result<u32> {
+        fs::symlink_metadata(path).map(|m| m.uid())
+    }
+    fn owner_followed(&self, path: &Path) -> io::Result<u32> {
+        fs::metadata(path).map(|m| m.uid())
+    }
+}
+
+/// The kernel's `/proc`.
+const PROC: &str = "/proc";
 
 /// An error that means the process has vanished: `ENOENT`, or `ESRCH` from a read of a process
 /// that was reaped after the open.
@@ -104,15 +141,15 @@ fn vanished(err: &io::Error) -> bool {
 /// Reads and parses `/proc/<pid>/stat` (`/proc/self/stat` for `None`).
 pub(crate) fn read_stat(pid: Option<u32>) -> io::Result<Option<Stat>> {
     let path = match pid {
-        Some(pid) => proc_path(pid, "stat"),
+        Some(pid) => Path::new(PROC).join(pid.to_string()).join("stat"),
         None => PathBuf::from("/proc/self/stat"),
     };
-    read_stat_at(&path)
+    read_stat_at(&RealProc, &path)
 }
 
 /// Reads and parses the `stat` file at `path`; `None` when it has vanished.
-fn read_stat_at(path: &Path) -> io::Result<Option<Stat>> {
-    match fs::read(path) {
+fn read_stat_at(p: &dyn ProcFs, path: &Path) -> io::Result<Option<Stat>> {
+    match p.read(path) {
         Ok(text) => parse_stat(&text).map(Some).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "unexpected /proc stat line")
         }),
@@ -123,7 +160,13 @@ fn read_stat_at(path: &Path) -> io::Result<Option<Stat>> {
 
 /// Classifies `pid` by the liveness rule.
 pub(crate) fn probe(pid: u32) -> io::Result<Probe> {
-    let Some(stat) = read_stat(Some(pid))? else {
+    probe_in(&RealProc, Path::new(PROC), pid)
+}
+
+/// [`probe`] over the `/proc` at `root`.
+fn probe_in(p: &dyn ProcFs, root: &Path, pid: u32) -> io::Result<Probe> {
+    let dir = root.join(pid.to_string());
+    let Some(stat) = read_stat_at(p, &dir.join("stat"))? else {
         return Ok(Probe::Gone);
     };
     if !matches!(stat.state, b'Z' | b'X' | b'x') {
@@ -131,15 +174,10 @@ pub(crate) fn probe(pid: u32) -> io::Result<Probe> {
     }
     // A thread-group leader that ended while other threads run shows as a zombie; the process
     // still runs (and holds its files) until the last thread ends.
-    match fs::read_dir(proc_path(pid, "task")) {
+    match p.names(&dir.join("task")) {
         Ok(tasks) => {
-            let mut others = 0usize;
-            for task in tasks {
-                let task = task?;
-                if task.file_name() != OsStr::new(&pid.to_string()) {
-                    others += 1;
-                }
-            }
+            let own = pid.to_string();
+            let others = tasks.iter().filter(|t| *t != OsStr::new(&own)).count();
             Ok(if others == 0 {
                 Probe::Dead(stat)
             } else {
@@ -153,18 +191,35 @@ pub(crate) fn probe(pid: u32) -> io::Result<Probe> {
 
 /// Whether the process `id` has exited, by the liveness rule.
 pub(crate) fn has_exited(id: &ProcessId) -> io::Result<bool> {
-    Ok(match probe(id.pid)? {
+    has_exited_in(&RealProc, Path::new(PROC), id)
+}
+
+fn has_exited_in(p: &dyn ProcFs, root: &Path, id: &ProcessId) -> io::Result<bool> {
+    Ok(match probe_in(p, root, id.pid)? {
         Probe::Gone | Probe::Dead(_) => true,
         Probe::Running(stat) => stat.start_ticks != id.start_ticks,
     })
 }
 
 /// The in-use scan of [`Process::tree_in_use`](lunepack_core::Process::tree_in_use); `tree`
-/// is canonical. Errors only when `/proc` itself cannot be listed or this process's own entry
-/// cannot be read.
+/// is canonical. Only this user's processes are looked at ([`scan`] with this process's uid).
+pub(crate) fn tree_in_use(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool> {
+    let my_uid = RealProc.owner_followed(Path::new("/proc/self"))?;
+    scan(&RealProc, Path::new(PROC), tree, exclude, Some(my_uid))
+}
+
+/// The in-use scan of [`Process::tree_in_use_strict`](lunepack_core::Process::tree_in_use_strict)
+/// (M11-D13 as restated): [`scan`] over every user's processes, with exactly the per-user scan's
+/// rules otherwise.
+pub(crate) fn tree_in_use_strict(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool> {
+    scan(&RealProc, Path::new(PROC), tree, exclude, None)
+}
+
+/// The in-use scan over the `/proc` at `root`: the processes of `only_uid` (every process for
+/// `None`). Errors only when `/proc` itself cannot be listed.
 ///
-/// A same-uid process whose `exe`, `cwd`, `fd` or `maps` cannot be read because the kernel denies
-/// it (`EACCES`/`EPERM`: a non-dumpable process, such as a systemd `(sd-pam)` or an ssh-agent,
+/// A process whose `exe`, `cwd`, `fd` or `maps` cannot be read because the kernel denies it
+/// (`EACCES`/`EPERM`: a non-dumpable process, such as a systemd `(sd-pam)` or an ssh-agent,
 /// which every desktop login and CI runner has) does not count as in use by that failure. What is
 /// still readable, its command line, decides: in use when `argv[0]` or an absolute argument,
 /// canonicalised, lies under the tree (M5-D9, user decision Q40).
@@ -173,29 +228,32 @@ pub(crate) fn has_exited(id: &ProcessId) -> io::Result<bool> {
 /// or its thread-group leader has ended while other threads run. Then the process's live threads
 /// are read instead (`/proc/<pid>/task/<tid>/`), and the pid is re-probed for at most
 /// [`VANISH_BOUND`]: it is skipped once it counts as exited, decided by its live threads when all
-/// of them read cleanly, and otherwise counts as in use. Any other read error answers `true`
-/// (fail closed). Gap: a non-dumpable process started by a relative path, or not from the tree's
-/// path, is not seen.
-pub(crate) fn tree_in_use(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool> {
-    let my_uid = fs::metadata("/proc/self")?.uid();
-    for entry in fs::read_dir("/proc")? {
-        let entry = entry?;
-        let Some(pid) = entry
-            .file_name()
+/// of them read cleanly, and otherwise counts as in use. Kernel threads are skipped. Any other
+/// read error answers `true` (fail closed). Gap: a non-dumpable process started by a relative
+/// path, or not from the tree's path, is not seen.
+pub(crate) fn scan(
+    p: &dyn ProcFs,
+    root: &Path,
+    tree: &Path,
+    exclude: &[ProcessId],
+    only_uid: Option<u32>,
+) -> io::Result<bool> {
+    for name in p.names(root)? {
+        let Some(pid) = name
             .to_str()
             .filter(|n| all_digits(n.as_bytes()))
             .and_then(|n| n.parse::<u32>().ok())
         else {
             continue;
         };
-        match fs::symlink_metadata(entry.path()) {
-            Ok(meta) if meta.uid() != my_uid => continue,
+        match p.owner(&root.join(&name)) {
+            Ok(uid) if only_uid.is_some_and(|only| only != uid) => continue,
             Ok(_) => {}
             Err(e) if vanished(&e) => continue,
             // Whose process this is cannot be told: fail closed.
             Err(_) => return Ok(true),
         }
-        let stat = match probe(pid) {
+        let stat = match probe_in(p, root, pid) {
             Ok(Probe::Running(stat)) => stat,
             Ok(Probe::Gone | Probe::Dead(_)) => continue,
             Err(_) => return Ok(true),
@@ -210,12 +268,12 @@ pub(crate) fn tree_in_use(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool
         if exclude.contains(&id) {
             continue;
         }
-        match process_uses_tree(&id, tree) {
+        match process_uses_tree(p, root, &id, tree) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(e) => {
                 let used = if permission_denied(&e) {
-                    cmdline_uses_tree(pid, tree)
+                    cmdline_uses_tree(p, root, pid, tree)
                 } else {
                     Err(e)
                 };
@@ -225,7 +283,7 @@ pub(crate) fn tree_in_use(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool
                     // Unreadable: fine only if the process ended (or the pid was reused)
                     // meanwhile.
                     Err(_) => {
-                        if !has_exited(&id).unwrap_or(false) {
+                        if !has_exited_in(p, root, &id).unwrap_or(false) {
                             return Ok(true);
                         }
                     }
@@ -247,8 +305,8 @@ fn permission_denied(err: &io::Error) -> bool {
 /// `/proc/<pid>/cmdline` lies under `tree`, as written or after resolving symlinks (so a path
 /// through `R/current` resolves into the version tree). A relative argument cannot be resolved
 /// without the process's working directory and is not counted.
-fn cmdline_uses_tree(pid: u32, tree: &Path) -> io::Result<bool> {
-    let cmdline = fs::read(proc_path(pid, "cmdline"))?;
+fn cmdline_uses_tree(p: &dyn ProcFs, root: &Path, pid: u32, tree: &Path) -> io::Result<bool> {
+    let cmdline = p.read(&root.join(pid.to_string()).join("cmdline"))?;
     Ok(cmdline
         .split(|&b| b == 0)
         .filter(|arg| arg.first() == Some(&b'/'))
@@ -271,18 +329,18 @@ fn resolve(path: &Path) -> Option<PathBuf> {
 /// and the answer of its live threads once every one of them reads cleanly; past the bound the
 /// vanished error is returned, which the caller counts as in use. Any other error is returned at
 /// once.
-fn process_uses_tree(id: &ProcessId, tree: &Path) -> io::Result<bool> {
+fn process_uses_tree(p: &dyn ProcFs, root: &Path, id: &ProcessId, tree: &Path) -> io::Result<bool> {
     let deadline = Instant::now() + VANISH_BOUND;
     loop {
-        let err = match uses_tree(&PathBuf::from(format!("/proc/{}", id.pid)), tree) {
+        let err = match uses_tree(p, &root.join(id.pid.to_string()), tree) {
             Ok(used) => return Ok(used),
             Err(e) if vanished(&e) => e,
             Err(e) => return Err(e),
         };
-        if has_exited(id)? {
+        if has_exited_in(p, root, id)? {
             return Ok(false);
         }
-        match threads_use_tree(id.pid, tree) {
+        match threads_use_tree(p, root, id.pid, tree) {
             Ok(Some(used)) => return Ok(used),
             Ok(None) => {}
             Err(e) if vanished(&e) => {}
@@ -301,18 +359,23 @@ fn process_uses_tree(id: &ProcessId, tree: &Path) -> io::Result<bool> {
 /// `Some(false)` when at least one live thread was read and every live thread read cleanly;
 /// `None` when a thread's files vanished too (it is exiting) or no live thread was found, so the
 /// caller re-probes. Any other error is returned.
-fn threads_use_tree(pid: u32, tree: &Path) -> io::Result<Option<bool>> {
+fn threads_use_tree(
+    p: &dyn ProcFs,
+    root: &Path,
+    pid: u32,
+    tree: &Path,
+) -> io::Result<Option<bool>> {
     let mut settled = false;
     let mut unsettled = false;
-    for task in fs::read_dir(proc_path(pid, "task"))? {
-        let task = task?;
-        let dir = task.path();
-        match read_stat_at(&dir.join("stat"))? {
+    let tasks = root.join(pid.to_string()).join("task");
+    for task in p.names(&tasks)? {
+        let dir = tasks.join(task);
+        match read_stat_at(p, &dir.join("stat"))? {
             None => continue,
             Some(stat) if matches!(stat.state, b'Z' | b'X' | b'x') => continue,
             Some(_) => {}
         }
-        match uses_tree(&dir, tree) {
+        match uses_tree(p, &dir, tree) {
             Ok(true) => return Ok(Some(true)),
             Ok(false) => settled = true,
             Err(e) if vanished(&e) => unsettled = true,
@@ -325,15 +388,15 @@ fn threads_use_tree(pid: u32, tree: &Path) -> io::Result<Option<bool>> {
 /// Whether the process or thread whose `/proc` directory is `dir` has its executable, working
 /// directory, an open file or a mapped file under `tree`. Any read error is returned (the caller
 /// decides); a descriptor closed between the listing and its read is skipped.
-fn uses_tree(dir: &Path, tree: &Path) -> io::Result<bool> {
+fn uses_tree(p: &dyn ProcFs, dir: &Path, tree: &Path) -> io::Result<bool> {
     for leaf in ["exe", "cwd"] {
-        if under(&fs::read_link(dir.join(leaf))?, tree) {
+        if under(&p.read_link(&dir.join(leaf))?, tree) {
             return Ok(true);
         }
     }
-    for fd in fs::read_dir(dir.join("fd"))? {
-        let fd = fd?;
-        match fs::read_link(fd.path()) {
+    let fds = dir.join("fd");
+    for fd in p.names(&fds)? {
+        match p.read_link(&fds.join(fd)) {
             Ok(target) => {
                 if under(&target, tree) {
                     return Ok(true);
@@ -343,7 +406,7 @@ fn uses_tree(dir: &Path, tree: &Path) -> io::Result<bool> {
             Err(e) => return Err(e),
         }
     }
-    let maps = fs::read(dir.join("maps"))?;
+    let maps = p.read(&dir.join("maps"))?;
     Ok(maps
         .split(|&b| b == b'\n')
         .filter_map(maps_path)
@@ -451,6 +514,259 @@ mod tests {
             None
         );
         assert_eq!(maps_path(b""), None);
+    }
+
+    // ---- the scan over a scripted `/proc` (M11-D13) ------------------------------------------
+
+    use std::cell::RefCell;
+    use std::collections::{HashMap, VecDeque};
+
+    /// One scripted answer.
+    #[derive(Clone)]
+    enum Answer {
+        Names(Vec<String>),
+        Bytes(Vec<u8>),
+        Link(PathBuf),
+        Uid(u32),
+        Errno(i32),
+    }
+
+    /// A `/proc` whose every read is scripted: each path answers its queue in order, the last
+    /// answer repeating; an unscripted path is `ENOENT`.
+    #[derive(Default)]
+    struct FakeProc {
+        answers: RefCell<HashMap<PathBuf, VecDeque<Answer>>>,
+    }
+
+    impl FakeProc {
+        fn set(&self, path: impl Into<PathBuf>, answers: Vec<Answer>) {
+            self.answers
+                .borrow_mut()
+                .insert(path.into(), answers.into_iter().collect());
+        }
+
+        fn next(&self, path: &Path) -> Answer {
+            let mut all = self.answers.borrow_mut();
+            match all.get_mut(path) {
+                Some(q) if q.len() > 1 => q.pop_front().unwrap(),
+                Some(q) => q.front().cloned().unwrap(),
+                None => Answer::Errno(libc::ENOENT),
+            }
+        }
+
+        fn err(errno: i32) -> io::Error {
+            io::Error::from_raw_os_error(errno)
+        }
+    }
+
+    impl ProcFs for FakeProc {
+        fn names(&self, path: &Path) -> io::Result<Vec<OsString>> {
+            match self.next(path) {
+                Answer::Names(n) => Ok(n.into_iter().map(OsString::from).collect()),
+                Answer::Errno(e) => Err(FakeProc::err(e)),
+                _ => Err(FakeProc::err(libc::ENOTDIR)),
+            }
+        }
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            match self.next(path) {
+                Answer::Bytes(b) => Ok(b),
+                Answer::Errno(e) => Err(FakeProc::err(e)),
+                _ => Err(FakeProc::err(libc::EISDIR)),
+            }
+        }
+        fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+            match self.next(path) {
+                Answer::Link(l) => Ok(l),
+                Answer::Errno(e) => Err(FakeProc::err(e)),
+                _ => Err(FakeProc::err(libc::EINVAL)),
+            }
+        }
+        fn owner(&self, path: &Path) -> io::Result<u32> {
+            match self.next(&path.join("#owner")) {
+                Answer::Uid(u) => Ok(u),
+                Answer::Errno(e) => Err(FakeProc::err(e)),
+                _ => Err(FakeProc::err(libc::EIO)),
+            }
+        }
+        fn owner_followed(&self, path: &Path) -> io::Result<u32> {
+            self.owner(path)
+        }
+    }
+
+    const ROOT: &str = "/fakeproc";
+    const TREE: &str = "/lunepack-test-tree/app/1.0.0";
+    const ME: u32 = 501;
+    const OTHER: u32 = 1000;
+
+    fn stat_line(pid: u32, state: &str, flags: u64) -> Vec<u8> {
+        let mut fields: Vec<String> = (3..=52).map(|n| n.to_string()).collect();
+        fields[0] = state.to_owned();
+        fields[9 - 3] = flags.to_string();
+        fields[22 - 3] = "777".to_owned();
+        format!("{pid} (p) {}\n", fields.join(" ")).into_bytes()
+    }
+
+    /// A running process of `uid` whose files are `exe`, `cwd`, no descriptor and empty maps.
+    fn process(f: &FakeProc, pid: u32, uid: u32, exe: Answer, cmdline: &[u8]) {
+        let dir = Path::new(ROOT).join(pid.to_string());
+        f.set(dir.join("#owner"), vec![Answer::Uid(uid)]);
+        f.set(
+            dir.join("stat"),
+            vec![Answer::Bytes(stat_line(pid, "S", 0))],
+        );
+        f.set(dir.join("exe"), vec![exe]);
+        f.set(dir.join("cwd"), vec![Answer::Link(PathBuf::from("/"))]);
+        f.set(dir.join("fd"), vec![Answer::Names(Vec::new())]);
+        f.set(dir.join("maps"), vec![Answer::Bytes(Vec::new())]);
+        f.set(dir.join("cmdline"), vec![Answer::Bytes(cmdline.to_vec())]);
+    }
+
+    fn listing(f: &FakeProc, pids: &[u32]) {
+        let mut names: Vec<String> = pids.iter().map(u32::to_string).collect();
+        names.push("self".to_owned());
+        f.set(ROOT, vec![Answer::Names(names)]);
+    }
+
+    fn strict(f: &FakeProc) -> bool {
+        scan(f, Path::new(ROOT), Path::new(TREE), &[], None).unwrap()
+    }
+
+    fn per_user(f: &FakeProc) -> bool {
+        scan(f, Path::new(ROOT), Path::new(TREE), &[], Some(ME)).unwrap()
+    }
+
+    fn in_tree(rel: &str) -> PathBuf {
+        Path::new(TREE).join(rel)
+    }
+
+    #[test]
+    fn another_users_process_in_the_tree_is_in_use_only_for_the_strict_scan() {
+        let f = FakeProc::default();
+        listing(&f, &[10]);
+        process(&f, 10, OTHER, Answer::Link(in_tree("bin/app")), b"");
+        assert!(strict(&f), "the strict scan sees every user");
+        assert!(!per_user(&f), "the per-user scan skips other uids");
+        // The same process of this user is in use for both.
+        process(&f, 10, ME, Answer::Link(in_tree("bin/app")), b"");
+        assert!(per_user(&f));
+        assert!(strict(&f));
+    }
+
+    #[test]
+    fn a_refused_process_of_another_user_is_judged_by_its_command_line() {
+        for leaf in ["exe", "cwd", "fd", "maps"] {
+            let f = FakeProc::default();
+            listing(&f, &[11]);
+            process(
+                &f,
+                11,
+                OTHER,
+                Answer::Link(PathBuf::from("/usr/bin/x")),
+                b"/usr/bin/agent\0-d\0",
+            );
+            let path = Path::new(ROOT).join("11").join(leaf);
+            f.set(path.clone(), vec![Answer::Errno(libc::EACCES)]);
+            assert!(
+                !strict(&f),
+                "{leaf}: argv outside the tree is not in use (Q40)"
+            );
+            process(
+                &f,
+                11,
+                OTHER,
+                Answer::Link(PathBuf::from("/usr/bin/x")),
+                format!("{TREE}/bin/app\0--x\0").as_bytes(),
+            );
+            f.set(path, vec![Answer::Errno(libc::EPERM)]);
+            assert!(strict(&f), "{leaf}: argv[0] in the tree is in use");
+        }
+    }
+
+    #[test]
+    fn a_vanishing_process_of_another_user_follows_f9() {
+        let f = FakeProc::default();
+        listing(&f, &[12]);
+        process(&f, 12, OTHER, Answer::Errno(libc::ENOENT), b"");
+        // Running at the listing, gone at the re-probe: skipped.
+        f.set(
+            Path::new(ROOT).join("12/stat"),
+            vec![
+                Answer::Bytes(stat_line(12, "S", 0)),
+                Answer::Errno(libc::ENOENT),
+            ],
+        );
+        assert!(!strict(&f));
+        // Still running, its files vanished and no thread readable past the bound: in use.
+        let f = FakeProc::default();
+        listing(&f, &[12]);
+        process(&f, 12, OTHER, Answer::Errno(libc::ENOENT), b"");
+        f.set(
+            Path::new(ROOT).join("12/task"),
+            vec![Answer::Names(Vec::new())],
+        );
+        assert!(strict(&f), "fails closed past the bound");
+    }
+
+    #[test]
+    fn kernel_threads_are_skipped() {
+        let f = FakeProc::default();
+        listing(&f, &[2]);
+        process(&f, 2, 0, Answer::Errno(libc::ENOENT), b"");
+        f.set(
+            Path::new(ROOT).join("2/stat"),
+            vec![Answer::Bytes(stat_line(2, "S", PF_KTHREAD))],
+        );
+        assert!(!strict(&f));
+    }
+
+    #[test]
+    fn any_other_unreadable_read_is_in_use() {
+        // An owner that cannot be read.
+        let f = FakeProc::default();
+        listing(&f, &[13]);
+        process(
+            &f,
+            13,
+            OTHER,
+            Answer::Link(PathBuf::from("/usr/bin/x")),
+            b"",
+        );
+        f.set(
+            Path::new(ROOT).join("13/#owner"),
+            vec![Answer::Errno(libc::EIO)],
+        );
+        assert!(strict(&f));
+        // A descriptor table that fails with anything but a refusal or a vanishing.
+        let f = FakeProc::default();
+        listing(&f, &[13]);
+        process(
+            &f,
+            13,
+            OTHER,
+            Answer::Link(PathBuf::from("/usr/bin/x")),
+            b"",
+        );
+        f.set(
+            Path::new(ROOT).join("13/fd"),
+            vec![Answer::Errno(libc::EIO)],
+        );
+        assert!(strict(&f));
+        // Nothing in the tree anywhere: not in use.
+        let f = FakeProc::default();
+        listing(&f, &[13, 14]);
+        process(
+            &f,
+            13,
+            OTHER,
+            Answer::Link(PathBuf::from("/usr/bin/x")),
+            b"",
+        );
+        process(&f, 14, ME, Answer::Link(PathBuf::from("/usr/bin/y")), b"");
+        assert!(!strict(&f));
+        // An unlisted /proc is an error, not an answer.
+        let f = FakeProc::default();
+        f.set(ROOT, vec![Answer::Errno(libc::EACCES)]);
+        assert!(scan(&f, Path::new(ROOT), Path::new(TREE), &[], None).is_err());
     }
 
     #[test]

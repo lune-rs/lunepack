@@ -338,6 +338,35 @@ pub struct MachinePolicy {
     pub no_update_ui: bool,
 }
 
+impl MachinePolicy {
+    /// Both switches on: what an unreadable or invalid policy means (M10-D12, M11-D11).
+    pub const FAIL_CLOSED: MachinePolicy = MachinePolicy {
+        self_update_disabled: true,
+        no_update_ui: true,
+    };
+
+    /// The policy a policy file's bytes hold (M11-D11): strict JSON, one object whose only
+    /// members are `disable_self_update` and `no_update_ui`, each optional and a boolean. Anything
+    /// else (not strict JSON, a repeated key, an unknown member, a value that is not a boolean,
+    /// `null` included) is `None`, which the caller reads as [`MachinePolicy::FAIL_CLOSED`].
+    pub fn from_json(bytes: &[u8]) -> Option<MachinePolicy> {
+        let members: std::collections::BTreeMap<String, serde_json::Value> =
+            crate::json::parse_strict(bytes).ok()?;
+        let mut policy = MachinePolicy::default();
+        for (key, value) in members {
+            let serde_json::Value::Bool(on) = value else {
+                return None;
+            };
+            match key.as_str() {
+                "disable_self_update" => policy.self_update_disabled = on,
+                "no_update_ui" => policy.no_update_ui = on,
+                _ => return None,
+            }
+        }
+        Some(policy)
+    }
+}
+
 /// Reads the machine policy (M10-D12). An unreadable policy counts as on: the implementation
 /// returns `true` for each value it cannot read, so the answer is infallible.
 pub trait PolicySource: Send + Sync {
@@ -367,6 +396,12 @@ pub enum Standing {
 pub trait ElevatedChild: Send {
     /// Waits for the child and returns its exit code.
     fn wait(&mut self) -> std::result::Result<i32, ElevationError>;
+
+    /// The child's standard output, when the hand-off pipes it (Linux's pkexec, M11-D9); taken
+    /// once. The default has none.
+    fn take_output(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+        None
+    }
 }
 
 /// What [`Elevation::run_elevated`] did.

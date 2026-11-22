@@ -177,7 +177,7 @@ fn resolve(path: &Path) -> Result<PathBuf, IntegrationError> {
 }
 
 /// The Linux per-user [`OsIntegration`]: an XDG desktop entry, a command link and an autostart
-/// entry. Per-machine scope is `Unsupported` in M5.
+/// entry. Per-machine scope is `Unsupported` here ([`MachineIntegration`] serves it).
 #[derive(Debug, Clone)]
 pub struct XdgIntegration {
     env: XdgEnv,
@@ -220,70 +220,7 @@ impl OsIntegration for XdgIntegration {
         scope: Scope,
         req: &IntegrationRequest,
     ) -> Result<IntegrationReport, IntegrationError> {
-        let p = self.prepare(scope, req)?;
-        ensure_dir(p.dirs.applications())?;
-        if p.bin.is_some() || !p.stale.is_empty() {
-            ensure_dir(p.dirs.bin())?;
-        }
-
-        // The desktop entry first: a failure after it leaves a valid entry and a retry finishes
-        // the rest.
-        let name = file_name(&p.desktop_path)?;
-        let unchanged = match probe(&p.desktop_path)? {
-            Slot::File => {
-                read_capped(&p.desktop_path).is_ok_and(|bytes| bytes == p.content.as_bytes())
-            }
-            _ => false,
-        };
-        if !unchanged {
-            write_atomic(p.dirs.applications(), name, p.content.as_bytes())?;
-        }
-
-        if let Some((link, target)) = &p.bin {
-            let current = match probe(link)? {
-                Slot::Symlink(t) => t.to_str() == Some(target.as_str()),
-                _ => false,
-            };
-            if !current {
-                replace_symlink(target, link)?;
-            }
-        }
-
-        let mut report = IntegrationReport::default();
-        let (autostart_path, autostart_content) = &p.autostart;
-        match autostart_content {
-            Some(content) => {
-                ensure_dir(p.dirs.autostart())?;
-                let unchanged = match probe(autostart_path)? {
-                    Slot::File => {
-                        read_capped(autostart_path).is_ok_and(|bytes| bytes == content.as_bytes())
-                    }
-                    _ => false,
-                };
-                if !unchanged {
-                    write_atomic(
-                        p.dirs.autostart(),
-                        file_name(autostart_path)?,
-                        content.as_bytes(),
-                    )?;
-                }
-            }
-            None => remove_autostart(autostart_path, req.app_id.as_str(), &mut report)?,
-        }
-        for link in &p.stale {
-            match probe(link)? {
-                Slot::Absent => {}
-                Slot::Symlink(t) if is_ours(&t, &p.root) => {
-                    fs::remove_file(link).map_err(|_| {
-                        IntegrationError::Failed("a stale command link was not removed")
-                    })?;
-                }
-                _ => report.kept.push(IntegrationItem::BinLink),
-            }
-        }
-        sync_dir(p.dirs.bin());
-        sync_dir(p.dirs.autostart());
-        Ok(report)
+        apply_prepared(self.prepare(scope, req)?, req)
     }
 
     fn remove(
@@ -294,46 +231,120 @@ impl OsIntegration for XdgIntegration {
         if scope != Scope::User {
             return Err(IntegrationError::Unsupported);
         }
-        let dirs = xdg_dirs(&self.env)?;
-        let root = check_root(&req.install_root)?;
-        let mut report = IntegrationReport::default();
-
-        let desktop_path = dirs
-            .applications()
-            .join(format!("{}.desktop", req.app_id.as_str()));
-        match probe(&desktop_path)? {
-            Slot::Absent => {}
-            Slot::File if has_marker(&desktop_path, req.app_id.as_str()) => {
-                fs::remove_file(&desktop_path)
-                    .map_err(|_| IntegrationError::Failed("the desktop entry was not removed"))?;
-            }
-            _ => report.kept.push(IntegrationItem::DesktopEntry),
-        }
-
-        if let Some(bin) = &req.meta.bin {
-            if !bin_ok(bin) {
-                return Err(IntegrationError::UnsafeField("bin"));
-            }
-            let link = dirs.bin().join(bin);
-            match probe(&link)? {
-                Slot::Absent => {}
-                Slot::Symlink(t) if is_ours(&t, &root) => {
-                    fs::remove_file(&link).map_err(|_| {
-                        IntegrationError::Failed("the command link was not removed")
-                    })?;
-                }
-                _ => report.kept.push(IntegrationItem::BinLink),
-            }
-        }
-        let autostart_path = dirs
-            .autostart()
-            .join(format!("{}.desktop", req.app_id.as_str()));
-        remove_autostart(&autostart_path, req.app_id.as_str(), &mut report)?;
-        sync_dir(dirs.applications());
-        sync_dir(dirs.bin());
-        sync_dir(dirs.autostart());
-        Ok(report)
+        remove_with(xdg_dirs(&self.env)?, req)
     }
+}
+
+/// `apply` over what [`prepare_with`] resolved.
+fn apply_prepared(
+    p: Prepared,
+    req: &IntegrationRequest,
+) -> Result<IntegrationReport, IntegrationError> {
+    ensure_dir(p.dirs.applications())?;
+    if p.bin.is_some() || !p.stale.is_empty() {
+        ensure_dir(p.dirs.bin())?;
+    }
+
+    // The desktop entry first: a failure after it leaves a valid entry and a retry finishes
+    // the rest.
+    let name = file_name(&p.desktop_path)?;
+    let unchanged = match probe(&p.desktop_path)? {
+        Slot::File => read_capped(&p.desktop_path).is_ok_and(|bytes| bytes == p.content.as_bytes()),
+        _ => false,
+    };
+    if !unchanged {
+        write_atomic(p.dirs.applications(), name, p.content.as_bytes())?;
+    }
+
+    if let Some((link, target)) = &p.bin {
+        let current = match probe(link)? {
+            Slot::Symlink(t) => t.to_str() == Some(target.as_str()),
+            _ => false,
+        };
+        if !current {
+            replace_symlink(target, link)?;
+        }
+    }
+
+    let mut report = IntegrationReport::default();
+    let (autostart_path, autostart_content) = &p.autostart;
+    match autostart_content {
+        Some(content) => {
+            ensure_dir(p.dirs.autostart())?;
+            let unchanged = match probe(autostart_path)? {
+                Slot::File => {
+                    read_capped(autostart_path).is_ok_and(|bytes| bytes == content.as_bytes())
+                }
+                _ => false,
+            };
+            if !unchanged {
+                write_atomic(
+                    p.dirs.autostart(),
+                    file_name(autostart_path)?,
+                    content.as_bytes(),
+                )?;
+            }
+        }
+        None => remove_autostart(autostart_path, req.app_id.as_str(), &mut report)?,
+    }
+    for link in &p.stale {
+        match probe(link)? {
+            Slot::Absent => {}
+            Slot::Symlink(t) if is_ours(&t, &p.root) => {
+                fs::remove_file(link).map_err(|_| {
+                    IntegrationError::Failed("a stale command link was not removed")
+                })?;
+            }
+            _ => report.kept.push(IntegrationItem::BinLink),
+        }
+    }
+    sync_dir(p.dirs.bin());
+    sync_dir(p.dirs.autostart());
+    Ok(report)
+}
+
+/// `remove` with the directories `dirs`.
+fn remove_with(
+    dirs: XdgDirs,
+    req: &IntegrationRequest,
+) -> Result<IntegrationReport, IntegrationError> {
+    let root = check_root(&req.install_root)?;
+    let mut report = IntegrationReport::default();
+
+    let desktop_path = dirs
+        .applications()
+        .join(format!("{}.desktop", req.app_id.as_str()));
+    match probe(&desktop_path)? {
+        Slot::Absent => {}
+        Slot::File if has_marker(&desktop_path, req.app_id.as_str()) => {
+            fs::remove_file(&desktop_path)
+                .map_err(|_| IntegrationError::Failed("the desktop entry was not removed"))?;
+        }
+        _ => report.kept.push(IntegrationItem::DesktopEntry),
+    }
+
+    if let Some(bin) = &req.meta.bin {
+        if !bin_ok(bin) {
+            return Err(IntegrationError::UnsafeField("bin"));
+        }
+        let link = dirs.bin().join(bin);
+        match probe(&link)? {
+            Slot::Absent => {}
+            Slot::Symlink(t) if is_ours(&t, &root) => {
+                fs::remove_file(&link)
+                    .map_err(|_| IntegrationError::Failed("the command link was not removed"))?;
+            }
+            _ => report.kept.push(IntegrationItem::BinLink),
+        }
+    }
+    let autostart_path = dirs
+        .autostart()
+        .join(format!("{}.desktop", req.app_id.as_str()));
+    remove_autostart(&autostart_path, req.app_id.as_str(), &mut report)?;
+    sync_dir(dirs.applications());
+    sync_dir(dirs.bin());
+    sync_dir(dirs.autostart());
+    Ok(report)
 }
 
 /// Removes the autostart entry when it is ours (a regular file with the marker); reports a foreign
@@ -364,86 +375,158 @@ impl XdgIntegration {
         if scope != Scope::User {
             return Err(IntegrationError::Unsupported);
         }
-        let dirs = xdg_dirs(&self.env)?;
-        let root = check_root(&req.install_root)?;
-        let meta = &req.meta;
+        prepare_with(xdg_dirs(&self.env)?, req)
+    }
+}
 
-        let current = root.join("current");
-        let exec_path = current.join(meta.entry.as_str());
-        let exec = path_str(&exec_path, "executable path")?;
-        let icon = match &meta.icon {
-            Some(icon) => Some(path_str(&current.join(icon.as_str()), "icon path")?.to_owned()),
-            None => None,
-        };
-        // The home and the data home sit under every path the entry and the link refer to; a
-        // hostile one is refused here (FORMAT.md 13.5), not escaped.
-        for (what, path) in [("home", dirs.home()), ("data home", dirs.data_home())] {
-            path_str(path, what)?;
-        }
-        check_fields(meta)?;
-        for stale in &req.stale_bins {
-            if !bin_ok(stale) {
-                return Err(IntegrationError::UnsafeField("stale bin"));
-            }
-        }
+/// Every check that writes nothing, with the directories `dirs`: paths, fields, conflicts.
+fn prepare_with(dirs: XdgDirs, req: &IntegrationRequest) -> Result<Prepared, IntegrationError> {
+    let root = check_root(&req.install_root)?;
+    let meta = &req.meta;
 
-        let content = entry_bytes(req.app_id.as_str(), meta, exec, icon.as_deref(), false);
-        let desktop_path = dirs
-            .applications()
-            .join(format!("{}.desktop", req.app_id.as_str()));
-        match probe(&desktop_path)? {
+    let current = root.join("current");
+    let exec_path = current.join(meta.entry.as_str());
+    let exec = path_str(&exec_path, "executable path")?;
+    let icon = match &meta.icon {
+        Some(icon) => Some(path_str(&current.join(icon.as_str()), "icon path")?.to_owned()),
+        None => None,
+    };
+    // The home and the data home sit under every path the entry and the link refer to; a
+    // hostile one is refused here (FORMAT.md 13.5), not escaped.
+    for (what, path) in [("home", dirs.home()), ("data home", dirs.data_home())] {
+        path_str(path, what)?;
+    }
+    check_fields(meta)?;
+    for stale in &req.stale_bins {
+        if !bin_ok(stale) {
+            return Err(IntegrationError::UnsafeField("stale bin"));
+        }
+    }
+
+    let content = entry_bytes(req.app_id.as_str(), meta, exec, icon.as_deref(), false);
+    let desktop_path = dirs
+        .applications()
+        .join(format!("{}.desktop", req.app_id.as_str()));
+    match probe(&desktop_path)? {
+        Slot::Absent => {}
+        Slot::File if has_marker(&desktop_path, req.app_id.as_str()) => {}
+        _ => return Err(IntegrationError::Conflict(IntegrationItem::DesktopEntry)),
+    }
+    let autostart_path = dirs
+        .autostart()
+        .join(format!("{}.desktop", req.app_id.as_str()));
+    let autostart_content = if meta.autostart {
+        match probe(&autostart_path)? {
             Slot::Absent => {}
-            Slot::File if has_marker(&desktop_path, req.app_id.as_str()) => {}
-            _ => return Err(IntegrationError::Conflict(IntegrationItem::DesktopEntry)),
+            Slot::File if has_marker(&autostart_path, req.app_id.as_str()) => {}
+            _ => return Err(IntegrationError::Conflict(IntegrationItem::Autostart)),
         }
-        let autostart_path = dirs
-            .autostart()
-            .join(format!("{}.desktop", req.app_id.as_str()));
-        let autostart_content = if meta.autostart {
-            match probe(&autostart_path)? {
+        Some(entry_bytes(
+            req.app_id.as_str(),
+            meta,
+            exec,
+            icon.as_deref(),
+            true,
+        ))
+    } else {
+        None
+    };
+
+    let bin = match &meta.bin {
+        Some(name) => {
+            let link = dirs.bin().join(name);
+            match probe(&link)? {
                 Slot::Absent => {}
-                Slot::File if has_marker(&autostart_path, req.app_id.as_str()) => {}
-                _ => return Err(IntegrationError::Conflict(IntegrationItem::Autostart)),
+                Slot::Symlink(t) if is_ours(&t, &root) => {}
+                _ => return Err(IntegrationError::Conflict(IntegrationItem::BinLink)),
             }
-            Some(entry_bytes(
-                req.app_id.as_str(),
-                meta,
-                exec,
-                icon.as_deref(),
-                true,
-            ))
-        } else {
-            None
-        };
+            Some((link, exec.to_owned()))
+        }
+        None => None,
+    };
+    let stale = req
+        .stale_bins
+        .iter()
+        .filter(|name| Some(*name) != meta.bin.as_ref())
+        .map(|name| dirs.bin().join(name))
+        .collect();
 
-        let bin = match &meta.bin {
-            Some(name) => {
-                let link = dirs.bin().join(name);
-                match probe(&link)? {
-                    Slot::Absent => {}
-                    Slot::Symlink(t) if is_ours(&t, &root) => {}
-                    _ => return Err(IntegrationError::Conflict(IntegrationItem::BinLink)),
-                }
-                Some((link, exec.to_owned()))
-            }
-            None => None,
-        };
-        let stale = req
-            .stale_bins
-            .iter()
-            .filter(|name| Some(*name) != meta.bin.as_ref())
-            .map(|name| dirs.bin().join(name))
-            .collect();
+    Ok(Prepared {
+        dirs,
+        root,
+        desktop_path,
+        content,
+        bin,
+        stale,
+        autostart: (autostart_path, autostart_content),
+    })
+}
 
-        Ok(Prepared {
-            dirs,
-            root,
-            desktop_path,
-            content,
-            bin,
-            stale,
-            autostart: (autostart_path, autostart_content),
-        })
+// ---- the per-machine integration (M11-D12) -------------------------------------------------------
+
+/// The Linux per-machine [`OsIntegration`] (M11-D12), run as root by the engine: the desktop
+/// entry in `/usr/local/share/applications`, the command link in `/usr/local/bin` and the
+/// autostart entry in `/etc/xdg/autostart`, each through `R/current`, under the per-user rules
+/// (an entry that is not this app's is refused, never replaced). The package manager's
+/// `/usr/share` and `/usr/bin` are never touched. Per-user scope is `Unsupported`.
+#[derive(Debug, Clone)]
+pub struct MachineIntegration {
+    dirs: XdgDirs,
+}
+
+impl Default for MachineIntegration {
+    fn default() -> Self {
+        MachineIntegration::new()
+    }
+}
+
+impl MachineIntegration {
+    /// The system's directories.
+    pub fn new() -> MachineIntegration {
+        MachineIntegration::under(Path::new("/"))
+    }
+
+    /// The same directories under `prefix` (tests use a scratch directory; `/` is the system).
+    pub fn under(prefix: &Path) -> MachineIntegration {
+        let share = prefix.join("usr/local/share");
+        MachineIntegration {
+            dirs: XdgDirs {
+                home: prefix.to_path_buf(),
+                applications: share.join("applications"),
+                data_home: share,
+                bin: prefix.join("usr/local/bin"),
+                autostart: prefix.join("etc/xdg/autostart"),
+            },
+        }
+    }
+
+    fn dirs(&self, scope: Scope) -> Result<XdgDirs, IntegrationError> {
+        if scope != Scope::Machine {
+            return Err(IntegrationError::Unsupported);
+        }
+        Ok(self.dirs.clone())
+    }
+}
+
+impl OsIntegration for MachineIntegration {
+    fn check(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+        prepare_with(self.dirs(scope)?, req).map(|_| ())
+    }
+
+    fn apply(
+        &self,
+        scope: Scope,
+        req: &IntegrationRequest,
+    ) -> Result<IntegrationReport, IntegrationError> {
+        apply_prepared(prepare_with(self.dirs(scope)?, req)?, req)
+    }
+
+    fn remove(
+        &self,
+        scope: Scope,
+        req: &IntegrationRequest,
+    ) -> Result<IntegrationReport, IntegrationError> {
+        remove_with(self.dirs(scope)?, req)
     }
 }
 

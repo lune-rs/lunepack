@@ -781,6 +781,14 @@ pub enum ElevationError {
     /// The operating system refused (a fixed description).
     #[error("elevation failed: {0}")]
     Failed(&'static str),
+    /// The user declined a prompt that answers only when the elevated child ends (pkexec's exit
+    /// code 126, M11-D9): nothing ran as the administrator.
+    #[error("the elevation was declined")]
+    Declined,
+    /// No elevation agent can ask the user (pkexec missing, or its exit code 127, M11-D9): the
+    /// caller shows the command to run as an administrator instead.
+    #[error("no elevation agent")]
+    NoAgent,
 }
 
 /// Why a service-protocol session (`service`, M10-D1) ended or a request failed. Carries no peer

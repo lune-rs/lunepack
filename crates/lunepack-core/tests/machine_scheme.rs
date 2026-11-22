@@ -365,3 +365,46 @@ fn admin_only_rule() {
         assert_eq!(unix_protect::check(&link, A), Err(Reason::Link));
     }
 }
+
+// ---- the policy file's bytes (M11-D11) ----------------------------------------------------------
+
+#[test]
+fn machine_policy_from_json_is_strict() {
+    use lunepack_core::MachinePolicy;
+    assert_eq!(
+        MachinePolicy::from_json(b"{}"),
+        Some(MachinePolicy::default())
+    );
+    assert_eq!(
+        MachinePolicy::from_json(br#"{"disable_self_update": true, "no_update_ui": false}"#),
+        Some(MachinePolicy {
+            self_update_disabled: true,
+            no_update_ui: false
+        })
+    );
+    for bad in [
+        &br#"{"disable_self_update": true, "disable_self_update": true}"#[..],
+        br#"{"other": true}"#,
+        br#"{"no_update_ui": "yes"}"#,
+        br#"{"no_update_ui": null}"#,
+        br#"{"no_update_ui": 0}"#,
+        b"[]",
+        b"true",
+        b"",
+        b"{",
+    ] {
+        assert_eq!(
+            MachinePolicy::from_json(bad),
+            None,
+            "{}",
+            String::from_utf8_lossy(bad)
+        );
+    }
+    assert_eq!(
+        MachinePolicy::FAIL_CLOSED,
+        MachinePolicy {
+            self_update_disabled: true,
+            no_update_ui: true
+        }
+    );
+}

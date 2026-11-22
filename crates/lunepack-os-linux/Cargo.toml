@@ -34,3 +34,9 @@ lunepack-testkit.workspace = true
 [[test]]
 name = "process"
 harness = false
+
+# Own main: the test binary is also the child that takes descriptor 3 (`--child`), so no other
+# test's descriptors meet it.
+[[test]]
+name = "activation"
+harness = false
