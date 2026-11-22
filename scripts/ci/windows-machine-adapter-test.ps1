@@ -73,10 +73,6 @@ function Row([string]$id, [scriptblock]$body) {
     } catch {
         $failures.Add("row $id")
         Write-Output "FAIL row ${id}: $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))"
-        # Once per run: whether the standard user can open the service manager at all (F12).
-        if ($user -and $userExe -and (Test-Path -LiteralPath $userExe)) {
-            Write-ScmOpenDiagnostics -User $user -Probe $userExe -AppId $appSvc -WorkDir $workDir -OutDir $outDir
-        }
     }
 }
 
@@ -240,6 +236,8 @@ try {
     Set-Content -LiteralPath (Join-Path $svc 'app-id.txt') -Value $appSvc -Encoding ASCII
     $f = Join-Path $root 'f.txt'
     Set-Content -LiteralPath $f -Value 'x' -Encoding ASCII -NoNewline
+    # Whether the standard user opens the service manager, by logon kind (F12).
+    Write-ScmOpenReport -User $user -Probe $userExe -AppId $appSvc -WorkDir $workDir -OutDir $outDir
 
     # ---- row 1: protected directories ------------------------------------------------------------
     Row '1 protected directories under Program Files' {

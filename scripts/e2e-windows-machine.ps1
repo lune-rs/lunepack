@@ -697,10 +697,6 @@ function Write-Diagnostics {
             Write-Output "     record: current $($r.current.version) pending $p bad [$(@($r.bad) -join ',')]"
         }
     }
-    # Once per run: whether the standard user can open the service manager at all (F12).
-    if ($user -and $probeCopy -and $apps.Count -gt 0 -and (Test-Path -LiteralPath $probeCopy)) {
-        Write-ScmOpenDiagnostics -User $user -Probe $probeCopy -AppId $apps[0].Id -WorkDir $workDir -OutDir $outDir -WithProfile
-    }
 }
 
 function Remove-Everything {
@@ -858,6 +854,8 @@ try {
         Write-Output "standard user created: $($user.Name)"
         $probeCopy = Join-Path $workDir 'machine_probe.exe'
         Copy-Item -LiteralPath $probeExe -Destination $probeCopy
+        # Whether the standard user opens the service manager, by logon kind (F12).
+        Write-ScmOpenReport -User $user -Probe $probeCopy -AppId $M.Id -WorkDir $workDir -OutDir $outDir -WithProfile
         $M.Root = Join-Path $pf $M.BaseName
         Require (-not (Test-Path -LiteralPath $M.Root)) 'no earlier install of this unique name'
         $key = Join-Path $uninstallKeyRoot $M.Id

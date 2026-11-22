@@ -5,10 +5,15 @@ using System.Security.AccessControl;
 using System.Security.Principal;
 
 // Runs one command line as another local account without the Task Scheduler and without loading
-// the account's profile: a batch logon token, a process made with it, and an access entry for the
-// account on this process's window station and desktop (without it the new process dies at start
-// with 0xC0000142 in a non-interactive session). Everything is released when Run returns.
+// the account's profile: a logon token (interactive, as a person who signs in has, or batch), a
+// process made with it, and an access entry for the account on this process's window station and
+// desktop (without it the new process dies at start with 0xC0000142 in a non-interactive session).
+// Everything is released when Run returns.
 public static class LpRun {
+    public const int Interactive = 2;   // LOGON32_LOGON_INTERACTIVE
+    public const int Network = 3;       // LOGON32_LOGON_NETWORK
+    public const int Batch = 4;         // LOGON32_LOGON_BATCH
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct STARTUPINFO {
         public int cb; public string lpReserved, lpDesktop, lpTitle;
@@ -34,6 +39,11 @@ public static class LpRun {
     [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
     [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr h, uint code);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool ImpersonateLoggedOnUser(IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool RevertToSelf();
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr OpenSCManagerW(string machine, string database, int access);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool CloseServiceHandle(IntPtr h);
 
     const int DACL_SECURITY_INFORMATION = 4;
     const int WINSTA_ALL = 0x37F | 0x20000;   // WINSTA_ALL_ACCESS | READ_CONTROL
@@ -69,22 +79,18 @@ public static class LpRun {
             ?? Edit(GetThreadDesktop(GetCurrentThreadId()), sid, DESKTOP_ALL, grant);
     }
 
-    // Runs `cmdline` as `user` with a batch logon token and no window; returns the exit code, or
-    // -2 (logon failed), -3 (the process could not be made) or -1 (timed out; the process is
-    // ended). `error` carries the Windows error code of a -2 or -3. The account's profile is not
-    // loaded (the process sees the default profile's folders).
-    public static int Run(string user, string password, string cmdline, string dir, int timeoutMs, out int error) {
-        return Run(user, password, cmdline, dir, timeoutMs, false, out error);
-    }
-
-    // The same, loading the account's profile first (LOGON_WITH_PROFILE; the profile is created at
-    // the first load), so the process has its own USERPROFILE and LocalAppData. Measured on
-    // Windows 11: the profile is unloaded again when the last process of the run has ended, and
+    // Runs `cmdline` as `user` with a logon token of `logonType` (Interactive or Batch) and no
+    // window; returns the exit code, or -2 (logon failed), -3 (the process could not be made) or
+    // -1 (timed out; the process is ended). `error` carries the Windows error code of a -2 or -3.
+    // Without `loadProfile` the account's profile is not loaded (the process sees the default
+    // profile's folders); with it the profile is loaded first (LOGON_WITH_PROFILE; created at the
+    // first load), so the process has its own USERPROFILE and LocalAppData. Measured on Windows
+    // 11: the profile is unloaded again when the last process of the run has ended, and
     // Remove-StandardUser then deletes it.
-    public static int Run(string user, string password, string cmdline, string dir, int timeoutMs, bool loadProfile, out int error) {
+    public static int Run(string user, string password, string cmdline, string dir, int timeoutMs, bool loadProfile, int logonType, out int error) {
         error = 0;
         IntPtr token;
-        if (!LogonUserW(user, ".", password, 4, 0, out token)) { error = Marshal.GetLastWin32Error(); return -2; }
+        if (!LogonUserW(user, ".", password, logonType, 0, out token)) { error = Marshal.GetLastWin32Error(); return -2; }
         try {
             var si = new STARTUPINFO();
             si.cb = Marshal.SizeOf(si);
@@ -104,6 +110,27 @@ public static class LpRun {
                 GetExitCodeProcess(pi.hProcess, out code);
                 return (int)code;
             } finally { CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
+        } finally { CloseHandle(token); }
+    }
+
+    // Opens the service manager of this machine with `access` while this thread impersonates
+    // `user` logged on with `logonType`. Returns 0 (opened, and closed again), 1 (refused: `error`
+    // is the Windows error code), -2 (logon failed) or -4 (the impersonation failed). Always
+    // reverts to this process's own identity before it returns.
+    public static int ScmOpen(string user, string password, int logonType, int access, out int error) {
+        error = 0;
+        IntPtr token;
+        if (!LogonUserW(user, ".", password, logonType, 0, out token)) { error = Marshal.GetLastWin32Error(); return -2; }
+        try {
+            if (!ImpersonateLoggedOnUser(token)) { error = Marshal.GetLastWin32Error(); return -4; }
+            try {
+                IntPtr scm = OpenSCManagerW(null, null, access);
+                if (scm == IntPtr.Zero) { error = Marshal.GetLastWin32Error(); return 1; }
+                CloseServiceHandle(scm);
+                return 0;
+            } finally {
+                if (!RevertToSelf()) throw new InvalidOperationException("RevertToSelf failed");
+            }
         } finally { CloseHandle(token); }
     }
 }
