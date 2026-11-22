@@ -14,6 +14,8 @@ pub mod session;
 
 #[cfg(windows)]
 pub mod host;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod host_unix;
 
 /// The process's exit codes.
 pub mod exit {
@@ -21,7 +23,8 @@ pub mod exit {
     pub const OK: u8 = 0;
     /// The service or its self-test failed after it started.
     pub const FAILED: u8 = 1;
-    /// The command line was not understood, or this system has no host yet.
+    /// The command line was not understood, the system has no host, or the process was not
+    /// started by the init system for its socket (unix).
     pub const USAGE: u8 = 2;
     /// The image is not where the service may run from.
     pub const LOCATION: u8 = 3;

@@ -3,10 +3,15 @@
 //! text and `<R>`'s parent the Program Files known folder. Anything else is refused before any
 //! other action: a copy of the binary somewhere else (a user's folder, a download) never serves a
 //! pipe as LocalSystem, and never finds an install root it was not placed in.
+//!
+//! On Linux and macOS (M11) the rule is [`locate_unix`]: the image is
+//! `<R>/.lunepack/machine/service/<version>/lunepack-service`, `<R>` is named by its app id and its
+//! parent is the machine home, compared exactly (bytes, no case folding) against a path the caller
+//! resolved the way the kernel reports image paths.
 
 use std::path::{Component, Path, PathBuf, Prefix};
 
-use lunepack_core::{MachineLayout, Version};
+use lunepack_core::{AppId, MachineLayout, MachineScheme, Version};
 
 /// Why an image path is not the service's place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +20,8 @@ pub enum LocationError {
     NotAServiceImage,
     /// `<R>` is not directly under the Program Files folder.
     NotUnderProgramFiles,
+    /// `<R>` is not directly under the machine home (`/opt`, `/Library/Application Support/lunepack`).
+    NotUnderMachineHome,
 }
 
 /// Where the service runs from.
@@ -42,6 +49,49 @@ pub fn locate(image: &Path, program_files: &Path) -> Result<Located, LocationErr
         return Err(LocationError::NotUnderProgramFiles);
     }
     Ok(Located { layout, version })
+}
+
+/// Checks `image` (the running binary's own path, as the kernel reports it) against the unix rule
+/// of `scheme` (M11-D6): exactly `<R>/.lunepack/machine/service/<version>/lunepack-service` with
+/// `<version>` in its canonical text, `<R>`'s name a valid app id, and `<R>`'s parent equal to
+/// `home`, the machine home resolved by the caller (never taken from the environment). Neither
+/// path may be relative, hold `.` or `..`, or be spelled other than the kernel would spell it (a
+/// doubled or trailing separator). The comparison is of path components, byte for byte:
+/// the caller resolves `home` with the source that names `image` (the kernel).
+pub fn locate_unix(
+    image: &Path,
+    home: &Path,
+    scheme: MachineScheme,
+) -> Result<Located, LocationError> {
+    if !image.is_absolute() || has_dots(image) || !normal_spelling(image) {
+        return Err(LocationError::NotAServiceImage);
+    }
+    let (layout, version) =
+        MachineLayout::of_service_image_as(image, scheme).ok_or(LocationError::NotAServiceImage)?;
+    if root_app_id(&layout).is_none() {
+        return Err(LocationError::NotAServiceImage);
+    }
+    if !home.is_absolute()
+        || has_dots(home)
+        || !normal_spelling(home)
+        || layout.root().parent() != Some(home)
+    {
+        return Err(LocationError::NotUnderMachineHome);
+    }
+    Ok(Located { layout, version })
+}
+
+/// Whether `path` is spelled the way its components rejoin: no `.` inside, no doubled or trailing
+/// separator (`Path` comparison reads those away; the kernel never reports them).
+fn normal_spelling(path: &Path) -> bool {
+    path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
+}
+
+/// The app id `<R>` is named by (the unix machine roots are `<home>/<app id>`), `None` when the
+/// name is not a valid app id.
+pub fn root_app_id(layout: &MachineLayout) -> Option<AppId> {
+    let name = layout.root().file_name()?.to_str()?;
+    AppId::parse(name).ok()
 }
 
 fn has_dots(path: &Path) -> bool {

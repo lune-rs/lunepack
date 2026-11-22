@@ -1,10 +1,12 @@
 //! The pieces of the service loop that need no operating system: the cap on one connection's
-//! length and the idle rule.
+//! length, the idle rule and the log numbers of engine errors.
 
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 use lunepack_core::Duplex;
+use lunepack_core::engine::EngineError;
+use lunepack_core::service::ErrorCode;
 
 /// A connection is cut after this long, whatever it is doing (M10-D11).
 pub const CONNECTION_LIMIT: Duration = Duration::from_secs(30 * 60);
@@ -72,4 +74,17 @@ impl<D: Duplex> Duplex for Capped<D> {
 /// window, and a later `attempt` or `confirm` will need the same engine memory).
 pub fn idle_exit(idle_for: Duration, lease_running: bool) -> bool {
     idle_for >= IDLE_EXIT && !lease_running
+}
+
+/// The index of `code` in the protocol's closed set, for the log.
+pub fn code_number(code: ErrorCode) -> u32 {
+    ErrorCode::ALL
+        .iter()
+        .position(|c| *c == code)
+        .map_or(0, |i| u32::try_from(i).unwrap_or(0))
+}
+
+/// The log number of an engine error.
+pub fn engine_code(e: &EngineError) -> u32 {
+    code_number(e.code)
 }

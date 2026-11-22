@@ -8,6 +8,7 @@ use lunepack_service::exit;
 
 fn main() -> ExitCode {
     // First, before any library load: only System32 from here on (M7-D10).
+    #[cfg(windows)]
     lunepack_os_windows::harden_dll_search();
     // The one place the command line is read.
     let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -26,9 +27,13 @@ fn run(mode: args::Mode) -> ExitCode {
     ExitCode::from(lunepack_service::host::run(mode))
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run(mode: args::Mode) -> ExitCode {
-    // The Linux and macOS hosts come with M11.
+    ExitCode::from(lunepack_service::host_unix::run(mode))
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn run(mode: args::Mode) -> ExitCode {
     let _ = mode;
     println!("lunepack-service: this system has no update service host yet");
     ExitCode::from(exit::USAGE)

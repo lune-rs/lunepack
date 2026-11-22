@@ -11,8 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lunepack_codec_lzma::LzmaCodec;
-use lunepack_core::engine::{Engine, EngineError, Ports, serve};
-use lunepack_core::service::ErrorCode;
+use lunepack_core::engine::{Engine, Ports, serve};
 use lunepack_core::{AppId, Clock, Duplex, ServerSession};
 use lunepack_crypto::{Ed25519Verifier, OsRng, Sha256Hasher};
 use lunepack_fs::StdFs;
@@ -26,7 +25,7 @@ use crate::args::Mode;
 use crate::exit;
 use crate::location::{self, Located};
 use crate::logfile::Log;
-use crate::session::{CONNECTION_LIMIT, Capped, idle_exit};
+use crate::session::{CONNECTION_LIMIT, Capped, engine_code, idle_exit};
 
 /// The name handed to the control manager's dispatcher. The service is registered as an own-process
 /// service, for which the manager ignores the name; the app's own name is read from the machine
@@ -153,18 +152,6 @@ fn service(located: Located) -> u8 {
             exit::USAGE
         }
     }
-}
-
-/// The index of `code` in the protocol's closed set, for the log.
-fn code_number(code: ErrorCode) -> u32 {
-    ErrorCode::ALL
-        .iter()
-        .position(|c| *c == code)
-        .map_or(0, |i| u32::try_from(i).unwrap_or(0))
-}
-
-fn engine_code(e: &EngineError) -> u32 {
-    code_number(e.code)
 }
 
 fn pipe_code(e: &PipeError) -> u32 {

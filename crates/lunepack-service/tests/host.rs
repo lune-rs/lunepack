@@ -335,21 +335,15 @@ fn the_binary_does_nothing_outside_an_install() {
     }
 }
 
-#[cfg(windows)]
 #[test]
 fn outside_an_install_the_binary_exits_with_the_location_code() {
+    // On every OS the image rule is the first thing the binary checks, ahead of any socket, pipe
+    // or log: a build folder is not an install's service folder.
     for args in [&["--self-test"][..], &[]] {
-        assert_eq!(run(args).status.code(), Some(3), "{args:?}");
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(3), "{args:?}");
+        assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{args:?}");
     }
-}
-
-#[cfg(not(windows))]
-#[test]
-fn off_windows_the_binary_says_so_in_one_line() {
-    let out = run(&["--self-test"]);
-    assert_eq!(out.status.code(), Some(2));
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(text.lines().count(), 1, "{text}");
 }
 
 // ---- the crate's own source ----------------------------------------------------------------------
@@ -384,7 +378,7 @@ fn the_source_names_no_impersonation_no_environment_and_no_unsafe() {
         }
         seen += 1;
     }
-    assert!(seen >= 7, "the scan saw the crate's files");
+    assert!(seen >= 8, "the scan saw the crate's files");
 }
 
 // ---- the PE image (Windows) ----------------------------------------------------------------------

@@ -104,10 +104,11 @@ pub const DEPENDS_ONLY_ON: &[(&str, &[&str])] = &[
             "lunepack-os-windows",
         ],
     ),
-    // The update service (M10-D7) runs as LocalSystem and is fed by any local user through one
-    // pipe: the core's engine, the filesystem, the hash and signature adapters, the frame decoder
-    // and the Windows adapters, and no facade, network, UI or packager code. `tracing` and
-    // `anyhow` are the only outside crates it may name.
+    // The update service (M10-D7, M11) runs as LocalSystem or root and is fed by any local user
+    // through one pipe or socket: the core's engine, the filesystem, the hash and signature
+    // adapters, the frame decoder and the Windows, Linux and macOS adapters, and no facade,
+    // network, UI or packager code. `tracing` and `anyhow` are the only outside crates it may
+    // name.
     (
         "lunepack-service",
         &[
@@ -116,6 +117,8 @@ pub const DEPENDS_ONLY_ON: &[(&str, &[&str])] = &[
             "lunepack-crypto",
             "lunepack-codec-lzma",
             "lunepack-os-windows",
+            "lunepack-os-linux",
+            "lunepack-os-macos",
             "tracing",
             "anyhow",
         ],

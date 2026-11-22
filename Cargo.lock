@@ -2278,6 +2278,8 @@ dependencies = [
  "lunepack-core",
  "lunepack-crypto",
  "lunepack-fs",
+ "lunepack-os-linux",
+ "lunepack-os-macos",
  "lunepack-os-windows",
  "lunepack-testkit",
  "tempfile",
