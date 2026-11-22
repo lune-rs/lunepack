@@ -88,6 +88,8 @@ struct Prepared {
     file: String,
     /// The entry's path.
     path: PathBuf,
+    /// The entry's label.
+    label: String,
     /// The entry's bytes, when the app declares autostart (else the entry is removed when ours).
     content: Option<String>,
 }
@@ -102,22 +104,7 @@ impl OsIntegration for MacIntegration {
         scope: Scope,
         req: &IntegrationRequest,
     ) -> Result<IntegrationReport, IntegrationError> {
-        let p = self.prepare(scope, req)?;
-        let mut report = IntegrationReport::default();
-        match &p.content {
-            Some(content) => {
-                ensure_dir(&p.dir)?;
-                let unchanged = match probe(&p.path)? {
-                    Slot::File => read_capped(&p.path).is_ok_and(|b| b == content.as_bytes()),
-                    _ => false,
-                };
-                if !unchanged {
-                    write_atomic(&p.dir, &p.file, content.as_bytes())?;
-                }
-            }
-            None => remove_entry(&p.path, req.app_id.as_str(), &mut report)?,
-        }
-        Ok(report)
+        apply_prepared(self.prepare(scope, req)?)
     }
 
     fn remove(
@@ -129,12 +116,36 @@ impl OsIntegration for MacIntegration {
             return Err(IntegrationError::Unsupported);
         }
         let dir = launch_agents(&self.env)?;
-        let path = dir.join(format!("{}.plist", label_of(req.app_id.as_str())));
-        let mut report = IntegrationReport::default();
-        remove_entry(&path, req.app_id.as_str(), &mut report)?;
-        sync_dir(&dir);
-        Ok(report)
+        remove_in(&dir, &label_of(req.app_id.as_str()))
     }
+}
+
+/// Removes the entry `<label>.plist` in `dir` when it is ours.
+fn remove_in(dir: &Path, label: &str) -> Result<IntegrationReport, IntegrationError> {
+    let path = dir.join(format!("{label}.plist"));
+    let mut report = IntegrationReport::default();
+    remove_entry(&path, label, &mut report)?;
+    sync_dir(dir);
+    Ok(report)
+}
+
+/// `apply` over what a `prepare` resolved.
+fn apply_prepared(p: Prepared) -> Result<IntegrationReport, IntegrationError> {
+    let mut report = IntegrationReport::default();
+    match &p.content {
+        Some(content) => {
+            ensure_dir(&p.dir)?;
+            let unchanged = match probe(&p.path)? {
+                Slot::File => read_capped(&p.path).is_ok_and(|b| b == content.as_bytes()),
+                _ => false,
+            };
+            if !unchanged {
+                write_atomic(&p.dir, &p.file, content.as_bytes())?;
+            }
+        }
+        None => remove_entry(&p.path, &p.label, &mut report)?,
+    }
+    Ok(report)
 }
 
 impl MacIntegration {
@@ -170,6 +181,7 @@ impl MacIntegration {
             dir,
             file,
             path,
+            label,
             content,
         })
     }
@@ -224,7 +236,7 @@ fn text_ok<'a>(text: &'a str, what: &'static str) -> Result<&'a str, Integration
 }
 
 /// XML text: the five markup characters escaped.
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -237,6 +249,30 @@ fn escape(text: &str) -> String {
         }
     }
     out
+}
+
+/// The text [`escape`] wrote back: exactly the five entities it writes are read, and any other
+/// `&` is `None` (not a text this crate wrote).
+pub(crate) fn unescape(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let (entity, c) = [
+            ("&amp;", '&'),
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&quot;", '"'),
+            ("&apos;", '\''),
+        ]
+        .into_iter()
+        .find(|(e, _)| rest.starts_with(e))?;
+        out.push(c);
+        rest = &rest[entity.len()..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// The entry's bytes: fixed layout, tabs for indentation, one trailing newline.
@@ -264,6 +300,110 @@ fn plist_bytes(label: &str, exec: &str, name: &str) -> String {
         exec = escape(exec),
         name = escape(name),
     )
+}
+
+// ---- the per-machine autostart (M11-D12) ----------------------------------------------------
+
+/// The macOS per-machine [`OsIntegration`] (M11-D12), run as root by the engine: the start-at-
+/// sign-in entry for every user, `/Library/LaunchAgents/lunepack-<app id>.autostart.plist`
+/// (label `lunepack-<app id>.autostart`, mode 0644, the per-user entry's bytes), whose program is
+/// `<B>/<install.entry>` with `B` the live bundle `R/bundle` names (the request's install root is
+/// the machine tree `R`). No shortcut: the bundle in the apps folder is the entry. Only an entry
+/// with this label is replaced or removed. Per-user scope is `Unsupported`.
+#[derive(Debug, Clone)]
+pub struct MacMachineIntegration {
+    dir: PathBuf,
+}
+
+impl Default for MacMachineIntegration {
+    fn default() -> Self {
+        MacMachineIntegration::new()
+    }
+}
+
+impl MacMachineIntegration {
+    /// The system's `/Library/LaunchAgents`.
+    pub fn new() -> MacMachineIntegration {
+        MacMachineIntegration::under(Path::new("/"))
+    }
+
+    /// `<prefix>/Library/LaunchAgents` (tests use a scratch directory; `/` is the system).
+    pub fn under(prefix: &Path) -> MacMachineIntegration {
+        MacMachineIntegration {
+            dir: prefix.join("Library").join("LaunchAgents"),
+        }
+    }
+
+    /// The machine label of `app_id`'s entry.
+    pub fn label(app_id: &str) -> String {
+        format!("lunepack-{app_id}.autostart")
+    }
+
+    fn prepare(
+        &self,
+        scope: Scope,
+        req: &IntegrationRequest,
+    ) -> Result<Prepared, IntegrationError> {
+        if scope != Scope::Machine {
+            return Err(IntegrationError::Unsupported);
+        }
+        let root = check_bundle(&req.install_root)?;
+        let label = MacMachineIntegration::label(req.app_id.as_str());
+        let file = format!("{label}.plist");
+        let path = self.dir.join(&file);
+        let name = text_ok(&req.meta.name, "name")?;
+        let content = if req.meta.autostart {
+            // `R/bundle` is an absolute link to the live bundle (FORMAT 17); read, never followed.
+            let bundle = fs::read_link(root.join(lunepack_core::layout::BUNDLE_LINK))
+                .map_err(|_| IntegrationError::Failed("the bundle pointer cannot be read"))?;
+            let bundle = check_bundle(&bundle)?;
+            let exec = bundle.join(req.meta.entry.as_str());
+            let exec = plain_text(&exec, "executable path")?;
+            match probe(&path)? {
+                Slot::Absent => {}
+                Slot::File if is_ours(&path, &label) => {}
+                _ => return Err(IntegrationError::Conflict(IntegrationItem::Autostart)),
+            }
+            Some(plist_bytes(&label, exec, name))
+        } else {
+            None
+        };
+        Ok(Prepared {
+            dir: self.dir.clone(),
+            file,
+            path,
+            label,
+            content,
+        })
+    }
+}
+
+impl OsIntegration for MacMachineIntegration {
+    fn check(&self, scope: Scope, req: &IntegrationRequest) -> Result<(), IntegrationError> {
+        self.prepare(scope, req).map(|_| ())
+    }
+
+    fn apply(
+        &self,
+        scope: Scope,
+        req: &IntegrationRequest,
+    ) -> Result<IntegrationReport, IntegrationError> {
+        apply_prepared(self.prepare(scope, req)?)
+    }
+
+    fn remove(
+        &self,
+        scope: Scope,
+        req: &IntegrationRequest,
+    ) -> Result<IntegrationReport, IntegrationError> {
+        if scope != Scope::Machine {
+            return Err(IntegrationError::Unsupported);
+        }
+        remove_in(
+            &self.dir,
+            &MacMachineIntegration::label(req.app_id.as_str()),
+        )
+    }
 }
 
 // ---- what is at a path ----
@@ -322,12 +462,12 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Removes the entry when it is ours; reports a foreign one as kept; an absent one is fine.
 fn remove_entry(
     path: &Path,
-    app_id: &str,
+    label: &str,
     report: &mut IntegrationReport,
 ) -> Result<(), IntegrationError> {
     match probe(path)? {
         Slot::Absent => {}
-        Slot::File if is_ours(path, &label_of(app_id)) => {
+        Slot::File if is_ours(path, label) => {
             fs::remove_file(path)
                 .map_err(|_| IntegrationError::Failed("the autostart entry was not removed"))?;
         }

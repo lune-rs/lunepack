@@ -5,29 +5,89 @@
 //! `osascript`, M8-D11) and the reduce-motion reader (M6-D8): [`prefers_reduced_motion`] runs `defaults`
 //! (no shell) to read the "Reduce motion" accessibility setting, so the runtime's graph gets no
 //! window-stack library.
+//!
+//! The per-machine ports (M11): [`MacProtect`] (protected directories), [`LaunchdRegistrar`] (the
+//! socket-activated LaunchDaemon), [`ActivatedListener`] and [`UnixConnector`] (the service's
+//! socket, both ends), [`FilePolicy`] (the administrator's policy file), [`MacMachineIntegration`]
+//! (the start-at-sign-in entry for every user) and [`MacElevation`] (the standing; no prompt of
+//! our own, D38 (a)).
 
 #[cfg(any(target_os = "macos", test))]
 mod code_status;
 #[cfg(target_os = "macos")]
 mod integration;
 #[cfg(target_os = "macos")]
+mod launchd;
+#[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub mod libproc;
 #[cfg(target_os = "macos")]
 mod notice;
 #[cfg(target_os = "macos")]
+mod policy;
+#[cfg(target_os = "macos")]
 mod process;
 #[cfg(target_os = "macos")]
+mod protect;
+#[cfg(target_os = "macos")]
 mod publisher;
+#[cfg(target_os = "macos")]
+mod socket;
 
 #[cfg(target_os = "macos")]
-pub use integration::{MacEnv, MacIntegration};
+pub use integration::{MacEnv, MacIntegration, MacMachineIntegration};
+#[cfg(target_os = "macos")]
+pub use launchd::{LAUNCHCTL, LaunchdRegistrar, SELF_TEST_LIMIT, daemon_plist};
 #[cfg(target_os = "macos")]
 pub use notice::{NoticeKind, notice};
 #[cfg(target_os = "macos")]
+pub use policy::{FilePolicy, MAX_POLICY_BYTES, POLICY_DIR};
+#[cfg(target_os = "macos")]
 pub use process::MacProcess;
 #[cfg(target_os = "macos")]
+pub use protect::{MacProtect, class_mode};
+#[cfg(target_os = "macos")]
 pub use publisher::MacPublisherCheck;
+#[cfg(target_os = "macos")]
+pub use socket::{
+    ActivatedListener, ActivationError, CONNECT_RETRY, UnixConnector, UnixDuplex, check_listener,
+    peer_uid,
+};
+
+/// [`Elevation`](lunepack_core::Elevation) on macOS (D38 (a)): the standing from the effective
+/// uid (0 is an administrator's), and no prompt of lunepack's own, so a hand-off is
+/// [`ElevationError::NoAgent`](lunepack_core::ElevationError::NoAgent): the caller shows the
+/// command to run as an administrator, or opens the installer package.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MacElevation;
+
+#[cfg(target_os = "macos")]
+impl lunepack_core::Elevation for MacElevation {
+    fn standing(&self) -> lunepack_core::Standing {
+        if effective_uid() == 0 {
+            lunepack_core::Standing::Admin
+        } else {
+            lunepack_core::Standing::Standard
+        }
+    }
+
+    fn run_elevated(
+        &self,
+        _exe: &std::path::Path,
+        _args: &[String],
+    ) -> Result<lunepack_core::Elevated, lunepack_core::ElevationError> {
+        Err(lunepack_core::ElevationError::NoAgent)
+    }
+}
+
+/// The effective uid of this process.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn effective_uid() -> u32 {
+    // SAFETY: geteuid(2) takes no arguments, cannot fail and touches no memory.
+    unsafe { libc::geteuid() }
+}
 
 use std::io::Read;
 use std::process::{Command, Stdio};

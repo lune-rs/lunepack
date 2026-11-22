@@ -437,7 +437,47 @@ impl Process for MacProcess {
         // The tree as the kernel names it, so the comparison with the kernel's paths is exact.
         let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
         let tree = libproc::kernel_path(&tree).map_err(|e| ProcessError::from_io("in use", e))?;
-        scan(&tree, exclude).map_err(|e| unreadable("in use", e))
+        scan(&RealPids, &tree, exclude, Some(effective_uid())).map_err(|e| unreadable("in use", e))
+    }
+
+    /// Every user's processes (M11-D13 as restated): the per-user scan without its skips of other
+    /// users; M8-D19's rules hold for every uid, and an identity the kernel refuses is a failed
+    /// read, read again, then in use.
+    fn tree_in_use_strict(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
+        let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
+        let tree = libproc::kernel_path(&tree).map_err(|e| ProcessError::from_io("in use", e))?;
+        scan(&RealPids, &tree, exclude, None).map_err(|e| unreadable("in use", e))
+    }
+}
+
+/// The reads the in-use scan makes of one process; [`RealPids`] asks libproc, the tests script
+/// the answers.
+trait PidSource {
+    fn list(&self) -> io::Result<Vec<u32>>;
+    fn info(&self, pid: u32) -> io::Result<Option<libproc::BsdInfo>>;
+    fn exe(&self, pid: u32) -> io::Result<Option<PathBuf>>;
+    fn cwd(&self, pid: u32) -> io::Result<Option<PathBuf>>;
+    fn files(&self, pid: u32) -> io::Result<Vec<PathBuf>>;
+}
+
+/// The kernel's answers.
+struct RealPids;
+
+impl PidSource for RealPids {
+    fn list(&self) -> io::Result<Vec<u32>> {
+        libproc::list_pids()
+    }
+    fn info(&self, pid: u32) -> io::Result<Option<libproc::BsdInfo>> {
+        libproc::bsd_info(pid)
+    }
+    fn exe(&self, pid: u32) -> io::Result<Option<PathBuf>> {
+        libproc::exe_path(pid)
+    }
+    fn cwd(&self, pid: u32) -> io::Result<Option<PathBuf>> {
+        libproc::cwd_path(pid)
+    }
+    fn files(&self, pid: u32) -> io::Result<Vec<PathBuf>> {
+        libproc::fd_paths(pid)
     }
 }
 
@@ -448,8 +488,9 @@ const REREADS: u32 = 3;
 /// troubled process.
 const REREAD_PAUSE: Duration = Duration::from_millis(10);
 
-/// Whether any process of this user other than those in `exclude` has its executable, working
-/// directory or an open file under `tree` (M5-D9, amended on macOS by M8-D19).
+/// Whether any process of `only_uid` (every process for `None`, M11-D13) other than those in
+/// `exclude` has its executable, working directory or an open file under `tree` (M5-D9, amended
+/// on macOS by M8-D19).
 ///
 /// A process of this user that cannot be read counts as in use (fail closed), with two exceptions:
 ///
@@ -465,10 +506,14 @@ const REREAD_PAUSE: Duration = Duration::from_millis(10);
 /// with another start time has ended meanwhile and is not in use; another user's process now is
 /// skipped; one still unreadable after the last re-read is in use. Any error listing the pids
 /// answers an error.
-fn scan(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool> {
-    let my_uid = effective_uid();
-    for pid in libproc::list_pids()? {
-        if listed_uses_tree(pid, tree, my_uid, exclude) {
+fn scan(
+    src: &dyn PidSource,
+    tree: &Path,
+    exclude: &[ProcessId],
+    only_uid: Option<u32>,
+) -> io::Result<bool> {
+    for pid in src.list()? {
+        if listed_uses_tree(src, pid, tree, only_uid, exclude) {
             return Ok(true);
         }
     }
@@ -476,20 +521,29 @@ fn scan(tree: &Path, exclude: &[ProcessId]) -> io::Result<bool> {
 }
 
 /// The in-use answer for one listed pid, with the bounded re-reads of [`scan`].
-fn listed_uses_tree(pid: u32, tree: &Path, my_uid: u32, exclude: &[ProcessId]) -> bool {
+fn listed_uses_tree(
+    src: &dyn PidSource,
+    pid: u32,
+    tree: &Path,
+    only_uid: Option<u32>,
+    exclude: &[ProcessId],
+) -> bool {
     // The start time first read for this pid: a later read naming another is another process.
     let mut start: Option<u64> = None;
     for attempt in 0..=REREADS {
         if attempt > 0 {
             std::thread::sleep(REREAD_PAUSE);
         }
-        let info = match libproc::bsd_info(pid) {
+        let info = match src.info(pid) {
             Ok(Some(info)) => info,
             // Gone: ended meanwhile.
             Ok(None) => return false,
             // Another user's process: the kernel refuses its details to everyone but that user
-            // and root, and it is not ours to scan (`PROC_PIDTBSDINFO` is a same-user call).
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return false,
+            // and root, and the per-user scan does not look at it (`PROC_PIDTBSDINFO` is a
+            // same-user call). The strict scan reads it again, then counts it in use.
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied && only_uid.is_some() => {
+                return false;
+            }
             // Whose process this is cannot be told yet: read it again.
             Err(_) => continue,
         };
@@ -499,7 +553,7 @@ fn listed_uses_tree(pid: u32, tree: &Path, my_uid: u32, exclude: &[ProcessId]) -
             Some(listed) if listed != info.start_micros => return false,
             Some(_) => {}
         }
-        if info.uid != my_uid || info.zombie {
+        if only_uid.is_some_and(|uid| info.uid != uid) || info.zombie {
             return false;
         }
         let id = ProcessId {
@@ -510,9 +564,9 @@ fn listed_uses_tree(pid: u32, tree: &Path, my_uid: u32, exclude: &[ProcessId]) -
             return false;
         }
         match verdict(
-            exe_source(pid, tree),
-            dir_source(libproc::cwd_path(pid), tree),
-            files_source(libproc::fd_paths(pid), tree),
+            exe_source(src.exe(pid), tree),
+            dir_source(src.cwd(pid), tree),
+            files_source(src.files(pid), tree),
         ) {
             Verdict::InUse => return true,
             Verdict::NotInUse => return false,
@@ -579,8 +633,8 @@ fn verdict(exe: Source, cwd: Source, fds: Source) -> Verdict {
 }
 
 /// Source one, the executable path; `Deleted` for `ENOENT`, the one error that is not a failure.
-fn exe_source(pid: u32, tree: &Path) -> Source {
-    match libproc::exe_path(pid) {
+fn exe_source(read: io::Result<Option<PathBuf>>, tree: &Path) -> Source {
+    match read {
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Source::Deleted,
         other => dir_source(other, tree),
     }
@@ -963,6 +1017,170 @@ impl Child for BackgroundApp {
 mod tests {
     use super::Source::{Deleted, Elsewhere, Failed, Refused, Under};
     use super::{Source, Verdict, verdict};
+
+    // ---- the scan over scripted sources (M11-D13) ----------------------------------------------
+
+    use std::cell::RefCell;
+    use std::collections::{HashMap, VecDeque};
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use super::{PidSource, scan};
+    use crate::libproc::BsdInfo;
+
+    const TREE: &str = "/Applications/Hello.app";
+    const ME: u32 = 501;
+    const OTHER: u32 = 502;
+
+    /// One process's scripted reads (an `Err` is its errno).
+    #[derive(Clone)]
+    struct Script {
+        /// Answered in order, the last one repeating.
+        info: VecDeque<Result<u32, i32>>,
+        exe: Result<Option<PathBuf>, i32>,
+        cwd: Result<Option<PathBuf>, i32>,
+        files: Result<Vec<PathBuf>, i32>,
+    }
+
+    fn process(uid: u32, exe: Result<&str, i32>, cwd: Result<&str, i32>) -> Script {
+        Script {
+            info: VecDeque::from([Ok(uid)]),
+            exe: exe.map(|p| Some(PathBuf::from(p))),
+            cwd: cwd.map(|p| Some(PathBuf::from(p))),
+            files: Ok(Vec::new()),
+        }
+    }
+
+    #[derive(Default)]
+    struct FakePids {
+        procs: RefCell<HashMap<u32, Script>>,
+    }
+
+    fn err(errno: i32) -> io::Error {
+        io::Error::from_raw_os_error(errno)
+    }
+
+    impl FakePids {
+        fn with(pids: Vec<(u32, Script)>) -> FakePids {
+            FakePids {
+                procs: RefCell::new(pids.into_iter().collect()),
+            }
+        }
+        fn script(&self, pid: u32) -> Script {
+            self.procs.borrow()[&pid].clone()
+        }
+    }
+
+    impl PidSource for FakePids {
+        fn list(&self) -> io::Result<Vec<u32>> {
+            let mut pids: Vec<u32> = self.procs.borrow().keys().copied().collect();
+            pids.sort_unstable();
+            Ok(pids)
+        }
+        fn info(&self, pid: u32) -> io::Result<Option<BsdInfo>> {
+            let mut procs = self.procs.borrow_mut();
+            let q = &mut procs.get_mut(&pid).unwrap().info;
+            let answer = if q.len() > 1 {
+                q.pop_front().unwrap()
+            } else {
+                *q.front().unwrap()
+            };
+            answer
+                .map(|uid| {
+                    Some(BsdInfo {
+                        ppid: 1,
+                        uid,
+                        start_micros: 7,
+                        zombie: false,
+                    })
+                })
+                .map_err(err)
+        }
+        fn exe(&self, pid: u32) -> io::Result<Option<PathBuf>> {
+            self.script(pid).exe.map_err(err)
+        }
+        fn cwd(&self, pid: u32) -> io::Result<Option<PathBuf>> {
+            self.script(pid).cwd.map_err(err)
+        }
+        fn files(&self, pid: u32) -> io::Result<Vec<PathBuf>> {
+            self.script(pid).files.map_err(err)
+        }
+    }
+
+    fn strict(f: &FakePids) -> bool {
+        scan(f, Path::new(TREE), &[], None).unwrap()
+    }
+
+    fn per_user(f: &FakePids) -> bool {
+        scan(f, Path::new(TREE), &[], Some(ME)).unwrap()
+    }
+
+    const IN_TREE: &str = "/Applications/Hello.app/Contents/MacOS/hello";
+
+    #[test]
+    fn another_users_protected_daemon_is_judged_by_what_is_readable() {
+        let mut daemon = process(OTHER, Ok("/usr/libexec/progressd"), Err(libc::EPERM));
+        daemon.files = Err(libc::EPERM);
+        let f = FakePids::with(vec![(10, daemon.clone())]);
+        assert!(!strict(&f), "executable readable and elsewhere: not in use");
+        daemon.exe = Ok(Some(PathBuf::from(IN_TREE)));
+        let f = FakePids::with(vec![(10, daemon)]);
+        assert!(strict(&f), "executable under the tree: in use");
+        assert!(
+            !per_user(&f),
+            "the per-user scan skips another user's process"
+        );
+    }
+
+    #[test]
+    fn another_users_deleted_executable_is_judged_by_its_directory_and_files() {
+        let deleted = |cwd| process(OTHER, Err(libc::ENOENT), cwd);
+        assert!(!strict(&FakePids::with(vec![(11, deleted(Ok("/tmp")))])));
+        assert!(strict(&FakePids::with(vec![(11, deleted(Ok(TREE)))])));
+        assert!(
+            strict(&FakePids::with(vec![(11, deleted(Err(libc::EPERM)))])),
+            "nothing about it can be told: in use"
+        );
+        let mut open = deleted(Ok("/tmp"));
+        open.files = Ok(vec![PathBuf::from(IN_TREE)]);
+        assert!(strict(&FakePids::with(vec![(11, open)])));
+    }
+
+    #[test]
+    fn a_refused_identity_is_read_again_then_in_use_for_the_strict_scan() {
+        let mut refused = process(OTHER, Ok("/bin/zsh"), Ok("/tmp"));
+        refused.info = VecDeque::from([Err(libc::EPERM)]);
+        let f = FakePids::with(vec![(12, refused.clone())]);
+        assert!(strict(&f), "an identity that keeps failing: in use");
+        assert!(
+            !per_user(&f),
+            "the per-user scan skips it as another user's"
+        );
+        // A refusal that clears on a re-read is judged by what is read then.
+        refused.info = VecDeque::from([Err(libc::EPERM), Ok(OTHER)]);
+        assert!(!strict(&FakePids::with(vec![(12, refused)])));
+        // Any other failed identity read keeps failing: in use for both.
+        let mut failing = process(ME, Ok("/bin/zsh"), Ok("/tmp"));
+        failing.info = VecDeque::from([Err(libc::EIO)]);
+        let f = FakePids::with(vec![(13, failing)]);
+        assert!(strict(&f));
+        assert!(per_user(&f));
+    }
+
+    #[test]
+    fn the_strict_scan_sees_every_user_and_nothing_else_changes() {
+        let f = FakePids::with(vec![
+            (20, process(ME, Ok("/bin/zsh"), Ok("/tmp"))),
+            (21, process(OTHER, Ok("/bin/zsh"), Ok(TREE))),
+        ]);
+        assert!(strict(&f));
+        assert!(!per_user(&f));
+        let f = FakePids::with(vec![
+            (20, process(ME, Ok("/bin/zsh"), Ok("/tmp"))),
+            (21, process(OTHER, Ok("/bin/zsh"), Ok("/Users/other"))),
+        ]);
+        assert!(!strict(&f));
+    }
 
     const ALL: [Source; 5] = [Under, Elsewhere, Refused, Deleted, Failed];
     /// What the kernel can give for the working directory and the open files (`Deleted` is the
