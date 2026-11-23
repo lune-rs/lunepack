@@ -52,7 +52,7 @@ fn choice(kind: PromptKind, flow: Option<Flow>, all_users: bool) -> ChoiceValue 
         PromptKind::Welcome | PromptKind::Confirm => ChoiceValue::Proceed,
         PromptKind::Done if flow == Some(Flow::Uninstall) => ChoiceValue::Close,
         PromptKind::Done => ChoiceValue::Finish { launch: false },
-        PromptKind::Failed => ChoiceValue::Close,
+        PromptKind::Failed | PromptKind::AdminCommand | PromptKind::HandedOff => ChoiceValue::Close,
         PromptKind::RolledBack => ChoiceValue::Acknowledge,
     }
 }

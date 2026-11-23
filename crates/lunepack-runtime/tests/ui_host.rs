@@ -499,7 +499,10 @@ mod native {
                     note("ui got close");
                     std::process::exit(0);
                 }
-                EngineMsg::Step { .. } | EngineMsg::Cancellable(_) => {}
+                EngineMsg::Step { .. }
+                | EngineMsg::Cancellable(_)
+                | EngineMsg::AdminCommand { .. }
+                | EngineMsg::HandedOffToInstaller => {}
             }
         }
     }

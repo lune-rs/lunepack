@@ -93,6 +93,7 @@ pub const HARNESSES: &[(&str, Harness)] = &[
     ("update_config", update_config),
     ("setup", setup),
     ("service", service),
+    ("ui", ui),
 ];
 
 /// Runs the harness `name` and reports whether `data` got all the way through it (`None`: no such
@@ -114,6 +115,7 @@ pub fn accepts(name: &str, data: &[u8]) -> Option<bool> {
         "update_config" => crate::update_config::fuzz_run(data),
         "setup" => setup_run(data),
         "service" => crate::service::fuzz_run(data),
+        "ui" => crate::ui::fuzz_run(data),
         _ => return None,
     })
 }
@@ -228,6 +230,14 @@ pub fn setup(data: &[u8]) {
 /// Accepted: every frame was valid and the stream ended on a frame boundary.
 pub fn service(data: &[u8]) {
     let _ = crate::service::fuzz_run(data);
+}
+
+/// `data` as the frames of the UI protocol (M6-D2, M11 step 8): the first byte selects the direction
+/// (even: the engine's frames, decoded and applied to a reducer; odd: the UI's frames, decoded and
+/// checked against a reducer at its welcome prompt), the rest is the byte stream. Accepted: every
+/// frame was valid and the stream ended on a frame boundary.
+pub fn ui(data: &[u8]) {
+    let _ = crate::ui::fuzz_run(data);
 }
 
 // ---- scaffolding: fake hasher, fake signatures, clock, codec -------------------------------------

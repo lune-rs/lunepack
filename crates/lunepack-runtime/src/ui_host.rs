@@ -861,7 +861,13 @@ impl UiHost {
                     }
                 }
                 Ok((_, value)) => {
-                    if matches!(kind, PromptKind::Done | PromptKind::Failed) {
+                    if matches!(
+                        kind,
+                        PromptKind::Done
+                            | PromptKind::Failed
+                            | PromptKind::AdminCommand
+                            | PromptKind::HandedOff
+                    ) {
                         self.outcome_acknowledged.store(true, Ordering::Release);
                     }
                     return value;
@@ -964,7 +970,10 @@ pub fn headless_answer(kind: PromptKind, flow: Flow) -> ChoiceValue {
     match kind {
         PromptKind::Welcome | PromptKind::Confirm => ChoiceValue::Proceed,
         PromptKind::Done if flow == Flow::Install => ChoiceValue::Finish { launch: false },
-        PromptKind::Done | PromptKind::Failed => ChoiceValue::Close,
+        PromptKind::Done
+        | PromptKind::Failed
+        | PromptKind::AdminCommand
+        | PromptKind::HandedOff => ChoiceValue::Close,
         PromptKind::RolledBack => ChoiceValue::Acknowledge,
     }
 }

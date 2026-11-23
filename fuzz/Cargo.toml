@@ -123,3 +123,10 @@ path = "fuzz_targets/service.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ui"
+path = "fuzz_targets/ui.rs"
+test = false
+doc = false
+bench = false

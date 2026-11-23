@@ -6,9 +6,9 @@ use std::io::{Cursor, ErrorKind, Read};
 
 use lunepack_core::progress::Phase;
 use lunepack_core::ui::{
-    AppCard, ChoiceValue, Details, EngineMsg, Flow, FlowState, MAX_FRAME, MAX_ICON_BYTES, Message,
-    Outcome, PromptKind, ProtocolError, Screen, StepItem, UiMsg, build_id, check_hello, read_frame,
-    write_frame,
+    AppCard, ChoiceValue, Details, EngineMsg, Flow, FlowState, MAX_ADMIN_COMMAND, MAX_FRAME,
+    MAX_ICON_BYTES, Message, Outcome, PromptKind, ProtocolError, Screen, StepItem, UiMsg, build_id,
+    check_hello, read_frame, write_frame,
 };
 
 fn card() -> AppCard {
@@ -123,9 +123,18 @@ fn every_engine_message_round_trips() {
         PromptKind::Done,
         PromptKind::Failed,
         PromptKind::RolledBack,
+        PromptKind::AdminCommand,
+        PromptKind::HandedOff,
     ] {
         msgs.push(EngineMsg::Prompt { id: 7, kind });
     }
+    msgs.push(EngineMsg::AdminCommand {
+        command: "sudo '/home/alice/It'\\''s here/setup' --all-users".into(),
+    });
+    msgs.push(EngineMsg::AdminCommand {
+        command: "sudo '/opt/\u{00e9}t\u{00e9}/runtime' uninstall".into(),
+    });
+    msgs.push(EngineMsg::HandedOffToInstaller);
     msgs.push(EngineMsg::Cancellable(true));
     msgs.push(EngineMsg::Cancellable(false));
     for outcome in [
@@ -1440,4 +1449,246 @@ fn the_ui_hello_is_not_a_reducer_message() {
     assert!(!FlowState::new().accepts(&UiMsg::Hello {
         build_id: build_id()
     }));
+}
+
+// ---- the administrator command and the hand-off to the installer (M11 step 8) ----
+
+fn admin(command: &str) -> EngineMsg {
+    EngineMsg::AdminCommand {
+        command: command.to_owned(),
+    }
+}
+
+/// A run that reached the installing (or removing) screen.
+fn running(flow: Flow) -> FlowState {
+    let mut st = started(flow);
+    let kind = if flow == Flow::Install {
+        PromptKind::Welcome
+    } else {
+        PromptKind::Confirm
+    };
+    prompt(&mut st, 1, kind);
+    st.answer(&choice(1, ChoiceValue::Proceed)).unwrap();
+    st
+}
+
+#[test]
+fn the_wire_form_of_the_two_events_is_fixed() {
+    assert_eq!(
+        read_engine(&frame(
+            r#"{"v":1,"type":"admin_command","command":"sudo '/a' --all-users"}"#
+        )),
+        Ok(admin("sudo '/a' --all-users"))
+    );
+    assert_eq!(
+        read_engine(&frame(r#"{"v":1,"type":"handed_off_to_installer"}"#)),
+        Ok(EngineMsg::HandedOffToInstaller)
+    );
+    for (kind, name) in [
+        (PromptKind::AdminCommand, "admin_command"),
+        (PromptKind::HandedOff, "handed_off"),
+    ] {
+        assert_eq!(
+            read_engine(&frame(&format!(
+                r#"{{"v":1,"type":"prompt","id":3,"kind":"{name}"}}"#
+            ))),
+            Ok(EngineMsg::Prompt { id: 3, kind })
+        );
+    }
+    // Closed shapes: a missing, an extra or a mistyped member, and the events are the engine's only.
+    for (body, err) in [
+        (
+            r#"{"v":1,"type":"admin_command"}"#,
+            ProtocolError::MissingField("command"),
+        ),
+        (
+            r#"{"v":1,"type":"admin_command","command":"x","y":1}"#,
+            ProtocolError::ExtraField,
+        ),
+        (
+            r#"{"v":1,"type":"admin_command","command":5}"#,
+            ProtocolError::WrongType("command"),
+        ),
+        (
+            r#"{"v":1,"type":"handed_off_to_installer","command":"x"}"#,
+            ProtocolError::ExtraField,
+        ),
+    ] {
+        assert_eq!(read_engine(&frame(body)), Err(err), "{body}");
+    }
+    assert_eq!(
+        read_ui(&frame(r#"{"v":1,"type":"handed_off_to_installer"}"#)),
+        Err(ProtocolError::UnknownType)
+    );
+}
+
+#[test]
+fn the_command_is_capped_and_must_be_printable_at_encode_and_at_decode() {
+    // The cap is in bytes: exactly the cap passes, one more is refused, both ways.
+    let at_cap = "a".repeat(MAX_ADMIN_COMMAND);
+    round_trip_engine(&admin(&at_cap));
+    let over = "a".repeat(MAX_ADMIN_COMMAND + 1);
+    let too_long = ProtocolError::TooLong {
+        what: "administrator command",
+        cap: MAX_ADMIN_COMMAND,
+    };
+    let mut wire = Vec::new();
+    assert_eq!(write_frame(&mut wire, &admin(&over)), Err(too_long.clone()));
+    assert!(wire.is_empty(), "nothing is written for a refused message");
+    let body = format!(r#"{{"v":1,"type":"admin_command","command":"{over}"}}"#);
+    assert_eq!(read_engine(&frame(&body)), Err(too_long));
+    // Two-byte scalars count by bytes: 513 of them are 1026 bytes.
+    assert!(matches!(
+        write_frame(&mut Vec::new(), &admin(&"\u{00e9}".repeat(513))),
+        Err(ProtocolError::TooLong { .. })
+    ));
+
+    // Empty, control characters (newline, tab, NUL, ESC, DEL, a C1 control), a space that is not
+    // U+0020 and invisible or reordering characters are refused.
+    let bad = [
+        "",
+        "sudo x\n",
+        "a\nb",
+        "a\tb",
+        "a\u{0}b",
+        "a\u{1b}[2Jb",
+        "a\u{7f}b",
+        "a\u{85}b",
+        "a\u{a0}b",
+        "a\u{2028}b",
+        "a\u{2003}b",
+        "a\u{200b}b",
+        "a\u{200e}b",
+        "a\u{202e}b",
+        "a\u{2066}b",
+        "a\u{feff}b",
+        "a\u{ad}b",
+        "a\u{e0041}b",
+    ];
+    for command in bad {
+        assert_eq!(
+            write_frame(&mut Vec::new(), &admin(command)),
+            Err(ProtocolError::BadText("command")),
+            "encode {command:?}"
+        );
+        // The same on the way in: the JSON text escapes what a literal cannot carry.
+        let json = serde_json::to_string(command).unwrap();
+        let body = format!(r#"{{"v":1,"type":"admin_command","command":{json}}}"#);
+        assert_eq!(
+            read_engine(&frame(&body)),
+            Err(ProtocolError::BadText("command")),
+            "decode {command:?}"
+        );
+    }
+    // Spaces, quotes, an escape and non-ASCII letters are text.
+    round_trip_engine(&admin(
+        "sudo '/home/\u{e9}l\u{e8}ve/It'\\''s a dir/x' --all-users",
+    ));
+}
+
+#[test]
+fn the_command_screen_follows_the_run_and_waits_for_close() {
+    for flow in [Flow::Install, Flow::Uninstall] {
+        let mut st = running(flow);
+        st.apply(&EngineMsg::Cancellable(true)).unwrap();
+        assert!(st.cancellable());
+        st.apply(&admin("sudo '/x' --all-users")).unwrap();
+        assert_eq!(st.screen(), Screen::AdminCommand);
+        assert!(!st.cancellable(), "the hand-off ends cancelling");
+        assert!(!st.accepts(&UiMsg::Cancel));
+        // Nothing but the prompt, the ping and the close.
+        for msg in [
+            progress(Phase::Stage),
+            progress(Phase::Uninstall),
+            step(StepItem::Verify),
+            step(StepItem::Remove),
+            EngineMsg::Cancellable(true),
+            EngineMsg::Outcome(Outcome::Installed),
+            EngineMsg::Outcome(Outcome::Failed { code: 1 }),
+            EngineMsg::Outcome(Outcome::UninstallFailed { code: 1 }),
+            EngineMsg::Outcome(Outcome::Cancelled),
+            admin("sudo '/y'"),
+            EngineMsg::HandedOffToInstaller,
+            EngineMsg::Prompt {
+                id: 2,
+                kind: PromptKind::Failed,
+            },
+            EngineMsg::Prompt {
+                id: 2,
+                kind: PromptKind::HandedOff,
+            },
+        ] {
+            refuses(&st, &msg);
+        }
+        prompt(&mut st, 2, PromptKind::AdminCommand);
+        for value in [
+            ChoiceValue::Proceed,
+            ChoiceValue::ProceedAllUsers,
+            ChoiceValue::Cancel,
+            ChoiceValue::Retry,
+            ChoiceValue::Acknowledge,
+            ChoiceValue::Finish { launch: false },
+            ChoiceValue::Reveal { index: 0 },
+        ] {
+            assert!(!st.accepts(&choice(2, value)), "{value:?}");
+        }
+        assert!(!st.accepts(&choice(1, ChoiceValue::Close)), "an old id");
+        assert!(st.accepts(&choice(2, ChoiceValue::Close)));
+        st.answer(&choice(2, ChoiceValue::Close)).unwrap();
+        st.apply(&EngineMsg::Close).unwrap();
+        assert_eq!(st.screen(), Screen::Closed);
+    }
+}
+
+#[test]
+fn the_hand_off_screen_is_the_install_flows_only() {
+    let mut st = running(Flow::Install);
+    st.apply(&EngineMsg::HandedOffToInstaller).unwrap();
+    assert_eq!(st.screen(), Screen::HandedOff);
+    refuses(&st, &EngineMsg::HandedOffToInstaller);
+    refuses(&st, &admin("sudo '/x'"));
+    refuses(&st, &progress(Phase::Stage));
+    prompt(&mut st, 2, PromptKind::HandedOff);
+    assert!(st.accepts(&choice(2, ChoiceValue::Close)));
+    assert!(!st.accepts(&choice(2, ChoiceValue::Finish { launch: true })));
+    st.answer(&choice(2, ChoiceValue::Close)).unwrap();
+    st.apply(&EngineMsg::Close).unwrap();
+
+    // The uninstall flow has no installer to continue in; the update window has neither screen.
+    refuses(&running(Flow::Uninstall), &EngineMsg::HandedOffToInstaller);
+    let mut up = started(Flow::Update);
+    up.apply(&progress(Phase::Apply)).unwrap();
+    refuses(&up, &EngineMsg::HandedOffToInstaller);
+    refuses(&up, &admin("sudo '/x'"));
+}
+
+#[test]
+fn the_events_need_a_running_operation_with_no_prompt_open() {
+    // At the welcome and the confirm screens nothing runs yet.
+    for flow in [Flow::Install, Flow::Uninstall] {
+        let mut st = started(flow);
+        refuses(&st, &admin("sudo '/x'"));
+        refuses(&st, &EngineMsg::HandedOffToInstaller);
+        let kind = if flow == Flow::Install {
+            PromptKind::Welcome
+        } else {
+            PromptKind::Confirm
+        };
+        prompt(&mut st, 1, kind);
+        refuses(&st, &admin("sudo '/x'"));
+        refuses(&st, &EngineMsg::HandedOffToInstaller);
+    }
+    // After an outcome, and before the hello.
+    let mut st = running(Flow::Install);
+    st.apply(&EngineMsg::Outcome(Outcome::Failed { code: 9 }))
+        .unwrap();
+    refuses(&st, &admin("sudo '/x'"));
+    refuses(&st, &EngineMsg::HandedOffToInstaller);
+    refuses(&FlowState::new(), &admin("sudo '/x'"));
+    refuses(&FlowState::new(), &EngineMsg::HandedOffToInstaller);
+    // The prompts of the two screens fit no other screen.
+    let st = running(Flow::Install);
+    for kind in [PromptKind::AdminCommand, PromptKind::HandedOff] {
+        refuses(&st, &EngineMsg::Prompt { id: 2, kind });
+    }
 }

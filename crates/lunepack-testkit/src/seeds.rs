@@ -87,6 +87,7 @@ pub fn fuzz_seeds() -> Vec<Seed> {
     update_config_seeds(&mut out);
     setup_seeds(&fx, &mut out);
     service_seeds(&mut out);
+    ui_seeds(&mut out);
     out.0
 }
 
@@ -1617,4 +1618,223 @@ fn service_seeds(out: &mut Out) {
     );
     out.bad("service", "client-data-frame", client_stream(&[data(1, 0)]));
     out.bad("service", "empty", Vec::new());
+}
+
+// ---- UI protocol (M6-D2, M11 step 8) -------------------------------------------------------------
+
+fn ui_stream<M: lunepack_core::ui::Message>(side: u8, msgs: &[M]) -> Vec<u8> {
+    let mut out = vec![side];
+    for m in msgs {
+        lunepack_core::ui::write_frame(&mut out, m).expect("a message within its caps");
+    }
+    out
+}
+
+/// A frame whose body is `body` as it is (what the writer would refuse to make).
+fn ui_raw(body: &str) -> Vec<u8> {
+    let mut out = vec![0u8];
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(body.as_bytes());
+    out
+}
+
+fn ui_seeds(out: &mut Out) {
+    use lunepack_core::ui::{
+        AppCard, ChoiceValue, Details, EngineMsg, Flow, MAX_ADMIN_COMMAND, Outcome, PromptKind,
+        StepItem, UiMsg, build_id,
+    };
+    let hello = |flow: Flow| EngineMsg::Hello {
+        build_id: build_id(),
+        flow,
+        app: AppCard {
+            name: "Example".into(),
+            version: "1.0.0".into(),
+            from_version: None,
+            publisher: None,
+            icon_png: None,
+        },
+        details: Details {
+            location: Some("/home/u/.local/share/Example".into()),
+            size_bytes: Some(1_000_000),
+            all_users_location: (flow == Flow::Install).then(|| "/opt/Example".into()),
+        },
+    };
+    let prompt = |id, kind| EngineMsg::Prompt { id, kind };
+    let command = |c: &str| EngineMsg::AdminCommand { command: c.into() };
+
+    out.ok(
+        "ui",
+        "engine-install-done",
+        ui_stream(
+            0,
+            &[
+                hello(Flow::Install),
+                prompt(1, PromptKind::Welcome),
+                EngineMsg::Step {
+                    item: StepItem::Verify,
+                },
+                EngineMsg::Outcome(Outcome::Installed),
+                prompt(2, PromptKind::Done),
+                EngineMsg::Close,
+            ],
+        ),
+    );
+    out.ok(
+        "ui",
+        "engine-install-admin-command",
+        ui_stream(
+            0,
+            &[
+                hello(Flow::Install),
+                prompt(1, PromptKind::Welcome),
+                command("sudo '/home/alice/Example-setup' --all-users"),
+                prompt(2, PromptKind::AdminCommand),
+                EngineMsg::Close,
+            ],
+        ),
+    );
+    out.ok(
+        "ui",
+        "engine-install-admin-command-at-cap",
+        ui_stream(
+            0,
+            &[
+                hello(Flow::Install),
+                prompt(1, PromptKind::Welcome),
+                command(&"a".repeat(MAX_ADMIN_COMMAND)),
+                prompt(2, PromptKind::AdminCommand),
+            ],
+        ),
+    );
+    out.ok(
+        "ui",
+        "engine-uninstall-admin-command",
+        ui_stream(
+            0,
+            &[
+                hello(Flow::Uninstall),
+                prompt(1, PromptKind::Confirm),
+                command("sudo '/opt/example/app/1.0.0/lunepack-runtime' uninstall"),
+                prompt(2, PromptKind::AdminCommand),
+                EngineMsg::Close,
+            ],
+        ),
+    );
+    out.ok(
+        "ui",
+        "engine-install-handed-off",
+        ui_stream(
+            0,
+            &[
+                hello(Flow::Install),
+                prompt(1, PromptKind::Welcome),
+                EngineMsg::HandedOffToInstaller,
+                prompt(2, PromptKind::HandedOff),
+                EngineMsg::Close,
+            ],
+        ),
+    );
+    out.ok(
+        "ui",
+        "ui-choices",
+        ui_stream(
+            1,
+            &[
+                UiMsg::Choice {
+                    id: 1,
+                    value: ChoiceValue::ProceedAllUsers,
+                },
+                UiMsg::Choice {
+                    id: 2,
+                    value: ChoiceValue::Close,
+                },
+                UiMsg::Cancel,
+                UiMsg::Pong { n: 1 },
+            ],
+        ),
+    );
+
+    // The command's own refusals: over the cap by one byte, empty, a newline, an escape sequence,
+    // a direction override, and the event in a flow or a state that has no such screen.
+    let raw_command = |c: &str| {
+        ui_raw(&format!(
+            r#"{{"v":1,"type":"admin_command","command":{}}}"#,
+            serde_json::to_string(c).expect("json text")
+        ))
+    };
+    out.bad(
+        "ui",
+        "admin-command-over-cap",
+        raw_command(&"a".repeat(MAX_ADMIN_COMMAND + 1)),
+    );
+    out.bad("ui", "admin-command-empty", raw_command(""));
+    out.bad(
+        "ui",
+        "admin-command-newline",
+        raw_command("sudo x\nrm -rf /"),
+    );
+    out.bad(
+        "ui",
+        "admin-command-escape",
+        raw_command("sudo \u{1b}[2J x"),
+    );
+    out.bad(
+        "ui",
+        "admin-command-override",
+        raw_command("sudo \u{202e}x"),
+    );
+    out.bad(
+        "ui",
+        "admin-command-extra-field",
+        ui_raw(r#"{"v":1,"type":"admin_command","command":"sudo x","run":true}"#),
+    );
+    out.bad(
+        "ui",
+        "handed-off-with-a-member",
+        ui_raw(r#"{"v":1,"type":"handed_off_to_installer","command":"x"}"#),
+    );
+    out.bad(
+        "ui",
+        "admin-command-before-hello",
+        ui_stream(0, &[command("sudo x")]),
+    );
+    out.bad(
+        "ui",
+        "admin-command-at-the-welcome-prompt",
+        ui_stream(
+            0,
+            &[hello(Flow::Install), prompt(1, PromptKind::AdminCommand)],
+        ),
+    );
+    out.bad(
+        "ui",
+        "handed-off-in-the-uninstall-flow",
+        ui_stream(
+            0,
+            &[
+                hello(Flow::Uninstall),
+                prompt(1, PromptKind::Confirm),
+                EngineMsg::HandedOffToInstaller,
+            ],
+        ),
+    );
+    out.bad(
+        "ui",
+        "outcome-after-admin-command",
+        ui_stream(
+            0,
+            &[
+                hello(Flow::Install),
+                prompt(1, PromptKind::Welcome),
+                command("sudo x"),
+                EngineMsg::Outcome(Outcome::Installed),
+            ],
+        ),
+    );
+    out.bad("ui", "truncated-frame", {
+        let mut v = ui_stream(0, &[hello(Flow::Install)]);
+        v.pop();
+        v
+    });
+    out.bad("ui", "empty", Vec::new());
 }

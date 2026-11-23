@@ -40,6 +40,8 @@ pub const MAX_LEFTOVERS: usize = 64;
 pub const MAX_LEFTOVER: usize = 4096;
 /// Longest build id in bytes.
 pub const MAX_BUILD_ID: usize = 256;
+/// Longest administrator command in bytes (M11-D9, D14: `sudo '<path>' ...`).
+pub const MAX_ADMIN_COMMAND: usize = 1024;
 
 /// The build id of this build: [`BUILD_ID`], plus `.<id>` when the release build sets
 /// `LUNEPACK_BUILD_ID` while compiling the core (M13).
@@ -103,6 +105,10 @@ pub enum ProtocolError {
     /// A name is not in the closed set for this field.
     #[error("field `{0}` has an unknown value")]
     UnknownValue(&'static str),
+    /// A text holds a control character, an invisible or direction-changing character, or a space
+    /// other than U+0020, or is empty (a field that is shown to a person to copy and run).
+    #[error("field `{0}` is empty or holds a character that is not printable")]
+    BadText(&'static str),
     /// A string or list is over its cap.
     #[error("{what} is over its cap of {cap}")]
     TooLong {
@@ -224,6 +230,12 @@ pub enum PromptKind {
     Failed,
     /// Update: acknowledge that the previous version was restored.
     RolledBack,
+    /// Install and uninstall: close the screen that shows the administrator command
+    /// ([`EngineMsg::AdminCommand`]).
+    AdminCommand,
+    /// Install: close the screen that says to continue in Installer
+    /// ([`EngineMsg::HandedOffToInstaller`]).
+    HandedOff,
 }
 
 /// An answer to a prompt.
@@ -324,6 +336,18 @@ pub enum EngineMsg {
     },
     /// Whether the user may cancel the running operation now.
     Cancellable(bool),
+    /// The operation needs an administrator and no prompt of ours can ask for one: show this
+    /// command to run in a terminal as one (M11-D9, D14). Valid while an install or an uninstall
+    /// runs; the screen then asks [`PromptKind::AdminCommand`] and the operation is over for the UI.
+    /// The command is shown as it is, selectable and copyable, and never run by the UI.
+    AdminCommand {
+        /// The text the engine built: at most [`MAX_ADMIN_COMMAND`] bytes, not empty, printable.
+        command: String,
+    },
+    /// The operation was handed to the operating system's installer (the macOS `.pkg`, M11-D8):
+    /// the window says to continue there. Valid while an install runs; the screen then asks
+    /// [`PromptKind::HandedOff`].
+    HandedOffToInstaller,
     /// The operation ended.
     Outcome(Outcome),
     /// A liveness probe; the UI answers with `Pong` of the same `n`.
@@ -375,6 +399,29 @@ fn check_bytes(text: &str, what: &'static str, cap: usize) -> Result<(), Protoco
         Ok(())
     } else {
         Err(ProtocolError::TooLong { what, cap })
+    }
+}
+
+/// Whether `c` may not appear in a text a person copies into a terminal as an administrator: a
+/// control character (newline and tab included), a space other than U+0020, or a character that
+/// is invisible or reorders the text it sits in (zero-width and direction marks and overrides,
+/// the BOM, the soft hyphen), any of which could make the screen show something else than what
+/// would run.
+fn hides_text(c: char) -> bool {
+    c.is_control()
+        || (c.is_whitespace() && c != ' ')
+        || matches!(c,
+            '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}')
+}
+
+/// `text` is not empty and holds no character that [`hides_text`] names.
+fn check_printable(text: &str, what: &'static str) -> Result<(), ProtocolError> {
+    if text.is_empty() || text.chars().any(hides_text) {
+        Err(ProtocolError::BadText(what))
+    } else {
+        Ok(())
     }
 }
 
@@ -442,9 +489,14 @@ fn validate_engine(msg: &EngineMsg) -> Result<(), ProtocolError> {
                 check_bytes(path, "leftover", MAX_LEFTOVER)?;
             }
         }
+        EngineMsg::AdminCommand { command } => {
+            check_bytes(command, "administrator command", MAX_ADMIN_COMMAND)?;
+            check_printable(command, "command")?;
+        }
         EngineMsg::Step { .. }
         | EngineMsg::Prompt { .. }
         | EngineMsg::Cancellable(_)
+        | EngineMsg::HandedOffToInstaller
         | EngineMsg::Outcome(_)
         | EngineMsg::Ping { .. }
         | EngineMsg::Close => {}
@@ -486,6 +538,8 @@ const PROMPTS: &[(&str, PromptKind)] = &[
     ("done", PromptKind::Done),
     ("failed", PromptKind::Failed),
     ("rolled_back", PromptKind::RolledBack),
+    ("admin_command", PromptKind::AdminCommand),
+    ("handed_off", PromptKind::HandedOff),
 ];
 
 /// Phase names, as the runtime's JSON writes them (`events.rs`); `Phase` carries no serde.
@@ -777,6 +831,11 @@ impl Message for EngineMsg {
                 m = base("outcome");
                 outcome_json(&mut m, outcome);
             }
+            EngineMsg::AdminCommand { command } => {
+                m = base("admin_command");
+                m.insert("command".into(), Value::from(command.as_str()));
+            }
+            EngineMsg::HandedOffToInstaller => m = base("handed_off_to_installer"),
             EngineMsg::Ping { n } => {
                 m = base("ping");
                 m.insert("n".into(), Value::from(*n));
@@ -840,6 +899,10 @@ impl Message for EngineMsg {
             },
             "cancellable" => EngineMsg::Cancellable(f.boolean("value")?),
             "outcome" => EngineMsg::Outcome(read_outcome(&mut f)?),
+            "admin_command" => EngineMsg::AdminCommand {
+                command: f.string("command")?,
+            },
+            "handed_off_to_installer" => EngineMsg::HandedOffToInstaller,
             "ping" => EngineMsg::Ping { n: f.u32("n")? },
             "close" => EngineMsg::Close,
             _ => return Err(ProtocolError::UnknownType),
@@ -1005,6 +1068,10 @@ pub enum Screen {
     UninstallDone,
     /// Uninstall: failed.
     UninstallFailed,
+    /// Install and uninstall: the command to run as an administrator ([`EngineMsg::AdminCommand`]).
+    AdminCommand,
+    /// Install: continue in the operating system's installer ([`EngineMsg::HandedOffToInstaller`]).
+    HandedOff,
     /// The window is closed.
     Closed,
 }
@@ -1041,6 +1108,11 @@ struct OpenPrompt {
 /// - Uninstall: the confirm prompt; removing; `Uninstalled` and the done prompt (`close`, or
 ///   `reveal` of a leftover the outcome listed) or `UninstallFailed` and the failed prompt.
 ///
+/// - Install and uninstall, while running: `AdminCommand` (the screen of the command to run as an
+///   administrator; an uninstall too) and, install only, `HandedOffToInstaller`. Each ends the
+///   operation for the UI: the matching prompt (`close`) is the only thing that follows, then
+///   `Close`; no progress, step, outcome or `Cancellable` is accepted after it.
+///
 /// `Ping` is valid in every state after the hello and changes no screen. A cancel before an
 /// outcome (the `cancel` choice of a prompt, or `Cancel` while cancellable) is the only way
 /// `Cancelled` can follow.
@@ -1058,6 +1130,9 @@ pub struct FlowState {
     outcome: Option<Outcome>,
     leftovers: usize,
     all_users_offered: bool,
+    /// An [`EngineMsg::AdminCommand`] or [`EngineMsg::HandedOffToInstaller`] was applied: the
+    /// operation is over for the UI, which only waits for the close.
+    handed_off: bool,
 }
 
 impl Default for FlowState {
@@ -1086,6 +1161,7 @@ impl FlowState {
             outcome: None,
             leftovers: 0,
             all_users_offered: false,
+            handed_off: false,
         }
     }
 
@@ -1114,7 +1190,7 @@ impl FlowState {
 
     /// Whether a `Cancel` is accepted now.
     pub fn cancellable(&self) -> bool {
-        self.cancellable && self.outcome.is_none() && self.flow.is_some()
+        self.cancellable && self.outcome.is_none() && !self.handed_off && self.flow.is_some()
     }
 
     /// Whether the hello offered the all-users install (an install flow with a
@@ -1145,6 +1221,10 @@ impl FlowState {
             }
             (Flow::Install, Screen::InstallDone) => Some(PromptKind::Done),
             (Flow::Install, Screen::InstallFailed) => Some(PromptKind::Failed),
+            (Flow::Install | Flow::Uninstall, Screen::AdminCommand) => {
+                Some(PromptKind::AdminCommand)
+            }
+            (Flow::Install, Screen::HandedOff) => Some(PromptKind::HandedOff),
             (Flow::Update, Screen::UpdateRolledBack) => Some(PromptKind::RolledBack),
             (Flow::Update, Screen::UpdateFailed) => Some(PromptKind::Failed),
             (Flow::Uninstall, Screen::UninstallConfirm) if self.outcome.is_none() => {
@@ -1193,7 +1273,7 @@ impl FlowState {
                 Ok(())
             }
             EngineMsg::Cancellable(on) => {
-                if self.outcome.is_some() {
+                if self.outcome.is_some() || self.handed_off {
                     return out_of_order("cancellable after the outcome");
                 }
                 self.cancellable = *on;
@@ -1231,8 +1311,32 @@ impl FlowState {
                 });
                 Ok(())
             }
+            EngineMsg::AdminCommand { .. } => {
+                if flow == Flow::Update {
+                    return out_of_order("an administrator command in the update flow");
+                }
+                self.hand_off(Screen::AdminCommand)
+            }
+            EngineMsg::HandedOffToInstaller => {
+                if flow != Flow::Install {
+                    return out_of_order("a hand-off to the installer outside the install flow");
+                }
+                self.hand_off(Screen::HandedOff)
+            }
             EngineMsg::Outcome(outcome) => self.finish_with(flow, outcome),
         }
+    }
+
+    /// The operation goes on elsewhere: only while it runs with no prompt open, and then only
+    /// the prompt of `screen` and the close follow.
+    fn hand_off(&mut self, screen: Screen) -> Result<(), ProtocolError> {
+        if !self.is_running() {
+            return out_of_order("a hand-off while not running");
+        }
+        self.handed_off = true;
+        self.cancellable = false;
+        self.set_screen(screen);
+        Ok(())
     }
 
     fn progress(&mut self, flow: Flow, phase: Phase) -> Result<(), ProtocolError> {
@@ -1271,7 +1375,7 @@ impl FlowState {
     }
 
     fn finish_with(&mut self, flow: Flow, outcome: &Outcome) -> Result<(), ProtocolError> {
-        if self.outcome.is_some() || self.prompt.is_some() {
+        if self.outcome.is_some() || self.prompt.is_some() || self.handed_off {
             return out_of_order("an outcome after one, or with a prompt open");
         }
         let screen = match (flow, outcome) {
@@ -1347,6 +1451,8 @@ impl FlowState {
             }
             (Flow::Uninstall | Flow::Update, PromptKind::Failed, C::Close) => true,
             (Flow::Update, PromptKind::RolledBack, C::Acknowledge) => true,
+            (Flow::Install | Flow::Uninstall, PromptKind::AdminCommand, C::Close) => true,
+            (Flow::Install, PromptKind::HandedOff, C::Close) => true,
             _ => false,
         }
     }
@@ -1392,6 +1498,76 @@ impl FlowState {
             },
         }
         Ok(())
+    }
+}
+
+/// The fuzz harness over the UI frames (`fuzz::ui`): the first byte selects the direction (even: the
+/// engine's frames, read by a UI and applied to a reducer that answers its prompts; odd: the UI's frames, read by the engine
+/// and checked against a reducer that is at its welcome prompt), the rest is the byte stream.
+/// Accepted: every frame decoded (and applied) and the stream ended on a frame boundary.
+pub(crate) fn fuzz_run(data: &[u8]) -> bool {
+    let Some((side, rest)) = data.split_first() else {
+        return false;
+    };
+    let mut input = std::io::Cursor::new(rest);
+    if side % 2 == 0 {
+        let mut state = FlowState::new();
+        loop {
+            match read_frame::<_, EngineMsg>(&mut input) {
+                Ok(msg) => {
+                    if state.apply(&msg).is_err() {
+                        return false;
+                    }
+                    // A UI that answers every prompt with its first fitting choice, so the
+                    // frames after a prompt reach the states behind it.
+                    if let Some((id, _)) = state.open_prompt() {
+                        for value in [
+                            ChoiceValue::Proceed,
+                            ChoiceValue::Close,
+                            ChoiceValue::Acknowledge,
+                            ChoiceValue::Finish { launch: false },
+                        ] {
+                            if state.answer(&UiMsg::Choice { id, value }).is_ok() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(ProtocolError::Closed) => return true,
+                Err(_) => return false,
+            }
+        }
+    }
+    let mut state = FlowState::new();
+    let hello = EngineMsg::Hello {
+        build_id: build_id(),
+        flow: Flow::Install,
+        app: AppCard {
+            name: "A".into(),
+            version: "1".into(),
+            from_version: None,
+            publisher: None,
+            icon_png: None,
+        },
+        details: Details {
+            location: None,
+            size_bytes: None,
+            all_users_location: Some("/opt/A".into()),
+        },
+    };
+    let _ = state.apply(&hello);
+    let _ = state.apply(&EngineMsg::Prompt {
+        id: 1,
+        kind: PromptKind::Welcome,
+    });
+    loop {
+        match read_frame::<_, UiMsg>(&mut input) {
+            Ok(msg) => {
+                let _ = state.accepts(&msg);
+            }
+            Err(ProtocolError::Closed) => return true,
+            Err(_) => return false,
+        }
     }
 }
 
