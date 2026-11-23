@@ -829,7 +829,7 @@ umask_tree_ok() { # MASK-LABEL
   eq "$1: the desktop entry's mode" "$(stat -c %a "/usr/local/share/applications/$APP.desktop")" 644
   eq "$1: the applications folder's mode" "$(stat -c %a /usr/local/share/applications)" 755
   check "$1: the standard user can run the app" as_user "$R/current/bin/e2e-app"
-  check "$1: the standard user can read the desktop entry" as_user cat "/usr/local/share/applications/$APP.desktop"
+  check "$1: the standard user can read the desktop entry" as_user test -r "/usr/local/share/applications/$APP.desktop"
 }
 
 row_umask() {
