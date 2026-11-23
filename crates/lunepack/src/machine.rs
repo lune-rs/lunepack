@@ -100,11 +100,13 @@ impl MachineInstall {
     }
 }
 
-/// Whether `a` is the directory `b` (as paths; on Windows without regard to case).
+/// Whether `a` is the directory `b` (as paths; on Windows without regard to case, and with `/` and
+/// `\` alike, both being separators there: a unix-scheme root is `/`-joined on every host,
+/// M12-D11).
 fn same_dir(a: &Path, b: &Path) -> bool {
     if cfg!(windows) {
-        a.to_string_lossy()
-            .eq_ignore_ascii_case(&b.to_string_lossy())
+        let text = |p: &Path| p.to_string_lossy().replace('/', "\\");
+        text(a).eq_ignore_ascii_case(&text(b))
     } else {
         a == b
     }
@@ -182,7 +184,7 @@ pub(crate) fn detect_bundle(
     let Some(home) = platform.machine_home() else {
         return Ok(None);
     };
-    let root = home.join(config.app_id.as_str());
+    let root = lunepack_core::machine_root(&home, &config.app_id);
     let layout = MachineLayout::with_scheme(&root, scheme);
     if !has_machine_record(platform, &layout, config) {
         return Ok(None);

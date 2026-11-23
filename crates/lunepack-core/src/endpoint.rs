@@ -72,14 +72,20 @@ pub fn systemd_service_unit(app_id: &AppId) -> String {
     format!("{NAME_PREFIX}{}.service", app_id.as_str())
 }
 
-/// `/etc/systemd/system/lunepack-<app id>.socket`.
+/// `/etc/systemd/system/lunepack-<app id>.socket`, `/`-separated on every host (M12-D11).
 pub fn systemd_socket_unit_path(app_id: &AppId) -> PathBuf {
-    PathBuf::from(SYSTEMD_UNIT_DIR).join(systemd_socket_unit(app_id))
+    PathBuf::from(format!(
+        "{SYSTEMD_UNIT_DIR}/{}",
+        systemd_socket_unit(app_id)
+    ))
 }
 
-/// `/etc/systemd/system/lunepack-<app id>.service`.
+/// `/etc/systemd/system/lunepack-<app id>.service`, `/`-separated on every host (M12-D11).
 pub fn systemd_service_unit_path(app_id: &AppId) -> PathBuf {
-    PathBuf::from(SYSTEMD_UNIT_DIR).join(systemd_service_unit(app_id))
+    PathBuf::from(format!(
+        "{SYSTEMD_UNIT_DIR}/{}",
+        systemd_service_unit(app_id)
+    ))
 }
 
 /// The LaunchDaemon's label: `lunepack-<app id>`.
@@ -87,7 +93,10 @@ pub fn launchd_label(app_id: &AppId) -> String {
     format!("{NAME_PREFIX}{}", app_id.as_str())
 }
 
-/// `/Library/LaunchDaemons/lunepack-<app id>.plist`.
+/// `/Library/LaunchDaemons/lunepack-<app id>.plist`, `/`-separated on every host (M12-D11).
 pub fn launchd_plist_path(app_id: &AppId) -> PathBuf {
-    PathBuf::from(LAUNCH_DAEMONS_DIR).join(format!("{}.plist", launchd_label(app_id)))
+    PathBuf::from(format!(
+        "{LAUNCH_DAEMONS_DIR}/{}.plist",
+        launchd_label(app_id)
+    ))
 }

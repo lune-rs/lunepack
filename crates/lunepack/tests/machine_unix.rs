@@ -374,6 +374,7 @@ impl Rig {
             .with_layout_scheme(self.os.per_user)
             .with_machine_scheme(self.os.scheme)
             .with_machine_home(self.host.home())
+            .with_system_apps_dir(abs_path("/Applications"))
             .with_data_home(abs_path(self.os.data_home))
             .with_home(abs_path(if is_mac(self.os) {
                 "/Users/alice"

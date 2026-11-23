@@ -152,7 +152,7 @@ fn unix_names() -> Vec<String> {
         (UnixOs::Macos, "macos", MachineScheme::MACOS),
     ] {
         let home = Path::new(scheme.home.expect("a unix scheme has a machine home"));
-        let root = home.join(app.as_str());
+        let root = lunepack_core::machine_root(home, &app);
         let layout = MachineLayout::with_scheme(&root, scheme);
         let show = |p: &Path| p.display().to_string();
         line(&format!("{name} machine home"), show(home));

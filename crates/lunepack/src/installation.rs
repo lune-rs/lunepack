@@ -57,6 +57,7 @@ pub struct Platform {
     pub(crate) layout_scheme: LayoutScheme,
     pub(crate) busy_wait: Duration,
     pub(crate) machine_home: Option<PathBuf>,
+    pub(crate) system_apps: Option<PathBuf>,
     pub(crate) machine_scheme: Option<MachineScheme>,
     pub(crate) service_wait: Duration,
     pub(crate) local_data: Option<PathBuf>,
@@ -100,6 +101,7 @@ impl Platform {
             layout_scheme: native_layout_scheme(),
             busy_wait: DEFAULT_BUSY_WAIT,
             machine_home: None,
+            system_apps: None,
             machine_scheme: None,
             service_wait: machine::STARTUP_WAIT,
             local_data: None,
@@ -203,6 +205,14 @@ impl Platform {
     /// install only inside it.
     pub fn with_machine_home(mut self, home: PathBuf) -> Platform {
         self.machine_home = Some(home);
+        self
+    }
+
+    /// The system's apps folder under [`LayoutScheme::MACOS`], instead of `/Applications`: a
+    /// bundle directly in it may be adopted (M8-D9). Tests use it to run the macOS layout on a
+    /// host whose absolute paths have a prefix (Windows).
+    pub fn with_system_apps_dir(mut self, dir: PathBuf) -> Platform {
+        self.system_apps = Some(dir);
         self
     }
 
@@ -601,6 +611,10 @@ fn bundle_layout(
     let facts = platform.fs.place(tree)?;
     let data_home = platform.data_home()?;
     let home = platform.home()?;
+    let system_apps = platform
+        .system_apps
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(lunepack_core::layout::SYSTEM_APPS_DIR));
     let probe = BundleProbe {
         exe,
         tree,
@@ -609,6 +623,7 @@ fn bundle_layout(
         facts: &facts,
         data_home: &data_home,
         home: &home,
+        system_apps: &system_apps,
     };
     let scheme = platform.layout_scheme;
     match discover_bundle(&*platform.fs, &*platform.hasher, &probe) {

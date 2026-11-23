@@ -1795,6 +1795,7 @@ mod bundle {
                 facts,
                 data_home,
                 home,
+                system_apps: Path::new(lunepack_core::layout::SYSTEM_APPS_DIR),
             },
         )
     }
@@ -2338,6 +2339,7 @@ mod bundle {
                 facts: &facts,
                 data_home: &data_home(),
                 home: &home(),
+                system_apps: Path::new(lunepack_core::layout::SYSTEM_APPS_DIR),
             },
         );
         assert!(matches!(got, Err(LayoutError::NotThisTree)), "{got:?}");
@@ -2463,6 +2465,7 @@ mod bundle {
                     facts: &facts,
                     data_home: &dh,
                     home: &canonical,
+                    system_apps: Path::new(lunepack_core::layout::SYSTEM_APPS_DIR),
                 },
             )
             .unwrap();

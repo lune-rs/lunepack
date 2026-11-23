@@ -288,6 +288,30 @@ fn join_names(base: &Path, rel: &str) -> PathBuf {
     out
 }
 
+/// `base` and the plain name `name` joined with `/` on every host (M12-D11): a location on a unix
+/// target keeps its target's separator when a Windows host composes it. No separator is added
+/// after an empty `base` or one that already ends in a separator, so on a unix host this is
+/// byte for byte `base.join(name)`.
+fn join_unix(base: &Path, name: &str) -> PathBuf {
+    let ends_in_separator = base
+        .as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_none_or(|b| std::path::is_separator(char::from(*b)));
+    let mut out = base.as_os_str().to_owned();
+    if !ends_in_separator {
+        out.push("/");
+    }
+    out.push(name);
+    PathBuf::from(out)
+}
+
+/// [`join_names`] with `/` on every host ([`join_unix`]).
+fn join_names_unix(base: &Path, rel: &str) -> PathBuf {
+    rel.split('/')
+        .fold(base.to_path_buf(), |out, name| join_unix(&out, name))
+}
+
 /// The directories of a per-user install rooted at `R`, under a [`LayoutScheme`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserLayout {
@@ -950,10 +974,12 @@ pub fn resolve_root_scoped(
     scope: Scope,
 ) -> Result<RootChoice, LayoutError> {
     if scheme.root == RootNaming::AppId {
-        let root = data_home.join(app_id.as_str());
         if scope == Scope::Machine {
+            // Only the unix machine views name `R` after the app id (M11-D6).
+            let root = machine_root(data_home, app_id);
             return resolve_machine_app_id_root(fs, hasher, root, app_id, scheme);
         }
+        let root = data_home.join(app_id.as_str());
         return Ok(if is_real_dir(fs, &root) {
             RootChoice::Existing(root)
         } else {
@@ -1460,6 +1486,9 @@ pub struct BundleProbe<'a> {
     pub data_home: &'a Path,
     /// The canonical home directory (for its Trash).
     pub home: &'a Path,
+    /// The system's apps folder, [`SYSTEM_APPS_DIR`] on macOS. The caller gives it, as it gives
+    /// the homes, so a test can stand it on a host whose absolute paths have a prefix.
+    pub system_apps: &'a Path,
 }
 
 /// What [`discover_bundle`] found.
@@ -1517,7 +1546,7 @@ pub enum BundleDiscovery {
 ///    is this app's, per user, with the tree's version current. (A missing pointer is followed
 ///    too: an adoption cut off after its commit and before its pointer leaves exactly that.)
 /// 6. [`BundleDiscovery::Adoptable`] when the tree's parent is, byte for byte, `<home>/`
-///    [`USER_APPS_DIR`] or [`SYSTEM_APPS_DIR`], and `R` holds no record, a record of this app per
+///    [`USER_APPS_DIR`] or the probe's system apps folder ([`SYSTEM_APPS_DIR`]), and `R` holds no record, a record of this app per
 ///    user with no current version, or an orphaned one ([`bundle_orphaned`]). A record that does
 ///    not load, or is another app's or scope's, is never adopted over.
 /// 7. Otherwise [`BundleDiscovery::NotInstalled`].
@@ -1562,7 +1591,7 @@ pub fn discover_bundle(
             };
             return Ok(match replaced {
                 false => installed(),
-                true if in_apps_folder(probe.tree, probe.home) => {
+                true if in_apps_folder(probe.tree, probe.home, probe.system_apps) => {
                     BundleDiscovery::Adoptable { root }
                 }
                 true => BundleDiscovery::NotInstalled,
@@ -1592,7 +1621,7 @@ pub fn discover_bundle(
             version: config.version.clone(),
         });
     }
-    if !in_apps_folder(probe.tree, probe.home) {
+    if !in_apps_folder(probe.tree, probe.home, probe.system_apps) {
         return Ok(BundleDiscovery::NotInstalled);
     }
     let free = match &record {
@@ -1606,15 +1635,15 @@ pub fn discover_bundle(
     Ok(BundleDiscovery::NotInstalled)
 }
 
-/// Whether `tree`'s parent is, byte for byte, `<home>/Applications` or `/Applications` (M8-D9's
-/// place rule; both sides are canonical, so a link or another spelling is never a match).
-fn in_apps_folder(tree: &Path, home: &Path) -> bool {
+/// Whether `tree`'s parent is, byte for byte, `<home>/Applications` or `system_apps`
+/// (`/Applications`; M8-D9's place rule; both sides are canonical, so a link or another spelling
+/// is never a match).
+fn in_apps_folder(tree: &Path, home: &Path, system_apps: &Path) -> bool {
     let Some(parent) = tree.parent() else {
         return false;
     };
     let user = home.join(USER_APPS_DIR);
-    parent.as_os_str() == user.as_os_str()
-        || parent.as_os_str() == Path::new(SYSTEM_APPS_DIR).as_os_str()
+    parent.as_os_str() == user.as_os_str() || parent.as_os_str() == system_apps.as_os_str()
 }
 
 /// Whether `record` is orphaned under `layout` (M8-D16), read only: it names a current version,
@@ -2052,8 +2081,20 @@ impl MachineScheme {
 /// home is the caller's (`$XDG_DATA_HOME` or `~/.local/share` on Linux,
 /// `~/Library/Application Support` on macOS); the core looks nothing up. An app id never starts
 /// with `.`, so this never meets a per-user `R = <data home>/<app id>`.
+///
+/// A unix location: joined with `/` on every host (M12-D11).
 pub fn machine_user_home(data_home: &Path, app_id: &AppId) -> PathBuf {
-    data_home.join(MACHINE_USER_HOME_DIR).join(app_id.as_str())
+    join_unix(
+        &join_unix(data_home, MACHINE_USER_HOME_DIR),
+        app_id.as_str(),
+    )
+}
+
+/// The install root `R = <machine home>/<app id>` of a per-machine install on Linux or macOS
+/// (M11-D6), joined with `/` on every host (M12-D11). A Windows machine root is named after the
+/// display name and found by [`resolve_root_scoped`] instead.
+pub fn machine_root(machine_home: &Path, app_id: &AppId) -> PathBuf {
+    join_unix(machine_home, app_id.as_str())
 }
 
 /// The directories of a per-machine install (M10-D8, M11-D6): `app/<ver>`, `.lunepack/state`
@@ -2096,61 +2137,77 @@ impl MachineLayout {
         UserLayout::from_root(self.root.clone(), self.scheme.view)
     }
 
+    /// `base` joined with the plain name `name`: with `/` on every host under a unix scheme
+    /// (M12-D11), with the host's separator under the Windows one.
+    fn join(&self, base: &Path, name: &str) -> PathBuf {
+        match self.scheme.os.unix() {
+            Some(_) => join_unix(base, name),
+            None => base.join(name),
+        }
+    }
+
+    /// `base` joined with each `/`-separated name of `rel`, as [`MachineLayout::join`].
+    fn join_rel(&self, base: &Path, rel: &str) -> PathBuf {
+        match self.scheme.os.unix() {
+            Some(_) => join_names_unix(base, rel),
+            None => join_names(base, rel),
+        }
+    }
+
     /// `R\app`.
     pub fn app_dir(&self) -> PathBuf {
-        join_names(&self.root, self.scheme.view.versions)
+        self.join_rel(&self.root, self.scheme.view.versions)
     }
 
     /// `R\app\<version>`.
     pub fn version_dir(&self, version: &Version) -> PathBuf {
-        self.app_dir().join(version.to_string())
+        self.join(&self.app_dir(), &version.to_string())
     }
 
     /// `R\.lunepack`.
     pub fn lunepack_dir(&self) -> PathBuf {
-        self.root.join(MACHINE_LUNEPACK_DIR)
+        self.join(&self.root, MACHINE_LUNEPACK_DIR)
     }
 
     /// `R\.lunepack\state`, the machine record's directory.
     pub fn state_dir(&self) -> PathBuf {
-        join_names(&self.root, self.scheme.view.state)
+        self.join_rel(&self.root, self.scheme.view.state)
     }
 
     /// `R\.lunepack\logs`.
     pub fn logs_dir(&self) -> PathBuf {
-        join_names(&self.root, self.scheme.view.logs)
+        self.join_rel(&self.root, self.scheme.view.logs)
     }
 
     /// `R\.lunepack\machine`, admin-only.
     pub fn machine_dir(&self) -> PathBuf {
-        self.lunepack_dir().join(MACHINE_ADMIN_DIR)
+        self.join(&self.lunepack_dir(), MACHINE_ADMIN_DIR)
     }
 
     /// The engine's lock file.
     pub fn lock_path(&self) -> PathBuf {
-        self.machine_dir().join(LOCK_FILE)
+        self.join(&self.machine_dir(), LOCK_FILE)
     }
 
     /// `R\.lunepack\machine\incoming`.
     pub fn incoming_dir(&self) -> PathBuf {
-        self.machine_dir().join(MACHINE_INCOMING_DIR)
+        self.join(&self.machine_dir(), MACHINE_INCOMING_DIR)
     }
 
     /// `R\.lunepack\machine\service`.
     pub fn service_dir(&self) -> PathBuf {
-        self.machine_dir().join(MACHINE_SERVICE_DIR)
+        self.join(&self.machine_dir(), MACHINE_SERVICE_DIR)
     }
 
     /// `R\.lunepack\machine\service\<version>`.
     pub fn service_version_dir(&self, version: &Version) -> PathBuf {
-        self.service_dir().join(version.to_string())
+        self.join(&self.service_dir(), &version.to_string())
     }
 
     /// The service binary of `version`: `service\<version>\lunepack-service.exe` on Windows,
     /// `service/<version>/lunepack-service` on unix.
     pub fn service_image(&self, version: &Version) -> PathBuf {
-        self.service_version_dir(version)
-            .join(self.scheme.service_file)
+        self.join(&self.service_version_dir(version), self.scheme.service_file)
     }
 
     /// The stable service link `R/.lunepack/machine/lunepack-service` (unix, M11-D6): the path
@@ -2160,7 +2217,7 @@ impl MachineLayout {
     pub fn stable_service_link(&self) -> Option<PathBuf> {
         self.scheme
             .has_stable_link()
-            .then(|| self.machine_dir().join(self.scheme.service_file))
+            .then(|| self.join(&self.machine_dir(), self.scheme.service_file))
     }
 
     /// The inverse of [`MachineLayout::service_image`] under [`MachineScheme::WINDOWS`]: the root
