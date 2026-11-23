@@ -103,9 +103,9 @@ pub use manifest::{
     VerifiedPatch, read_entry, verify_manifest, verify_payload_manifest,
 };
 pub use pack::{
-    DeltaFile, DeltaPatch, FileClass, FinishedRelease, PackedFile, ReleaseLayout,
+    DeltaFile, DeltaPatch, FileClass, FinishedRelease, PackedFile, PatchChoice, ReleaseLayout,
     RuntimeImageError, candidates, check_pe_stub, check_runtime_image, check_service_image,
-    check_ui_image, classify, pack_file,
+    check_ui_image, choose_patch, classify, encode_patch_checked, pack_file, patch_candidates,
 };
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};

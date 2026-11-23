@@ -3,8 +3,9 @@
 //! The same function backs both commands, so `inspect` shows nothing that did not verify. The
 //! order is the client's (FORMAT.md 11.1): the root walk, `keys.json`, each feed, then for every
 //! release and target the manifest through the feed's reference, the pack against the manifest's
-//! reference, and every frame through the decoder a client uses. The first failure ends the run
-//! (exit 1).
+//! reference, and every frame through the decoder a client uses; then every delta file (FORMAT.md
+//! 9.3) against its manifest, and every patch through the client's patch decoder when its base
+//! release is in the directory. The first failure ends the run (exit 1).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -15,8 +16,9 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use lunepack_codec_lzma::LzmaCodec;
 use lunepack_core::{
-    Channel, Clock, ClockReading, FeedTargetEntry, Limits, RollbackFloor, Target, VerifiedEntry,
-    VerifiedFeed, VerifiedKeySet, VerifiedManifest, decode_verified, verify_feed, verify_manifest,
+    Channel, Clock, ClockReading, FeedTargetEntry, Hasher, Limits, RelPath, RollbackFloor, Target,
+    VerifiedDelta, VerifiedEntry, VerifiedFeed, VerifiedKeySet, VerifiedManifest,
+    decode_patch_verified, decode_verified, verify_feed, verify_manifest,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
@@ -173,8 +175,101 @@ pub fn check_target(
     })
 }
 
+/// Checks one delta file of `t` (FORMAT.md 9.3): its size and SHA-256, every patch's SHA-256, and,
+/// when the base release `from` is among the verified manifests of `feeds`, every patch decoded
+/// against the base file read back from the base's pack (the base file must be the base release's
+/// file at that path, of the patch's size and SHA-256). Without the base the delta is reported as
+/// not round-tripped, which is not an error. Returns the report line.
+fn check_delta(
+    dir: &Path,
+    t: &TargetCheck,
+    delta: &VerifiedDelta,
+    feeds: &[FeedCheck],
+) -> Result<String> {
+    let hasher = Sha256Hasher;
+    let reference = delta.file();
+    let name = reference.path();
+    let bytes = read_capped(&dir.join(name), reference.size())?
+        .with_context(|| format!("{name} does not exist"))?;
+    reference
+        .check_bytes(&bytes, &hasher)
+        .with_context(|| format!("{name} does not match the manifest"))?;
+    let patch_bytes = |offset: u64, length: u64| -> Result<&[u8]> {
+        let start = usize::try_from(offset)?;
+        let end = start + usize::try_from(length)?;
+        bytes
+            .get(start..end)
+            .context("a patch lies outside its delta file")
+    };
+    for patch in delta.patches() {
+        if hasher.sha256(patch_bytes(patch.offset(), patch.length())?) != patch.sha256() {
+            bail!("{name}: the patch of {} does not match", patch.path());
+        }
+    }
+    let count = delta.patches().len();
+    let from = delta.from_text();
+    let base = feeds
+        .iter()
+        .flat_map(|f| &f.releases)
+        .filter(|r| r.version == from)
+        .flat_map(|r| &r.targets)
+        .find(|b| b.target == t.target);
+    let Some(base) = base else {
+        return Ok(format!(
+            "{name}: {count} patch(es) ok; base {from} not present, not round-tripped"
+        ));
+    };
+    let pack_ref = base.manifest.pack();
+    let pack = read_capped(&dir.join(pack_ref.path()), pack_ref.size())?
+        .with_context(|| format!("{} does not exist", pack_ref.path()))?;
+    pack_ref
+        .check_bytes(&pack, &hasher)
+        .with_context(|| format!("{} does not match the manifest", pack_ref.path()))?;
+    let files: BTreeMap<&RelPath, &VerifiedEntry> = base
+        .manifest
+        .entries()
+        .iter()
+        .map(|e| (e.path(), e))
+        .collect();
+    for patch in delta.patches() {
+        let path = patch.path();
+        let Some(VerifiedEntry::File {
+            size,
+            sha256,
+            frame: Some(frame),
+            ..
+        }) = files.get(path).copied()
+        else {
+            bail!("{name}: {path} is not a non-empty file of {from}");
+        };
+        if *size != patch.base_size() || *sha256 != patch.base_sha256() {
+            bail!("{name}: the base of {path} is not the file of {from}");
+        }
+        let start = usize::try_from(frame.offset())?;
+        let end = start + usize::try_from(frame.length())?;
+        let slice = pack
+            .get(start..end)
+            .context("a frame lies outside the pack")?;
+        let mut base_file = Vec::new();
+        decode_verified(frame, slice, &hasher, &LzmaCodec, &mut base_file)
+            .with_context(|| format!("{}: {path} does not decode", pack_ref.path()))?;
+        decode_patch_verified(
+            patch,
+            patch_bytes(patch.offset(), patch.length())?,
+            &base_file,
+            &hasher,
+            &LzmaCodec,
+            &mut io::sink(),
+        )
+        .with_context(|| format!("{name}: the patch of {path} does not decode"))?;
+    }
+    Ok(format!(
+        "{name}: {count} patch(es) ok, round-tripped against {from}"
+    ))
+}
+
 /// The names of the `feed-*.json` files of `dir`, sorted.
-fn feed_file_names(dir: &Path) -> Result<Vec<String>> {
+pub(crate) fn feed_file_names(dir: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(dir).with_context(|| format!("cannot list {}", dir.display()))? {
         let entry = entry.with_context(|| format!("cannot list {}", dir.display()))?;
@@ -188,7 +283,7 @@ fn feed_file_names(dir: &Path) -> Result<Vec<String>> {
 }
 
 /// The channel a `feed-<channel>.json` file name holds.
-fn channel_of(name: &str) -> Result<Channel> {
+pub(crate) fn channel_of(name: &str) -> Result<Channel> {
     let channel = name
         .strip_prefix("feed-")
         .and_then(|n| n.strip_suffix(".json"))
@@ -385,6 +480,21 @@ pub fn check_release_dir(
             releases,
         });
     }
+    // Deltas last, once every manifest of the directory verified, so a base listed by a later feed
+    // is found; a manifest listed by two feeds is checked once.
+    let mut seen = BTreeSet::new();
+    for t in feeds
+        .iter()
+        .flat_map(|f| &f.releases)
+        .flat_map(|r| &r.targets)
+    {
+        if !seen.insert(t.manifest_path.clone()) {
+            continue;
+        }
+        for delta in t.manifest.deltas() {
+            say(&check_delta(dir, t, delta, &feeds)?)?;
+        }
+    }
     let unreferenced = unreferenced_manifests(dir, &referenced)?;
     for path in &unreferenced {
         say(&format!("{path}: unreferenced (no feed lists it)"))?;
@@ -475,6 +585,34 @@ fn print_manifest(c: &TargetCheck, entries: bool) -> Result<()> {
             list.join(" ")
         }
     ))?;
+    let frames: BTreeMap<&RelPath, u64> = c
+        .manifest
+        .entries()
+        .iter()
+        .filter_map(|e| match e {
+            VerifiedEntry::File {
+                path,
+                frame: Some(f),
+                ..
+            } => Some((path, f.length())),
+            _ => None,
+        })
+        .collect();
+    for d in c.manifest.deltas() {
+        let patched: u64 = d.patches().iter().map(|p| p.length()).sum();
+        let replaced: u64 = d
+            .patches()
+            .iter()
+            .map(|p| frames.get(p.path()).copied().unwrap_or(0))
+            .sum();
+        out(&format!(
+            "      delta from {}: {} bytes, {} patch(es), {patched} bytes for {replaced} bytes of frames ({})",
+            d.from_text(),
+            d.file().size(),
+            d.patches().len(),
+            percent(patched, replaced)
+        ))?;
+    }
     if entries {
         for e in c.manifest.entries() {
             let line = match e {

@@ -18,11 +18,11 @@ use lunepack_core::digest::U53;
 use lunepack_core::error::UpdateConfigError;
 use lunepack_core::update_config::MACOS_ENTRY_DIR;
 use lunepack_core::{
-    AppId, ArtifactRef, Channel, ClockReading, CodeSign, Hasher, InstallMeta, NameRule,
-    PayloadKind, RelPath, ReleaseDoc, ReleaseLayout, RollbackFloor, Signer, Target, UpdateConfig,
-    VerifiedEntry, VerifiedKeySet, Version, check_pe_stub, check_runtime_image,
-    check_service_image, check_ui_image, decode_verified, macos_name_ok, next_feed, sign_envelope,
-    verify_feed, verify_manifest, windows_name_ok,
+    AppId, ArtifactRef, Channel, ClockReading, CodeSign, DeltaFile, Hasher, InstallMeta, Limits,
+    MAX_PATCH_WINDOW, NameRule, PayloadKind, RelPath, ReleaseDoc, ReleaseLayout, RollbackFloor,
+    Signer, Target, UpdateConfig, VerifiedEntry, VerifiedKeySet, Version, check_pe_stub,
+    check_runtime_image, check_service_image, check_ui_image, decode_verified, macos_name_ok,
+    next_feed, sign_envelope, verify_feed, verify_manifest, windows_name_ok,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
@@ -47,6 +47,8 @@ const MAX_STUB_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SERVICE_BYTES: u64 = 32 * 1024 * 1024;
 /// Default memory budget of the pack stage, in MiB.
 const DEFAULT_BUDGET_MIB: u64 = 2048;
+/// Default of `--deltas` (M12-D3).
+const DEFAULT_DELTAS: u8 = 3;
 /// The channel of the throwaway feed the self-check signs; never written anywhere.
 const SELF_CHECK_CHANNEL: &str = "pack-self-check";
 
@@ -100,6 +102,12 @@ pub struct PackArgs {
     /// refused for any other target. The console stub for a terminal app, the GUI stub otherwise.
     #[arg(long)]
     stub: Option<PathBuf>,
+    /// Delta patches (M12-D3): from each feed of the release directory, the N highest earlier
+    /// versions it lists for this target (with no usable feed, the N highest earlier versions in
+    /// the directory), at most 16 in all; `0` writes no delta.
+    #[arg(long, default_value_t = DEFAULT_DELTAS,
+          value_parser = clap::value_parser!(u8).range(0..=16))]
+    deltas: u8,
     /// The update service, placed beside the entry as `lunepack-service.exe` (Windows) or
     /// `lunepack-service` (Linux and macOS; in `Contents/MacOS` for macOS). Optional: it enables
     /// per-machine installs. Needs `--runtime` and `[update]`.
@@ -208,7 +216,8 @@ fn self_verify(
     now: u64,
     manifest: &[u8],
     pack: &[u8],
-) -> Result<usize> {
+    deltas: &[DeltaFile],
+) -> Result<(usize, usize)> {
     let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
     let reference = ArtifactRef {
         path: format!("{version}/{}.manifest.json", target.as_str()),
@@ -266,7 +275,39 @@ fn self_verify(
             frames += 1;
         }
     }
-    Ok(frames)
+    // Every delta file the manifest lists is the one about to be placed, and every patch's bytes
+    // are the ones it signs; each patch was round-tripped against its base when it was encoded.
+    if manifest.deltas().len() != deltas.len() {
+        bail!("the manifest lists another number of delta files than were made");
+    }
+    let mut patches = 0;
+    for (delta, file) in manifest.deltas().iter().zip(deltas) {
+        if delta.file().path() != file.path {
+            bail!(
+                "the manifest lists {} where {} was made",
+                delta.file().path(),
+                file.path
+            );
+        }
+        delta.file().check_bytes(&file.bytes, &hasher)?;
+        for patch in delta.patches() {
+            let start = usize::try_from(patch.offset())?;
+            let end = start + usize::try_from(patch.length())?;
+            let bytes = file
+                .bytes
+                .get(start..end)
+                .context("a patch lies outside its delta file")?;
+            if hasher.sha256(bytes) != patch.sha256() {
+                bail!(
+                    "{}: the patch of {} does not match",
+                    file.path,
+                    patch.path()
+                );
+            }
+            patches += 1;
+        }
+    }
+    Ok((frames, patches))
 }
 
 /// What `[update]` adds to a pack, built before anything is read from the input tree.
@@ -686,6 +727,40 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
     check_precedence(release_dir_arg, &version, &args.version)?;
     let layout = ReleaseLayout::new(config.app_id.clone(), &args.version, target)?;
 
+    let mut delta_lines = Vec::new();
+    let bases = release_dir::select_bases(
+        &release_dir::BaseQuery {
+            dir: release_dir_arg,
+            keys: &keys,
+            app_id: &config.app_id,
+            version: &version,
+            target,
+            per_feed: usize::from(args.deltas),
+            now,
+            skip: &skip,
+        },
+        &hasher,
+        &verifier,
+        &mut delta_lines,
+    )?;
+    for base in &bases {
+        let path = release_dir_arg.join(delta_rel(&args.version, target, &base.version));
+        if exists(&path) {
+            bail!("{} already exists", path.display());
+        }
+    }
+    if args.deltas > 0 {
+        let list: Vec<&str> = bases.iter().map(|b| b.version.as_str()).collect();
+        say(&format!(
+            "delta: base(s) {}",
+            if list.is_empty() {
+                "none".to_owned()
+            } else {
+                list.join(", ")
+            }
+        ))?;
+    }
+
     let workers = match args.jobs {
         Some(n) => n.get(),
         None => std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
@@ -699,6 +774,8 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         codec: &LzmaCodec,
         hasher: &hasher,
         update: update_plan,
+        bases: &bases,
+        patch_window_cap: MAX_PATCH_WINDOW,
     };
     // Removed on drop: on success and on every error path.
     let work = tempfile::Builder::new()
@@ -725,7 +802,8 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         &verifier,
     )?;
     say(&format!("sign: manifest signed by {} key(s)", refs.len()))?;
-    let frames = self_verify(
+    check_manifest_size(manifest.len() as u64)?;
+    let (frames, patches) = self_verify(
         &keys,
         &refs,
         &config.app_id,
@@ -734,16 +812,32 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         now,
         &manifest,
         &built.pack,
+        &built.deltas,
     )
     .context("the new release does not verify (nothing was written)")?;
     say(&format!("verify: manifest, pack and {frames} frame(s) ok"))?;
+    if !built.deltas.is_empty() {
+        say(&format!(
+            "verify: {} delta file(s) and {patches} patch(es) ok",
+            built.deltas.len()
+        ))?;
+    }
 
+    // The pack and the delta files first, the manifest that names them last.
     fs::create_dir_all(&version_dir)
         .with_context(|| format!("cannot create {}", version_dir.display()))?;
     place::write_new(&pack_path, &built.pack)?;
+    let mut placed = vec![pack_path.clone()];
+    for delta in &built.deltas {
+        let path = release_dir_arg.join(&delta.path);
+        place::write_new(&path, &delta.bytes)?;
+        placed.push(path);
+    }
     place::write_new(&manifest_path, &manifest)?;
-    say(&format!("placed: {}", pack_path.display()))?;
-    say(&format!("placed: {}", manifest_path.display()))?;
+    placed.push(manifest_path.clone());
+    for path in &placed {
+        say(&format!("placed: {}", path.display()))?;
+    }
 
     let r = &built.report;
     say(&format!(
@@ -758,5 +852,41 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
     for (path, codec, reason) in &r.dropped {
         say(&format!("dropped: {path} {}: {reason}", codec.id()))?;
     }
+    for line in &delta_lines {
+        say(line)?;
+    }
+    for line in &r.deltas {
+        say(line)?;
+    }
     Ok(())
+}
+
+/// FORMAT.md 4: a signed manifest is at most 64 MiB; deltas are what can push one over, so the
+/// error names `--deltas`.
+fn check_manifest_size(len: u64) -> Result<()> {
+    let cap = Limits::V1.manifest_doc_bytes;
+    if len > cap {
+        bail!(
+            "the signed manifest is {len} bytes, over the format's {cap}-byte cap; pack with a lower --deltas (nothing was written)"
+        );
+    }
+    Ok(())
+}
+
+/// The delta file of `version` from `from`, relative to the release directory (FORMAT.md 9.3).
+fn delta_rel(version: &str, target: Target, from: &str) -> String {
+    format!("{version}/{}.from-{from}.delta", target.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_manifest_over_the_cap_names_deltas() {
+        let cap = Limits::V1.manifest_doc_bytes;
+        assert!(check_manifest_size(cap).is_ok());
+        let e = check_manifest_size(cap + 1).unwrap_err();
+        assert!(format!("{e:#}").contains("--deltas"), "{e:#}");
+    }
 }

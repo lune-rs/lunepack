@@ -12,11 +12,14 @@ use std::io;
 use crate::digest::{Sha256Digest, U53};
 use crate::error::{Error, PackError, Result, Untrusted};
 use crate::feed::ArtifactRef;
-use crate::frame::{FrameDesc, StreamDesc, check_file_frame, decode_verified};
+use crate::frame::{
+    FrameDesc, StreamDesc, check_file_frame, decode_patch_verified, decode_verified,
+};
 use crate::ident::AppId;
 use crate::limits::Limits;
 use crate::manifest::{
-    DeltaDoc, EntryDoc, ManifestDocument, PatchDoc, VerifiedEntry, check_deltas, check_entry,
+    DeltaDoc, EntryDoc, ManifestDocument, PatchDoc, VerifiedEntry, VerifiedPatch, check_deltas,
+    check_entry,
 };
 use crate::path::{EntryKind, RelPath, validate_tree};
 use crate::pe::{
@@ -450,6 +453,95 @@ pub fn candidates(class: FileClass) -> Vec<CodecId> {
             list
         }
         FileClass::Data => vec![CodecId::Lzma2],
+    }
+}
+
+/// The patch codecs worth trying for a changed file of `class` (M12-D4), in rank order: `lzma2`
+/// for every class with bytes, plus each BCJ filter the file's code calls for. `stored` and
+/// `bcj2` never encode a patch (FORMAT.md 9.3); an empty file gets none.
+pub fn patch_candidates(class: FileClass) -> Vec<CodecId> {
+    match class {
+        FileClass::Empty => Vec::new(),
+        FileClass::Data | FileClass::Compressed => vec![CodecId::Lzma2],
+        FileClass::X86 => vec![CodecId::Lzma2, CodecId::BcjX86Lzma2],
+        FileClass::Arm64 => vec![CodecId::Lzma2, CodecId::BcjArm64Lzma2],
+        FileClass::Fat { x86, arm64 } => {
+            let mut list = vec![CodecId::Lzma2];
+            if x86 {
+                list.push(CodecId::BcjX86Lzma2);
+            }
+            if arm64 {
+                list.push(CodecId::BcjArm64Lzma2);
+            }
+            list
+        }
+    }
+}
+
+/// Encodes `input` as a patch against `base` with `codec_id` and round-trips it (D27) through the
+/// client's own [`decode_patch_verified`] with a sink that discards the output: the patch's hash,
+/// the base's size and hash, the decode, the output's size and hash. `path` names the file in
+/// messages only. An error means the candidate is dropped; nothing of it is kept.
+pub fn encode_patch_checked(
+    path: &RelPath,
+    codec_id: CodecId,
+    base: &[u8],
+    input: &[u8],
+    encoder: &dyn Encoder,
+    codec: &dyn Codec,
+    hasher: &dyn Hasher,
+) -> Result<DeltaPatch> {
+    if !crate::frame::is_patch_codec(codec_id) {
+        return Err(PackError::Invariant("a patch is encoded with a patch codec").into());
+    }
+    let encoded = encoder.encode_patch(codec_id, base, input)?;
+    if encoded.codec != codec_id {
+        return Err(PackError::Invariant("the encoder returned another codec").into());
+    }
+    let base_sha256 = hasher.sha256(base);
+    let patch = VerifiedPatch::for_round_trip(
+        path.clone(),
+        codec_id,
+        (&encoded.bytes, hasher.sha256(&encoded.bytes)),
+        (base.len() as u64, base_sha256),
+        (input.len() as u64, hasher.sha256(input)),
+    )?;
+    decode_patch_verified(&patch, &encoded.bytes, base, hasher, codec, &mut io::sink())?;
+    Ok(DeltaPatch {
+        codec: codec_id,
+        bytes: encoded.bytes,
+        base_size: base.len() as u64,
+        base_sha256,
+    })
+}
+
+/// What [`choose_patch`] decides for one file and one base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchChoice {
+    /// The patch to write.
+    Patch(DeltaPatch),
+    /// The smallest patch is not at least 10% shorter than the file's frame (M12-D4): its length.
+    NotSmaller(u64),
+    /// No candidate was kept.
+    None,
+}
+
+/// Chooses among the round-tripped patches of one file and one base (M12-D4): the shortest, the
+/// earlier in the fixed rank on equal length, written only when `length × 10 ≤ frame_len × 9`.
+pub fn choose_patch(kept: Vec<DeltaPatch>, frame_len: u64) -> PatchChoice {
+    let best = kept
+        .into_iter()
+        .min_by_key(|p| (p.bytes.len() as u64, rank(p.codec)));
+    match best {
+        None => PatchChoice::None,
+        Some(p) => {
+            let len = p.bytes.len() as u64;
+            if u128::from(len) * 10 <= u128::from(frame_len) * 9 {
+                PatchChoice::Patch(p)
+            } else {
+                PatchChoice::NotSmaller(len)
+            }
+        }
     }
 }
 

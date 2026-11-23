@@ -266,6 +266,34 @@ impl VerifiedPatch {
     pub fn window(&self) -> u64 {
         self.window
     }
+
+    /// The writer's own descriptor of a patch it just encoded, for its round trip (D27) through
+    /// [`decode_patch_verified`](crate::frame::decode_patch_verified) before the patch is kept:
+    /// every value comes from the bytes in hand, not from a document. The window is computed here
+    /// and must be within the format's cap.
+    pub(crate) fn for_round_trip(
+        path: RelPath,
+        codec: CodecId,
+        patch: (&[u8], Sha256Digest),
+        base: (u64, Sha256Digest),
+        file: (u64, Sha256Digest),
+    ) -> Result<VerifiedPatch> {
+        let window = patch_window(base.0, file.0)
+            .filter(|w| *w <= Limits::V1.patch_window_bytes)
+            .ok_or(Error::Field("patch window above 128 MiB"))?;
+        Ok(VerifiedPatch {
+            path,
+            base_size: base.0,
+            base_sha256: base.1,
+            codec,
+            offset: 0,
+            length: patch.0.len() as u64,
+            sha256: patch.1,
+            size: file.0,
+            file_sha256: file.1,
+            window,
+        })
+    }
 }
 
 /// A delta that passed the checks of FORMAT.md 9.3.
