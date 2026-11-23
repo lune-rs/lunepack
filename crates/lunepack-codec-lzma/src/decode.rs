@@ -12,8 +12,8 @@ use std::rc::Rc;
 
 use lunepack_core::error::CodecError;
 use lunepack_core::frame::{MAX_DICT_SIZE, MIN_DICT_SIZE};
-use lunepack_core::{CodecId, DecodeReport, Error, FrameView, StreamView};
-use lzma_rust2::filter::bcj::BcjReader;
+use lunepack_core::{CodecId, DecodeReport, Error, FrameView, PatchView, StreamView};
+use lzma_rust2::filter::bcj::{BcjReader, BcjWriter};
 use lzma_rust2::filter::bcj2::Bcj2Reader;
 use lzma_rust2::{Lzma2Reader, lzma2_get_memory_usage};
 
@@ -268,4 +268,70 @@ fn bcj2(frame: &FrameView<'_>, out: &mut dyn Write) -> Result<DecodeReport, Erro
         .finish()
         .map_err(|e| read_error(e, streams, &tallies))?;
     report(streams, &tallies)
+}
+
+/// `base` through the encode-direction BCJ filter of `codec` (start offset 0), the dictionary a
+/// BCJ patch starts from (FORMAT.md 9.3); `None` for plain `lzma2`. The filter keeps the length.
+pub(crate) fn filtered_base(codec: CodecId, base: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    let out = Vec::with_capacity(base.len());
+    let mut w = match codec {
+        CodecId::BcjX86Lzma2 => BcjWriter::new_x86(out, 0),
+        CodecId::BcjArm64Lzma2 => BcjWriter::new_arm64(out, 0),
+        _ => return Ok(None),
+    };
+    w.write_all(base)?;
+    let filtered = w.finish()?;
+    if filtered.len() != base.len() {
+        return Err(io::Error::other("the BCJ filter changed the base's length"));
+    }
+    Ok(Some(filtered))
+}
+
+/// Decodes a patch (FORMAT.md 9.3): the view's checks first ([`PatchView::check`], nothing
+/// allocated before them), then one raw LZMA2 stream whose dictionary starts as the base (BCJ
+/// filtered for the BCJ ids), at most `output_size` bytes out and every input byte consumed.
+///
+/// Memory: the reader copies the (filtered) base into its window when it is made, so the filtered
+/// copy is dropped right after; the window then grows geometrically up to `window` bytes.
+pub(crate) fn decode_patch(
+    patch: &PatchView<'_>,
+    base: &[u8],
+    out: &mut dyn Write,
+) -> Result<DecodeReport, Error> {
+    let window = patch.check(base.len())?;
+    let tally = Rc::new(Tally::default());
+    let input = Counted {
+        input: patch.input,
+        tally: Rc::clone(&tally),
+    };
+    let mem_limit_kb = lzma2_get_memory_usage(window);
+    let reader = {
+        let filtered = filtered_base(patch.codec, base)
+            .map_err(|e| Error::from(CodecError::Decoder(Box::new(e))))?;
+        let preset = filtered.as_deref().unwrap_or(base);
+        Lzma2Reader::new_mem_limit(input, window, mem_limit_kb, Some(preset))
+            .map_err(|e| Error::from(CodecError::Decoder(Box::new(e))))?
+    };
+    let r = Limited {
+        inner: reader,
+        limit: patch.output_size,
+        tally: Rc::clone(&tally),
+    };
+    let stream = [StreamView {
+        input: patch.input,
+        decoded_size: patch.output_size,
+        dict_size: Some(window),
+    }];
+    let tallies = [tally];
+    let res = match patch.codec {
+        CodecId::BcjX86Lzma2 => pump(BcjReader::new_x86(r, 0), out),
+        CodecId::BcjArm64Lzma2 => pump(BcjReader::new_arm64(r, 0), out),
+        _ => pump(r, out),
+    };
+    res.map_err(|e| pump_error(e, &stream, &tallies))?;
+    let report = report(&stream, &tallies)?;
+    if report.consumed.first() != Some(&(patch.input.len() as u64)) {
+        return Err(corrupt("trailing input after the patch's LZMA2 stream"));
+    }
+    Ok(report)
 }

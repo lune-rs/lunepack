@@ -348,6 +348,21 @@ pub fn decoder_memory(frame: &CheckedFrame) -> u64 {
         + overhead
 }
 
+/// Decoder memory a patch may need (M12-D7, the stage's budget input): two windows plus the
+/// overhead constant of its codec. Measured by `lunepack-codec-lzma/tests/patch_memory.rs`:
+/// `lzma-rust2` 0.25 starts the window as a copy of the base and grows it geometrically, and the
+/// last growth holds the old block (half the window to just under it, depending on the base's
+/// size) and the whole window at once, so the peak is below two windows plus the reader's state.
+/// The base itself, and the patch's bytes, are the caller's and are charged apart.
+pub fn patch_decoder_memory(codec: CodecId, window: u64) -> u64 {
+    let overhead = match codec {
+        CodecId::BcjX86Lzma2 => DECODER_OVERHEAD_BCJ_X86_LZMA2_BYTES,
+        CodecId::BcjArm64Lzma2 => DECODER_OVERHEAD_BCJ_ARM64_LZMA2_BYTES,
+        _ => DECODER_OVERHEAD_LZMA2_BYTES,
+    };
+    window.saturating_mul(2).saturating_add(overhead)
+}
+
 /// A checked frame split over its (hash-verified) bytes, ready for the codec.
 pub(crate) struct ParsedFrame<'a> {
     codec: CodecId,

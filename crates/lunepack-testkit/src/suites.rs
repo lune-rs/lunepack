@@ -11,8 +11,9 @@ use lunepack_core::frame::{MAX_DICT_SIZE, MIN_DICT_SIZE};
 use lunepack_core::{
     BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId, DecodeReport, EncodedFrame,
     Encoder, Error, FileKind, FrameDesc, FrameView, Fs, FsError, FsErrorKind, Hasher, Head,
-    Outcome, Request, ResponseInfo, Sha256Digest, SignatureAlg, Signer, StreamDesc, StreamView,
-    Transport, TransportError, TransportErrorKind, U53, Validator, Verifier, decode_verified,
+    Outcome, PatchView, Request, ResponseInfo, Sha256Digest, SignatureAlg, Signer, StreamDesc,
+    StreamView, Transport, TransportError, TransportErrorKind, U53, Validator, Verifier,
+    decode_verified, patch_window,
 };
 
 use crate::transport::{SeenRequest, TransportFixture, block_on};
@@ -513,6 +514,24 @@ fn frame_error(err: &Error) -> Option<&FrameError> {
 ///     is an `Err` through both paths;
 /// 12. a writer failing after N bytes gives an `Err` and no write after the failure, through both
 ///     paths.
+///
+/// Delta patches (FORMAT.md 9.3), for each patch id (`lzma2`, `bcj-x86+lzma2`,
+/// `bcj-arm64+lzma2`) the encoder patches with, through `Codec::decode_patch` (the core's
+/// verified patch path arrives with the stage); at least one id must be patched, and `stored` and
+/// `bcj2` must be refused by both sides. Pairs: one byte against one byte, a 64 KiB base and a
+/// copy with spans changed, inserted and removed, 256 KiB of text and a shorter edit of it:
+///
+/// P1. the round trip equals the new file and consumes the whole patch;
+/// P2. `encode_patch` is deterministic;
+/// P3. a base with one byte flipped never panics, and (for the random pair, which can only be
+///     rebuilt from its base) of 16 flips spread over the base at least one changes the output or
+///     fails;
+/// P4. the patch truncated by one byte, and with one trailing byte, is an `Err`;
+/// P5. an `output_size` one below the file is an `Err` with at most that many bytes written; one
+///     above is an `Err`;
+/// P6. a base shorter than `base_size`, a window other than the format's, and `stored` or `bcj2`
+///     as the view's codec are `Err`s;
+/// P7. a writer failing after N bytes gives an `Err` and no write after the failure.
 pub fn run_codec_suite(codec: &dyn Codec, encoder: &dyn Encoder, hasher: &dyn Hasher) {
     const IDS: [CodecId; 5] = [
         CodecId::Stored,
@@ -544,6 +563,178 @@ pub fn run_codec_suite(codec: &dyn Codec, encoder: &dyn Encoder, hasher: &dyn Ha
         }
     }
     assert!(tested > 0, "the encoder supports no codec id");
+    patch_suite(codec, encoder, &mut rng);
+}
+
+/// The patch half of [`run_codec_suite`] (P1 to P7).
+fn patch_suite(codec: &dyn Codec, encoder: &dyn Encoder, rng: &mut Rng) {
+    for id in [CodecId::Stored, CodecId::Bcj2] {
+        assert!(
+            encoder.encode_patch(id, b"base", b"new").is_err(),
+            "{id:?}: a patch codec it is not"
+        );
+    }
+    let base = rng.bytes(64 * 1024);
+    let mut edited = base.clone();
+    edited[1000..1064].copy_from_slice(&rng.bytes(64));
+    edited.splice(20_000..20_000, rng.bytes(300));
+    edited.drain(50_000..50_200);
+    let long = text(256 * 1024);
+    let mut shorter = long[..200 * 1024].to_vec();
+    shorter.extend_from_slice(b"a new tail");
+    // (name, base, new, whether the new file is random data that only its base can rebuild)
+    let pairs: Vec<(&str, Vec<u8>, Vec<u8>, bool)> = vec![
+        ("1 byte", vec![0x41], vec![0x42], false),
+        ("64 KiB edited", base, edited, true),
+        ("256 KiB text, shorter", long, shorter, false),
+    ];
+    let mut tested = 0;
+    for id in [CodecId::Lzma2, CodecId::BcjX86Lzma2, CodecId::BcjArm64Lzma2] {
+        if encoder.encode_patch(id, &[1], &[2]).is_err() {
+            continue;
+        }
+        tested += 1;
+        for (name, base, new, random) in &pairs {
+            patch_cases(codec, encoder, id, name, (base, new), *random);
+        }
+    }
+    assert!(tested > 0, "the encoder makes no patch");
+}
+
+fn patch_view<'a>(id: CodecId, input: &'a [u8], base: &[u8], output_size: u64) -> PatchView<'a> {
+    PatchView {
+        codec: id,
+        input,
+        base_size: base.len() as u64,
+        output_size,
+        window: patch_window(base.len() as u64, output_size).expect("window"),
+    }
+}
+
+/// Counts the bytes written.
+struct Counting(u64);
+
+impl Write for Counting {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn patch_cases(
+    codec: &dyn Codec,
+    encoder: &dyn Encoder,
+    id: CodecId,
+    name: &str,
+    (base, new): (&[u8], &[u8]),
+    random: bool,
+) {
+    let ctx = format!("patch {id:?} / {name}");
+    let patch = encoder
+        .encode_patch(id, base, new)
+        .unwrap_or_else(|e| panic!("{ctx}: encode_patch failed: {e}"));
+    assert_eq!(patch.codec, id, "{ctx}: the patch names its codec");
+    assert!(!patch.bytes.is_empty(), "{ctx}: empty patch");
+    let n = new.len() as u64;
+    let view = patch_view(id, &patch.bytes, base, n);
+    let decode = |view: &PatchView<'_>, base: &[u8], out: &mut dyn Write| {
+        codec.decode_patch(view, base, out)
+    };
+
+    // P1. round trip
+    let mut out = Vec::new();
+    let report = decode(&view, base, &mut out)
+        .unwrap_or_else(|e| panic!("{ctx}: patch round trip failed: {e}"));
+    assert_eq!(out, new, "{ctx}: patch round trip differs");
+    assert_eq!(
+        report.consumed,
+        vec![patch.bytes.len() as u64],
+        "{ctx}: the whole patch is consumed"
+    );
+
+    // P2. deterministic
+    let again = encoder
+        .encode_patch(id, base, new)
+        .expect("second encode_patch");
+    assert_eq!(patch, again, "{ctx}: encode_patch is not deterministic");
+
+    // P3. a wrong base
+    let mut changed = 0;
+    for k in 0..16 {
+        let at = k * base.len() / 16;
+        let mut wrong = base.to_vec();
+        wrong[at] ^= 0x01;
+        let mut out = Vec::new();
+        if decode(&view, &wrong, &mut out).is_err() || out != new {
+            changed += 1;
+        }
+    }
+    // Only random data must be copied from the base: the one-byte pair shares nothing with it,
+    // and repeated text is matched from the new file's own recent bytes as well as the base's.
+    assert!(
+        changed > 0 || !random,
+        "{ctx}: no flipped base byte changed the output"
+    );
+
+    // P4. truncated and trailing
+    let short = &patch.bytes[..patch.bytes.len() - 1];
+    let res = decode(&patch_view(id, short, base, n), base, &mut Vec::new());
+    assert!(res.is_err(), "{ctx}: a truncated patch decoded");
+    let mut long = patch.bytes.clone();
+    long.push(0);
+    let res = decode(&patch_view(id, &long, base, n), base, &mut Vec::new());
+    assert!(res.is_err(), "{ctx}: a patch with a trailing byte decoded");
+
+    // P5. the output size bounds what is written
+    if n > 1 {
+        let mut count = Counting(0);
+        let res = decode(&patch_view(id, &patch.bytes, base, n - 1), base, &mut count);
+        assert!(res.is_err(), "{ctx}: decoded past a smaller output size");
+        assert!(count.0 < n, "{ctx}: wrote {} bytes past {}", count.0, n - 1);
+    }
+    let res = decode(
+        &patch_view(id, &patch.bytes, base, n + 1),
+        base,
+        &mut Vec::new(),
+    );
+    assert!(res.is_err(), "{ctx}: a short output decoded");
+
+    // P6. the view is checked
+    if base.len() > 1 {
+        let res = decode(&view, &base[1..], &mut Vec::new());
+        assert!(res.is_err(), "{ctx}: a base shorter than base_size decoded");
+    }
+    let off = PatchView {
+        window: view.window + 4096,
+        ..view
+    };
+    assert!(
+        decode(&off, base, &mut Vec::new()).is_err(),
+        "{ctx}: a window other than the format's decoded"
+    );
+    for other in [CodecId::Stored, CodecId::Bcj2] {
+        let res = decode(
+            &PatchView {
+                codec: other,
+                ..view
+            },
+            base,
+            &mut Vec::new(),
+        );
+        assert!(res.is_err(), "{ctx}: {other:?} decoded as a patch");
+    }
+
+    // P7. a failing writer
+    if n > 1 {
+        let mut w = FailAfter::new(new.len() / 2);
+        let res = decode(&view, base, &mut w);
+        assert!(res.is_err(), "{ctx}: a failing writer gave Ok");
+        assert_eq!(w.after_failure, 0, "{ctx}: wrote after a write error");
+    }
 }
 
 fn codec_cases(

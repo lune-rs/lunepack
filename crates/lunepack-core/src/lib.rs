@@ -71,7 +71,7 @@ pub use fetch::{
 };
 pub use frame::{
     CheckedFrame, FrameDesc, MAX_PATCH_WINDOW, PATCH_WINDOW_ALIGN, StreamDesc, check_file_frame,
-    decode_verified, decoder_memory, is_patch_codec, patch_window,
+    decode_verified, decoder_memory, is_patch_codec, patch_decoder_memory, patch_window,
 };
 pub use fs::{
     DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, PlaceFacts,
@@ -127,8 +127,9 @@ pub use state::{
 pub use stub::{LaunchTarget, STUB_CONTRACT_VERSION, STUB_FILE, StubError, launch_target};
 pub use target::Target;
 pub use traits::{
-    Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,
-    HashState, Hasher, PublisherCheck, Rng, SignatureAlg, SignedTree, Signer, StreamView, Verifier,
+    Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedPatch, EncodedStream,
+    Encoder, FrameView, HashState, Hasher, PatchView, PublisherCheck, Rng, SignatureAlg,
+    SignedTree, Signer, StreamView, Verifier,
 };
 pub use traits::{
     DirClass, Elevated, ElevatedChild, Elevation, MachinePolicy, PolicySource, Protect,

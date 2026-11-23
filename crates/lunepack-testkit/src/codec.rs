@@ -6,8 +6,8 @@ use std::io::Write;
 use lunepack_core::error::CodecError;
 use lunepack_core::frame::{MAX_DICT_SIZE, MIN_DICT_SIZE};
 use lunepack_core::{
-    Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, Error, FrameView,
-    StreamView,
+    Codec, CodecId, DecodeReport, EncodedFrame, EncodedPatch, EncodedStream, Encoder, Error,
+    FrameView, PatchView, StreamView, is_patch_codec, patch_window,
 };
 
 /// XOR key of the toy transform.
@@ -40,12 +40,36 @@ pub enum Fault {
     RetryAfterWriteError,
 }
 
+/// Bytes of the base fingerprint at the head of a toy patch.
+const TOY_FINGERPRINT: usize = 8;
+
+/// FNV-1a 64 of `bytes`: the toy patch's stand-in for "this is the base it was made against".
+fn fingerprint(bytes: &[u8]) -> [u8; TOY_FINGERPRINT] {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h.to_le_bytes()
+}
+
+/// The toy patch body: each input byte XORed with the base byte at the same position (the base
+/// repeated) and the toy key. Its own inverse.
+fn toy_patch_body<'a>(base: &'a [u8], data: &'a [u8]) -> impl Iterator<Item = u8> + 'a {
+    data.iter()
+        .enumerate()
+        .map(move |(i, b)| b ^ base[i % base.len()] ^ TOY_KEY)
+}
+
 /// Extra 4 KiB chunks [`Fault::Flood`] writes at most.
 const FLOOD_CHUNKS: usize = 16 * 1024;
 
 /// The fake codec. `Stored` is the real thing. A compressed id is encoded by [`FakeCodec::encode`]
 /// as `data ^ 0x5A` followed by one end byte, per stream; BCJ2 is four such streams (the last one
-/// stored) whose outputs are concatenated in order. Not a compressor: test-only.
+/// stored) whose outputs are concatenated in order. A patch (the three patch ids alike) is the
+/// base's 8-byte FNV-1a fingerprint, then each byte XORed with the base byte at its position (the
+/// base repeated) and `0x5A`, then the end byte: a wrong base is an error, the patch decodes only
+/// against its own base. Not a compressor: test-only.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FakeCodec {
     fault: Option<Fault>,
@@ -209,6 +233,35 @@ impl Encoder for FakeCodec {
         // One copy of the input per stream at most, plus the frame.
         input_len.saturating_mul(2).saturating_add(64)
     }
+
+    fn encode_patch(
+        &self,
+        codec: CodecId,
+        base: &[u8],
+        input: &[u8],
+    ) -> Result<EncodedPatch, Error> {
+        if !is_patch_codec(codec) {
+            return Err(CodecError::Unsupported(codec).into());
+        }
+        if base.is_empty() || input.is_empty() {
+            return Err(CodecError::Encoder("a toy patch needs a base and an input".into()).into());
+        }
+        if patch_window(base.len() as u64, input.len() as u64)
+            .is_none_or(|w| w > lunepack_core::MAX_PATCH_WINDOW)
+        {
+            return Err(CodecError::Encoder("the patch window is above 128 MiB".into()).into());
+        }
+        let mut bytes = Vec::with_capacity(TOY_FINGERPRINT + input.len() + 1);
+        bytes.extend_from_slice(&fingerprint(base));
+        bytes.extend(toy_patch_body(base, input));
+        bytes.push(TOY_END);
+        Ok(EncodedPatch { codec, bytes })
+    }
+
+    fn encode_patch_memory(&self, _codec: CodecId, window: u64) -> u64 {
+        // The patch itself, at most the window plus the fingerprint and the end byte.
+        window.saturating_add(64)
+    }
 }
 
 impl Codec for FakeCodec {
@@ -256,6 +309,53 @@ impl Codec for FakeCodec {
             decoded.push(data);
         }
 
+        self.emit(&decoded, &mut consumed, out)?;
+        Ok(DecodeReport { consumed })
+    }
+
+    fn decode_patch(
+        &self,
+        patch: &PatchView<'_>,
+        base: &[u8],
+        out: &mut dyn Write,
+    ) -> Result<DecodeReport, Error> {
+        assert!(
+            self.fault != Some(Fault::PanicIfCalled),
+            "FakeCodec::decode_patch called with Fault::PanicIfCalled"
+        );
+        patch.check(base.len())?;
+        let Some((&TOY_END, body)) = patch.input.split_last() else {
+            return Err(CodecError::Corrupt("missing end marker").into());
+        };
+        let Some((print, body)) = body.split_first_chunk::<TOY_FINGERPRINT>() else {
+            return Err(CodecError::Corrupt("a toy patch without its fingerprint").into());
+        };
+        if *print != fingerprint(base) {
+            return Err(CodecError::Corrupt("the patch was not made against this base").into());
+        }
+        if body.len() as u64 != patch.output_size {
+            return Err(CodecError::StreamSize {
+                index: 0,
+                expected: patch.output_size,
+                actual: body.len() as u64,
+            }
+            .into());
+        }
+        let decoded = vec![toy_patch_body(base, body).collect::<Vec<u8>>()];
+        let mut consumed = vec![patch.input.len() as u64];
+        self.emit(&decoded, &mut consumed, out)?;
+        Ok(DecodeReport { consumed })
+    }
+}
+
+impl FakeCodec {
+    /// Writes the decoded streams to `out`, with this codec's fault applied.
+    fn emit(
+        &self,
+        decoded: &[Vec<u8>],
+        consumed: &mut [u64],
+        out: &mut dyn Write,
+    ) -> Result<(), Error> {
         let write =
             |out: &mut dyn Write, bytes: &[u8]| out.write_all(bytes).map_err(CodecError::Write);
         match self.fault {
@@ -269,14 +369,14 @@ impl Codec for FakeCodec {
                 write(out, &all[..all.len().saturating_sub(1)])?;
             }
             Some(Fault::RetryAfterWriteError) => {
-                for part in &decoded {
+                for part in decoded {
                     if out.write_all(part).is_err() {
                         let _ = out.write_all(part);
                     }
                 }
             }
             _ => {
-                for part in &decoded {
+                for part in decoded {
                     write(out, part)?;
                 }
             }
@@ -295,6 +395,6 @@ impl Codec for FakeCodec {
         if self.fault == Some(Fault::WrongConsumed) {
             consumed[0] = if consumed[0] == 0 { 1 } else { consumed[0] - 1 };
         }
-        Ok(DecodeReport { consumed })
+        Ok(())
     }
 }
