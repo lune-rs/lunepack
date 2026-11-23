@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lunepack::{FileKind, Phase, Process, Progress, Version};
+use lunepack_core::ElevationError;
 use lunepack_core::engine::{InstallRequest, Installed, MachineOpError, Ports, install};
 use lunepack_core::limits::Limits;
 use lunepack_core::setup::{
@@ -41,15 +42,13 @@ use lunepack_core::{
     root_valid_for_uninstall,
 };
 #[cfg(unix)]
-use lunepack_core::{ElevationError, RollbackFloor, setup::verify_setup, verify_key_set};
+use lunepack_core::{RollbackFloor, setup::verify_setup, verify_key_set};
 
 use crate::events::{Event, Events};
 use crate::modes::{
     Kind, MACHINE_INSTALL, MACHINE_REPAIR, MACHINE_UNINSTALL, MachineArgs, SetupArgs,
 };
-#[cfg(unix)]
-use crate::relay::StreamConnector;
-use crate::relay::{EventConnector, RelaySink};
+use crate::relay::{EventConnector, RelaySink, StreamConnector};
 use crate::setup::Found;
 
 /// How long the elevated copy waits for the unelevated setup to open its pipe before it goes on
@@ -1220,6 +1219,20 @@ pub struct Host<'a> {
     pub rng: &'a dyn Rng,
     /// The user's SID, as text: the one account that may read an elevated child's pipe.
     pub sid: Option<&'a str>,
+    /// How an elevated child's progress comes back.
+    pub relay: Relay,
+}
+
+/// How the progress of an elevated child reaches the unelevated process that started it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relay {
+    /// Windows: a named pipe the child makes (`--events <id> --for-sid <SID>`), read through
+    /// [`Host::pipes`].
+    Pipe,
+    /// Linux and macOS (M11-D14): the child's standard output (`--events stdout`), which pkexec
+    /// keeps; its exit code passes through. On macOS nothing is started this way (no prompt of
+    /// our own, D38 (a)), the command to run as an administrator is shown instead.
+    Stdout,
 }
 
 /// Whether an administrator's policy makes the runtime of the install of `app_id` headless
@@ -1287,6 +1300,17 @@ pub struct Located {
 /// before any effect: `usage` for a place that is no machine tree, `install_mismatch` for one that
 /// is not the install the machine record knows.
 pub fn locate(fs: &dyn Fs, hasher: &dyn Hasher, home: &Path, exe: &Path) -> Result<Located, Kind> {
+    locate_in(fs, hasher, home, exe, MachineScheme::WINDOWS)
+}
+
+/// [`locate`] under the machine `scheme` of an OS (the Linux tree is `R/app/<version>` too).
+pub fn locate_in(
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    home: &Path,
+    exe: &Path,
+    scheme: MachineScheme,
+) -> Result<Located, Kind> {
     let (root, tree) = tree_of(exe, home).ok_or(Kind::Usage)?;
     let version = tree
         .file_name()
@@ -1294,7 +1318,7 @@ pub fn locate(fs: &dyn Fs, hasher: &dyn Hasher, home: &Path, exe: &Path) -> Resu
         .and_then(|n| Version::parse(n).ok().filter(|v| v.to_string() == n))
         .ok_or(Kind::Usage)?;
     let mut config_path = tree.clone();
-    for part in LayoutScheme::WINDOWS.config.split('/') {
+    for part in scheme.view.config.split('/') {
         config_path.push(part);
     }
     let bytes = fs
@@ -1307,20 +1331,42 @@ pub fn locate(fs: &dyn Fs, hasher: &dyn Hasher, home: &Path, exe: &Path) -> Resu
     if config.version != version || config.version.to_string() != version.to_string() {
         return Err(Kind::UpdateConfig);
     }
-    let name = config.install.name.clone();
-    match find(fs, hasher, home, &config.app_id, &name) {
-        Machine::Present(found, _) if same_dir(&found, &root) => {}
-        _ => return Err(Kind::InstallMismatch),
-    }
-    if !root_valid_for_uninstall(fs, home, &root, &config.app_id, LayoutScheme::WINDOWS) {
-        return Err(Kind::InstallMismatch);
-    }
+    validated(
+        fs,
+        hasher,
+        home,
+        scheme,
+        &root,
+        &config.app_id,
+        &config.install.name,
+    )?;
     Ok(Located {
         root,
         app_id: config.app_id,
-        name,
+        name: config.install.name,
         version,
     })
+}
+
+/// Whether `root` is the install the machine record of `app_id` knows (found under `name`) and a
+/// real install root directly in `home`; else `install_mismatch`.
+pub fn validated(
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    home: &Path,
+    scheme: MachineScheme,
+    root: &Path,
+    app_id: &AppId,
+    name: &str,
+) -> Result<(), Kind> {
+    match find_in(fs, hasher, home, app_id, name, scheme) {
+        Machine::Present(found, _) if same_dir(&found, root) => {}
+        _ => return Err(Kind::InstallMismatch),
+    }
+    if !root_valid_for_uninstall(fs, home, root, app_id, scheme.view) {
+        return Err(Kind::InstallMismatch);
+    }
+    Ok(())
 }
 
 /// The hidden `machine-repair` mode: the engine's `repair` for the install the image stands in,
@@ -1334,10 +1380,24 @@ pub fn run_repair_mode(
     standing: Standing,
     exe: &Path,
 ) -> Kind {
+    run_repair_mode_in(ops, fs, hasher, home, standing, exe, MachineScheme::WINDOWS)
+}
+
+/// [`run_repair_mode`] under the machine `scheme` of an OS (Linux: `machine-repair --events
+/// stdout`, started by pkexec; its exit code is its whole result).
+pub fn run_repair_mode_in(
+    ops: &dyn Ops,
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    home: &Path,
+    standing: Standing,
+    exe: &Path,
+    scheme: MachineScheme,
+) -> Kind {
     if standing == Standing::Standard {
         return Kind::Usage;
     }
-    let located = match locate(fs, hasher, home, exe) {
+    let located = match locate_in(fs, hasher, home, exe, scheme) {
         Ok(located) => located,
         Err(kind) => return kind,
     };
@@ -1418,6 +1478,9 @@ fn run_elevated_mode(host: &Host<'_>, target: &Site, mode: &str) -> Result<(Stri
 /// current version inside `R` run `machine-repair`, the result being its exit code. With `silent`
 /// a standard user's run exits `elevation_required` and nothing is asked.
 pub fn repair(host: &Host<'_>, target: &Site, silent: bool) -> Result<(), Kind> {
+    if host.relay == Relay::Stdout {
+        return repair_stdout(host, target, silent);
+    }
     match host.elevation.standing() {
         Standing::Admin | Standing::UacElevated => {
             host.ops.repair(&target.root, &target.name).map(|_| ())
@@ -1786,6 +1849,431 @@ pub fn uninstall(
     }
 }
 
+// ---- repair and uninstall of a machine install on Linux and macOS (M11-D14) -------------------
+
+/// The prefix of the folder phase 1 of the unix uninstall copies the runtime into, before the 16
+/// hex characters of its name (D14; the Windows folder has 32).
+#[cfg(unix)]
+pub const UNIX_UNINSTALL_PREFIX: &str = UNINSTALL_PREFIX;
+/// The runtime's file name in that folder.
+#[cfg(unix)]
+pub const UNIX_UNINSTALL_COPY: &str = "lunepack-runtime";
+/// The first line of a unix marker.
+#[cfg(unix)]
+const UNIX_MARKER_HEAD: &str = "lunepack-uninstall 2";
+/// The random bytes of that folder's name.
+#[cfg(unix)]
+const UNIX_UNINSTALL_RANDOM: usize = 8;
+
+/// Why the elevated side of `uninstall` did not remove the install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UninstallEnd {
+    /// The exit kind.
+    Kind(Kind),
+    /// No agent can ask for an administrator (no pkexec; macOS never has one, D38 (a)): the
+    /// command to run in a terminal as one instead, when it can be shown.
+    NeedsAdministrator(Option<String>),
+}
+
+impl From<Kind> for UninstallEnd {
+    fn from(kind: Kind) -> UninstallEnd {
+        UninstallEnd::Kind(kind)
+    }
+}
+
+/// [`uninstall`], whichever way the host's elevated child reports ([`Relay`]).
+#[allow(clippy::too_many_arguments)]
+pub fn uninstall_any(
+    host: &Host<'_>,
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    home: &Path,
+    scheme: MachineScheme,
+    target: &Site,
+    silent: bool,
+    events: &Events,
+) -> Result<(), UninstallEnd> {
+    match host.relay {
+        Relay::Pipe => {
+            uninstall(host, fs, hasher, home, target, silent, events).map_err(Into::into)
+        }
+        Relay::Stdout => uninstall_stdout(host, fs, hasher, home, scheme, target, silent, events),
+    }
+}
+
+/// The command an administrator runs in a terminal when no prompt can ask: `sudo '<runtime>'
+/// <word>` for `word` `repair` or `uninstall`; `None` when it does not fit the UI's screen.
+pub fn admin_command_for(runtime: &Path, word: &str) -> Option<String> {
+    let quoted = runtime.to_str()?.replace('\'', "'\\''");
+    let command = format!("sudo '{quoted}' {word}");
+    (command.len() <= lunepack_core::ui::MAX_ADMIN_COMMAND).then_some(command)
+}
+
+/// What the elevated child of a unix machine install ended with: its exit kind, or why it could
+/// not be started.
+fn elevated_stdout(
+    host: &Host<'_>,
+    target: &Site,
+    mode: &str,
+    events: Option<&Events>,
+) -> Result<(i32, Option<u8>), UninstallEnd> {
+    let args = [
+        mode.to_owned(),
+        "--events".to_owned(),
+        crate::modes::EVENTS_STDOUT.to_owned(),
+    ];
+    let mut child = match host.elevation.run_elevated(&target.runtime, &args) {
+        Ok(Elevated::Started(child)) => child,
+        Ok(Elevated::Declined) | Err(ElevationError::Declined) => {
+            return Err(Kind::ElevationDeclined.into());
+        }
+        Err(ElevationError::NoAgent) => return Err(needs_administrator(target, mode)),
+        Err(_) => return Err(Kind::Process.into()),
+    };
+    let connector = child.take_output().map(StreamConnector::new);
+    let ended = AtomicBool::new(false);
+    let (code, end) = std::thread::scope(|scope| {
+        let relayed = match (&connector, events) {
+            (Some(connector), Some(events)) => Some(scope.spawn(|| {
+                crate::relay::relay_ending(connector, crate::modes::EVENTS_STDOUT, events, &ended)
+            })),
+            _ => None,
+        };
+        let code = child.wait();
+        ended.store(true, Ordering::Release);
+        let end = relayed.and_then(|r| r.join().ok()).and_then(|(_, end)| end);
+        (code, end)
+    });
+    match code {
+        Ok(code) => Ok((code, end)),
+        Err(ElevationError::Declined) => Err(Kind::ElevationDeclined.into()),
+        Err(ElevationError::NoAgent) => Err(needs_administrator(target, mode)),
+        Err(_) => Err(Kind::Process.into()),
+    }
+}
+
+fn needs_administrator(target: &Site, mode: &str) -> UninstallEnd {
+    let word = if mode == MACHINE_REPAIR {
+        "repair"
+    } else {
+        "uninstall"
+    };
+    UninstallEnd::NeedsAdministrator(admin_command_for(&target.runtime, word))
+}
+
+/// `repair` of a unix machine install ([`Relay::Stdout`]): an administrator's process runs the
+/// engine's `repair` itself; a standard user's has pkexec run the runtime of the current version
+/// inside `R` (root-owned, never a copy of the user's) as `machine-repair --events stdout`, the
+/// result being its exit code. Where nothing can ask (no pkexec; macOS), or with `silent`, it is
+/// `elevation_required` and nothing was asked.
+fn repair_stdout(host: &Host<'_>, target: &Site, silent: bool) -> Result<(), Kind> {
+    match host.elevation.standing() {
+        Standing::Admin | Standing::UacElevated => {
+            host.ops.repair(&target.root, &target.name).map(|_| ())
+        }
+        Standing::Standard if silent => Err(Kind::ElevationRequired),
+        Standing::Standard => match elevated_stdout(host, target, MACHINE_REPAIR, None) {
+            Ok((code, _)) => match Kind::from_exit_code(code) {
+                Kind::Ok => Ok(()),
+                kind => Err(kind),
+            },
+            Err(UninstallEnd::Kind(kind)) => Err(kind),
+            Err(UninstallEnd::NeedsAdministrator(_)) => Err(Kind::ElevationRequired),
+        },
+    }
+}
+
+/// The unelevated side of `uninstall` on a unix machine install, after the user confirmed: has
+/// pkexec run the runtime inside `R` as `machine-uninstall --events stdout` (phase 1 becomes the
+/// copy outside `R`, phase 2, so the exit code is phase 2's), follows its progress, and judges
+/// the result by the machine record: the install being gone is success. The caller removes this
+/// user's own home afterwards. With `silent` a standard user's run is `elevation_required` and
+/// nothing is asked.
+#[allow(clippy::too_many_arguments)]
+fn uninstall_stdout(
+    host: &Host<'_>,
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    home: &Path,
+    scheme: MachineScheme,
+    target: &Site,
+    silent: bool,
+    events: &Events,
+) -> Result<(), UninstallEnd> {
+    if host.elevation.standing() == Standing::Standard && silent {
+        return Err(Kind::ElevationRequired.into());
+    }
+    let (code, end) = elevated_stdout(host, target, MACHINE_UNINSTALL, Some(events))?;
+    match find_in(fs, hasher, home, &target.app_id, &target.name, scheme) {
+        Machine::Absent => Ok(()),
+        _ => Err(match Kind::from_exit_code(code) {
+            Kind::Ok => match end.map(|c| Kind::from_exit_code(i32::from(c))) {
+                Some(Kind::Ok) | None => Kind::State,
+                Some(kind) => kind,
+            },
+            kind => kind,
+        }
+        .into()),
+    }
+}
+
+/// The marker phase 1 of a unix uninstall leaves in its folder: what phase 2 does is derived from
+/// it and from the machine record, never from its arguments (it has none beyond its mode).
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnixMarker {
+    /// The app.
+    pub app_id: AppId,
+    /// The display name.
+    pub name: String,
+    /// The install root to remove.
+    pub root: PathBuf,
+}
+
+#[cfg(unix)]
+impl UnixMarker {
+    fn encode(&self) -> Option<String> {
+        let root = self.root.to_str()?;
+        let plain = |t: &str| !t.is_empty() && !t.chars().any(char::is_control);
+        (plain(&self.name) && plain(root)).then(|| {
+            format!(
+                "{UNIX_MARKER_HEAD}\napp {}\nname {}\nroot {root}\n",
+                self.app_id.as_str(),
+                self.name
+            )
+        })
+    }
+
+    /// The marker of `text`; `None` for anything but exactly the lines `encode` writes.
+    pub fn parse(text: &str) -> Option<UnixMarker> {
+        let mut lines = text.strip_suffix('\n')?.split('\n');
+        if lines.next()? != UNIX_MARKER_HEAD {
+            return None;
+        }
+        let mut value = |key: &str| -> Option<String> {
+            lines
+                .next()?
+                .strip_prefix(key)?
+                .strip_prefix(' ')
+                .filter(|v| !v.is_empty() && !v.chars().any(char::is_control))
+                .map(str::to_owned)
+        };
+        let app_id = AppId::parse(&value("app")?).ok()?;
+        let name = value("name")?;
+        let root = PathBuf::from(value("root")?);
+        (lines.next().is_none() && root.is_absolute()).then_some(UnixMarker { app_id, name, root })
+    }
+}
+
+/// Replaces this process by a program (a fake in tests).
+#[cfg(unix)]
+pub trait Exec: Send + Sync {
+    /// Runs `program` with `args` in place of this process, its environment empty and its
+    /// standard streams this process's own. `Ok(())` is only ever answered by a fake: a real
+    /// replacement does not return.
+    fn exec(&self, program: &Path, args: &[String]) -> io::Result<()>;
+}
+
+/// [`Exec`] through the operating system's `exec`.
+#[cfg(unix)]
+pub struct StdExec;
+
+#[cfg(unix)]
+impl Exec for StdExec {
+    fn exec(&self, program: &Path, args: &[String]) -> io::Result<()> {
+        use std::os::unix::process::CommandExt as _;
+        // Only reached by a process that holds no other descriptor of its own than the standard
+        // ones and the images' (the standard library opens everything close-on-exec).
+        let error = std::process::Command::new(program)
+            .args(args)
+            .env_clear()
+            .exec();
+        Err(error)
+    }
+}
+
+/// Phase 1 of the unix machine uninstall, in a process of an administrator's started from the
+/// image `exe` inside `R` (or `B`): that image cannot stay while the engine removes `R`, whose
+/// removal guard sees every process running from it, so this process copies the runtime into a
+/// new admin-only folder `.lunepack-uninstall-<16 hex>` directly under the machine home, with a
+/// marker naming the install, makes that folder its working directory and becomes the copy
+/// (`machine-uninstall --second`, with `--events stdout` when `relay`), which keeps the standard
+/// streams. It deletes nothing and starts nothing from a place a standard user can write. A
+/// failure removes the folder and is the exit kind; success does not return.
+#[cfg(unix)]
+pub fn run_uninstall_start_unix(
+    base: &Base<'_>,
+    ops: &dyn Ops,
+    exec: &dyn Exec,
+    standing: Standing,
+    located: &Located,
+    relay: bool,
+    exe: &Path,
+) -> Kind {
+    if standing == Standing::Standard {
+        return Kind::Usage;
+    }
+    let marker = UnixMarker {
+        app_id: located.app_id.clone(),
+        name: located.name.clone(),
+        root: located.root.clone(),
+    };
+    let Some(text) = marker.encode() else {
+        return Kind::UpdateConfig;
+    };
+    let mut raw = [0u8; UNIX_UNINSTALL_RANDOM];
+    if base.rng.fill(&mut raw).is_err() {
+        return Kind::Internal;
+    }
+    let dir = base
+        .home
+        .join(format!("{UNIX_UNINSTALL_PREFIX}{}", hex(&raw)));
+    if base.protect.create_dir(&dir, DirClass::AdminOnly).is_err() {
+        return Kind::NotProtected;
+    }
+    let started = (|| {
+        let copy = dir.join(UNIX_UNINSTALL_COPY);
+        base.fs.copy_file(exe, &copy).map_err(|_| Kind::Fs)?;
+        let mut out = base
+            .fs
+            .create_new(&dir.join(UNINSTALL_MARKER))
+            .map_err(|_| Kind::Fs)?;
+        out.write_all(text.as_bytes()).map_err(|_| Kind::Fs)?;
+        out.sync().map_err(|_| Kind::Fs)?;
+        drop(out);
+        // The copy inherits this directory, not one inside `R`.
+        if !ops.enter(&dir) {
+            return Err(Kind::Fs);
+        }
+        let mut args = vec![MACHINE_UNINSTALL.to_owned(), "--second".to_owned()];
+        if relay {
+            args.push("--events".to_owned());
+            args.push(crate::modes::EVENTS_STDOUT.to_owned());
+        }
+        exec.exec(&copy, &args).map_err(|_| Kind::Process)
+    })();
+    match started {
+        Ok(()) => Kind::Ok,
+        Err(kind) => {
+            let _ = base.fs.remove_dir_all_nofollow(&dir);
+            kind
+        }
+    }
+}
+
+/// The own-folder rule of phase 2 on a unix system: `exe` is the runtime copy directly inside a
+/// real, admin-only folder `.lunepack-uninstall-<16 lowercase hex>` directly under the machine
+/// home, which holds a marker; the folder, or `None` anywhere else.
+#[cfg(unix)]
+pub fn unix_own_folder(
+    fs: &dyn Fs,
+    protect: &dyn Protect,
+    home: &Path,
+    exe: &Path,
+) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    let id = dir
+        .file_name()?
+        .to_str()?
+        .strip_prefix(UNIX_UNINSTALL_PREFIX)?;
+    let hex16 = id.len() == UNIX_UNINSTALL_RANDOM * 2
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if exe.file_name().and_then(|n| n.to_str()) != Some(UNIX_UNINSTALL_COPY)
+        || !hex16
+        || dir.parent() != Some(home)
+    {
+        return None;
+    }
+    let is = |path: &Path, kind: FileKind| matches!(fs.symlink_metadata(path), Ok(Some(m)) if m.kind == kind);
+    (is(dir, FileKind::Dir)
+        && is(&dir.join(UNINSTALL_MARKER), FileKind::File)
+        && protect.check(dir, DirClass::AdminOnly).is_ok())
+    .then(|| dir.to_path_buf())
+}
+
+/// Phase 2 of the unix machine uninstall, run as root from its own folder (`machine-uninstall
+/// --second`): the own-folder rule first (a usage error, nothing done), the marker next, then the
+/// re-validation of the install the marker names against the machine record and the removal
+/// guard's own view (`install_mismatch` when it is not a valid machine install: nothing is
+/// removed), the engine's `uninstall` and, whatever the result, the copy's own folder (a running
+/// file may be unlinked here). The result is the exit kind.
+#[cfg(unix)]
+pub fn run_uninstall_second_unix(
+    base: &Base<'_>,
+    ops: &dyn Ops,
+    standing: Standing,
+    scheme: MachineScheme,
+    events: &Events,
+    exe: &Path,
+) -> Kind {
+    if standing == Standing::Standard {
+        return Kind::Usage;
+    }
+    let Some(dir) = unix_own_folder(base.fs, base.protect, base.home, exe) else {
+        return Kind::Usage;
+    };
+    let marker = base
+        .fs
+        .read_capped(&dir.join(UNINSTALL_MARKER), MARKER_MAX)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| UnixMarker::parse(&text));
+    let Some(marker) = marker else {
+        return Kind::InstallMismatch;
+    };
+    // Nothing of this process stays in `R` (the strict removal guard sees a working directory).
+    if !ops.enter(&dir) {
+        return Kind::Fs;
+    }
+    events.emit(&Event::phase(Phase::Uninstall, None));
+    let valid = validated(
+        base.fs,
+        base.hasher,
+        base.home,
+        scheme,
+        &marker.root,
+        &marker.app_id,
+        &marker.name,
+    )
+    .is_ok();
+    let kind = if valid {
+        match ops.uninstall(&marker.root, &marker.name) {
+            Ok(()) => Kind::Ok,
+            Err(kind) => kind,
+        }
+    } else {
+        Kind::InstallMismatch
+    };
+    let _ = base.fs.remove_dir_all_nofollow(&dir);
+    kind
+}
+
+/// [`run_uninstall_second_unix`] with its progress as relay lines on `out` (the standard output
+/// the unelevated parent reads) and the `end` line last: the unelevated side judges success by
+/// the machine record and takes the code as advice.
+#[cfg(unix)]
+pub fn run_uninstall_second_relayed(
+    base: &Base<'_>,
+    ops: &dyn Ops,
+    standing: Standing,
+    scheme: MachineScheme,
+    out: Box<dyn Write + Send>,
+    exe: &Path,
+) -> Kind {
+    let shared = Shared(Arc::new(Mutex::new(out)));
+    let events = Events::new(
+        None,
+        Some(Box::new(RelaySink::new(Box::new(shared.clone()))) as Box<dyn crate::events::Sink>),
+    );
+    let kind = run_uninstall_second_unix(base, ops, standing, scheme, &events, exe);
+    events.finish(Duration::from_secs(2));
+    let mut end = shared;
+    crate::relay::write_end(&mut end, kind.code());
+    kind
+}
+
 // ---- the Windows adapters --------------------------------------------------------------------
 
 /// The Windows adapters of the all-users install: the engine's ports, the elevation pipe's two
@@ -2042,7 +2530,7 @@ pub mod native_linux {
     use lunepack::SystemClock;
     use lunepack_codec_lzma::LzmaCodec;
     use lunepack_core::MachineScheme;
-    use lunepack_core::engine::{Installed, Ports};
+    use lunepack_core::engine::{Engine, Installed, MachineOpError, Ports};
     use lunepack_crypto::{Ed25519Verifier, OsRng, Sha256Hasher};
     use lunepack_fs::StdFs;
     use lunepack_os_linux::{
@@ -2050,7 +2538,7 @@ pub mod native_linux {
         SystemdRegistrar,
     };
 
-    use super::{Installer, Staged, install_staged};
+    use super::{Installer, Ops, Staged, install_staged, kind_of};
     use crate::modes::Kind;
 
     /// The machine home: the constant of the Linux scheme (`/opt`), resolved the way the kernel
@@ -2059,6 +2547,19 @@ pub mod native_linux {
         MachineScheme::LINUX
             .home
             .and_then(|home| std::fs::canonicalize(home).ok())
+    }
+
+    /// The scheme of this OS's machine installs.
+    pub const SCHEME: MachineScheme = MachineScheme::LINUX;
+
+    /// [`machine_home`], the name every unix OS has.
+    pub fn home() -> Option<PathBuf> {
+        machine_home()
+    }
+
+    /// This process's own executable as the kernel names it: the link `/proc/self/exe`.
+    pub fn image() -> Option<PathBuf> {
+        std::fs::read_link("/proc/self/exe").ok()
     }
 
     /// Every adapter the engine's ports name.
@@ -2127,6 +2628,38 @@ pub mod native_linux {
         }
     }
 
+    /// The engine's one-shot operations over the Linux adapters (repair and uninstall of an
+    /// install the administrator's process is running for). `enter` makes a directory the
+    /// working directory: the composition root passes it in.
+    pub struct NativeOps {
+        /// Makes the directory this process's working directory.
+        pub enter: fn(&Path) -> bool,
+    }
+
+    impl Ops for NativeOps {
+        fn repair(&self, root: &Path, _name: &str) -> Result<lunepack::Version, Kind> {
+            let adapters = Adapters::new();
+            let engine = Engine::open(adapters.ports(), root)
+                .map_err(|e| kind_of(MachineOpError::from(e)))?;
+            engine.repair().map_err(kind_of)
+        }
+
+        fn uninstall(&self, root: &Path, _name: &str) -> Result<(), Kind> {
+            let adapters = Adapters::new();
+            let engine = Engine::open(adapters.ports(), root)
+                .map_err(|e| kind_of(MachineOpError::from(e)))?;
+            engine.uninstall().map_err(kind_of)
+        }
+
+        fn enter(&self, dir: &Path) -> bool {
+            (self.enter)(dir)
+        }
+
+        fn delete_at_restart(&self, _path: &Path) -> bool {
+            false
+        }
+    }
+
     /// The engine over the Linux adapters.
     pub struct LinuxInstaller;
 
@@ -2161,7 +2694,7 @@ pub mod native_macos {
         MacPublisherCheck,
     };
 
-    use super::{Installer, Repairer, Staged, Stat, StatFacts, install_staged_in, kind_of};
+    use super::{Installer, Ops, Repairer, Staged, Stat, StatFacts, install_staged_in, kind_of};
     use crate::modes::Kind;
 
     /// The apps folder the live bundle goes in.
@@ -2182,6 +2715,19 @@ pub mod native_macos {
     /// This process's own executable as the kernel names it (`proc_pidpath`).
     pub fn own_image() -> io::Result<PathBuf> {
         exe_path(std::process::id())?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    /// The scheme of this OS's machine installs.
+    pub const SCHEME: MachineScheme = MachineScheme::MACOS;
+
+    /// [`machine_home`], the name every unix OS has.
+    pub fn home() -> Option<PathBuf> {
+        machine_home().ok()
+    }
+
+    /// [`own_image`], the name every unix OS has.
+    pub fn image() -> Option<PathBuf> {
+        own_image().ok()
     }
 
     /// `path` as the kernel names it.
@@ -2257,6 +2803,33 @@ pub mod native_macos {
         }
     }
 
+    /// The engine's one-shot operations over the macOS adapters (as [`super::native_linux`]).
+    pub struct NativeOps {
+        /// Makes the directory this process's working directory.
+        pub enter: fn(&Path) -> bool,
+    }
+
+    impl Ops for NativeOps {
+        fn repair(&self, root: &Path, _name: &str) -> Result<lunepack::Version, Kind> {
+            MacRepairer.repair(root)
+        }
+
+        fn uninstall(&self, root: &Path, _name: &str) -> Result<(), Kind> {
+            let adapters = Adapters::new();
+            let engine = Engine::open(adapters.ports(), root)
+                .map_err(|e| kind_of(lunepack_core::engine::MachineOpError::from(e)))?;
+            engine.uninstall().map_err(kind_of)
+        }
+
+        fn enter(&self, dir: &Path) -> bool {
+            (self.enter)(dir)
+        }
+
+        fn delete_at_restart(&self, _path: &Path) -> bool {
+            false
+        }
+    }
+
     /// The engine over the macOS adapters, the live bundle going into `apps_dir`.
     pub struct MacInstaller {
         /// The apps folder.
@@ -2307,6 +2880,27 @@ pub mod native_macos {
                 Err(e) => Err(e),
             }
         }
+    }
+}
+
+/// The adapters of this unix OS's machine installs under one name.
+#[cfg(target_os = "linux")]
+pub use native_linux as native_unix;
+/// The adapters of this unix OS's machine installs under one name.
+#[cfg(target_os = "macos")]
+pub use native_macos as native_unix;
+
+/// The elevated children of a unix machine install report on their standard output, never through
+/// a named pipe: this connector has no pipe to open ([`Relay::Stdout`]).
+pub struct NoPipes;
+
+impl EventConnector for NoPipes {
+    fn connect(
+        &self,
+        _id: &str,
+        _wait: Duration,
+    ) -> Result<Box<dyn lunepack_core::service::Duplex>, crate::relay::Attempt> {
+        Err(crate::relay::Attempt::Refused)
     }
 }
 
@@ -3746,6 +4340,7 @@ mod tests {
             policy: &host.policy,
             rng: &host.rng,
             sid,
+            relay: super::Relay::Pipe,
         }
     }
 
@@ -5494,6 +6089,916 @@ mod tests {
                 pkg: None
             }));
             assert!(process.spawns().is_empty());
+        }
+    }
+
+    // ---- repair and uninstall of a machine install on Linux and macOS (M11-D14) --------------
+
+    #[cfg(unix)]
+    mod unix_machine {
+        use super::*;
+        use std::io::Read;
+
+        use lunepack_core::ElevatedChild;
+        use lunepack_core::error::ElevationError;
+
+        const ID: &str = lunepack_testkit::SUITE_APP_ID;
+
+        /// A Linux machine install of 1.0.0 with its runtime in `R/app/1.0.0`.
+        fn linux() -> (Host, PathBuf) {
+            let host = Host::linux();
+            let b = Built::linux("1.0.0", true);
+            let (events, _) = collecting();
+            install_all_own_image(&host.base(), &FakeInstaller(&host), &b.found(), &events)
+                .expect("installed");
+            let exe = host
+                .home
+                .join(ID)
+                .join("app/1.0.0")
+                .join(UNIX_UNINSTALL_COPY);
+            host.mem
+                .create_new(&exe)
+                .unwrap()
+                .write_all(b"runtime")
+                .unwrap();
+            (host, exe)
+        }
+
+        /// What `exec` was asked.
+        #[derive(Default)]
+        struct FakeExec {
+            calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
+            fail: bool,
+        }
+
+        impl Exec for FakeExec {
+            fn exec(&self, program: &Path, args: &[String]) -> io::Result<()> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((program.to_path_buf(), args.to_vec()));
+                if self.fail {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        fn located(host: &Host, exe: &Path) -> Located {
+            locate_in(
+                &host.mem,
+                &FakeHasher,
+                &host.home,
+                exe,
+                MachineScheme::LINUX,
+            )
+            .expect("located")
+        }
+
+        fn uninstall_dirs(host: &Host) -> Vec<PathBuf> {
+            lunepack_core::Fs::list_dir(&host.mem, &host.home)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.name.to_string_lossy().starts_with(UNIX_UNINSTALL_PREFIX))
+                .map(|e| host.home.join(e.name))
+                .collect()
+        }
+
+        #[test]
+        fn the_linux_install_is_found_from_the_image_inside_its_tree() {
+            let (host, exe) = linux();
+            let found = located(&host, &exe);
+            assert_eq!(found.root, host.home.join(ID));
+            assert_eq!(found.name, "Hello");
+            assert_eq!(found.version.to_string(), "1.0.0");
+            // A copy elsewhere, in the wrong depth or of an install the record does not know.
+            for bad in [
+                "/tmp/lunepack-runtime",
+                "/opt/lunepack-runtime",
+                "/opt/app/1.0.0/rt",
+            ] {
+                let got = locate_in(
+                    &host.mem,
+                    &FakeHasher,
+                    &host.home,
+                    &abs_path(bad),
+                    MachineScheme::LINUX,
+                );
+                assert_eq!(got, Err(Kind::Usage), "{bad}");
+            }
+        }
+
+        #[test]
+        fn phase_one_copies_the_runtime_into_an_admin_only_folder_and_becomes_it() {
+            for relay in [true, false] {
+                let (host, exe) = linux();
+                let ops = EngineOps::new(&host);
+                let exec = FakeExec::default();
+                let kind = run_uninstall_start_unix(
+                    &host.base(),
+                    &ops,
+                    &exec,
+                    Standing::Admin,
+                    &located(&host, &exe),
+                    relay,
+                    &exe,
+                );
+                assert_eq!(kind, Kind::Ok);
+                let dirs = uninstall_dirs(&host);
+                assert_eq!(dirs.len(), 1, "{dirs:?}");
+                let dir = &dirs[0];
+                // `.lunepack-uninstall-` and 16 lowercase hex digits, admin-only, in the home.
+                let id = dir.file_name().unwrap().to_str().unwrap();
+                let id = id.strip_prefix(UNIX_UNINSTALL_PREFIX).unwrap();
+                assert!(id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()));
+                assert_eq!(host.protect.class_of(dir), Some(DirClass::AdminOnly));
+                let copy = dir.join(UNIX_UNINSTALL_COPY);
+                assert_eq!(host.mem.read_capped(&copy, 100).unwrap(), b"runtime");
+                let text = String::from_utf8(
+                    host.mem
+                        .read_capped(&dir.join(UNINSTALL_MARKER), 4096)
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    UnixMarker::parse(&text),
+                    Some(UnixMarker {
+                        app_id: app_id(),
+                        name: "Hello".to_owned(),
+                        root: host.home.join(ID),
+                    })
+                );
+                // The process moves into the folder first; it execs the copy with the fixed
+                // arguments of phase 2 and nothing from its own command line.
+                assert_eq!(*ops.entered.lock().unwrap(), vec![dir.clone()]);
+                let mut want = vec!["machine-uninstall", "--second"];
+                if relay {
+                    want.extend(["--events", "stdout"]);
+                }
+                assert_eq!(
+                    *exec.calls.lock().unwrap(),
+                    vec![(
+                        copy,
+                        want.into_iter().map(str::to_owned).collect::<Vec<_>>()
+                    )]
+                );
+                // It deleted nothing.
+                assert!(ops.engine_calls.lock().unwrap().is_empty());
+                assert!(matches!(host.machine(), Machine::Present(..)));
+            }
+        }
+
+        #[test]
+        fn phase_one_is_for_administrators_and_a_failure_leaves_no_folder() {
+            let (host, exe) = linux();
+            let ops = EngineOps::new(&host);
+            let exec = FakeExec::default();
+            assert_eq!(
+                run_uninstall_start_unix(
+                    &host.base(),
+                    &ops,
+                    &exec,
+                    Standing::Standard,
+                    &located(&host, &exe),
+                    true,
+                    &exe,
+                ),
+                Kind::Usage
+            );
+            assert!(uninstall_dirs(&host).is_empty() && exec.calls.lock().unwrap().is_empty());
+            // The exec fails: nothing stays, and the process goes on as itself.
+            let failing = FakeExec {
+                fail: true,
+                ..FakeExec::default()
+            };
+            assert_eq!(
+                run_uninstall_start_unix(
+                    &host.base(),
+                    &ops,
+                    &failing,
+                    Standing::Admin,
+                    &located(&host, &exe),
+                    true,
+                    &exe,
+                ),
+                Kind::Process
+            );
+            assert!(uninstall_dirs(&host).is_empty());
+            // The folder cannot be made admin-only: not protected, nothing copied.
+            let rng = FakeRng::new(5);
+            let probe = FakeRng::new(5);
+            let mut first = [0u8; UNIX_UNINSTALL_RANDOM];
+            lunepack_core::Rng::fill(&probe, &mut first).unwrap();
+            host.protect.fail_create(
+                &host
+                    .home
+                    .join(format!("{UNIX_UNINSTALL_PREFIX}{}", hex(&first))),
+            );
+            let base = Base {
+                rng: &rng,
+                ..host.base()
+            };
+            assert_eq!(
+                run_uninstall_start_unix(
+                    &base,
+                    &ops,
+                    &exec,
+                    Standing::Admin,
+                    &located(&host, &exe),
+                    true,
+                    &exe,
+                ),
+                Kind::NotProtected
+            );
+            assert!(exec.calls.lock().unwrap().is_empty());
+        }
+
+        /// Phase 1 run in place, so phase 2 has its folder.
+        fn at_phase_two(host: &Host, exe: &Path) -> PathBuf {
+            let ops = EngineOps::new(host);
+            let exec = FakeExec::default();
+            assert_eq!(
+                run_uninstall_start_unix(
+                    &host.base(),
+                    &ops,
+                    &exec,
+                    Standing::Admin,
+                    &located(host, exe),
+                    true,
+                    exe,
+                ),
+                Kind::Ok
+            );
+            uninstall_dirs(host).remove(0).join(UNIX_UNINSTALL_COPY)
+        }
+
+        #[test]
+        fn phase_two_removes_the_install_and_its_own_folder_and_leaves_nothing() {
+            let (host, exe) = linux();
+            let copy = at_phase_two(&host, &exe);
+            let ops = EngineOps::new(&host);
+            let (events, seen) = collecting();
+            let kind = run_uninstall_second_unix(
+                &host.base(),
+                &ops,
+                Standing::Admin,
+                MachineScheme::LINUX,
+                &events,
+                &copy,
+            );
+            assert_eq!(kind, Kind::Ok);
+            events.finish(Duration::from_secs(1));
+            assert!(
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, Event::Phase { .. }))
+            );
+            assert_eq!(*ops.engine_calls.lock().unwrap(), vec!["uninstall"]);
+            assert_eq!(
+                *ops.entered.lock().unwrap(),
+                vec![copy.parent().unwrap().to_path_buf()]
+            );
+            // The record, `R`, the registration, the link and the copy's folder: all gone.
+            assert_eq!(host.machine(), Machine::Absent);
+            assert!(
+                host.mem
+                    .symlink_metadata(&host.home.join(ID))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(host.registrar.image(&app_id()).unwrap(), None);
+            assert!(uninstall_dirs(&host).is_empty());
+            assert!(host.payload_dirs().is_empty());
+            assert!(
+                lunepack_core::Fs::list_dir(&host.mem, &host.home)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn phase_two_runs_only_from_its_own_admin_only_folder_for_an_administrator() {
+            let (host, exe) = linux();
+            let copy = at_phase_two(&host, &exe);
+            let dir = copy.parent().unwrap().to_path_buf();
+            let go = |standing, exe: &Path, ops: &EngineOps<'_>| {
+                let (events, _) = collecting();
+                run_uninstall_second_unix(
+                    &host.base(),
+                    ops,
+                    standing,
+                    MachineScheme::LINUX,
+                    &events,
+                    exe,
+                )
+            };
+            let ops = EngineOps::new(&host);
+            assert_eq!(go(Standing::Standard, &copy, &ops), Kind::Usage);
+            // The image in `R`, a copy in a folder of another name, one with a short id, one
+            // that is not admin-only, one with no marker: none is the own folder.
+            assert_eq!(go(Standing::Admin, &exe, &ops), Kind::Usage);
+            let named = |name: &str| host.home.join(name).join(UNIX_UNINSTALL_COPY);
+            assert_eq!(
+                go(Standing::Admin, &named(".lunepack-uninstall-1234"), &ops),
+                Kind::Usage
+            );
+            assert_eq!(
+                go(
+                    Standing::Admin,
+                    &named(".lunepack-uninstall-0123456789ABCDEF"),
+                    &ops
+                ),
+                Kind::Usage
+            );
+            host.protect.set_unprotected(&dir, true);
+            assert_eq!(go(Standing::Admin, &copy, &ops), Kind::Usage);
+            host.protect.set_unprotected(&dir, false);
+            lunepack_core::Fs::remove_file(&host.mem, &dir.join(UNINSTALL_MARKER)).unwrap();
+            assert_eq!(go(Standing::Admin, &copy, &ops), Kind::Usage);
+            assert!(ops.engine_calls.lock().unwrap().is_empty());
+            assert!(
+                matches!(host.machine(), Machine::Present(..)),
+                "nothing was removed"
+            );
+        }
+
+        #[test]
+        fn a_marker_that_names_no_valid_install_removes_nothing() {
+            for marker in [
+                "garbage".to_owned(),
+                format!("{UNIX_MARKER_HEAD}\napp {ID}\nname Hello\nroot relative\n"),
+                // Another folder of the machine home than the install the record knows.
+                format!("{UNIX_MARKER_HEAD}\napp {ID}\nname Hello\nroot /opt/other\n"),
+                // Another app than the record of that folder.
+                format!("{UNIX_MARKER_HEAD}\napp org.example.other\nname Hello\nroot /opt/{ID}\n"),
+            ] {
+                let (host, exe) = linux();
+                let copy = at_phase_two(&host, &exe);
+                let dir = copy.parent().unwrap().to_path_buf();
+                lunepack_core::Fs::remove_file(&host.mem, &dir.join(UNINSTALL_MARKER)).unwrap();
+                host.mem
+                    .create_new(&dir.join(UNINSTALL_MARKER))
+                    .unwrap()
+                    .write_all(marker.as_bytes())
+                    .unwrap();
+                let ops = EngineOps::new(&host);
+                let (events, _) = collecting();
+                let kind = run_uninstall_second_unix(
+                    &host.base(),
+                    &ops,
+                    Standing::Admin,
+                    MachineScheme::LINUX,
+                    &events,
+                    &copy,
+                );
+                assert_eq!(kind, Kind::InstallMismatch, "{marker:?}");
+                assert!(ops.engine_calls.lock().unwrap().is_empty(), "{marker:?}");
+                assert!(matches!(host.machine(), Machine::Present(..)), "{marker:?}");
+            }
+        }
+
+        #[test]
+        fn an_install_something_runs_from_is_kept_and_the_copys_folder_goes() {
+            let (host, exe) = linux();
+            let copy = at_phase_two(&host, &exe);
+            // The removal guard sees a process running from `R`.
+            host.process.script_in_use_strict(true);
+            let ops = EngineOps::new(&host);
+            let (events, _) = collecting();
+            let kind = run_uninstall_second_unix(
+                &host.base(),
+                &ops,
+                Standing::Admin,
+                MachineScheme::LINUX,
+                &events,
+                &copy,
+            );
+            assert_eq!(kind, Kind::InUse);
+            assert!(matches!(host.machine(), Machine::Present(..)));
+            assert!(uninstall_dirs(&host).is_empty());
+        }
+
+        #[test]
+        fn phase_two_relays_its_progress_and_ends_with_its_code() {
+            let (host, exe) = linux();
+            let copy = at_phase_two(&host, &exe);
+            let ops = EngineOps::new(&host);
+            let (reader, writer) = std::io::pipe().unwrap();
+            let kind = run_uninstall_second_relayed(
+                &host.base(),
+                &ops,
+                Standing::Admin,
+                MachineScheme::LINUX,
+                Box::new(writer),
+                &copy,
+            );
+            assert_eq!(kind, Kind::Ok);
+            let mut text = String::new();
+            let mut reader = reader;
+            reader.read_to_string(&mut text).unwrap();
+            assert_eq!(text, "phase uninstall\nend 0\n");
+            assert!(text.lines().all(|l| crate::relay::decode_line(l).is_some()));
+        }
+
+        // ---- the unelevated side --------------------------------------------------------------
+
+        struct Child {
+            wait: Option<Result<i32, ElevationError>>,
+            output: Option<Box<dyn Read + Send>>,
+        }
+
+        impl ElevatedChild for Child {
+            fn wait(&mut self) -> Result<i32, ElevationError> {
+                self.wait.take().expect("waited once")
+            }
+
+            fn take_output(&mut self) -> Option<Box<dyn Read + Send>> {
+                self.output.take()
+            }
+        }
+
+        type Start = Box<dyn Fn() -> Result<Elevated, ElevationError> + Send + Sync>;
+
+        struct Pkexec {
+            standing: Standing,
+            start: Start,
+            calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
+        }
+
+        impl Pkexec {
+            fn new(standing: Standing, start: Start) -> Pkexec {
+                Pkexec {
+                    standing,
+                    start,
+                    calls: Mutex::new(Vec::new()),
+                }
+            }
+        }
+
+        impl Elevation for Pkexec {
+            fn standing(&self) -> Standing {
+                self.standing
+            }
+
+            fn run_elevated(
+                &self,
+                exe: &Path,
+                args: &[String],
+            ) -> Result<Elevated, ElevationError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((exe.to_path_buf(), args.to_vec()));
+                (self.start)()
+            }
+        }
+
+        fn child(code: Result<i32, ElevationError>, lines: &'static [u8]) -> Start {
+            Box::new(move || {
+                Ok(Elevated::Started(Box::new(Child {
+                    wait: Some(match &code {
+                        Ok(c) => Ok(*c),
+                        Err(ElevationError::Declined) => Err(ElevationError::Declined),
+                        Err(ElevationError::NoAgent) => Err(ElevationError::NoAgent),
+                        Err(_) => Err(ElevationError::Failed("x")),
+                    }),
+                    output: Some(Box::new(lines)),
+                })))
+            })
+        }
+
+        fn site(host: &Host) -> Site {
+            Site {
+                root: host.home.join(ID),
+                app_id: app_id(),
+                name: "Hello".to_owned(),
+                runtime: host
+                    .home
+                    .join(ID)
+                    .join("app/1.0.0")
+                    .join(UNIX_UNINSTALL_COPY),
+            }
+        }
+
+        fn unelevated<'a>(
+            elevation: &'a Pkexec,
+            ops: &'a EngineOps<'_>,
+            host: &'a Host,
+        ) -> super::Host_<'a> {
+            super::Host_ {
+                elevation,
+                ops,
+                pipes: &NoPipes,
+                service: &super::NoService,
+                policy: &host.policy,
+                rng: &host.rng,
+                sid: None,
+                relay: Relay::Stdout,
+            }
+        }
+
+        #[test]
+        fn repair_runs_for_an_administrator_and_asks_pkexec_for_a_standard_user() {
+            let (host, _) = linux();
+            // An administrator's process: the engine, no prompt.
+            let elevation = Pkexec::new(Standing::Admin, child(Ok(0), b""));
+            let ops = EngineOps::new(&host);
+            let h = unelevated(&elevation, &ops, &host);
+            host.registrar.remove(&app_id()).unwrap();
+            assert_eq!(repair(&h, &site(&host), false), Ok(()));
+            assert!(elevation.calls.lock().unwrap().is_empty());
+            assert!(host.registrar.image(&app_id()).unwrap().is_some());
+            // A standard user's: pkexec, the runtime of the current version, the fixed arguments;
+            // the child's exit code is the result.
+            for (start, want) in [
+                (child(Ok(0), b""), Ok(())),
+                (child(Ok(25), b""), Err(Kind::InUse)),
+                (child(Ok(35), b""), Err(Kind::NotProtected)),
+                (
+                    child(Err(ElevationError::Declined), b""),
+                    Err(Kind::ElevationDeclined),
+                ),
+                // Nothing can ask: `elevation_required`.
+                (
+                    child(Err(ElevationError::NoAgent), b""),
+                    Err(Kind::ElevationRequired),
+                ),
+                (
+                    Box::new(|| Err(ElevationError::NoAgent)) as Start,
+                    Err(Kind::ElevationRequired),
+                ),
+                (
+                    Box::new(|| Err(ElevationError::Declined)) as Start,
+                    Err(Kind::ElevationDeclined),
+                ),
+                (
+                    Box::new(|| Err(ElevationError::Failed("x"))) as Start,
+                    Err(Kind::Process),
+                ),
+            ] {
+                let elevation = Pkexec::new(Standing::Standard, start);
+                let ops = EngineOps::new(&host);
+                let h = unelevated(&elevation, &ops, &host);
+                assert_eq!(repair(&h, &site(&host), false), want);
+                let calls = elevation.calls.lock().unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].0, site(&host).runtime);
+                assert_eq!(calls[0].1, ["machine-repair", "--events", "stdout"]);
+                assert!(ops.engine_calls.lock().unwrap().is_empty());
+            }
+            // `--silent`: nothing is asked.
+            let elevation = Pkexec::new(Standing::Standard, child(Ok(0), b""));
+            let ops = EngineOps::new(&host);
+            let h = unelevated(&elevation, &ops, &host);
+            assert_eq!(repair(&h, &site(&host), true), Err(Kind::ElevationRequired));
+            assert!(elevation.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn the_unelevated_uninstall_asks_pkexec_follows_its_stdout_and_judges_by_the_record() {
+            // The install is gone when the child ends: success, its progress relayed.
+            let fresh = Host::linux();
+            let elevation = Pkexec::new(
+                Standing::Standard,
+                child(Ok(0), b"phase uninstall\nend 0\n"),
+            );
+            let ops = EngineOps::new(&fresh);
+            let h = unelevated(&elevation, &ops, &fresh);
+            let (events, seen) = collecting();
+            let target = site(&fresh);
+            assert_eq!(
+                uninstall_any(
+                    &h,
+                    &fresh.mem,
+                    &FakeHasher,
+                    &fresh.home,
+                    MachineScheme::LINUX,
+                    &target,
+                    false,
+                    &events
+                ),
+                Ok(())
+            );
+            events.finish(Duration::from_secs(1));
+            assert_eq!(seen.lock().unwrap().len(), 1);
+            let calls = elevation.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, target.runtime);
+            assert_eq!(calls[0].1, ["machine-uninstall", "--events", "stdout"]);
+            drop(calls);
+
+            // The install is still there: the code, or `state` for a code that says it is done.
+            let (host, _) = linux();
+            for (start, want) in [
+                (child(Ok(0), b"end 0\n"), UninstallEnd::Kind(Kind::State)),
+                (
+                    child(Ok(25), b"phase uninstall\nend 25\n"),
+                    UninstallEnd::Kind(Kind::InUse),
+                ),
+                (child(Ok(35), b""), UninstallEnd::Kind(Kind::NotProtected)),
+                (
+                    child(Err(ElevationError::Declined), b""),
+                    UninstallEnd::Kind(Kind::ElevationDeclined),
+                ),
+                (
+                    child(Err(ElevationError::Failed("x")), b""),
+                    UninstallEnd::Kind(Kind::Process),
+                ),
+            ] {
+                let elevation = Pkexec::new(Standing::Standard, start);
+                let ops = EngineOps::new(&host);
+                let h = unelevated(&elevation, &ops, &host);
+                let (events, _) = collecting();
+                assert_eq!(
+                    uninstall_any(
+                        &h,
+                        &host.mem,
+                        &FakeHasher,
+                        &host.home,
+                        MachineScheme::LINUX,
+                        &site(&host),
+                        false,
+                        &events
+                    ),
+                    Err(want)
+                );
+            }
+        }
+
+        #[test]
+        fn with_no_way_to_ask_the_command_for_an_administrator_is_shown_and_nothing_is_run() {
+            let (host, _) = linux();
+            let target = site(&host);
+            for start in [
+                Box::new(|| Err(ElevationError::NoAgent)) as Start,
+                child(Err(ElevationError::NoAgent), b""),
+            ] {
+                let elevation = Pkexec::new(Standing::Standard, start);
+                let ops = EngineOps::new(&host);
+                let h = unelevated(&elevation, &ops, &host);
+                let (events, _) = collecting();
+                let got = uninstall_any(
+                    &h,
+                    &host.mem,
+                    &FakeHasher,
+                    &host.home,
+                    MachineScheme::LINUX,
+                    &target,
+                    false,
+                    &events,
+                );
+                let command = format!("sudo '{}' uninstall", target.runtime.display());
+                assert_eq!(got, Err(UninstallEnd::NeedsAdministrator(Some(command))));
+                assert!(matches!(host.machine(), Machine::Present(..)));
+            }
+            // `--silent` as a standard user asks nothing at all.
+            let elevation = Pkexec::new(Standing::Standard, child(Ok(0), b""));
+            let ops = EngineOps::new(&host);
+            let h = unelevated(&elevation, &ops, &host);
+            let (events, _) = collecting();
+            assert_eq!(
+                uninstall_any(
+                    &h,
+                    &host.mem,
+                    &FakeHasher,
+                    &host.home,
+                    MachineScheme::LINUX,
+                    &target,
+                    true,
+                    &events
+                ),
+                Err(UninstallEnd::Kind(Kind::ElevationRequired))
+            );
+            assert!(elevation.calls.lock().unwrap().is_empty());
+        }
+
+        // ---- the unelevated uninstall's copy ---------------------------------------------------
+
+        const DATA_HOME: &str = "/home/alice/.local/share";
+
+        /// The runtime's adapters over the host's filesystem, standing in the installed tree.
+        fn adapters(host: &Host, exe: &Path) -> crate::modes::Adapters {
+            use lunepack::{Fs, Platform};
+            let fs: Arc<dyn Fs> = Arc::new(host.mem.clone());
+            let process = FakeProcess::new(exe.to_path_buf());
+            let platform = Platform::native()
+                .with_fs(Arc::clone(&fs))
+                .with_hasher(Arc::new(FakeHasher))
+                .with_verifier(Arc::new(FakeVerifier))
+                .with_process(Arc::new(process.clone()))
+                .with_integration(Arc::new(lunepack_testkit::FakeIntegration::new()))
+                .with_rng(Arc::new(FakeRng::new(9)))
+                .with_health_token(None)
+                .with_layout_scheme(LayoutScheme::XDG)
+                .with_machine_scheme(MachineScheme::LINUX)
+                .with_machine_home(host.home.clone())
+                .with_data_home(abs_path(DATA_HOME));
+            crate::modes::Adapters {
+                fs,
+                hasher: Arc::new(FakeHasher),
+                verifier: Arc::new(FakeVerifier),
+                codec: Arc::new(FakeCodec::new()),
+                process: Arc::new(process),
+                integration: Arc::new(lunepack_testkit::FakeIntegration::new()),
+                rng: Arc::new(FakeRng::new(9)),
+                platform,
+            }
+        }
+
+        #[test]
+        fn the_unelevated_uninstall_becomes_a_copy_in_the_users_own_home() {
+            use lunepack::Installation;
+            let (host, exe) = linux();
+            host.mem
+                .create_new(&exe.with_file_name("lunepack-ui"))
+                .unwrap()
+                .write_all(b"ui")
+                .unwrap();
+            let ad = adapters(&host, &exe);
+            let inst =
+                Installation::from_exe_with(&exe, ad.platform.clone()).expect("installation");
+            let user_home = abs_path(DATA_HOME).join(".lunepack").join(ID);
+            assert_eq!(inst.user_home(), Some(user_home.as_path()));
+
+            let exec = FakeExec::default();
+            let entered = Mutex::new(Vec::new());
+            let enter = |dir: &Path| {
+                entered.lock().unwrap().push(dir.to_path_buf());
+                true
+            };
+            crate::uninstall::user_copy_hand_off(&ad, &inst, &exec, &enter).expect("handed off");
+            let calls = exec.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            let (copy, args) = &calls[0];
+            let dir = copy.parent().unwrap().to_path_buf();
+            assert_eq!(dir.parent(), Some(user_home.as_path()));
+            assert!(crate::tempdirs::is_dir_name(
+                dir.file_name().unwrap().to_str().unwrap(),
+                crate::tempdirs::UNINSTALL_PREFIX
+            ));
+            assert_eq!(copy.file_name().unwrap(), UNIX_UNINSTALL_COPY);
+            assert_eq!(args, &["uninstall", "--user-copy"]);
+            // The runtime and the UI beside it, the marker naming the app; this process moved in.
+            assert_eq!(host.mem.read_capped(copy, 100).unwrap(), b"runtime");
+            assert_eq!(
+                host.mem.read_capped(&dir.join("lunepack-ui"), 100).unwrap(),
+                b"ui"
+            );
+            let marker = crate::tempdirs::read_marker(&host.mem, &dir).expect("marker");
+            assert_eq!(marker.app_id, ID);
+            assert_eq!(*entered.lock().unwrap(), vec![dir.clone()]);
+            // Nothing was removed or asked: the install is whole.
+            assert!(matches!(host.machine(), Machine::Present(..)));
+            drop(calls);
+
+            // The copy finds the install from its own folder, and only from it.
+            let copy_exe = dir.join(UNIX_UNINSTALL_COPY);
+            let found = crate::uninstall::user_copy_installation(
+                &ad,
+                &copy_exe,
+                &abs_path(DATA_HOME),
+                &host.home,
+                MachineScheme::LINUX,
+            )
+            .expect("installation");
+            assert_eq!(found.machine_layout().unwrap().root(), host.home.join(ID));
+            assert_eq!(found.app_id(), &app_id());
+            let go = |exe: &Path, data: &str| {
+                crate::uninstall::user_copy_installation(
+                    &ad,
+                    exe,
+                    &abs_path(data),
+                    &host.home,
+                    MachineScheme::LINUX,
+                )
+                .err()
+            };
+            // Anywhere else is a usage error: the install's own image, another folder name, a
+            // user home that is not this user's, a folder with no marker.
+            assert_eq!(go(&exe, DATA_HOME), Some(Kind::Usage));
+            assert_eq!(go(&copy_exe, "/home/bob/.local/share"), Some(Kind::Usage));
+            let other = user_home
+                .join("lunepack-uninstall-ZZZZZZZZZZZZZZZZ")
+                .join(UNIX_UNINSTALL_COPY);
+            assert_eq!(go(&other, DATA_HOME), Some(Kind::Usage));
+            lunepack_core::Fs::remove_file(&host.mem, &dir.join(crate::tempdirs::MARKER_FILE))
+                .unwrap();
+            assert_eq!(go(&copy_exe, DATA_HOME), Some(Kind::Usage));
+            // The marker names an app that has no machine install: nothing is touched.
+            let lost = Host::linux();
+            let lost_ad = adapters(&lost, &exe);
+            assert_eq!(
+                crate::uninstall::user_copy_installation(
+                    &lost_ad,
+                    &copy_exe,
+                    &abs_path(DATA_HOME),
+                    &lost.home,
+                    MachineScheme::LINUX,
+                )
+                .err(),
+                Some(Kind::Usage),
+                "no folder, no marker: not the copy's own"
+            );
+        }
+
+        #[test]
+        fn a_copy_that_cannot_become_the_copy_leaves_no_folder_and_the_process_stays() {
+            use lunepack::Installation;
+            let (host, exe) = linux();
+            let ad = adapters(&host, &exe);
+            let inst =
+                Installation::from_exe_with(&exe, ad.platform.clone()).expect("installation");
+            let user_home = abs_path(DATA_HOME).join(".lunepack").join(ID);
+            let entered = Mutex::new(Vec::new());
+            let enter = |dir: &Path| {
+                entered.lock().unwrap().push(dir.to_path_buf());
+                true
+            };
+            let failing = FakeExec {
+                fail: true,
+                ..FakeExec::default()
+            };
+            let got = crate::uninstall::user_copy_hand_off(&ad, &inst, &failing, &enter);
+            assert_eq!(got, Err(Kind::Process));
+            // Into the folder, then back to the home it started from.
+            assert_eq!(entered.lock().unwrap().len(), 2);
+            assert_eq!(entered.lock().unwrap().last(), Some(&user_home));
+            let left = lunepack_core::Fs::list_dir(&host.mem, &user_home).unwrap();
+            assert!(left.is_empty(), "{left:?}");
+            // A working directory that cannot be entered ends before the exec.
+            let exec = FakeExec::default();
+            let got = crate::uninstall::user_copy_hand_off(&ad, &inst, &exec, &|_: &Path| false);
+            assert_eq!(got, Err(Kind::Fs));
+            assert!(exec.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_machine_uninstall_that_cannot_ask_ends_with_the_command_and_elevation_required() {
+            use lunepack::Installation;
+            let (host, exe) = linux();
+            let ad = adapters(&host, &exe);
+            let inst =
+                Installation::from_exe_with(&exe, ad.platform.clone()).expect("installation");
+            let elevation = Pkexec::new(
+                Standing::Standard,
+                Box::new(|| Err(ElevationError::NoAgent)),
+            );
+            let ops = EngineOps::new(&host);
+            let h = unelevated(&elevation, &ops, &host);
+            let (events, _) = collecting();
+            let ui = crate::ui_host::UiHost::headless(lunepack_core::ui::Flow::Uninstall);
+            let (kind, last) =
+                crate::uninstall::run_machine_uninstall(&ad, Some(&h), &inst, false, &events, &ui);
+            assert_eq!(kind, Kind::ElevationRequired);
+            assert!(
+                matches!(
+                    &last,
+                    Event::Error {
+                        exit_code: 30,
+                        kind: "elevation_required",
+                        ..
+                    }
+                ),
+                "{last:?}"
+            );
+            // pkexec was asked to run the runtime inside `R`, nothing of the user's.
+            let calls = elevation.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, exe);
+            assert!(matches!(host.machine(), Machine::Present(..)));
+            // No home of the user was removed on a refusal.
+            assert!(
+                host.mem
+                    .symlink_metadata(&host.home.join(ID))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        #[test]
+        fn the_command_for_an_administrator_quotes_the_runtime_path() {
+            assert_eq!(
+                admin_command_for(
+                    Path::new("/opt/org.example.hello/app/1.0.0/lunepack-runtime"),
+                    "uninstall"
+                )
+                .as_deref(),
+                Some("sudo '/opt/org.example.hello/app/1.0.0/lunepack-runtime' uninstall")
+            );
+            assert_eq!(
+                admin_command_for(
+                    Path::new("/Applications/O'Neil.app/Contents/MacOS/lunepack-runtime"),
+                    "repair"
+                )
+                .as_deref(),
+                Some("sudo '/Applications/O'\\''Neil.app/Contents/MacOS/lunepack-runtime' repair")
+            );
+            assert_eq!(
+                admin_command_for(Path::new(&format!("/{}", "a".repeat(2000))), "uninstall"),
+                None
+            );
         }
     }
 }

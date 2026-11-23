@@ -152,6 +152,10 @@ fn main() -> ExitCode {
         Mode::MachineUninstall(phase) => machine_uninstall_mode(&phase),
         // macOS: the installer package's postinstall (M11-D8); anywhere else a usage error.
         Mode::MachinePkg => machine_pkg_mode(),
+        // Linux and macOS (M11-D14): the elevated modes of a machine install, and the
+        // unelevated uninstall's copy; Windows has its own words for these.
+        Mode::MachineUnix(mode) => machine_unix_mode(mode),
+        Mode::UninstallCopy { silent } => run(|ad| uninstall_copy_mode(ad, silent)),
         // Windows: phase 2, from the uninstaller's own temp copy only; anywhere else a usage
         // error before any action (M7-D5).
         Mode::UninstallHandOff(args) => run(|ad| hand_off_phase_2(ad, &args)),
@@ -207,7 +211,12 @@ fn uninstall_mode(
 }
 
 /// Linux, and macOS (the bundle `B`, the install root `R` and the LaunchAgent, M8-D5, M8-D15):
-/// the uninstall runs in this process, from the installed tree.
+/// the uninstall of a per-user install runs in this process, from the installed tree. A machine
+/// install (M11-D14) is removed by the engine in an administrator's process: this process's own
+/// when it is one (headless, no UI, as an elevated process never shows one), else on Linux
+/// through a copy of this runtime in the user's own home (outside `R`, so the engine's removal
+/// guard finds none of our processes in it) that asks pkexec, and on macOS through the command
+/// to run as an administrator (no prompt of our own, D38 (a)).
 #[cfg(not(windows))]
 fn uninstall_mode(
     ad: &modes::Adapters,
@@ -215,7 +224,112 @@ fn uninstall_mode(
     data_home: &std::path::Path,
     silent: bool,
 ) -> Kind {
-    uninstall_flow(ad, None, inst, data_home, silent)
+    if !inst.is_machine() {
+        return uninstall_flow(ad, None, inst, data_home, silent);
+    }
+    use lunepack_core::Elevation as _;
+    if unix_elevation().standing() != lunepack_core::Standing::Standard {
+        return uninstall_machine_in_place(ad, inst);
+    }
+    // A standard user's run that may not ask asks nothing and copies nothing.
+    if silent {
+        return headless_fail(uninstall::COMMAND, Kind::ElevationRequired);
+    }
+    if cfg!(target_os = "linux") {
+        // Only a failure returns: the copy took this process's place.
+        let kind = match uninstall::user_copy_hand_off(ad, inst, &machine::StdExec, &enter_dir) {
+            Ok(()) => Kind::Ok,
+            Err(kind) => kind,
+        };
+        return headless_fail(uninstall::COMMAND, kind);
+    }
+    with_host(ad, |host| uninstall_flow(ad, host, inst, data_home, silent))
+}
+
+/// The pkexec of Linux, the standing-only elevation of macOS.
+#[cfg(all(unix, target_os = "linux"))]
+fn unix_elevation() -> lunepack_os_linux::PkexecElevation {
+    lunepack_os_linux::PkexecElevation::new()
+}
+
+/// The pkexec of Linux, the standing-only elevation of macOS.
+#[cfg(all(unix, target_os = "macos"))]
+fn unix_elevation() -> lunepack_os_macos::MacElevation {
+    lunepack_os_macos::MacElevation
+}
+
+#[cfg(all(not(windows), not(any(target_os = "linux", target_os = "macos"))))]
+fn unix_elevation() -> UnsupportedElevation {
+    UnsupportedElevation
+}
+
+/// An elevation for a system with no machine installs.
+#[cfg(all(not(windows), not(any(target_os = "linux", target_os = "macos"))))]
+struct UnsupportedElevation;
+
+#[cfg(all(not(windows), not(any(target_os = "linux", target_os = "macos"))))]
+impl lunepack_core::Elevation for UnsupportedElevation {
+    fn standing(&self) -> lunepack_core::Standing {
+        lunepack_core::Standing::Standard
+    }
+
+    fn run_elevated(
+        &self,
+        _exe: &std::path::Path,
+        _args: &[String],
+    ) -> Result<lunepack_core::Elevated, lunepack_core::ElevationError> {
+        Err(lunepack_core::ElevationError::NoAgent)
+    }
+}
+
+/// An administrator's `uninstall` of a machine install: phase 1 in this process, headless (S1,
+/// D35): it copies the runtime into an admin-only folder of the machine home and becomes the copy,
+/// which removes the install and prints the result. Only a failure returns.
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn uninstall_machine_in_place(ad: &modes::Adapters, inst: &lunepack::Installation) -> Kind {
+    use lunepack_core::Elevation as _;
+
+    let (Some(home), Ok(exe), Some(layout)) = (
+        machine::native_unix::home(),
+        ad.process.current_exe(),
+        inst.machine_layout(),
+    ) else {
+        return headless_fail(uninstall::COMMAND, Kind::Fs);
+    };
+    let scheme = machine::native_unix::SCHEME;
+    if let Err(kind) = machine::validated(
+        &*ad.fs,
+        &*ad.hasher,
+        &home,
+        scheme,
+        layout.root(),
+        inst.app_id(),
+        &inst.meta().name,
+    ) {
+        return headless_fail(uninstall::COMMAND, kind);
+    }
+    let located = machine::Located {
+        root: layout.root().to_path_buf(),
+        app_id: inst.app_id().clone(),
+        name: inst.meta().name.clone(),
+        version: inst.tree_version().clone(),
+    };
+    let adapters = machine::native_unix::Adapters::new();
+    let kind = machine::run_uninstall_start_unix(
+        &adapters.base(&home),
+        &machine::native_unix::NativeOps { enter: enter_dir },
+        &machine::StdExec,
+        unix_elevation().standing(),
+        &located,
+        false,
+        &exe,
+    );
+    headless_fail(uninstall::COMMAND, kind)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn uninstall_machine_in_place(_ad: &modes::Adapters, _inst: &lunepack::Installation) -> Kind {
+    headless_fail(uninstall::COMMAND, Kind::Unsupported)
 }
 
 /// The uninstall of `inst` with its UI and its outcome (M5-D10, M6): the confirm prompt, the
@@ -603,10 +717,53 @@ fn with_host<T>(ad: &modes::Adapters, body: impl FnOnce(Option<&machine::Host<'_
         policy: &policy,
         rng: &*ad.rng,
         sid: sid.as_deref(),
+        relay: machine::Relay::Pipe,
     }))
 }
 
-#[cfg(not(windows))]
+/// The host of a machine install's modes on Linux and macOS (M11-D14): its elevation (pkexec on
+/// Linux, none of our own on macOS), the engine's one-shot operations for a process that is an
+/// administrator's already, the update service's socket and the policy file. Nothing is read
+/// here; the child's events come back on its standard output.
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn with_host<T>(ad: &modes::Adapters, body: impl FnOnce(Option<&machine::Host<'_>>) -> T) -> T {
+    let elevation = unix_elevation();
+    let ops = machine::native_unix::NativeOps { enter: enter_dir };
+    let service = machine_service();
+    let policy = machine_policy();
+    body(Some(&machine::Host {
+        elevation: &elevation,
+        ops: &ops,
+        pipes: &machine::NoPipes,
+        service: &service,
+        policy: &policy,
+        rng: &*ad.rng,
+        sid: None,
+        relay: machine::Relay::Stdout,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn machine_service() -> lunepack_os_linux::UnixConnector {
+    lunepack_os_linux::UnixConnector::new()
+}
+
+#[cfg(target_os = "macos")]
+fn machine_service() -> lunepack_os_macos::UnixConnector {
+    lunepack_os_macos::UnixConnector::new()
+}
+
+#[cfg(target_os = "linux")]
+fn machine_policy() -> lunepack_os_linux::FilePolicy {
+    lunepack_os_linux::FilePolicy::new()
+}
+
+#[cfg(target_os = "macos")]
+fn machine_policy() -> lunepack_os_macos::FilePolicy {
+    lunepack_os_macos::FilePolicy::new()
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn with_host<T>(_ad: &modes::Adapters, body: impl FnOnce(Option<&machine::Host<'_>>) -> T) -> T {
     body(None)
 }
@@ -618,7 +775,7 @@ fn policy_quiet(host: Option<&machine::Host<'_>>, inst: &lunepack::Installation)
 }
 
 /// Makes `dir` the working directory of this process.
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn enter_dir(dir: &std::path::Path) -> bool {
     std::env::set_current_dir(dir).is_ok()
 }
@@ -761,6 +918,125 @@ fn machine_pkg_mode() -> Kind {
 
 #[cfg(not(target_os = "macos"))]
 fn machine_pkg_mode() -> Kind {
+    Kind::Usage
+}
+
+/// The hidden elevated modes of a machine install on Linux and macOS (M11-D14), started by pkexec
+/// or by phase 1 of the uninstall. Each builds its few adapters itself and reads no environment
+/// variable, no temporary directory and nothing of a user's profile; its inputs are its own image
+/// (the root it stands in) and the machine record, its exit code is its result, and a standard
+/// user's process is refused (usage) before anything is looked at.
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn machine_unix_mode(mode: modes::MachineUnix) -> Kind {
+    use lunepack_core::Elevation as _;
+    use modes::MachineUnix;
+
+    let standing = unix_elevation().standing();
+    if standing == lunepack_core::Standing::Standard {
+        eprintln!("{USAGE_LINE}");
+        return Kind::Usage;
+    }
+    let (Some(home), Some(exe)) = (machine::native_unix::home(), machine::native_unix::image())
+    else {
+        return Kind::Fs;
+    };
+    let scheme = machine::native_unix::SCHEME;
+    let adapters = machine::native_unix::Adapters::new();
+    let base = adapters.base(&home);
+    let ops = machine::native_unix::NativeOps { enter: enter_dir };
+    match mode {
+        MachineUnix::Repair => {
+            machine::run_repair_mode_in(&ops, base.fs, base.hasher, &home, standing, &exe, scheme)
+        }
+        MachineUnix::UninstallStart => {
+            match machine::locate_in(base.fs, base.hasher, &home, &exe, scheme) {
+                Ok(located) => machine::run_uninstall_start_unix(
+                    &base,
+                    &ops,
+                    &machine::StdExec,
+                    standing,
+                    &located,
+                    true,
+                    &exe,
+                ),
+                Err(kind) => kind,
+            }
+        }
+        MachineUnix::UninstallSecond { relay: true } => machine::run_uninstall_second_relayed(
+            &base,
+            &ops,
+            standing,
+            scheme,
+            Box::new(std::io::stdout()),
+            &exe,
+        ),
+        MachineUnix::UninstallSecond { relay: false } => {
+            let events = stderr_events();
+            let kind =
+                machine::run_uninstall_second_unix(&base, &ops, standing, scheme, &events, &exe);
+            let last = match kind {
+                Kind::Ok => Event::Result {
+                    command: uninstall::COMMAND,
+                    tree_version: None,
+                    outcome: uninstall::OUTCOME,
+                    version: None,
+                },
+                kind => Event::Error {
+                    command: uninstall::COMMAND,
+                    tree_version: None,
+                    kind: kind.name(),
+                    exit_code: kind.code(),
+                    reason: kind.reason(),
+                },
+            };
+            conclude(events, &last);
+            kind
+        }
+    }
+}
+
+#[cfg(not(all(unix, any(target_os = "linux", target_os = "macos"))))]
+fn machine_unix_mode(_mode: modes::MachineUnix) -> Kind {
+    Kind::Usage
+}
+
+/// The hidden `uninstall --user-copy` mode (M11-D14, Linux): the unelevated uninstall of a machine
+/// install, run from the copy of this runtime the user's own `uninstall` made in their home.
+/// Anywhere else it is a usage error before any action.
+#[cfg(target_os = "linux")]
+fn uninstall_copy_mode(ad: &modes::Adapters, silent: bool) -> Kind {
+    let (Ok(data_home), Ok(exe), Some(home)) = (
+        data_home(),
+        ad.process.current_exe(),
+        machine::native_unix::home(),
+    ) else {
+        return headless_fail(uninstall::COMMAND, Kind::Fs);
+    };
+    let inst = match uninstall::user_copy_installation(
+        ad,
+        &exe,
+        &data_home,
+        &home,
+        machine::native_unix::SCHEME,
+    ) {
+        Ok(inst) => inst,
+        Err(Kind::Usage) => {
+            eprintln!("{USAGE_LINE}");
+            return Kind::Usage;
+        }
+        Err(kind) => return headless_fail(uninstall::COMMAND, kind),
+    };
+    let kind = with_host(ad, |host| {
+        uninstall_flow(ad, host, &inst, &data_home, silent)
+    });
+    // The copy's folder is in this user's home, which a removal that succeeded took with it.
+    uninstall::user_copy_cleanup(ad, &exe);
+    kind
+}
+
+#[cfg(not(target_os = "linux"))]
+fn uninstall_copy_mode(_ad: &modes::Adapters, _silent: bool) -> Kind {
+    eprintln!("{USAGE_LINE}");
     Kind::Usage
 }
 

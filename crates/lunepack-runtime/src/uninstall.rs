@@ -136,14 +136,29 @@ pub fn run_machine_uninstall(
             });
             ui.prompt(PromptKind::Done, events, &mut |_| {});
         }
-        Err(kind) => {
+        // No prompt can ask for an administrator (Linux without pkexec, macOS always, D38 (a)):
+        // the window shows the command to run as one, and the run is over. Nothing was changed.
+        Err(machine::UninstallEnd::NeedsAdministrator(command)) => {
+            if let Some(command) = command.clone()
+                && ui.admin_command(command)
+            {
+                let _ = ui.prompt(PromptKind::AdminCommand, events, &mut |_| {});
+            }
+        }
+        Err(machine::UninstallEnd::Kind(kind)) => {
             ui.outcome(Outcome::UninstallFailed {
                 code: u32::from(kind.code()),
             });
             ui.prompt(PromptKind::Failed, events, &mut |_| {});
         }
     }
-    report(inst, result.map(|()| false))
+    report(
+        inst,
+        result.map(|()| false).map_err(|end| match end {
+            machine::UninstallEnd::Kind(kind) => kind,
+            machine::UninstallEnd::NeedsAdministrator(_) => Kind::ElevationRequired,
+        }),
+    )
 }
 
 /// The elevated removal of the machine install `inst` is a version of, then this user's home.
@@ -153,16 +168,28 @@ fn machine_uninstall(
     inst: &Installation,
     silent: bool,
     events: &Events,
-) -> Result<(), Kind> {
+) -> Result<(), machine::UninstallEnd> {
     let host = host.ok_or(Kind::Unsupported)?;
     let target = machine::target_of(&*ad.fs, &*ad.hasher, inst).ok_or(Kind::NotInstalled)?;
+    let scheme = inst
+        .machine_layout()
+        .map_or(lunepack_core::MachineScheme::WINDOWS, |l| l.scheme());
     let home = target
         .root
         .parent()
         .ok_or(Kind::InstallMismatch)?
         .to_path_buf();
     events.emit(&Event::phase(Phase::Uninstall, Some(inst.tree_version())));
-    machine::uninstall(host, &*ad.fs, &*ad.hasher, &home, &target, silent, events)?;
+    machine::uninstall_any(
+        host,
+        &*ad.fs,
+        &*ad.hasher,
+        &home,
+        scheme,
+        &target,
+        silent,
+        events,
+    )?;
     // This user's counters, cache and log; the homes of other users are theirs. Best effort: the
     // install is gone either way.
     if let Some(user_home) = inst.user_home() {
@@ -782,22 +809,144 @@ pub fn hand_off_installation(
     }
 }
 
+/// The prefix of the unelevated uninstall's copy folder in the user's own home (M11-D14).
+#[cfg(unix)]
+const USER_COPY_PREFIX: &str = crate::tempdirs::UNINSTALL_PREFIX;
+
+/// The unelevated uninstall of a machine install on Linux, phase 1 (M11-D14): this runtime (and
+/// the UI beside it, when it is a regular file) is copied into a fresh private folder of this
+/// user's own home for the install (`<home>/lunepack-uninstall-<16 hex>`, with the marker of
+/// M7-D5), the folder becomes this process's working directory (`enter`), and this process becomes
+/// the copy (`exec`, `uninstall --user-copy`). The engine's removal guard sees every process that
+/// runs from `R`: this one and its UI would be two. Nothing is deleted, nothing elevated is
+/// started. Only a failure returns; the folder is then removed.
+#[cfg(unix)]
+pub fn user_copy_hand_off(
+    ad: &Adapters,
+    inst: &Installation,
+    exec: &dyn machine::Exec,
+    enter: &dyn Fn(&Path) -> bool,
+) -> Result<(), Kind> {
+    use crate::tempdirs::{self, Marker};
+    use std::io::Write as _;
+
+    let home = inst.user_home().ok_or(Kind::NotInstalled)?;
+    ad.fs.create_dir_all(home).map_err(|_| Kind::Fs)?;
+    let exe = ad.process.current_exe().map_err(|e| Kind::of(&e.into()))?;
+    let me = ad.process.current().map_err(|e| Kind::of(&e.into()))?;
+    let marker = Marker {
+        app_id: inst.app_id().as_str().to_owned(),
+        owner: me,
+    };
+    let mut random = [0u8; 8];
+    ad.rng.fill(&mut random).map_err(|_| Kind::Internal)?;
+    let name: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let dir = home.join(format!("{USER_COPY_PREFIX}{name}"));
+    // A new name: an existing entry is an error and is never followed or changed.
+    ad.fs.create_dir_private(&dir).map_err(|_| Kind::Fs)?;
+    let started = (|| {
+        let mut out = ad
+            .fs
+            .create_new(&dir.join(tempdirs::MARKER_FILE))
+            .map_err(|_| Kind::Fs)?;
+        out.write_all(marker.to_text().as_bytes())
+            .map_err(|_| Kind::Fs)?;
+        out.sync().map_err(|_| Kind::Fs)?;
+        drop(out);
+        let copy = dir.join(machine::UNIX_UNINSTALL_COPY);
+        ad.fs.copy_file(&exe, &copy).map_err(|_| Kind::Fs)?;
+        let ui = exe.with_file_name(ui_host::UI_FILE);
+        if matches!(ad.fs.symlink_metadata(&ui), Ok(Some(m)) if m.kind == FileKind::File) {
+            // Best effort: without its UI, the copy runs headless.
+            let _ = ad.fs.copy_file(&ui, &dir.join(ui_host::UI_FILE));
+        }
+        if !enter(&dir) {
+            return Err(Kind::Fs);
+        }
+        exec.exec(
+            &copy,
+            &[
+                "uninstall".to_owned(),
+                crate::modes::USER_COPY_FLAG.to_owned(),
+            ],
+        )
+        .map_err(|_| Kind::Process)
+    })();
+    if started.is_err() {
+        let _ = enter(home);
+        let _ = ad.fs.remove_dir_all_nofollow(&dir);
+    }
+    started
+}
+
+/// The copy's own-folder rule and its installation (M11-D14): the runtime at `exe` is directly
+/// inside a real directory `lunepack-uninstall-<16 lowercase hex>` that is directly inside this
+/// user's home for the app its marker names (`<data home>/.lunepack/<app id>`), and the install
+/// is the machine install of that app in the machine home `home` under `scheme`, validated
+/// against the machine record. Any other place is a usage error; any other mismatch
+/// `install_mismatch`, with nothing changed.
+#[cfg(unix)]
+pub fn user_copy_installation(
+    ad: &Adapters,
+    exe: &Path,
+    data_home: &Path,
+    home: &Path,
+    scheme: lunepack_core::MachineScheme,
+) -> Result<Installation, Kind> {
+    use crate::tempdirs;
+
+    let dir = exe.parent().ok_or(Kind::Usage)?;
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or(Kind::Usage)?;
+    if !tempdirs::is_dir_name(name, USER_COPY_PREFIX)
+        || exe.file_name().and_then(|n| n.to_str()) != Some(machine::UNIX_UNINSTALL_COPY)
+        || !matches!(ad.fs.symlink_metadata(dir), Ok(Some(m)) if m.kind == FileKind::Dir)
+    {
+        return Err(Kind::Usage);
+    }
+    let marker = tempdirs::read_marker(&*ad.fs, dir).ok_or(Kind::Usage)?;
+    // This user's home for the app: the folder the copy was made in.
+    let app = lunepack::AppId::parse(&marker.app_id).map_err(|_| Kind::Usage)?;
+    let user_home = lunepack_core::machine_user_home(data_home, &app);
+    if dir.parent() != Some(user_home.as_path()) {
+        return Err(Kind::Usage);
+    }
+    let root = home.join(&marker.app_id);
+    hand_off_machine_installation_in(ad, home, &root, &marker.app_id, scheme)
+}
+
+/// Removes the copy's own folder at `exe` (best effort; a removal that succeeded took it with the
+/// home).
+#[cfg(unix)]
+pub fn user_copy_cleanup(ad: &Adapters, exe: &Path) {
+    if let Some(dir) = exe.parent()
+        && dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| crate::tempdirs::is_dir_name(n, USER_COPY_PREFIX))
+    {
+        let _ = ad.fs.remove_dir_all_nofollow(dir);
+    }
+}
+
 /// Phase 2's installation for a machine install (M10 step 18): `given` must be a real directory
 /// whose canonical path is a real directory with the canonical machine home `home` as its parent
 /// ([`lunepack_core::root_valid_for_uninstall`] under the Windows scheme), holding a machine record
 /// of `app_id`; the installation is the record's current version's tree there, and it must be found
 /// as that machine install. Any mismatch is `install_mismatch`, with nothing changed.
-#[cfg(windows)]
-pub fn hand_off_machine_installation(
+pub fn hand_off_machine_installation_in(
     ad: &Adapters,
     home: &Path,
     given: &Path,
     app_id: &str,
+    scheme: lunepack_core::MachineScheme,
 ) -> Result<Installation, Kind> {
     use lunepack::{AppId, UpdateConfig};
+    use lunepack_core::MachineLayout;
     use lunepack_core::state::MachineStore;
     use lunepack_core::update_config::{MAX_UPDATE_CONFIG_BYTES, runtime_file};
-    use lunepack_core::{LayoutScheme, MachineLayout};
 
     let is_dir =
         |p: &Path| matches!(ad.fs.symlink_metadata(p), Ok(Some(m)) if m.kind == FileKind::Dir);
@@ -805,19 +954,19 @@ pub fn hand_off_machine_installation(
     if !is_dir(given) {
         return Err(Kind::InstallMismatch);
     }
-    let root = std::fs::canonicalize(given).map_err(|_| Kind::InstallMismatch)?;
+    // Windows names the root after the display name, so the given one is resolved; a unix
+    // root is `<machine home>/<app id>` that the caller built from the canonical home.
+    let root = if scheme.home.is_some() {
+        given.to_path_buf()
+    } else {
+        std::fs::canonicalize(given).map_err(|_| Kind::InstallMismatch)?
+    };
     if !is_dir(&root)
-        || !lunepack_core::root_valid_for_uninstall(
-            &*ad.fs,
-            home,
-            &root,
-            &app,
-            LayoutScheme::WINDOWS,
-        )
+        || !lunepack_core::root_valid_for_uninstall(&*ad.fs, home, &root, &app, scheme.view)
     {
         return Err(Kind::InstallMismatch);
     }
-    let layout = MachineLayout::new(&root);
+    let layout = MachineLayout::with_scheme(&root, scheme);
     let store = MachineStore {
         dir: layout.state_dir(),
         app_id: app.clone(),
@@ -832,7 +981,7 @@ pub fn hand_off_machine_installation(
     let current = record.current.ok_or(Kind::NotInstalled)?.version;
     let tree = layout.version_dir(&current);
     let mut config_path = tree.clone();
-    for part in LayoutScheme::WINDOWS.config.split('/') {
+    for part in scheme.view.config.split('/') {
         config_path.push(part);
     }
     if !matches!(ad.fs.symlink_metadata(&config_path), Ok(Some(m)) if m.kind == FileKind::File) {
@@ -854,4 +1003,21 @@ pub fn hand_off_machine_installation(
         Some(l) if l.root() == root && inst.app_id() == &app => Ok(inst),
         _ => Err(Kind::InstallMismatch),
     }
+}
+
+/// [`hand_off_machine_installation_in`] under the Windows scheme.
+#[cfg(windows)]
+pub fn hand_off_machine_installation(
+    ad: &Adapters,
+    home: &Path,
+    given: &Path,
+    app_id: &str,
+) -> Result<Installation, Kind> {
+    hand_off_machine_installation_in(
+        ad,
+        home,
+        given,
+        app_id,
+        lunepack_core::MachineScheme::WINDOWS,
+    )
 }

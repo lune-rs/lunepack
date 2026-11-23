@@ -144,3 +144,63 @@ fn the_machine_apply_has_no_write_of_its_own() {
     // The instrument: the per-user section above it has them.
     assert!(code[..start].contains(".commit(") && code[..start].contains("lock_retry"));
 }
+
+/// M11-D14: the hidden modes of a unix machine install do nothing for an ordinary run: the runtime
+/// of this test is in no machine tree and no uninstall folder, so each is the usage code with
+/// nothing installed, removed or started (as a user, and as root in the gate's container alike),
+/// and nothing printed names an argument.
+#[cfg(unix)]
+#[test]
+fn the_unix_machine_modes_do_nothing_for_an_ordinary_run() {
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["machine-repair", "--events", "stdout"],
+        vec!["machine-uninstall", "--events", "stdout"],
+        vec!["machine-uninstall", "--second"],
+        vec!["machine-uninstall", "--second", "--events", "stdout"],
+        vec!["uninstall", "--user-copy"],
+        vec!["uninstall", "--user-copy", "--silent"],
+        // Not words of the grammar here.
+        vec!["machine-repair"],
+        vec!["machine-uninstall", "--events", "stdout", "--second"],
+        vec!["uninstall", "--user-copy", "/tmp/x"],
+    ];
+    for args in cases {
+        let (code, _stdout, stderr) = run(&args);
+        assert_eq!(code, 2, "{args:?}: {stderr}");
+        assert!(!stderr.contains("/tmp/x"), "{args:?} echoed an argument");
+    }
+}
+
+/// M11-D14: the unix modes that run elevated read no environment variable, no temporary directory
+/// and nothing of a user's profile (`machine_unix_mode`), and the elevated child's progress goes
+/// to its standard output only; the unelevated copy is made only inside the user's own home for
+/// the install, through the filesystem port.
+#[test]
+fn the_unix_elevated_modes_have_no_ambient_input() {
+    let main = source("main.rs");
+    let needles = [
+        ["std::", "env"].concat(),
+        ["env", "::var"].concat(),
+        ["temp", "_dir"].concat(),
+        ["current", "_dir"].concat(),
+        ["data", "_home("].concat(),
+        ["ui", "_for("].concat(),
+        ["Platform", "::native"].concat(),
+    ];
+    let start = main
+        .find("fn machine_unix_mode(mode: modes::MachineUnix) -> Kind {")
+        .expect("the mode");
+    let body = item(&main[start..], "fn machine_unix_mode(");
+    for needle in &needles {
+        assert!(
+            !body.contains(needle.as_str()),
+            "machine_unix_mode mentions `{needle}`"
+        );
+    }
+    // The instrument: the scan finds those words where they are used (the unelevated side).
+    let user_side = item(
+        &main[main.find("fn uninstall_copy_mode(ad").expect("copy mode")..],
+        "fn uninstall_copy_mode(",
+    );
+    assert!(user_side.contains(needles[4].as_str()));
+}

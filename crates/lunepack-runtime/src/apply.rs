@@ -867,10 +867,34 @@ fn read_machine(
         .ok_or(Kind::NotInstalled)
 }
 
-/// The launcher stub of the install, `R\<entry file name>`: it starts whatever version is current.
-fn stub_of(layout: &MachineLayout, meta: &lunepack::InstallMeta) -> Option<std::path::PathBuf> {
-    let name = meta.entry.as_str().rsplit('/').next()?;
-    Some(layout.root().join(name))
+/// What starts whatever version of a machine install is current, by the scheme's projection
+/// (M10-D8, M11-D6, M11-D12): the launcher stub `R\<entry file name>` on Windows, the entry
+/// through the link `R/current` on Linux, the entry of the live bundle `B` on macOS (`B` is read
+/// from `R/bundle`, never taken from where the old tree was). `None` when the bundle's place
+/// cannot be read: nothing is started from a guess.
+fn stub_of(
+    ad: &Adapters,
+    layout: &MachineLayout,
+    meta: &lunepack::InstallMeta,
+) -> Option<std::path::PathBuf> {
+    let entry_in = |tree: std::path::PathBuf| {
+        meta.entry
+            .components()
+            .fold(tree, |dir, part| dir.join(part))
+    };
+    match layout.scheme().projection() {
+        Projection::None => {
+            let name = meta.entry.as_str().rsplit('/').next()?;
+            Some(layout.root().join(name))
+        }
+        Projection::CurrentLink => Some(entry_in(
+            layout.root().join(lunepack_core::layout::CURRENT_LINK),
+        )),
+        Projection::Bundle => {
+            let bundle = layout.view().bundle_path(&*ad.fs).ok().flatten()?;
+            Some(entry_in(bundle))
+        }
+    }
 }
 
 /// Window 1 on a machine install: checks what can be read (policy, the record, the tree, the new
@@ -1017,7 +1041,7 @@ fn relaunch_machine(
     if unmoved == Some(false) {
         return;
     }
-    let started = stub_of(layout, inst.meta()).is_some_and(|program| {
+    let started = stub_of(ad, layout, inst.meta()).is_some_and(|program| {
         let spec = SpawnSpec {
             program,
             args: args.restart.clone(),
@@ -1068,8 +1092,13 @@ fn apply_machine(
     // Launch, never through a shell: the new tree's entry from its own config, with the token in
     // its environment only.
     events.emit(&Event::phase(Phase::Launch, Some(v)));
+    // The new tree is where the service left it: on macOS the swap moved it into the live bundle.
+    let program = match layout.scheme().projection() {
+        Projection::Bundle => stub_of(ad, &layout, applied.new.meta()),
+        Projection::None | Projection::CurrentLink => Some(applied.new.entry_path()),
+    };
     let spec = SpawnSpec {
-        program: applied.new.entry_path(),
+        program: program.unwrap_or_else(|| applied.new.entry_path()),
         args: args.restart.clone(),
         env_set: vec![(OsString::from(HEALTH_TOKEN_VAR), hex(&applied.token))],
         env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
@@ -1115,7 +1144,7 @@ fn apply_machine(
                     reason: Some(reason),
                 });
                 // The launcher starts whatever is current now: the previous version.
-                let started = stub_of(&layout, previous.meta()).is_some_and(|program| {
+                let started = stub_of(ad, &layout, previous.meta()).is_some_and(|program| {
                     let relaunch = SpawnSpec {
                         program,
                         args: args.restart.clone(),
@@ -2495,6 +2524,7 @@ mod machine_tests {
             policy: &rig.host.policy,
             rng: &FakeRng::new(5),
             sid: Some("S-1-5-21-1-2-3-1001"),
+            relay: crate::machine::Relay::Pipe,
         };
         let inst = rig.open();
         let (events, _) = collecting();
@@ -2555,6 +2585,43 @@ mod machine_tests {
                 .symlink_metadata(&home_of("alice"))
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// What starts the install again after an apply or a rollback is by the scheme's projection
+    /// (M11-D6, D12): the launcher stub on Windows, the entry through `R/current` on Linux, the
+    /// entry of the live bundle `R/bundle` names on macOS; no bundle pointer, nothing to start.
+    #[test]
+    fn the_launcher_follows_the_projection_of_the_scheme() {
+        use lunepack_core::MachineScheme;
+
+        let rig = Rig::new(false);
+        let root = abs_path("/opt/org.example.hello");
+        let nested = InstallMeta {
+            entry: RelPath::parse("Contents/MacOS/app").expect("entry"),
+            ..meta()
+        };
+        let windows = MachineLayout::with_scheme(&rig.root(), MachineScheme::WINDOWS);
+        assert_eq!(
+            super::stub_of(&rig.ad, &windows, &meta()),
+            Some(rig.root().join(ENTRY))
+        );
+        let linux = MachineLayout::with_scheme(&root, MachineScheme::LINUX);
+        assert_eq!(
+            super::stub_of(&rig.ad, &linux, &nested),
+            Some(root.join("current/Contents/MacOS/app"))
+        );
+        // macOS: from the bundle pointer, never from where the old tree was.
+        let mac_root = abs_path("/Library/Application Support/lunepack/org.example.hello");
+        let mac = MachineLayout::with_scheme(&mac_root, MachineScheme::MACOS);
+        assert_eq!(super::stub_of(&rig.ad, &mac, &nested), None);
+        let bundle = abs_path("/Applications/Hello.app");
+        rig.host.fs.create_dir_all(&bundle).expect("bundle");
+        rig.host.fs.create_dir_all(&mac_root).expect("root");
+        lunepack_core::set_bundle_pointer(&rig.host.fs, &mac.view(), &bundle).expect("pointer");
+        assert_eq!(
+            super::stub_of(&rig.ad, &mac, &nested),
+            Some(bundle.join("Contents/MacOS/app"))
         );
     }
 }

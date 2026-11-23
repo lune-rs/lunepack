@@ -527,10 +527,40 @@ pub enum Mode {
     MachineRepair(MachineArgs),
     /// Windows only, hidden: the two phases of the elevated machine uninstall (M10 step 18).
     MachineUninstall(MachineUninstall),
+    /// Linux and macOS, hidden: the elevated modes of a machine install, with their events on the
+    /// standard output (M11-D14); the Windows modes above take a pipe id and a SID instead.
+    MachineUnix(MachineUnix),
+    /// Linux and macOS, hidden: `uninstall --user-copy [--silent]`, the unelevated uninstall run
+    /// from the copy of the runtime its first run made in the user's own home for the install
+    /// (outside `R`, so the removal guard sees no process of ours in it; M11-D14).
+    UninstallCopy {
+        /// `--silent`: no UI and no prompt (D41).
+        silent: bool,
+    },
     /// macOS only, hidden: `machine-install --pkg`, the first all-users install from the payload
     /// the installer package placed beside this runtime (M11-D8). It takes nothing from its
     /// caller: no other argument, no environment variable.
     MachinePkg,
+}
+
+/// The hidden elevated modes of a machine install on a unix system (M11-D14). Every value any of
+/// them needs comes from the process's own image and the machine record; none takes a path, an
+/// id or an account from its command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineUnix {
+    /// `machine-repair --events stdout`: the engine's `repair` for the install the image stands in.
+    Repair,
+    /// `machine-uninstall --events stdout`: phase 1, from the runtime inside `R`: copies itself
+    /// into an admin-only folder of the machine home and becomes the copy (it never deletes).
+    UninstallStart,
+    /// `machine-uninstall --second [--events stdout]`: phase 2, in the copy: the engine's
+    /// `uninstall`, then the copy's own folder. `relay`: progress as relay lines on the standard
+    /// output (the unelevated parent reads them), else the events and the result line of a run
+    /// started by an administrator.
+    UninstallSecond {
+        /// The events go to the standard output as relay lines.
+        relay: bool,
+    },
 }
 
 /// The phases of the hidden `machine-uninstall` mode.
@@ -581,9 +611,40 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
         Some("uninstall") if HAND_OFF && rest.iter().any(|a| a == "--install-root") => {
             parse_hand_off(rest).map(Mode::UninstallHandOff)
         }
+        Some("uninstall") if UNIX_MACHINE && rest.first().is_some_and(|a| a == USER_COPY_FLAG) => {
+            match &rest[1..] {
+                [] => Ok(Mode::UninstallCopy { silent: false }),
+                [flag] if flag == "--silent" => Ok(Mode::UninstallCopy { silent: true }),
+                _ => Err(UsageError),
+            }
+        }
         Some("uninstall") => silent_or_s(rest).map(|silent| Mode::Uninstall { silent }),
-        // The elevated modes of a machine install exist on Windows only; elsewhere they are not
-        // a word of the grammar.
+        Some(MACHINE_REPAIR) if UNIX_MACHINE => match rest {
+            [name, value] if name == "--events" && value == EVENTS_STDOUT => {
+                Ok(Mode::MachineUnix(MachineUnix::Repair))
+            }
+            _ => Err(UsageError),
+        },
+        Some(MACHINE_UNINSTALL) if UNIX_MACHINE => match rest {
+            [name, value] if name == "--events" && value == EVENTS_STDOUT => {
+                Ok(Mode::MachineUnix(MachineUnix::UninstallStart))
+            }
+            [second] if second == "--second" => {
+                Ok(Mode::MachineUnix(MachineUnix::UninstallSecond {
+                    relay: false,
+                }))
+            }
+            [second, name, value]
+                if second == "--second" && name == "--events" && value == EVENTS_STDOUT =>
+            {
+                Ok(Mode::MachineUnix(MachineUnix::UninstallSecond {
+                    relay: true,
+                }))
+            }
+            _ => Err(UsageError),
+        },
+        // The elevated modes of a machine install take a pipe and a SID on Windows only;
+        // elsewhere that shape is not a word of the grammar.
         Some(MACHINE_REPAIR) if MACHINE_MODES => {
             parse_machine_install(rest).map(Mode::MachineRepair)
         }
@@ -659,7 +720,6 @@ pub enum SetupCommand {
 }
 
 /// The value of `--events` that names the elevated copy's standard output (M11-D9).
-#[cfg(unix)]
 pub const EVENTS_STDOUT: &str = "stdout";
 
 /// Parses the command line of a setup file on a unix system with per-machine installs (Linux):
@@ -746,6 +806,12 @@ pub(crate) fn parse_machine_install(args: &[OsString]) -> Result<MachineArgs, Us
 
 /// Whether the hidden elevated modes of a machine install exist: Windows only (M10).
 const MACHINE_MODES: bool = cfg!(windows);
+
+/// Whether the hidden elevated modes of a unix machine install exist: Linux and macOS (M11-D14).
+const UNIX_MACHINE: bool = cfg!(unix);
+
+/// The only argument of the unelevated uninstall's copy.
+pub const USER_COPY_FLAG: &str = "--user-copy";
 
 /// Whether the hidden `machine-install --pkg` mode exists: macOS only (M11-D8).
 const PKG_MODE: bool = cfg!(target_os = "macos");
@@ -1330,6 +1396,80 @@ mod tests {
             parse(&os(&["machine-install", "--events", "stdout"])),
             Err(UsageError)
         );
+    }
+
+    /// M11-D14: the elevated modes of a unix machine install take `--events stdout` and nothing
+    /// else (phase 2 of the uninstall also `--second`); the unelevated uninstall's copy takes
+    /// `--user-copy` and at most `--silent`. Windows has none of these words.
+    #[test]
+    fn the_unix_machine_modes_are_closed_and_exist_on_unix_only() {
+        let events = ["--events", "stdout"];
+        let cases: [(Vec<&str>, Mode); 7] = [
+            (
+                [&["machine-repair"][..], &events].concat(),
+                Mode::MachineUnix(MachineUnix::Repair),
+            ),
+            (
+                [&["machine-uninstall"][..], &events].concat(),
+                Mode::MachineUnix(MachineUnix::UninstallStart),
+            ),
+            (
+                vec!["machine-uninstall", "--second"],
+                Mode::MachineUnix(MachineUnix::UninstallSecond { relay: false }),
+            ),
+            (
+                [&["machine-uninstall", "--second"][..], &events].concat(),
+                Mode::MachineUnix(MachineUnix::UninstallSecond { relay: true }),
+            ),
+            (
+                vec!["uninstall", "--user-copy"],
+                Mode::UninstallCopy { silent: false },
+            ),
+            (
+                vec!["uninstall", "--user-copy", "--silent"],
+                Mode::UninstallCopy { silent: true },
+            ),
+            (vec!["uninstall"], Mode::Uninstall { silent: false }),
+        ];
+        for (args, want) in cases {
+            let got = parse(&os(&args));
+            let is_unix_word = !matches!(want, Mode::Uninstall { .. });
+            if is_unix_word && !cfg!(unix) {
+                assert_eq!(got, Err(UsageError), "{args:?}");
+            } else {
+                assert_eq!(got, Ok(want), "{args:?}");
+            }
+        }
+        if !cfg!(unix) {
+            return;
+        }
+        for bad in [
+            vec!["machine-repair"],
+            vec!["machine-repair", "--events"],
+            vec!["machine-repair", "--events", "Stdout"],
+            vec!["machine-repair", "--events", "stdout", "--silent"],
+            vec![
+                "machine-repair",
+                "--events",
+                "0123456789abcdef0123456789abcdef",
+                "--for-sid",
+                "S-1-5-21-1",
+            ],
+            vec!["machine-repair", "--second"],
+            vec!["machine-uninstall"],
+            vec!["machine-uninstall", "--second", "--second"],
+            vec!["machine-uninstall", "--second", "--events"],
+            vec!["machine-uninstall", "--second", "stdout"],
+            vec!["machine-uninstall", "--events", "stdout", "--second"],
+            vec!["machine-uninstall", "--wait-pid", "42", "--wait-start", "7"],
+            vec!["uninstall", "--user-copy", "--user-copy"],
+            vec!["uninstall", "--user-copy", "/tmp/x"],
+            vec!["uninstall", "--user-copy=1"],
+            vec!["uninstall", "--silent", "--user-copy"],
+            vec!["uninstall", "--user-copy", "--silent", "--silent"],
+        ] {
+            assert_eq!(parse(&os(&bad)), Err(UsageError), "{bad:?}");
+        }
     }
 
     /// M11-D8: `machine-install --pkg` is a word of the macOS grammar, with nothing beside it.
