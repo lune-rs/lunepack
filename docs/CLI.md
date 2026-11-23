@@ -451,6 +451,14 @@ only an Authenticode signature lets the administrator tell a genuine setup file 
 the installer of an app that installs for all users. A release packed with `--service` offers the "For all
 users" choice (RUNTIME.md, "Per-machine installs").
 
+**Linux for all users (M11-D9).** The same setup file of a `linux-*` release packed with `--service` also installs for
+all users: its window's "Install for all users" goes through `pkexec`, or shows the `sudo '<file>' --all-users`
+command to run in a terminal, and a run as root with `--all-users` installs headless (RUNTIME.md, "Per-machine
+installs (Linux and macOS, M11)"). The file carries **no anchor**: the `pkexec` prompt names a path, not a
+publisher, so there is nothing a digest in the file could tell the administrator; the root side copies the payload
+out of its own executed image and verifies it under the trailer's root (THREAT-MODEL, "Linux and macOS
+per-machine"). Distribute the file from the publisher's own channel and publish its checksum.
+
 ### macOS targets (M8)
 
 A `macos-*` pack with `[update]` packs an app bundle (`<Name>.app`'s contents) and adds files inside it,
@@ -752,8 +760,9 @@ the same bytes. `--at` verifies at that Unix time instead of the system clock. A
 installing when its key set expires or its release keys' windows end: build it from a current
 release.
 
-**macOS (M8-D7, M8-D9).** A `macos-*` release has no setup file. `setup` writes one of two things, by the
-same checks as above, taking every file out of the pack through its signed frame:
+**macOS (M8-D7, M8-D9, M11-D8).** A `macos-*` release has no setup file. `setup` writes one of two things (three
+with the service: the `.pkg` below is written beside the `.dmg`), by the same checks as above, taking every file out
+of the pack through its signed frame:
 
 - **The installer `.dmg`** (default; a macOS host only, because it runs the system's `hdiutil`): an
   LZMA-compressed APFS disk image (`hdiutil create -format ULMO -fs APFS`, no Spotlight index, verified with

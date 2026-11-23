@@ -932,10 +932,12 @@ step 3 completed.
 - **Per-user install** (`scope: user`): one store in the install's state directory, read and written
   by the library.
 - **Per-machine install** (`scope: machine`): the `install-state` store in the machine state
-  directory, `R\.lunepack\state` (18.1; world-readable, writable by administrators only), is written
+  directory, `R\.lunepack\state` (18.1; `R/.lunepack/state` on Linux and macOS, 20.1; world-readable,
+  writable by administrators only), is written
   only by the privileged engine; the library reads it and never writes it. Each user keeps the floors
   they have verified for that install as `install-counters` records in
-  `<user home>\state\<install_id as 32 hex>\` (18.5). A counters record whose `install_id` differs from
+  `<user home>\state\<install_id as 32 hex>\` (18.5; `<user home>/state/<install_id as 32 hex>/` on Linux
+  and macOS, 20.7). A counters record whose `install_id` differs from
   the machine record's is invalid (the load stops). A check starts from the **effective floors**: the
   key-set version and, per channel, the feed `seq` are the field-wise higher of the machine record's and
   the user's. The **root is never taken from a user's record** (M4-SEC-obs1, M10-D17): it is the machine
@@ -964,7 +966,10 @@ step 3 completed.
   versions directory (section 17); its current tree is that bundle, the explicit current tree above, and
   every other kept version's tree is in the versions directory as before. A reader recognises an installed
   tree by its parent directory being the versions directory of one of the three schemes, or, on macOS, by
-  it being the bundle the install's pointer names (section 17).
+  it being the bundle the install's pointer names (section 17). A per-machine install uses the names of
+  section 18 on Windows and of section 20 on Linux (`app/<ver>`, `.lunepack/state`, and the link
+  `current`) and macOS (`app/<ver>`, `.lunepack/state`, the bundle of 17 as its live tree); a reader finds
+  one by where the running tree stands and by the machine record, never by these names alone (20.1).
 - A `staged` entry is usable only when `staged.version` is newer than `current.version` by
   precedence, is not in `bad`, `staged.target` equals the record's `target`, and the tree directory
   `<versions dir>/<staged.tree>` exists as a real directory. Otherwise it is ignored and the next
@@ -1609,7 +1614,8 @@ state for any other purpose, and writes nothing while it does:
 
 After the tree is accepted as `B`, a runtime that is about to change the install checks the place once
 (`check_place`): `B`'s folder and `R/versions` are on one device (else `other_volume`); `B` is owned by the
-caller (else `not_owned`; a root-owned `B` is a machine install by ownership, D10, and is `machine_scope`, exit 17); the caller can create
+caller (else `not_owned`; a root-owned `B` that is not the live bundle of a per-machine install of this app
+(20.1, 20.5) is `machine_scope`, exit 17); the caller can create
 entries in `B`'s folder (else `not_writable`). The folder itself need not be the caller's, so an
 administrator's app in `/Applications` keeps updating (M8-D4).
 
@@ -1822,12 +1828,14 @@ only the uninstalling user's.
 
 ## 19. Privileged service protocol, version 1
 
-The update service of a per-machine install (18.3) and the copies of the library and the runtime that talk
-to it share this protocol. It is a **cross-version contract** (D28): an app of any version may meet a
+The update service of a per-machine install (18.3 on Windows, 20.3 to 20.5 on Linux and macOS) and the copies
+of the library and the runtime that talk to it share this protocol, over a named pipe on Windows and a unix
+socket on Linux and macOS (19.8). It is a **cross-version contract** (D28): an app of any version may meet a
 service of any other, and once an app ships, version 1 can only be extended. A new request, answer, member
 or error code arrives only with a new protocol version; `status`, `confirm` and `rollback` stay in every
 later version. The service never trusts what a client sends: it copies every byte into an admin-only
-folder and verifies it there against the machine record (THREAT-MODEL, "Windows per-machine").
+folder and verifies it there against the machine record (THREAT-MODEL, "Windows per-machine" and "Linux and
+macOS per-machine").
 
 ### 19.1 Frames
 
@@ -1915,7 +1923,8 @@ app_mismatch
 ```
 
 `busy` is the engine's answer when another host (an elevated mode of the runtime) holds its lock; a second
-client of the service itself waits for the pipe, which serves one connection at a time. No message carries
+client of the service itself waits for the pipe (on Linux and macOS, in the listening socket's queue, 19.8),
+which serves one connection at a time. No message carries
 a path of the file system, an operating-system error text, an install id, a token digest or key material;
 `need_fetch` carries release paths, which are the manifest's relative entry paths.
 
@@ -1980,4 +1989,325 @@ answer rolled_back | 2900000001 | {"type":"rolled_back","current":"1.0.0"}
 answer error | 2900000001 | {"type":"error","code":"token_mismatch"}
 answer error verify_failed | 3b00000001 | {"type":"error","code":"verify_failed","class":"rollback"}
 data | 0500000002 | 0001feff
+```
+
+### 19.8 The transport on Linux and macOS
+
+The frames, messages, requests, answers, errors, token, lease, deadlines and limits of 19.1 to 19.7 are the
+same bytes over a stream socket of the unix family (`AF_UNIX`, `SOCK_STREAM`) in place of the pipe (M11-D2):
+protocol version 1 is unchanged and the golden file of 19.7 serves all three systems. The client streams the
+signed documents and the pack or frames through the socket; no file descriptor crosses it (no `SCM_RIGHTS`),
+so the service never reads from a file, FIFO, device or socket a user chose.
+
+The service is started by the init system and takes its listening socket from it (systemd, file descriptor 3;
+launchd, the socket named `lunepack`; 20.4, 20.5); it serves one connection at a time and exits after 60
+seconds with no connection and no lease (19.6). The init system keeps the socket, so the next client starts
+the service again, and the lease of 19.5, which is in memory, is forgotten at the exit as it is at any
+restart. A second client is not refused: it waits in the socket's queue until the first connection ends,
+and a client whose hello does not arrive within its own deadline (ten seconds in the library and the
+runtime) ends with `service_unavailable`, reason `timeout`. The server takes no decision from who the peer
+is: any local user may talk to it. The client's checks of the socket and of the peer are 20.3.
+
+## 20. Linux and macOS per-machine layout
+
+A per-machine ("all users") install on Linux or macOS has an install root `R` in a fixed machine home and
+the names below. They are a **cross-version contract** with sections 12 and 19, as 18 is on Windows: the
+library, the runtime, the update service and every later build of each find the install by them. A
+per-machine install exists only for a release packed with the update service (`lunepack-service`, CLI.md
+`pack --service`); without it an app installs per user only (the layouts of 12.7 and 17). One set of
+directory names serves both systems and Windows (18.1 uses the same ones); only the machine home, the
+service file name and what is projected from the record differ.
+
+### 20.1 Directories
+
+`R` is `/opt/<app id>` on Linux and `/Library/Application Support/lunepack/<app id>` on macOS: the app id,
+never the display name, directly under the machine home. The machine home is a constant of the build, never
+read from the environment, an argument or a file.
+
+| Path under `R` | Holds | Class (20.2) |
+|---|---|---|
+| `app/<version>/` | the version's tree (12.7); on macOS the whole bundle tree (17) | machine tree |
+| `app/.gc-<16 hex>/` | a version tree being removed (transient; the engine removes it, or a later pass does) | machine tree |
+| `current` | Linux only: a symlink whose text is `app/<current version>` (relative); what the entry, the desktop entry and the command link go through | with `R` |
+| `bundle`, `bundle.id`, `app/.swap`, `app/.out` | macOS only: the pointer to the live bundle `B`, its identity and the two slots of the swap, as 17.1 and 17.3 define them (the slots are under `app/` here, not `versions/`) | with `R` and `app` |
+| `.lunepack/state/` | the machine `install-state` records (12; scope `machine`), world-readable | machine tree |
+| `.lunepack/logs/` | the update service's log | machine tree |
+| `.lunepack/machine/` | the engine's private area: | admin only |
+| `.lunepack/machine/lock` | the engine's lock file | admin only |
+| `.lunepack/machine/incoming/<random>/` | one folder per upload session, as 18.1 | admin only |
+| `.lunepack/machine/service/<version>/lunepack-service` | the service binary of a version | admin only |
+| `.lunepack/machine/lunepack-service` | the **stable service link**: a symlink whose text is `service/<version>/lunepack-service` (relative); the path the init system starts. It is switched only by creating a new link beside it and renaming that over it, so there is no moment without a target | admin only |
+
+The service binary is `lunepack-service` (no extension) on both systems. The version trees are placed from
+the verified release by the engine; a macOS tree is a bundle whose update configuration is
+`Contents/Resources/lunepack-update.json` (13.1), a Linux tree's is `lunepack-update.json` at its top.
+
+Directly under the machine home, and only while an elevated first install or an uninstall runs, one folder
+named `.lunepack-install-<32 hex>` (the payload copied out of the consented setup file or `.pkg` payload,
+FORMAT 14) or `.lunepack-uninstall-<16 hex>` (the uninstaller's copy of the runtime). Both are admin-only and
+carry nothing a later version reads; a cut-off one is swept by the next run. At uninstall `R` is renamed to
+the tombstone `.<app id>.removing-<16 hex>` in the machine home before it is deleted (as 18.1), and on macOS
+`B` to the same tombstone in its folder. The macOS home also holds `.installer/<app id>/` (the `.pkg`'s
+payload, CLI.md, removed once the install ends) and `.policy/` (20.6).
+
+**What is projected.** After every commit of the machine record (first install, apply, rollback, a service
+that opens an install) the engine makes the disk say what the record says: on Linux the link `current`
+names `app/<current version>`, replaced by a new link renamed over it; on macOS the live bundle `B` holds
+the current version's tree, by the reconcile of 17.3 run by the engine as root. `B` is
+`/Applications/<name>.app`, or `/Applications/<name> (<app id>).app` when that name is taken or `<name>` is
+not a valid bundle name (17.1); an existing entry is never touched, both names taken refuses the install
+(`install_mismatch`), and `/Applications` is never created or changed. The record is committed first; a crash
+between the commit and the projection is finished by the next operation. A rolled-back or removed version
+leaves the projection where the record says, never ahead of it.
+
+**Scope is by location.** An install is per machine when the running executable stands in a tree of `R/app/`
+(or, on macOS, is the live bundle `R/bundle` names) with `R` directly in the machine home, and the newest
+record in `R/.lunepack/state` is of scope `machine` and names the app. Never an argument, an environment
+variable, a unit or a property list.
+
+### 20.2 Protection
+
+Two classes, checked by the owner, the mode and the access control list of each directory, never through a
+link:
+
+- **machine tree** (`R`, `R/app` and the version trees, `R/.lunepack` and its `state` and `logs`): a real
+  directory (not a link) owned by uid 0, with no write bit for others, a group write bit only when the group
+  is gid 0 (on macOS also gid 80, `admin`), and no access control list (macOS: no extended ACL entry; Linux:
+  no `system.posix_acl_access`). The sticky bit does not stand in for a missing write bit. Created with
+  mode 0755;
+- **admin only** (`R/.lunepack/machine` and below): a real directory owned by uid 0 with no bit set for group
+  or others and no access control list. Created with mode 0700.
+
+`create_dir` makes the directory with mode 0700, sets its owner to 0:0 and its exact mode, syncs it and its
+parent, and then checks it as above, removing it again when the check fails; the default umask, a set-group-id
+parent and inheritable ACLs never decide a mode. The engine checks `R`, `R/app`, `R/.lunepack`,
+`R/.lunepack/state` and `R/.lunepack/machine` at the start of every operation and refuses to act
+(`not_protected`) when any is not as its class says; the check of `R` also applies the machine-tree rule to
+every directory above it up to `/` (`/opt`, `/Library`, `/Library/Application Support`, ...), so a group-
+or world-writable ancestor stops the engine.
+
+### 20.3 The endpoint and the client's checks
+
+| Item | Linux | macOS |
+|---|---|---|
+| socket | `/run/lunepack/<app id>.sock` | `/var/run/lunepack-<app id>.sock` |
+| mode and owner | 0666, root:root, made by systemd | 0666 (`SockPathMode` 438), made by launchd |
+| directory | `/run/lunepack`, mode 0755, owner root, made by systemd | the system's `/var/run` (`/private/var/run`, root:daemon 0775) |
+| longest path | 107 bytes (`sun_path` is 108 with its NUL) | 103 bytes (`sun_path` is 104 with its NUL) |
+| registration | two systemd units (20.4) | one LaunchDaemon (20.5) |
+
+An app id of at most 64 bytes always fits. Mode 0666 lets any local user connect, as Windows grants Users
+the pipe (M10-D10); the server decides nothing from who connects.
+
+A client, **before it sends a byte**, requires that: the socket's directory is a real directory owned by uid
+0 that no one but root's group (macOS: and `daemon`'s) can write; the socket path is a socket owned by uid 0;
+and, once connected, the peer's effective user id is 0 (`SO_PEERCRED` on Linux, `getpeereid` on macOS). Any
+other answer closes the connection with nothing sent and is `service_unavailable` with reason `untrusted`. A
+socket that does not exist (after retrying for three seconds) is `not_installed`; a socket nobody listens on
+is `disabled`. The service takes its listener from the init system and refuses to run without one: Linux,
+file descriptor 3, which must be a listening unix stream socket bound to the path above; macOS, the one
+descriptor `launch_activate_socket` returns for the name `lunepack`, which must be a unix stream socket;
+started any other way it prints one line and exits 2. It reads no environment variable and takes no
+argument but `--self-test`. It finds `R` from its own resolved image path, which must have exactly the shape
+`<machine home>/<app id>/.lunepack/machine/service/<version>/lunepack-service` with `<version>` its canonical
+text and the app id valid, and from nothing else; the machine home is compared with what the kernel names
+it (`F_GETPATH` on macOS, the canonical path on Linux).
+
+### 20.4 Linux: the units
+
+Two units in `/etc/systemd/system`, written with mode 0644 through a temporary file and a rename (the service
+unit first), after which `systemctl daemon-reload` and `systemctl enable --now lunepack-<app id>.socket` run.
+The first line marks a unit as lunepack's: the registrar reads the service's image from a unit only when it
+carries that line, exactly one `ExecStart=` and a path of the shape of the stable link, and otherwise reports
+the registration as not its own. The service unit has no `[Install]` section: the socket starts it.
+`ExecStart` is the stable service link of 20.1, so the unit never changes when the service updates itself.
+Removal runs `systemctl disable --now` on both units, deletes both files, reloads systemd and deletes the
+socket file `/run/lunepack/<app id>.sock` (a stopped socket unit leaves it behind), and nothing else.
+
+```text systemd-socket-unit
+# Written by lunepack; do not edit.
+[Unit]
+Description=lunepack update service socket of org.example.hello
+
+[Socket]
+ListenStream=/run/lunepack/org.example.hello.sock
+SocketMode=0666
+SocketUser=root
+SocketGroup=root
+DirectoryMode=0755
+Accept=no
+
+[Install]
+WantedBy=sockets.target
+```
+
+```text systemd-service-unit
+# Written by lunepack; do not edit.
+[Unit]
+Description=lunepack update service of org.example.hello
+
+[Service]
+Type=simple
+ExecStart=/opt/org.example.hello/.lunepack/machine/lunepack-service
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+UMask=0022
+```
+
+`Accept=no` makes the service a single long-lived process that is handed the listening socket (M11-D3), so
+the lease of 19.5 survives from `apply` to `attempt`. A path with a byte a unit file would need to escape
+(a space, `%`, `\`, `$`, `;`, a quote or a control character) is refused at registration. `systemctl` runs with an empty
+environment and an absolute path. The two tests in `crates/lunepack-os-linux/tests/format_doc.rs` check
+that both blocks above equal the bytes the registrar writes.
+
+The service updates its own binary as 18.3 says: it copies the new version's `lunepack-service` into
+`service/<N>/`, runs it with `--self-test` (it must check its own location and exit 0 within ten seconds),
+and only then renames a new link over the stable link; a failed self-test leaves the old link. The running
+service keeps its old image until it exits; the next start follows the new link.
+
+### 20.5 macOS: the daemon and the bundle
+
+One LaunchDaemon: the property list `/Library/LaunchDaemons/lunepack-<app id>.plist` (root:wheel, mode 0644,
+written through a temporary file and a rename), label `lunepack-<app id>`, loaded with
+`launchctl bootstrap system <plist>` (a replaced job is booted out and waited for first; a bootstrap is tried
+up to three times, a second apart) and removed with `launchctl bootout`. The program is the stable service
+link of 20.1; there is no `RunAtLoad` and no `KeepAlive`: the socket starts it. The plist carries a
+comment that marks it as lunepack's; the registrar reads the image from a plist only when it carries that
+comment, one `ProgramArguments` string and a path of the shape of the stable link. When the signed install
+metadata carries the app's bundle identifier the plist also holds `AssociatedBundleIdentifiers` with that one
+string, so that System Settings shows the daemon under the app; otherwise the key is left out.
+
+```text launchd-plist
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Written by lunepack; do not edit. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>lunepack-org.example.hello</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Library/Application Support/lunepack/org.example.hello/.lunepack/machine/lunepack-service</string>
+	</array>
+	<key>Sockets</key>
+	<dict>
+		<key>lunepack</key>
+		<dict>
+			<key>SockPathName</key>
+			<string>/var/run/lunepack-org.example.hello.sock</string>
+			<key>SockPathMode</key>
+			<integer>438</integer>
+		</dict>
+	</dict>
+</dict>
+</plist>
+```
+
+The block is the plist without a bundle identifier; the test in `crates/lunepack-os-macos/tests/format_doc.rs`
+checks it equals the bytes the registrar writes. The service updates its own binary as in 20.4 and 18.3.
+
+The bundle, its pointer, its identity, the swap slots and the reconcile are those of 17, run by the engine as
+root with `R` in the machine home; the engine, not the app, owns `B` (root-owned, in `/Applications`), and a
+user's app that finds itself in such a bundle is a machine install by 20.1, never an adoption (17.5) or a
+per-user update.
+
+The first install is a signed installer package (CLI.md, `setup`): Installer places the runtime and the
+payload file of 14.4 below `/Library/Application Support/lunepack/.installer/<app id>/`, in folders that
+only root can read or change, and runs the package's one `postinstall` line, `machine-install --pkg`. The
+mode takes no argument and no environment variable; it requires its own image and the payload to stand in
+admin-only folders of that path before it reads either, copies the payload into
+`.lunepack-install-<32 hex>`, verifies the copy under the trailer's root (there is no separate anchor,
+THREAT-MODEL), and then installs through the engine; the same version found installed is repaired, another
+is `already_installed`.
+
+### 20.6 Policy files
+
+An administrator's policy for an app is a JSON file, read and never written by lunepack:
+`/etc/lunepack/policy/<app id>.json` on Linux and `/Library/Application Support/lunepack/.policy/<app id>.json`
+on macOS. It is one strict-JSON object (3.1: duplicate keys refused) of at most 4096 bytes with two optional
+members, the booleans `disable_self_update` and `no_update_ui`, which mean what `DisableSelfUpdate` and
+`NoUpdateUi` mean in 18.4. No file at that name: both off. A file that is there but not a regular file (a link,
+FIFO, device or directory), not owned by uid 0, writable by its group or by others, in a directory that is
+not a real directory owned by uid 0 or is writable by its group or by others, larger than 4096 bytes, not
+strict JSON, holding an unknown member or a value that is not a boolean: **both on**, so a damaged policy
+errs toward no update (M10-D12). The file is opened without following a link and judged through the
+descriptor it opened.
+
+### 20.7 The per-user home
+
+Each user of a per-machine install keeps what the library needs in `<data home>/.lunepack/<app id>/`, with
+the data home `$XDG_DATA_HOME` (else `~/.local/share`) on Linux and `~/Library/Application Support` on
+macOS:
+
+| Path | Holds |
+|---|---|
+| `state/` | this user's lock, and `state/<install_id as 32 hex>/` with the `install-counters` records (12.6) |
+| `cache/` | the download cache |
+| `logs/` | the library's and the runtime's log for this user |
+
+No app id starts with `.`, so this never meets a per-user install's `R = <data home>/<app id>`. The location is
+a **cross-version contract** as 18.5 is: every later library version must find the counters (12.6, including
+`last_run`, 12.9) there. Another user's home is never read or written, and an uninstall removes only the
+uninstalling user's.
+
+### 20.8 Integration
+
+The engine writes, as root, the integration the per-user rules of 12.7 and 17.6 describe, to the system-wide
+places and under the same marker rules (an entry that is not lunepack's is never replaced and is reported):
+
+- Linux: the desktop entry `/usr/local/share/applications/<app id>.desktop`, the command link
+  `/usr/local/bin/<bin>` and, when the app declares autostart, `/etc/xdg/autostart/<app id>.desktop`, each
+  going through `R/current`. The package manager's `/usr/share` and `/usr/bin` are never touched.
+- macOS: when the app declares autostart, the LaunchAgent `/Library/LaunchAgents/lunepack-<app id>.autostart.plist`
+  (label `lunepack-<app id>.autostart`, root:wheel, mode 0644; the program is the entry inside the live bundle),
+  which runs in each user's session at the next sign-in and is never loaded with `launchctl`. There is no
+  shortcut: the bundle in `/Applications` is the entry.
+
+### 20.9 Names
+
+The names of 20.1 and 20.3 to 20.5 for the example app id `org.example.hello` and the version `1.2.3`, one
+`<name> | <value>` per line, generated by the core's own functions. A test (`format_doc` of `lunepack-core`)
+checks that this block equals what they return, line for line.
+
+```text unix-names
+app id | org.example.hello
+version | 1.2.3
+linux machine home | /opt
+linux install root R | /opt/org.example.hello
+linux versions | /opt/org.example.hello/app
+linux version tree | /opt/org.example.hello/app/1.2.3
+linux state | /opt/org.example.hello/.lunepack/state
+linux logs | /opt/org.example.hello/.lunepack/logs
+linux lock | /opt/org.example.hello/.lunepack/machine/lock
+linux incoming | /opt/org.example.hello/.lunepack/machine/incoming
+linux service binary | /opt/org.example.hello/.lunepack/machine/service/1.2.3/lunepack-service
+linux stable service link | /opt/org.example.hello/.lunepack/machine/lunepack-service
+linux per-user home | <data home>/.lunepack/org.example.hello
+linux socket directory | /run/lunepack
+linux socket | /run/lunepack/org.example.hello.sock
+linux longest socket path | 107
+macos machine home | /Library/Application Support/lunepack
+macos install root R | /Library/Application Support/lunepack/org.example.hello
+macos versions | /Library/Application Support/lunepack/org.example.hello/app
+macos version tree | /Library/Application Support/lunepack/org.example.hello/app/1.2.3
+macos state | /Library/Application Support/lunepack/org.example.hello/.lunepack/state
+macos logs | /Library/Application Support/lunepack/org.example.hello/.lunepack/logs
+macos lock | /Library/Application Support/lunepack/org.example.hello/.lunepack/machine/lock
+macos incoming | /Library/Application Support/lunepack/org.example.hello/.lunepack/machine/incoming
+macos service binary | /Library/Application Support/lunepack/org.example.hello/.lunepack/machine/service/1.2.3/lunepack-service
+macos stable service link | /Library/Application Support/lunepack/org.example.hello/.lunepack/machine/lunepack-service
+macos per-user home | <data home>/.lunepack/org.example.hello
+macos socket directory | /var/run
+macos socket | /var/run/lunepack-org.example.hello.sock
+macos longest socket path | 103
+linux projection target | app/1.2.3
+linux socket unit | lunepack-org.example.hello.socket
+linux service unit | lunepack-org.example.hello.service
+linux unit directory | /etc/systemd/system
+macos label | lunepack-org.example.hello
+macos plist | /Library/LaunchDaemons/lunepack-org.example.hello.plist
+macos launchd socket name | lunepack
+service file (unix) | lunepack-service
 ```
