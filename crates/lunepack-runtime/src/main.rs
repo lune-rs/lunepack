@@ -237,7 +237,12 @@ fn uninstall_mode(
     }
     if cfg!(target_os = "linux") {
         // Only a failure returns: the copy took this process's place.
-        let kind = match uninstall::user_copy_hand_off(ad, inst, &machine::StdExec, &enter_dir) {
+        let kind = match uninstall::user_copy_hand_off(
+            ad,
+            inst,
+            &machine::StdExec { keep_env: true },
+            &enter_dir,
+        ) {
             Ok(()) => Kind::Ok,
             Err(kind) => kind,
         };
@@ -318,7 +323,7 @@ fn uninstall_machine_in_place(ad: &modes::Adapters, inst: &lunepack::Installatio
     let kind = machine::run_uninstall_start_unix(
         &adapters.base(&home),
         &machine::native_unix::NativeOps { enter: enter_dir },
-        &machine::StdExec,
+        &machine::StdExec { keep_env: false },
         unix_elevation().standing(),
         &located,
         false,
@@ -953,7 +958,7 @@ fn machine_unix_mode(mode: modes::MachineUnix) -> Kind {
                 Ok(located) => machine::run_uninstall_start_unix(
                     &base,
                     &ops,
-                    &machine::StdExec,
+                    &machine::StdExec { keep_env: false },
                     standing,
                     &located,
                     true,

@@ -2074,21 +2074,28 @@ pub trait Exec: Send + Sync {
     fn exec(&self, program: &Path, args: &[String]) -> io::Result<()>;
 }
 
-/// [`Exec`] through the operating system's `exec`.
+/// [`Exec`] through the operating system's `exec`. A root process hands over an empty
+/// environment (`keep_env` false: nothing of the caller's reaches the copy that removes the
+/// install); the unelevated user's own copy keeps the user's environment (`keep_env` true: it
+/// needs `HOME` and the display, and it is no privilege boundary).
 #[cfg(unix)]
-pub struct StdExec;
+pub struct StdExec {
+    /// The copy keeps this process's environment.
+    pub keep_env: bool,
+}
 
 #[cfg(unix)]
 impl Exec for StdExec {
     fn exec(&self, program: &Path, args: &[String]) -> io::Result<()> {
         use std::os::unix::process::CommandExt as _;
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        if !self.keep_env {
+            command.env_clear();
+        }
         // Only reached by a process that holds no other descriptor of its own than the standard
         // ones and the images' (the standard library opens everything close-on-exec).
-        let error = std::process::Command::new(program)
-            .args(args)
-            .env_clear()
-            .exec();
-        Err(error)
+        Err(command.exec())
     }
 }
 

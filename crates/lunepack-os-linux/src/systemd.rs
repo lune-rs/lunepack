@@ -346,6 +346,13 @@ impl ServiceRegistrar for SystemdRegistrar {
             }
         }
         sync_dir(&self.unit_dir).map_err(|_| ServiceRegError::Os("the unit folder"))?;
-        self.systemctl(&["daemon-reload"])
+        self.systemctl(&["daemon-reload"])?;
+        // A stopped socket unit leaves its file behind (`RemoveOnStop` is off): the endpoint of
+        // this app goes with the registration. Only that one name, and a missing file is fine.
+        match fs::remove_file(endpoint::socket_path(UnixOs::Linux, app_id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(ServiceRegError::Os("the socket file could not be removed")),
+        }
     }
 }
