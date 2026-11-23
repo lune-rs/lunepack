@@ -15,7 +15,9 @@ use crate::feed::ArtifactRef;
 use crate::frame::{FrameDesc, StreamDesc, check_file_frame, decode_verified};
 use crate::ident::AppId;
 use crate::limits::Limits;
-use crate::manifest::{EntryDoc, ManifestDocument};
+use crate::manifest::{
+    DeltaDoc, EntryDoc, ManifestDocument, PatchDoc, VerifiedEntry, check_deltas, check_entry,
+};
 use crate::path::{EntryKind, RelPath, validate_tree};
 use crate::pe::{
     LOAD_LIBRARY_SEARCH_SYSTEM32, MACHINE_ARM64, MACHINE_X86_64, PeError, PeImage,
@@ -647,14 +649,56 @@ struct LayoutEntry {
     body: Body,
 }
 
+/// One encoded patch for [`ReleaseLayout::add_delta`] (FORMAT.md 9.3): the patched file's bytes
+/// encoded by `codec` against a base file of `base_size` bytes and `base_sha256`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaPatch {
+    /// `lzma2`, `bcj-x86+lzma2` or `bcj-arm64+lzma2`.
+    pub codec: CodecId,
+    /// The patch's bytes.
+    pub bytes: Vec<u8>,
+    /// The base file's size.
+    pub base_size: u64,
+    /// The base file's SHA-256.
+    pub base_sha256: Sha256Digest,
+}
+
+/// A delta file the writer made: its name in the release directory and its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaFile {
+    /// `<version>/<target>.from-<from>.delta`.
+    pub path: String,
+    /// The patches, back to back.
+    pub bytes: Vec<u8>,
+}
+
+/// What [`ReleaseLayout::finish_release`] makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedRelease {
+    /// The manifest document.
+    pub manifest: ManifestDocument,
+    /// The pack's bytes.
+    pub pack: Vec<u8>,
+    /// The delta files, in the manifest's `deltas` order.
+    pub deltas: Vec<DeltaFile>,
+}
+
+struct LayoutDelta {
+    from: String,
+    from_version: Version,
+    patches: Vec<(RelPath, DeltaPatch)>,
+}
+
 /// One release's entries, collected in any order and turned into a manifest document and its pack
-/// by [`ReleaseLayout::finish`] (M3-D8).
+/// by [`ReleaseLayout::finish`] (M3-D8), with its deltas by [`ReleaseLayout::finish_release`]
+/// (FORMAT.md 9.3).
 pub struct ReleaseLayout {
     app_id: AppId,
     version: String,
     target: Target,
     entries: Vec<LayoutEntry>,
     seen: BTreeSet<RelPath>,
+    deltas: Vec<LayoutDelta>,
 }
 
 impl ReleaseLayout {
@@ -668,6 +712,7 @@ impl ReleaseLayout {
             target,
             entries: Vec::new(),
             seen: BTreeSet::new(),
+            deltas: Vec::new(),
         })
     }
 
@@ -706,7 +751,33 @@ impl ReleaseLayout {
         self.push(path, Body::Symlink(target.to_owned()))
     }
 
-    /// Builds the manifest document and the pack bytes.
+    /// Adds the delta from release `from` (its version text, kept verbatim): one patch per file
+    /// entry path. The rules of FORMAT.md 9.3 are checked in
+    /// [`finish_release`](Self::finish_release), against the finished entries.
+    pub fn add_delta(&mut self, from: &str, patches: Vec<(RelPath, DeltaPatch)>) -> Result<()> {
+        let from_version = Version::parse(from)?;
+        self.deltas.push(LayoutDelta {
+            from: from.to_owned(),
+            from_version,
+            patches,
+        });
+        Ok(())
+    }
+
+    /// [`finish_release`](Self::finish_release) for a layout without deltas: the manifest
+    /// document and the pack bytes. A layout with a delta is [`PackError::Invariant`], so no
+    /// delta file is ever dropped.
+    pub fn finish(self, issued: u64, hasher: &dyn Hasher) -> Result<(ManifestDocument, Vec<u8>)> {
+        if !self.deltas.is_empty() {
+            return Err(
+                PackError::Invariant("a layout with deltas finishes with its delta files").into(),
+            );
+        }
+        let release = self.finish_release(issued, hasher)?;
+        Ok((release.manifest, release.pack))
+    }
+
+    /// Builds the manifest document, the pack bytes and the delta files.
     ///
     /// Entries are sorted by path bytes and checked with [`validate_tree`] (symlinks are rejected
     /// for Windows targets); identical files (same size and SHA-256) share the frame of the first
@@ -714,12 +785,19 @@ impl ReleaseLayout {
     /// reference is `<version>/<target>.pack`. The output depends only on the set of entries added,
     /// never on the order they were added in. Every frame descriptor is checked with
     /// [`check_file_frame`] against the finished pack before it is returned.
-    pub fn finish(self, issued: u64, hasher: &dyn Hasher) -> Result<(ManifestDocument, Vec<u8>)> {
+    ///
+    /// Deltas (FORMAT.md 9.3): one delta file per delta, named `<version>/<target>.from-<from>.delta`;
+    /// its patches in entry order, back to back from offset 0; the deltas listed by `from`
+    /// precedence, highest first. With no delta, `deltas` is left out and the manifest is byte
+    /// for byte what it was before deltas existed. The finished deltas pass the reader's own
+    /// checks before they are returned.
+    pub fn finish_release(self, issued: u64, hasher: &dyn Hasher) -> Result<FinishedRelease> {
         let ReleaseLayout {
             app_id,
             version,
             target,
             mut entries,
+            mut deltas,
             ..
         } = self;
         let max = Limits::V1.manifest_entries;
@@ -820,6 +898,50 @@ impl ReleaseLayout {
                 check_file_frame(doc.frame.as_ref(), size.get(), sha256, pack_size)?;
             }
         }
+
+        // Highest base first; a stable sort keeps equal precedences for the check to reject.
+        deltas.sort_by(|a, b| b.from_version.cmp(&a.from_version));
+        let mut delta_docs = Vec::with_capacity(deltas.len());
+        let mut delta_files = Vec::with_capacity(deltas.len());
+        for LayoutDelta {
+            from, mut patches, ..
+        } in deltas
+        {
+            patches.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut bytes = Vec::new();
+            let mut patch_docs = Vec::with_capacity(patches.len());
+            for (path, patch) in patches {
+                patch_docs.push(PatchDoc {
+                    path,
+                    base_size: U53::new(patch.base_size)?,
+                    base_sha256: patch.base_sha256,
+                    codec: patch.codec.id().to_owned(),
+                    offset: U53::new(bytes.len() as u64)?,
+                    length: U53::new(patch.bytes.len() as u64)?,
+                    sha256: hasher.sha256(&patch.bytes),
+                });
+                bytes.extend_from_slice(&patch.bytes);
+            }
+            let path = format!("{version}/{}.from-{from}.delta", target.as_str());
+            delta_docs.push(DeltaDoc {
+                from,
+                path: path.clone(),
+                size: U53::new(bytes.len() as u64)?,
+                sha256: hasher.sha256(&bytes),
+                patches: patch_docs,
+            });
+            delta_files.push(DeltaFile { path, bytes });
+        }
+        let delta_docs = (!delta_docs.is_empty()).then_some(delta_docs);
+        if delta_docs.is_some() {
+            let empty = hasher.sha256(b"");
+            let verified = docs
+                .iter()
+                .map(|doc| check_entry(doc.clone(), pack_size, empty))
+                .collect::<Result<Vec<VerifiedEntry>>>()?;
+            check_deltas(delta_docs.clone(), &Version::parse(&version)?, &verified)?;
+        }
+
         let manifest = ManifestDocument {
             format: U53::new(1)?,
             kind: "manifest".to_owned(),
@@ -834,7 +956,12 @@ impl ReleaseLayout {
             target: target.as_str().to_owned(),
             issued: U53::new(issued)?,
             entries: docs,
+            deltas: delta_docs,
         };
-        Ok((manifest, pack))
+        Ok(FinishedRelease {
+            manifest,
+            pack,
+            deltas: delta_files,
+        })
     }
 }

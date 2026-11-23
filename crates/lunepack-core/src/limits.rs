@@ -1,6 +1,6 @@
 //! The size and count caps of FORMAT.md section 4. Readers enforce them before the work they bound.
 
-use crate::frame::MAX_DICT_SIZE;
+use crate::frame::{MAX_DICT_SIZE, MAX_PATCH_WINDOW};
 
 // `Limits::V1.lzma2_dict_bytes` is `MAX_DICT_SIZE`; it must fit the `u32` field.
 const _: () = assert!(MAX_DICT_SIZE <= u32::MAX as u64);
@@ -34,6 +34,12 @@ pub struct Limits {
     pub manifest_entries: usize,
     /// LZMA2 dictionary bytes per stream.
     pub lzma2_dict_bytes: u32,
+    /// Deltas in a manifest.
+    pub deltas_per_manifest: usize,
+    /// Patches in a delta.
+    pub patches_per_delta: usize,
+    /// LZMA2 window bytes of a delta patch (base and file together, FORMAT.md 9.3).
+    pub patch_window_bytes: u64,
     /// JSON nesting depth.
     pub json_depth: u32,
 }
@@ -51,6 +57,9 @@ impl Limits {
         releases_per_feed: 10_000,
         manifest_entries: 200_000,
         lzma2_dict_bytes: MAX_DICT_SIZE as u32,
+        deltas_per_manifest: 16,
+        patches_per_delta: 200_000,
+        patch_window_bytes: MAX_PATCH_WINDOW,
         json_depth: MAX_JSON_DEPTH,
     };
 }

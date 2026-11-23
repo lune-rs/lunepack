@@ -70,7 +70,8 @@ pub use fetch::{
     plan_fetch,
 };
 pub use frame::{
-    CheckedFrame, FrameDesc, StreamDesc, check_file_frame, decode_verified, decoder_memory,
+    CheckedFrame, FrameDesc, MAX_PATCH_WINDOW, PATCH_WINDOW_ALIGN, StreamDesc, check_file_frame,
+    decode_verified, decoder_memory, is_patch_codec, patch_window,
 };
 pub use fs::{
     DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, PlaceFacts,
@@ -97,12 +98,13 @@ pub use lifecycle::{
 };
 pub use limits::Limits;
 pub use manifest::{
-    EntryDoc, ManifestDocument, VerifiedEntry, VerifiedManifest, read_entry, verify_manifest,
-    verify_payload_manifest,
+    DeltaDoc, EntryDoc, ManifestDocument, PatchDoc, VerifiedDelta, VerifiedEntry, VerifiedManifest,
+    VerifiedPatch, read_entry, verify_manifest, verify_payload_manifest,
 };
 pub use pack::{
-    FileClass, PackedFile, ReleaseLayout, RuntimeImageError, candidates, check_pe_stub,
-    check_runtime_image, check_service_image, check_ui_image, classify, pack_file,
+    DeltaFile, DeltaPatch, FileClass, FinishedRelease, PackedFile, ReleaseLayout,
+    RuntimeImageError, candidates, check_pe_stub, check_runtime_image, check_service_image,
+    check_ui_image, classify, pack_file,
 };
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};

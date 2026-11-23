@@ -16,12 +16,14 @@ use lunepack_core::service;
 use lunepack_core::state::{self, MAX_RECORD_BYTES};
 use lunepack_core::trust::PublicKey;
 use lunepack_core::{
-    AppId, ByteRange, Channel, CodecId, ContentRange, CurrentRef, EnvelopeSignature, Floors,
-    FrameDesc, Fs, Hasher, InstallCounters, InstallState, Loaded, PayloadKind, PreviousRef,
-    RootParts, Scope, StagedRef, StreamDesc, Target, Validator, Version, write_envelope,
+    AppId, ByteRange, Channel, CodecId, ContentRange, CurrentRef, DeltaPatch, EnvelopeSignature,
+    Floors, FrameDesc, Fs, Hasher, InstallCounters, InstallState, Loaded, ManifestDocument,
+    PayloadKind, PreviousRef, ReleaseLayout, RootParts, Scope, StagedRef, StreamDesc, Target,
+    Validator, Version, pack_file, write_envelope,
 };
 use lunepack_core::{InstallMeta, RelPath, UpdateConfig};
 
+use crate::codec::FakeCodec;
 use crate::docs::{ChainFixture, PackBuilder, SUITE_T0};
 use crate::hasher::FakeHasher;
 use crate::memfs::MemFs;
@@ -394,6 +396,91 @@ fn manifest_seeds(fx: &ChainFixture<'_>, out: &mut Out) {
         fx.manifest_document(FUZZ_VERSION, FUZZ_TARGET, &escaping)
             .to_payload(),
     );
+    delta_manifest_seeds(fx, out);
+}
+
+/// A release of [`FUZZ_VERSION`] with deltas (FORMAT.md 9.3), written by the core's
+/// `ReleaseLayout`: `deltas` lists `(from, [(path, codec)])`, each patch's bytes and base derived
+/// from its path and base version.
+fn delta_release(fx: &ChainFixture<'_>, deltas: &[(&str, &[(&str, CodecId)])]) -> ManifestDocument {
+    let data = |n: usize, salt: u8| -> Vec<u8> {
+        (0..n)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(salt))
+            .collect()
+    };
+    let app = AppId::parse(FUZZ_APP_ID).expect("app id");
+    let mut layout = ReleaseLayout::new(app, FUZZ_VERSION, FUZZ_TARGET).expect("layout");
+    let codec = FakeCodec::new();
+    for (path, exec, bytes) in [
+        ("bin/app", true, data(300, 1)),
+        ("lib/x.so.1", false, data(200, 2)),
+        ("share/empty", false, Vec::new()),
+    ] {
+        let packed = pack_file(&bytes, &codec, &codec, fx.hasher).expect("pack file");
+        layout
+            .add_file(RelPath::parse(path).expect("path"), exec, &packed)
+            .expect("add file");
+    }
+    layout
+        .add_symlink(RelPath::parse("lib/x.so").expect("path"), "x.so.1")
+        .expect("add symlink");
+    for (from, patches) in deltas {
+        let patches = patches
+            .iter()
+            .map(|(path, codec)| {
+                let base = format!("{path} at {from}");
+                let patch = DeltaPatch {
+                    codec: *codec,
+                    bytes: format!("patch of {path} from {from}").into_bytes(),
+                    base_size: base.len() as u64,
+                    base_sha256: fx.hasher.sha256(base.as_bytes()),
+                };
+                (RelPath::parse(path).expect("path"), patch)
+            })
+            .collect();
+        layout.add_delta(from, patches).expect("add delta");
+    }
+    layout
+        .finish_release(SUITE_T0, fx.hasher)
+        .expect("finish")
+        .manifest
+}
+
+fn delta_manifest_seeds(fx: &ChainFixture<'_>, out: &mut Out) {
+    out.ok(
+        "manifest",
+        "two-deltas",
+        delta_release(
+            fx,
+            &[
+                (
+                    "0.9.0",
+                    &[
+                        ("bin/app", CodecId::BcjX86Lzma2),
+                        ("lib/x.so.1", CodecId::Lzma2),
+                    ],
+                ),
+                ("1.0.0-beta.2", &[("bin/app", CodecId::BcjArm64Lzma2)]),
+            ],
+        )
+        .to_payload(),
+    );
+    out.ok(
+        "manifest",
+        "delta-from-build-metadata",
+        delta_release(fx, &[("0.9.0+build.7", &[("lib/x.so.1", CodecId::Lzma2)])]).to_payload(),
+    );
+    // The writer's document with one field changed.
+    let mut stored = delta_release(fx, &[("0.9.0", &[("bin/app", CodecId::Lzma2)])]);
+    if let Some(deltas) = stored.deltas.as_mut() {
+        deltas[0].patches[0].codec = CodecId::Stored.id().to_owned();
+    }
+    out.bad("manifest", "delta-patch-stored", stored.to_payload());
+    let mut wide = delta_release(fx, &[("0.9.0", &[("bin/app", CodecId::Lzma2)])]);
+    if let Some(deltas) = wide.deltas.as_mut() {
+        deltas[0].patches[0].base_size = u53(lunepack_core::MAX_PATCH_WINDOW);
+    }
+    out.bad("manifest", "delta-window-over-128-mib", wide.to_payload());
 }
 
 fn path_seeds(out: &mut Out) {

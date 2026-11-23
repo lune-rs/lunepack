@@ -20,6 +20,34 @@ use crate::trust::present;
 pub const MIN_DICT_SIZE: u64 = 4096;
 /// Largest LZMA2 dictionary a descriptor may declare (16 MiB).
 pub const MAX_DICT_SIZE: u64 = 16 * 1024 * 1024;
+/// Largest LZMA2 window of a delta patch (FORMAT.md 9.3, D8): 128 MiB. The window holds the base
+/// as preset dictionary and the patched file, so files of about 64 MiB and up get no patch.
+pub const MAX_PATCH_WINDOW: u64 = 128 * 1024 * 1024;
+/// The granule a patch window is rounded up to (FORMAT.md 9.3).
+pub const PATCH_WINDOW_ALIGN: u64 = 4096;
+
+/// The LZMA2 window of a patch from a base of `base_size` bytes to a file of `size` bytes
+/// (FORMAT.md 9.3): `base_size + size` rounded up to a multiple of [`PATCH_WINDOW_ALIGN`]. `None`
+/// when the sum or the rounding overflows; the caller compares the result with
+/// [`MAX_PATCH_WINDOW`].
+pub const fn patch_window(base_size: u64, size: u64) -> Option<u64> {
+    match base_size.checked_add(size) {
+        Some(sum) => match sum.checked_add(PATCH_WINDOW_ALIGN - 1) {
+            Some(up) => Some(up / PATCH_WINDOW_ALIGN * PATCH_WINDOW_ALIGN),
+            None => None,
+        },
+        None => None,
+    }
+}
+
+/// Whether `codec` may encode a delta patch (FORMAT.md 9.3): the three LZMA2 variants, never
+/// `stored` or `bcj2`.
+pub const fn is_patch_codec(codec: CodecId) -> bool {
+    matches!(
+        codec,
+        CodecId::Lzma2 | CodecId::BcjX86Lzma2 | CodecId::BcjArm64Lzma2
+    )
+}
 /// Decoder memory beyond the signed dictionaries, per codec (M4-D13). Each constant is the peak
 /// heap measured by `lunepack-codec-lzma/tests/memory.rs` (a counting allocator, a frame at the
 /// 16 MiB maximum dictionary), minus the dictionaries, times at least 1.25, rounded up to the next
