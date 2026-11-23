@@ -21,6 +21,8 @@ use super::{Btn, Draw, Out};
 
 /// The card's lowest edge: a button's height and a gap above the button row.
 const CARD_BOTTOM: f32 = CONTENT_BOTTOM - 32.0 - 16.0;
+/// How much of the next line shows under the last whole one when the text overflows.
+const PEEK: f32 = 8.0;
 /// The text's inset in the card: sides and top and bottom.
 const PAD_X: f32 = 14.0;
 const PAD_Y: f32 = 11.0;
@@ -48,13 +50,13 @@ pub(crate) fn command(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
     let spec = Spec::plain(command, style).wrapped(inner_w);
     let text_h = ui.painter().measure(&spec).1;
     let top = note_bottom + 18.0;
-    // A text that does not fit gets a whole number of lines, so the first view never cuts a line
-    // in half at the card's edge; the rest scrolls.
+    // A text that does not fit gets whole lines plus a peek of the next one, clipped at the
+    // viewport, so the card itself says that the text goes on; the rest scrolls.
     let room = CARD_BOTTOM - top - 2.0 * PAD_Y;
     let shown_h = if text_h <= room {
         text_h
     } else {
-        (room / style.line).floor() * style.line
+        ((room - PEEK) / style.line).floor() * style.line + PEEK
     };
     let height = 2.0 * PAD_Y + shown_h;
     let card = Rect::new(CONTENT_X, top, CONTENT_W, height);
