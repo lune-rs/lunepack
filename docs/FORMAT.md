@@ -622,14 +622,17 @@ optimisation: they never change which bytes are installed.
 2. check the patch's SHA-256 against the signed `sha256` before any decoder sees a byte;
 3. check that the base file has exactly `base_size` bytes and that their SHA-256 equals
    `base_sha256`, before the base is used;
-4. allocate decoder state only within the window above;
+4. allocate decoder state only within the memory bound below (at most two windows plus the codec's
+   fixed overhead);
 5. decode so that the output is exactly the entry's `size` bytes: stop with an error as soon as the
    output would exceed `size`, and reject a short output;
 6. require that the LZMA2 stream is consumed exactly: no trailing input after its end;
 7. check the SHA-256 of the output against the entry's `sha256` before the file is placed.
 
 On any error the decoded output is discarded and never placed. Decoder memory per patch is bounded
-by its window plus the base (and its filtered copy for the BCJ ids) and the codec's fixed overhead.
+by at most two windows plus the codec's fixed overhead: a decoder may hold the window twice while
+it grows it. The base (and its filtered copy for the BCJ ids) and the patch's bytes are the
+caller's and are charged apart.
 
 **Writer.** A writer writes one delta file per delta, named `<ver>/<target>.from-<from>.delta` with
 `<from>` the delta's `from` text; its patches in the manifest's entry order, back to back from

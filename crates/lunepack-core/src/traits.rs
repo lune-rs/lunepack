@@ -226,8 +226,9 @@ pub trait Codec: Send + Sync {
     /// - refuse, before allocating, a codec other than the three patch ids, a `base.len()` other
     ///   than `base_size`, and a `window` that is not [`crate::frame::patch_window`] of the sizes
     ///   or is above [`crate::frame::MAX_PATCH_WINDOW`];
-    /// - allocate no more than the window, a copy of the base and a fixed overhead
-    ///   ([`crate::frame::patch_decoder_memory`]);
+    /// - allocate no more than two windows and a fixed overhead
+    ///   ([`crate::frame::patch_decoder_memory`]); the base and the patch's bytes are the
+    ///   caller's and are charged apart;
     /// - produce exactly `output_size` bytes, stopping with an error at the first byte beyond;
     /// - consume the whole input: trailing bytes after the LZMA2 stream's end are an error;
     /// - stop on the first write error.
