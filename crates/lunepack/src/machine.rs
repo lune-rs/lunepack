@@ -33,7 +33,8 @@ use lunepack_core::{
 };
 
 use crate::Error;
-#[cfg(not(windows))]
+use lunepack_core::{Discovery, Projection, discover};
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 use lunepack_core::{MachinePolicy, PolicySource};
 
 use crate::error::ServiceReason;
@@ -124,25 +125,88 @@ pub(crate) fn detect(
     if !root.parent().is_some_and(|parent| same_dir(parent, &home)) {
         return Ok(None);
     }
-    let layout = MachineLayout::new(root);
+    let layout = MachineLayout::with_scheme(root, platform.machine_scheme());
+    if !has_machine_record(platform, &layout, config) {
+        return Ok(None);
+    }
+    let user_home = platform.user_home(&config.app_id)?;
+    Ok(Some(MachineInstall { layout, user_home }))
+}
+
+/// Whether the newest record in `layout`'s state directory is a machine record of this app.
+fn has_machine_record(platform: &Platform, layout: &MachineLayout, config: &UpdateConfig) -> bool {
     let scope = MachineScope {
         machine_dir: layout.state_dir(),
         user_dir: PathBuf::new(),
         app_id: config.app_id.clone(),
     };
-    match scope.load_machine(&*platform.fs, &*platform.hasher) {
-        Ok(loaded) if loaded.record.is_some() => {}
-        _ => return Ok(None),
+    matches!(
+        scope.load_machine(&*platform.fs, &*platform.hasher),
+        Ok(loaded) if loaded.record.is_some()
+    )
+}
+
+/// [`detect`] for a tree that is not under a per-user `versions` directory, on Linux (M11-D6):
+/// the tree is `X/app/<its version>` by the machine scheme's own names, then [`detect`]'s rules
+/// (`X` directly in the machine home, a machine record of this app).
+pub(crate) fn detect_tree(
+    platform: &Platform,
+    exe: &Path,
+    tree: &Path,
+    k: usize,
+    config: &UpdateConfig,
+) -> Result<Option<MachineInstall>, Error> {
+    match discover(exe, tree, k, config, platform.machine_scheme().view) {
+        Ok(Discovery::Installed { root, .. }) => detect(platform, &root, config),
+        Ok(Discovery::NotInstalled) | Err(_) => Ok(None),
+    }
+}
+
+/// [`detect`] for a macOS bundle (M11-D6, FORMAT 17): with `R = <machine home>/<app id>` and a
+/// machine record of this app in `R`, the running `tree` is the install's when it is the live
+/// bundle `R/bundle` names (byte for byte, as the pointer is canonical), or the old instance
+/// `R/app/<its version>` a swap parks (FORMAT 17.2 step 2). A root-owned bundle that is neither
+/// is not a machine install here (updating it stays [`Error::MachineScope`]). Nothing here reads
+/// an argument, an environment variable or a plist value.
+pub(crate) fn detect_bundle(
+    platform: &Platform,
+    exe: &Path,
+    tree: &Path,
+    k: usize,
+    config: &UpdateConfig,
+) -> Result<Option<MachineInstall>, Error> {
+    let scheme = platform.machine_scheme();
+    if scheme.projection() != Projection::Bundle {
+        return Ok(None);
+    }
+    let Some(home) = platform.machine_home() else {
+        return Ok(None);
+    };
+    let root = home.join(config.app_id.as_str());
+    let layout = MachineLayout::with_scheme(&root, scheme);
+    if !has_machine_record(platform, &layout, config) {
+        return Ok(None);
+    }
+    let parked = matches!(
+        discover(exe, tree, k, config, scheme.view),
+        Ok(Discovery::Installed { root: found, .. }) if same_dir(&found, &root)
+    );
+    let live = matches!(
+        layout.view().bundle_path(&*platform.fs),
+        Ok(Some(bundle)) if bundle.as_os_str() == tree.as_os_str()
+    );
+    if !(parked || live) {
+        return Ok(None);
     }
     let user_home = platform.user_home(&config.app_id)?;
     Ok(Some(MachineInstall { layout, user_home }))
 }
 
 /// Stand-in connector of a system with no update service: there is none to start.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub(crate) struct NoService;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 impl ServiceConnector for NoService {
     fn connect(&self, _: &AppId) -> Result<Box<dyn Duplex>, ConnectError> {
         Err(ConnectError::NotInstalled)
@@ -150,10 +214,10 @@ impl ServiceConnector for NoService {
 }
 
 /// Stand-in policy source of a system with no policy: nothing is disabled.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub(crate) struct NoPolicy;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 impl PolicySource for NoPolicy {
     fn read(&self, _: &AppId) -> MachinePolicy {
         MachinePolicy::default()

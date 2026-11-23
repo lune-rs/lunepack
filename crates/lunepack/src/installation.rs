@@ -19,10 +19,10 @@ use lunepack_core::state::UserScope;
 use lunepack_core::update_config::{MAX_UPDATE_CONFIG_BYTES, runtime_file};
 use lunepack_core::{
     AppId, BundleDiscovery, BundleProbe, Discovery, FeedKind, FileKind, Fs, FsErrorKind, Hasher,
-    InstallMeta, LayoutError, LayoutScheme, LockGuard, MachineLayout, MachinePolicy, OsIntegration,
-    PolicySource, Process, Projection, PublisherCheck, RelPath, Rng, ServiceConnector,
-    UPDATE_CONFIG_FILE, UpdateConfig, UpdateConfigError, UserLayout, Verifier, Version, discover,
-    discover_bundle, resolve_root, tree_candidates,
+    InstallMeta, LayoutError, LayoutScheme, LockGuard, MachineLayout, MachinePolicy, MachineScheme,
+    OsIntegration, PolicySource, Process, Projection, PublisherCheck, RelPath, Rng,
+    ServiceConnector, UPDATE_CONFIG_FILE, UpdateConfig, UpdateConfigError, UserLayout, Verifier,
+    Version, discover, discover_bundle, resolve_root, tree_candidates,
 };
 
 use crate::machine::{self, Kept, MachineInstall};
@@ -57,6 +57,7 @@ pub struct Platform {
     pub(crate) layout_scheme: LayoutScheme,
     pub(crate) busy_wait: Duration,
     pub(crate) machine_home: Option<PathBuf>,
+    pub(crate) machine_scheme: Option<MachineScheme>,
     pub(crate) service_wait: Duration,
     pub(crate) local_data: Option<PathBuf>,
     pub(crate) connector: Option<Arc<dyn ServiceConnector>>,
@@ -99,6 +100,7 @@ impl Platform {
             layout_scheme: native_layout_scheme(),
             busy_wait: DEFAULT_BUSY_WAIT,
             machine_home: None,
+            machine_scheme: None,
             service_wait: machine::STARTUP_WAIT,
             local_data: None,
             connector: None,
@@ -196,10 +198,20 @@ impl Platform {
     }
 
     /// The machine home, instead of the system's (the Program Files known folder on Windows,
-    /// none elsewhere): the folder a per-machine install's root is directly in (M10-D14). An
-    /// install is a machine install only inside it.
+    /// `/opt` on Linux, `/Library/Application Support/lunepack` on macOS): the folder a
+    /// per-machine install's root is directly in (M10-D14, M11-D6). An install is a machine
+    /// install only inside it.
     pub fn with_machine_home(mut self, home: PathBuf) -> Platform {
         self.machine_home = Some(home);
+        self
+    }
+
+    /// The names of a per-machine install (M11-D6), instead of the native ones: by default
+    /// [`MachineScheme::WINDOWS`] under [`LayoutScheme::WINDOWS`] (whatever the OS), else the
+    /// scheme of the OS this is built for. Tests use it to run a Linux or macOS machine install
+    /// on another OS.
+    pub fn with_machine_scheme(mut self, scheme: MachineScheme) -> Platform {
+        self.machine_scheme = Some(scheme);
         self
     }
 
@@ -212,14 +224,16 @@ impl Platform {
 
     /// The folder the per-user homes of machine installs live under, instead of the user's local
     /// application data (M10-D8): this user's home for an app is `<dir>/lunepack/<app id>`, with
-    /// `state`, `cache` and `logs` in it.
+    /// `state`, `cache` and `logs` in it. Windows names only: on Linux and macOS the home is
+    /// `<data home>/.lunepack/<app id>` (M11-D10, [`Platform::with_data_home`]).
     pub fn with_local_data(mut self, dir: PathBuf) -> Platform {
         self.local_data = Some(dir);
         self
     }
 
     /// How a machine install's update service is reached (default: the Windows service's pipe on
-    /// Windows, none elsewhere). The facade never elevates: a service that is not there is an
+    /// Windows, the service's unix socket on Linux and macOS, none elsewhere). The facade never
+    /// elevates: a service that is not there is an
     /// error ([`Error::ServiceUnavailable`]).
     pub fn with_service_connector(mut self, connector: Arc<dyn ServiceConnector>) -> Platform {
         self.connector = Some(connector);
@@ -227,22 +241,43 @@ impl Platform {
     }
 
     /// Where the administrator's policy is read from (default: the Windows policy key on Windows,
-    /// no policy elsewhere).
+    /// the policy file on Linux and macOS, no policy elsewhere).
     pub fn with_policy_source(mut self, policy: Arc<dyn PolicySource>) -> Platform {
         self.policy = Some(policy);
         self
     }
 
-    /// The machine home: the override, else the system's.
+    /// The names of a machine install: the override, else the Windows ones under the Windows
+    /// per-user scheme, else the native OS's (M11-D6). Never taken from the environment.
+    pub(crate) fn machine_scheme(&self) -> MachineScheme {
+        match self.machine_scheme {
+            Some(scheme) => scheme,
+            None if self.layout_scheme == LayoutScheme::WINDOWS => MachineScheme::WINDOWS,
+            None => native_machine_scheme(),
+        }
+    }
+
+    /// The machine home: the override, else the scheme's fixed one (`/opt`, `/Library/Application
+    /// Support/lunepack`, canonical when it exists), else the system's (Program Files).
     pub(crate) fn machine_home(&self) -> Option<PathBuf> {
-        match &self.machine_home {
-            Some(home) => Some(home.clone()),
+        if let Some(home) = &self.machine_home {
+            return Some(home.clone());
+        }
+        match self.machine_scheme().home {
+            Some(fixed) => {
+                let fixed = PathBuf::from(fixed);
+                Some(std::fs::canonicalize(&fixed).unwrap_or(fixed))
+            }
             None => native_machine_home(),
         }
     }
 
-    /// This user's home for the machine install of `app_id`: `<local data>/lunepack/<app id>`.
+    /// This user's home for the machine install of `app_id`: `<local data>/lunepack/<app id>` on
+    /// Windows (M10-D8), `<data home>/.lunepack/<app id>` on Linux and macOS (M11-D10).
     pub(crate) fn user_home(&self, app_id: &AppId) -> Result<PathBuf, Error> {
+        if self.machine_scheme().os.unix().is_some() {
+            return Ok(lunepack_core::machine_user_home(&self.data_home()?, app_id));
+        }
         let base = match &self.local_data {
             Some(dir) => dir.clone(),
             None => native_local_data()?,
@@ -324,7 +359,19 @@ pub(crate) fn default_publisher() -> Arc<dyn PublisherCheck> {
     check
 }
 
-/// The Program Files known folder, canonical, on Windows; no machine home elsewhere.
+/// The names of a machine install on the OS this is built for (M11-D6).
+fn native_machine_scheme() -> MachineScheme {
+    if cfg!(windows) {
+        MachineScheme::WINDOWS
+    } else if cfg!(target_os = "macos") {
+        MachineScheme::MACOS
+    } else {
+        MachineScheme::LINUX
+    }
+}
+
+/// The Program Files known folder, canonical, on Windows; Linux and macOS have a fixed machine
+/// home in their scheme ([`Platform::machine_home`]).
 #[cfg(windows)]
 fn native_machine_home() -> Option<PathBuf> {
     let dir = lunepack_os_windows::program_files().ok()?;
@@ -348,24 +395,46 @@ fn native_local_data() -> Result<PathBuf, Error> {
     Err(Error::Unsupported)
 }
 
-/// The default way to reach the update service: the Windows pipe, else none.
+/// The default way to reach the update service: the Windows pipe, the unix socket checked for a
+/// root owner (M11-D5) on Linux and macOS, else none.
 #[cfg(windows)]
 pub(crate) fn default_connector() -> Arc<dyn ServiceConnector> {
     Arc::new(lunepack_os_windows::WindowsConnector::new())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub(crate) fn default_connector() -> Arc<dyn ServiceConnector> {
+    Arc::new(lunepack_os_linux::UnixConnector::new())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn default_connector() -> Arc<dyn ServiceConnector> {
+    Arc::new(lunepack_os_macos::UnixConnector::new())
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub(crate) fn default_connector() -> Arc<dyn ServiceConnector> {
     Arc::new(machine::NoService)
 }
 
-/// The default policy source: the Windows policy key, else none (self-update is never disabled).
+/// The default policy source: the Windows policy key, the policy file (M11-D11) on Linux and
+/// macOS, else none (self-update is never disabled).
 #[cfg(windows)]
 pub(crate) fn default_policy() -> Arc<dyn PolicySource> {
     Arc::new(lunepack_os_windows::RegistryPolicy::new())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub(crate) fn default_policy() -> Arc<dyn PolicySource> {
+    Arc::new(lunepack_os_linux::FilePolicy::new())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn default_policy() -> Arc<dyn PolicySource> {
+    Arc::new(lunepack_os_macos::FilePolicy::new())
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub(crate) fn default_policy() -> Arc<dyn PolicySource> {
     Arc::new(machine::NoPolicy)
 }
@@ -724,19 +793,35 @@ impl Installation {
                 continue;
             };
             let mut machine = None;
+            let unix_machine = platform.machine_scheme().os.unix().is_some();
             let (layout, found) = if scheme.projection == Projection::Bundle {
-                bundle_layout(&platform, &exe, &tree, k, &config)?
+                // M11-D6: the bundle of a machine install is judged before the per-user rules,
+                // which would call a bundle in `/Applications` adoptable.
+                machine = machine::detect_bundle(&platform, &exe, &tree, k, &config)?;
+                match machine {
+                    Some(_) => (None, Found::Plain),
+                    None => bundle_layout(&platform, &exe, &tree, k, &config)?,
+                }
             } else {
                 let layout = match discover(&exe, &tree, k, &config, scheme) {
                     Ok(Discovery::Installed { root, .. }) => {
-                        // M10-D14: a machine install by location and record, nothing else.
-                        machine = machine::detect(&platform, &root, &config)?;
+                        // M10-D14: a machine install by location and record, nothing else. On
+                        // Linux the machine tree is `X/app/<version>`, which the per-user scheme
+                        // (`versions`) does not recognise: it is judged below.
+                        if !unix_machine {
+                            machine = machine::detect(&platform, &root, &config)?;
+                        }
                         match machine {
                             Some(_) => None,
                             None => Some(UserLayout::from_root(root, scheme)),
                         }
                     }
-                    Ok(Discovery::NotInstalled) => None,
+                    Ok(Discovery::NotInstalled) => {
+                        if unix_machine {
+                            machine = machine::detect_tree(&platform, &exe, &tree, k, &config)?;
+                        }
+                        None
+                    }
                     Err(_) => {
                         return Err(config_rule(
                             "install.entry",
@@ -804,7 +889,7 @@ impl Installation {
         version: &Version,
     ) -> Result<Installation, Error> {
         let tree = machine.layout().version_dir(version);
-        let path = scheme_config_path(&tree, LayoutScheme::WINDOWS);
+        let path = scheme_config_path(&tree, machine.layout().scheme().view);
         let config = read_config(&*self.platform.fs, &path)?.ok_or(Error::NoUpdateConfig)?;
         if config.app_id != self.config.app_id {
             return Err(Error::UpdateConfig(UpdateConfigError::RootMismatch(
@@ -965,11 +1050,11 @@ impl Installation {
         if let Some(layout) = &self.layout {
             return Ok(layout.clone());
         }
-        // A machine install's directories are named as the Windows scheme names them.
+        // A machine install's directories are named as its machine scheme names them.
         if let Some(machine) = &self.machine {
             return Ok(UserLayout::from_root(
                 machine.layout().root().to_path_buf(),
-                LayoutScheme::WINDOWS,
+                machine.layout().scheme().view,
             ));
         }
         let p = &self.platform;
@@ -1080,6 +1165,56 @@ mod tests {
     use super::*;
     use lunepack_core::FeedRule;
     use lunepack_testkit::{FakeHasher, FakeVerifier, MemFs, sample_update_config};
+
+    /// M11-D6: the native machine home and scheme are the OS's own; under the Windows per-user
+    /// scheme the machine names are Windows's whatever the OS; an override wins and a home
+    /// override is taken as given. Nothing here reads an environment variable.
+    #[test]
+    fn the_machine_home_and_scheme_follow_the_os_unless_overridden() {
+        let native = Platform::native();
+        if cfg!(target_os = "linux") {
+            assert_eq!(native.machine_scheme(), MachineScheme::LINUX);
+            assert_eq!(native.machine_home(), Some(PathBuf::from("/opt")));
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(native.machine_scheme(), MachineScheme::MACOS);
+            assert_eq!(
+                native.machine_home(),
+                Some(PathBuf::from("/Library/Application Support/lunepack"))
+            );
+        }
+        let windows = Platform::native().with_layout_scheme(LayoutScheme::WINDOWS);
+        assert_eq!(windows.machine_scheme(), MachineScheme::WINDOWS);
+        let forced = Platform::native()
+            .with_machine_scheme(MachineScheme::MACOS)
+            .with_machine_home(PathBuf::from("/m"));
+        assert_eq!(forced.machine_scheme(), MachineScheme::MACOS);
+        assert_eq!(forced.machine_home(), Some(PathBuf::from("/m")));
+    }
+
+    /// M11-D10: on Linux and macOS this user's home is `<data home>/.lunepack/<app id>`; on
+    /// Windows `<local data>/lunepack/<app id>` (M10-D8).
+    #[test]
+    fn the_per_user_home_of_a_machine_install_follows_the_scheme() {
+        let app = AppId::parse("org.example.hello").unwrap();
+        for scheme in [MachineScheme::LINUX, MachineScheme::MACOS] {
+            let platform = Platform::native()
+                .with_machine_scheme(scheme)
+                .with_data_home(PathBuf::from("/data"))
+                .with_local_data(PathBuf::from("/ignored"));
+            assert_eq!(
+                platform.user_home(&app).unwrap(),
+                PathBuf::from("/data/.lunepack/org.example.hello")
+            );
+        }
+        let windows = Platform::native()
+            .with_machine_scheme(MachineScheme::WINDOWS)
+            .with_data_home(PathBuf::from("/data"))
+            .with_local_data(PathBuf::from("/local"));
+        assert_eq!(
+            windows.user_home(&app).unwrap(),
+            PathBuf::from("/local/lunepack/org.example.hello")
+        );
+    }
 
     /// The builder runs the feed rule itself: a config edited through the typed document after it
     /// was read is refused before an updater (and so any request) exists.
