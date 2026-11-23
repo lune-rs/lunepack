@@ -120,7 +120,7 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 0 | | success |
 | 2 | `usage` | the command line is outside the grammar |
 | 3 | `not_installed` | the tree is not an installed version (a development or bootstrap tree), or there is no install state |
-| 4 | `busy` | another lunepack operation holds the install lock |
+| 4 | `busy` | another lunepack operation holds the install lock, or (a machine install) the update service is serving another connection and did not greet this one in time |
 | 5 | `cancelled` | the operation was cancelled, or stdout stopped accepting output |
 | 6 | `stale` | the update is no longer applicable |
 | 7 | `verify` | a document, hash or signature was refused; on macOS also a bundle that is not byte for byte the release its configuration names (adoption) |
@@ -605,9 +605,10 @@ first install may. The service's removal guard asks the all-users in-use scan be
 takes a path away from new launches, and any process it cannot read counts as in use (M11-D13), so a tree another
 user runs is never deleted. `service_unavailable` carries the closed reasons of the table above: `not_installed`
 when the socket is not there (after three seconds), `disabled` when nobody listens, `untrusted` when the socket's
-owner, folder or peer is not root (`docs/FORMAT.md` 20.3), and `timeout` when the hello does not come in ten
-seconds, which is also what a client sees while another connection is being served: a second client waits in the
-socket's queue and is not refused (M11-D15). The administrator's policy file (`docs/FORMAT.md` 20.6) makes `check`, `download` and
+owner, folder or peer is not root (`docs/FORMAT.md` 20.3). A second client that connects while the service
+serves another connection waits in the socket's queue, and a hello that does not come in ten seconds is exit 4
+`busy` on Linux and macOS, as on Windows (M11-D15; a daemon that hangs reads as busy too); `timeout` is a later
+answer that does not come. The administrator's policy file (`docs/FORMAT.md` 20.6) makes `check`, `download` and
 `apply-and-restart` exit 33 before any request or download, and `NoUpdateUi` makes the runtime show no update
 window, as on Windows.
 

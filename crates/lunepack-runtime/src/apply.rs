@@ -844,7 +844,7 @@ fn open_session(end: &ServiceEnd<'_>, app: &AppId) -> Result<ClientSession<Box<d
             answer: Some(SERVICE_ANSWER),
         },
     )
-    .map_err(service_kind)
+    .map_err(|e| Kind::of(&lunepack::unstable_internals::hello_error(e)))
 }
 
 fn machine_store(inst: &Installation, layout: &MachineLayout) -> MachineStore {

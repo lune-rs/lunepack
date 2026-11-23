@@ -266,13 +266,39 @@ pub fn service_error(e: ServiceError) -> Error {
 /// A session with the service of `app_id`.
 pub(crate) type Session = ClientSession<Box<dyn Duplex>>;
 
+/// What a failed hello is to the app: [`service_error`], except that on a system with a unix
+/// socket (Linux, macOS) no answer within the hello deadline is [`Error::Busy`] (M11-D15). The
+/// service serves one connection at a time and the kernel queues the next client in the listener's
+/// backlog, so a client that is connected but never greeted is a second client behind a first
+/// that is being served (Windows' pipe answers `busy` at once, M10-D11). A hung daemon reads as
+/// busy too: the trade-off the decision accepted.
+pub fn hello_error(e: ServiceError) -> Error {
+    match e {
+        ServiceError::Timeout
+        | ServiceError::Io(io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+            if cfg!(unix) =>
+        {
+            Error::Busy
+        }
+        e => service_error(e),
+    }
+}
+
 /// Connects and says hello. Never elevates and never prompts.
 pub(crate) fn open_session(
     connector: &dyn ServiceConnector,
     app_id: &AppId,
 ) -> Result<Session, Error> {
+    open_session_with(connector, app_id, TIMEOUTS)
+}
+
+fn open_session_with(
+    connector: &dyn ServiceConnector,
+    app_id: &AppId,
+    timeouts: ClientTimeouts,
+) -> Result<Session, Error> {
     let io = connector.connect(app_id).map_err(connect_error)?;
-    ClientSession::connect(io, app_id.clone(), TIMEOUTS).map_err(service_error)
+    ClientSession::connect(io, app_id.clone(), timeouts).map_err(hello_error)
 }
 
 // ---- stage ------------------------------------------------------------------------------------
@@ -737,4 +763,109 @@ pub(crate) fn staged_version(
         return Err(Error::NothingStaged);
     }
     Ok(staged.version.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+
+    use lunepack_core::service::ServerSession;
+    use lunepack_testkit::{FakeConnector, MemDuplex, mem_duplex};
+
+    use super::*;
+
+    const SHORT: ClientTimeouts = ClientTimeouts {
+        hello: Some(Duration::from_millis(200)),
+        answer: Some(Duration::from_secs(5)),
+    };
+
+    fn app() -> AppId {
+        AppId::parse("org.example.busy").expect("app id")
+    }
+
+    /// A service that serves one connection at a time, as the real one does and as a unix
+    /// listener's queue makes the rest wait: it greets the connection it takes, holds it until
+    /// `release` says so, and only then takes the next. Returns the connector and the release.
+    fn one_at_a_time() -> (FakeConnector, mpsc::Sender<()>, thread::JoinHandle<()>) {
+        let (queue_tx, queue_rx) = mpsc::channel::<MemDuplex>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            for io in queue_rx {
+                if let Ok(_session) = ServerSession::accept(io, app()) {
+                    // Held: nothing else is greeted while this connection is open.
+                    let _ = release_rx.recv();
+                }
+            }
+        });
+        let connector = FakeConnector::new(move |_| {
+            let (client, server_end) = mem_duplex();
+            queue_tx.send(server_end).expect("the service thread");
+            Ok(Box::new(client))
+        });
+        (connector, release_tx, server)
+    }
+
+    #[test]
+    fn a_second_client_that_is_not_greeted_in_time_is_busy_on_unix_and_timed_out_elsewhere() {
+        let (connector, release, server) = one_at_a_time();
+        let first = open_session_with(&connector, &app(), SHORT).expect("the first is greeted");
+        let second = open_session_with(&connector, &app(), SHORT)
+            .err()
+            .expect("the second waits");
+        if cfg!(unix) {
+            assert!(matches!(second, Error::Busy), "{second:?}");
+        } else {
+            assert!(
+                matches!(
+                    second,
+                    Error::ServiceUnavailable {
+                        reason: ServiceReason::Timeout
+                    }
+                ),
+                "{second:?}"
+            );
+        }
+        // The first connection ends: the queue moves on and a client is greeted again.
+        drop(first);
+        release.send(()).expect("release the first");
+        let third = open_session_with(&connector, &app(), SHORT);
+        assert!(third.is_ok(), "{:?}", third.err());
+        drop(third);
+        drop(connector);
+        let _ = release.send(());
+        drop(release);
+        server.join().expect("the service thread ends");
+    }
+
+    #[test]
+    fn only_the_hello_deadline_is_busy_every_other_failure_keeps_its_name() {
+        let timed_out = || ServiceError::Io(io::ErrorKind::TimedOut);
+        let reason = |e: Error| match e {
+            Error::ServiceUnavailable { reason } => Some(reason),
+            _ => None,
+        };
+        if cfg!(unix) {
+            assert!(matches!(hello_error(ServiceError::Timeout), Error::Busy));
+            assert!(matches!(hello_error(timed_out()), Error::Busy));
+        }
+        // A closed channel, a refusal and a protocol break are not "waiting".
+        assert_eq!(
+            reason(hello_error(ServiceError::Closed)),
+            Some(ServiceReason::Protocol)
+        );
+        assert_eq!(
+            reason(hello_error(ServiceError::Malformed("x"))),
+            Some(ServiceReason::Protocol)
+        );
+        assert!(matches!(
+            hello_error(ServiceError::Unsupported { min: 2, max: 3 }),
+            Error::ServiceUnsupported
+        ));
+        // After the hello a timeout keeps its name on every system.
+        assert_eq!(
+            reason(service_error(ServiceError::Timeout)),
+            Some(ServiceReason::Timeout)
+        );
+    }
 }
