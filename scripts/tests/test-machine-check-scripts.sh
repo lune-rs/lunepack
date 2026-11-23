@@ -42,7 +42,7 @@ run_cmd bash "$SUITE" --dry-run
 t_check "suite: --dry-run exits 0" rc_is 0
 t_check "suite: --dry-run says nothing runs" out_has "nothing is built, installed or changed"
 rows=$(grep -c '^  SKIPPED  ' "$OUT" || true)
-t_check "suite: --dry-run lists 15 rows, every one SKIPPED" test "$rows" -eq 15
+t_check "suite: --dry-run lists 16 rows, every one SKIPPED" test "$rows" -eq 16
 t_check "suite: --dry-run reports no failure" bash -c '! grep -q "^ *FAIL" "$1"' _ "$OUT"
 for row in "installer -pkg as root" "the supervisor killed" "the daemon disabled" "uninstall" "policy file"; do
   t_check "suite: --dry-run names the row '$row'" out_has "$row"

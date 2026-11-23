@@ -111,6 +111,12 @@ pub struct Release {
     pub small_files: usize,
     /// The UI packed beside the runtime.
     pub ui: Ui,
+    /// Bytes of `share/delta.bin` (0: no file): incompressible filler that is the same in every
+    /// release but for 16 bytes in the middle, which `delta_tweak` sets (M12 step 7), so a patch
+    /// from an earlier release is a few dozen bytes against a frame of the file's size.
+    pub delta_bytes: usize,
+    /// Which 16 bytes `delta.bin` has in the middle (0: the filler as it is).
+    pub delta_tweak: u8,
 }
 
 impl Release {
@@ -124,6 +130,8 @@ impl Release {
             blob_bytes: 0,
             small_files: 0,
             ui: Ui::None,
+            delta_bytes: 0,
+            delta_tweak: 0,
         }
     }
 }
@@ -167,6 +175,16 @@ fn filler(len: usize, seed: u64) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+/// The bytes of `share/delta.bin` of a release: the same filler for every release, with 16 bytes
+/// in the middle XORed with `tweak`.
+pub fn delta_content(len: usize, tweak: u8) -> Vec<u8> {
+    let mut bytes = filler(len, 0xD17A);
+    for byte in bytes.iter_mut().skip(len / 2).take(16) {
+        *byte ^= tweak;
+    }
+    bytes
 }
 
 /// The record, as far as the scenarios look at it.
@@ -509,6 +527,13 @@ impl Lab {
 
     /// Packs `release` with the real command line, adds it to the feed and serves it.
     pub fn publish(&self, release: &Release) {
+        self.publish_with(release, false);
+    }
+
+    /// As [`Lab::publish`]; with `drop_deltas` the release's `.delta` files are removed from the
+    /// release directory after the manifest and the feed were written, so what the signed
+    /// manifest lists is not served (the fallback of M12-D5).
+    pub fn publish_with(&self, release: &Release, drop_deltas: bool) {
         let input = self.work.join(format!("in-{}", release.version));
         let entry = self.entry_rel(release);
         let bytes = std::fs::read(&self.app.binary).expect("read the app");
@@ -523,6 +548,13 @@ impl Lab {
             write_file(
                 &input.join("share/blob.bin"),
                 &filler(release.blob_bytes, seed),
+                false,
+            );
+        }
+        if release.delta_bytes > 0 {
+            write_file(
+                &input.join("share/delta.bin"),
+                &delta_content(release.delta_bytes, release.delta_tweak),
                 false,
             );
         }
@@ -595,7 +627,31 @@ impl Lab {
             "--config",
             &base,
         ]);
+        if drop_deltas {
+            for entry in std::fs::read_dir(self.release_dir.join(release.version))
+                .expect("the release's directory")
+            {
+                let path = entry.expect("entry").path();
+                if path.extension().is_some_and(|e| e == "delta") {
+                    std::fs::remove_file(&path).expect("remove a delta file");
+                }
+            }
+        }
         self.sync();
+    }
+
+    /// The delta files the release directory holds for `version`, by file name, sorted.
+    pub fn delta_files(&self, version: &str) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.release_dir.join(version))
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".delta"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
     }
 
     /// Makes the loopback server serve what the release directory holds now (no-op for `file:`).

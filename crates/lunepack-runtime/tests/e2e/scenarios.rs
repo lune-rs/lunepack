@@ -8,11 +8,12 @@
 //! app under test, so the log holds versions and outcomes only.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::process::Command;
 use std::time::Instant;
 
 use crate::lab::{
-    App, Binaries, FeedKind, Lab, RUNTIME_FILE, RecordView, Release, desktop_file_validates,
-    have_desktop_file_validate, kill9, runtime_apply_pids,
+    App, Binaries, FeedKind, Lab, RUNTIME_FILE, RecordView, Release, TARGET, delta_content,
+    desktop_file_validates, have_desktop_file_validate, kill9, runtime_apply_pids,
 };
 
 /// One row of the table.
@@ -78,6 +79,39 @@ pub const ENFORCE_ROWS: &[Row] = &[Row {
     run: row_enforce_update,
 }];
 
+/// Rows 10 to 12 (M12 step 7): an update that fetches a changed file as a delta patch, and the two
+/// ways the patch is not available (the installed file is not the base; the delta file is not
+/// served). Each runs on a fresh lab, so each installs 1.0.0 itself.
+pub const DELTA_ROWS: &[Row] = &[
+    Row {
+        id: 10,
+        name: "update by delta: the changed file arrives as a patch",
+        run: row_delta_update,
+    },
+    Row {
+        id: 11,
+        name: "delta fallback: the installed base file changed by one byte",
+        run: row_delta_base_changed,
+    },
+    Row {
+        id: 12,
+        name: "delta fallback: the delta file is not served",
+        run: row_delta_missing,
+    },
+];
+
+/// The size of `share/delta.bin` of the delta rows' releases.
+const DELTA_BYTES: usize = 256 << 10;
+const D1: Release = Release {
+    delta_bytes: DELTA_BYTES,
+    ..Release::plain("1.0.0")
+};
+const D2: Release = Release {
+    delta_bytes: DELTA_BYTES,
+    delta_tweak: 0x5A,
+    ..Release::plain("1.1.0")
+};
+
 const V1: Release = Release::plain("1.0.0");
 const V2: Release = Release::plain("2.0.0");
 const V3: Release = Release {
@@ -115,6 +149,10 @@ pub fn run_table(bins: &Binaries, app: &App) -> Result<Vec<String>, String> {
     let mut lab = Lab::new(bins, app, FeedKind::Http);
     lab.set_publisher_check("enforce");
     run_rows(&mut lab, ENFORCE_ROWS, &mut log)?;
+    for row in DELTA_ROWS {
+        let mut lab = Lab::new(bins, app, FeedKind::Http);
+        run_rows(&mut lab, std::slice::from_ref(row), &mut log)?;
+    }
     Ok(log)
 }
 
@@ -214,7 +252,13 @@ pub fn start_from_link(lab: &Lab) {
 }
 
 fn row_install(lab: &mut Lab) -> Vec<String> {
-    lab.publish(&V1);
+    install_release(lab, &V1)
+}
+
+/// Publishes `release` (1.0.0) and installs it through the runtime's install mode; returns the
+/// outcome lines of [`check_installed`].
+fn install_release(lab: &mut Lab, release: &Release) -> Vec<String> {
+    lab.publish(release);
     let boot = lab.bootstrap();
     let (code, stdout) = lab.run_runtime(&boot.join("bin").join(RUNTIME_FILE), "install");
     assert_eq!(code, 0, "install exited {code}: {stdout}");
@@ -228,7 +272,7 @@ fn row_install(lab: &mut Lab) -> Vec<String> {
             "the loopback server saw no request"
         );
     }
-    check_installed(lab, &V1)
+    check_installed(lab, release)
 }
 
 /// What a first install of `release` (1.0.0) leaves behind, however it was made (the runtime's
@@ -556,6 +600,209 @@ fn row_enforce_update(lab: &mut Lab) -> Vec<String> {
     );
     let record = lab.record().expect("a record");
     assert!(record.bad.is_empty(), "nothing is marked bad");
+    lines
+}
+
+/// The runtime of the installed 1.0.0 (the entry is under `bin/` in these releases).
+fn installed_runtime_1_0_0(lab: &Lab) -> std::path::PathBuf {
+    lab.root.join("versions/1.0.0/bin").join(RUNTIME_FILE)
+}
+
+/// The `source` of every `stage` progress line of `stdout` (the runtime's JSON Lines) that names
+/// `path`. The runtime writes at most ten progress lines a second and a stage phase's last one, so
+/// a small file's own line may not be among them: rows use this only as a consistency check
+/// (every line that is there names the right source), never to demand a line.
+fn file_sources(stdout: &[u8], path: &str) -> Vec<String> {
+    let needle = format!("\"file\":{{\"path\":\"{path}\",");
+    let mut sources = Vec::new();
+    for line in String::from_utf8_lossy(stdout).lines() {
+        if line.starts_with("{\"schema\":1,\"type\":\"progress\",\"phase\":\"stage\"")
+            && line.contains(&needle)
+            && let Some(rest) = line.split("\"source\":\"").nth(1)
+            && let Some(source) = rest.split('"').next()
+        {
+            sources.push(source.to_owned());
+        }
+    }
+    sources
+}
+
+/// The bytes the download fetched: `done` of the last `download`-phase progress line (a phase's
+/// last snapshot is always delivered). A patch is a few dozen bytes; the file's frame is its size.
+fn download_bytes(stdout: &[u8]) -> u64 {
+    let head = "{\"schema\":1,\"type\":\"progress\",\"phase\":\"download\",\"done\":";
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix(head))
+        .filter_map(|rest| rest.split(',').next()?.parse::<u64>().ok())
+        .next_back()
+        .expect("a download progress line")
+}
+
+/// The lines of an update from 1.0.0 to 1.1.0 once it is staged and applied: the new version
+/// starts with the restart argument, sees the update, confirms.
+fn applied_delta_lines() -> Vec<&'static str> {
+    vec![
+        "1.1.0 start",
+        "1.1.0 arg after-update",
+        "1.1.0 event updated 1.0.0",
+        "1.1.0 event first_run",
+        "1.1.0 confirmed",
+    ]
+}
+
+/// Stages 1.1.0 with `download --json` from the installed 1.0.0 and returns what the runtime
+/// printed. Rows assert on its progress lines (RUNTIME.md schema 1), not on log text.
+fn download_delta_update(lab: &Lab) -> Vec<u8> {
+    let run = lab.run_cmd(&installed_runtime_1_0_0(lab), &["download", "--json"], None);
+    assert_eq!(run.code, 0, "download exited {}", run.code);
+    let last = run.last_line();
+    assert!(
+        last.contains("\"version\":\"1.1.0\",\"staged\":true"),
+        "download stages 1.1.0: {last}"
+    );
+    assert_eq!(
+        lab.record().and_then(|r| r.staged),
+        Some("1.1.0".to_owned()),
+        "the record names the staged version"
+    );
+    // The staged tree matches the manifest: the changed file and the version marker.
+    let staged = lab.root.join("versions/1.1.0");
+    assert_eq!(
+        std::fs::read(staged.join("share/delta.bin")).expect("the staged file"),
+        delta_content(DELTA_BYTES, D2.delta_tweak),
+        "the staged tree's share/delta.bin"
+    );
+    assert_eq!(
+        std::fs::read(staged.join("share/version.txt")).expect("the staged version marker"),
+        b"1.1.0\n"
+    );
+    run.stdout
+}
+
+/// Applies the staged 1.1.0 through `apply-and-restart` (waiting for a short-lived process of this
+/// harness), lets the new version confirm, and checks the record and the trees. Returns the
+/// outcome lines.
+fn apply_delta_update(lab: &Lab) -> Vec<String> {
+    let mut waited = Command::new("sleep")
+        .arg("1")
+        .spawn()
+        .expect("start the process to wait for");
+    let pid = waited.id().to_string();
+    let run = lab.run_cmd(
+        &installed_runtime_1_0_0(lab),
+        &[
+            "apply-and-restart",
+            "--json",
+            "--wait-pid",
+            &pid,
+            "--expect-version",
+            "1.1.0",
+            "--",
+            "--after-update",
+        ],
+        None,
+    );
+    let _ = waited.wait();
+    assert_eq!(run.code, 0, "apply-and-restart exited {}", run.code);
+    let lines = lab.expect_lines(&applied_delta_lines());
+    lab.wait_runtime_gone();
+    assert_eq!(
+        lab.record(),
+        Some(record("1.1.0", Some("1.0.0"), &[], 0)),
+        "the record after the confirmed update"
+    );
+    assert_eq!(lab.versions(), ["1.0.0", "1.1.0"]);
+    assert_current_link(lab, "1.1.0");
+    assert_eq!(
+        std::fs::read(lab.root.join("versions/1.1.0/share/delta.bin")).expect("the new file"),
+        delta_content(DELTA_BYTES, D2.delta_tweak),
+        "the applied tree's share/delta.bin"
+    );
+    assert_log_is_schema_1(lab);
+    lines
+}
+
+/// Row 10: 1.1.0 changes 16 bytes of one file; the packer writes a delta from 1.0.0 (the file is
+/// there), `download` fetches that file as a patch, the update applies and confirms.
+fn row_delta_update(lab: &mut Lab) -> Vec<String> {
+    let mut lines = install_release(lab, &D1);
+    lab.publish(&D2);
+    assert_eq!(
+        lab.delta_files("1.1.0"),
+        [format!("{TARGET}.from-1.0.0.delta")],
+        "the packer wrote the delta from 1.0.0"
+    );
+    let before = lab.requests().len();
+    let stdout = download_delta_update(lab);
+    let fetched = download_bytes(&stdout);
+    assert!(
+        fetched < DELTA_BYTES as u64 / 4,
+        "the download fetched {fetched} bytes: the file's frame, not a patch"
+    );
+    let sources = file_sources(&stdout, "share/delta.bin");
+    assert!(
+        sources.iter().all(|s| s == "patch"),
+        "share/delta.bin arrives as a patch: {sources:?}"
+    );
+    assert!(
+        lab.requests()[before..]
+            .iter()
+            .any(|u| u.contains(".from-1.0.0.delta")),
+        "the delta file was never requested"
+    );
+    lines.extend(apply_delta_update(lab));
+    lines
+}
+
+/// Row 11: the installed copy of the base file differs by one byte, so no patch can apply to it:
+/// the file arrives as its frame by `range`, the rest of the update is unchanged.
+fn row_delta_base_changed(lab: &mut Lab) -> Vec<String> {
+    let mut lines = install_release(lab, &D1);
+    lab.publish(&D2);
+    let base = lab.root.join("versions/1.0.0/share/delta.bin");
+    let mut bytes = std::fs::read(&base).expect("the installed base file");
+    bytes[100] ^= 1;
+    let mut perm = std::fs::metadata(&base).expect("metadata").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o644);
+    std::fs::set_permissions(&base, perm).expect("make the base file writable");
+    std::fs::write(&base, bytes).expect("change the installed base file");
+    let stdout = download_delta_update(lab);
+    let fetched = download_bytes(&stdout);
+    assert!(
+        fetched >= DELTA_BYTES as u64,
+        "the download fetched {fetched} bytes: not the file's frame"
+    );
+    let sources = file_sources(&stdout, "share/delta.bin");
+    assert!(
+        sources.iter().all(|s| s == "range"),
+        "share/delta.bin is fetched by range, never as a patch: {sources:?}"
+    );
+    lines.extend(apply_delta_update(lab));
+    lines
+}
+
+/// Row 12: the signed manifest lists the delta but the server has no such file: the failed patch
+/// is not retried, the file arrives as its frame by `range`, and the update completes.
+fn row_delta_missing(lab: &mut Lab) -> Vec<String> {
+    let mut lines = install_release(lab, &D1);
+    lab.publish_with(&D2, true);
+    assert!(
+        lab.delta_files("1.1.0").is_empty(),
+        "the delta file is gone from the release directory"
+    );
+    let stdout = download_delta_update(lab);
+    let fetched = download_bytes(&stdout);
+    assert!(
+        fetched >= DELTA_BYTES as u64,
+        "the download fetched {fetched} bytes: not the file's frame"
+    );
+    let sources = file_sources(&stdout, "share/delta.bin");
+    assert!(
+        sources.iter().all(|s| s == "range"),
+        "share/delta.bin falls back to range: {sources:?}"
+    );
+    lines.extend(apply_delta_update(lab));
     lines
 }
 

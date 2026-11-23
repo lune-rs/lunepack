@@ -22,7 +22,8 @@
 # that dies), 3 (update by the library with the update window, by the command line, stub replaced
 # while a console stub runs), 4 (crash, slow confirm, attempt counter), 5 (deferred GC), 6 (console
 # stub stdio and exit code), 7 (long path), 8 (uninstall by QuietUninstallString), 10 (no console
-# of the runtime's own), 11 (display-name change, Setup rerun, a user's rename), 12 (taken folder),
+# of the runtime's own), 11 (display-name change, Setup rerun, a user's rename), 3d (an update by
+# delta, M12: the changed file arrives as a patch), 12 (taken folder),
 # the console Ctrl+C / Ctrl+Break proof (scripts/ci/console-ctrl-test.ps1) and, on CI, the signed
 # Setup.exe and the publisher-continuity rows (scripts/ci/windows-sign-test.ps1, M9 step 9): the
 # release is signed by the packager's own [codesign.windows] templates (signtool, a throwaway
@@ -636,7 +637,7 @@ function Confirmed-Lines([string]$from, [string]$to) {
 
 # The command-line path: check, download, apply-and-restart, as an app in any language runs them.
 # The runtime that answers is the installed $from tree's own.
-function Update-ViaRuntime($app, [string]$from, [string]$to, [switch]$NoUi, [string[]]$restartArgs = @()) {
+function Update-ViaRuntime($app, [string]$from, [string]$to, [switch]$NoUi, [switch]$PassThru, [string[]]$restartArgs = @()) {
     $rt = Join-Path $app.Root "app\$from\lunepack-runtime.exe"
     $c = Run-Tool $rt @('check', '--json')
     SameV 'check exit code' $c.Code 0
@@ -654,6 +655,42 @@ function Update-ViaRuntime($app, [string]$from, [string]$to, [switch]$NoUi, [str
     $r = Run-Tool $rt $a
     SameV 'apply-and-restart exit code' $r.Code 0
     Require (@($r.Out)[-1] -match '"scheduled":true') 'apply-and-restart schedules the apply'
+    # The download's own output (its JSON Lines progress), for a row that asserts on its sources.
+    if ($PassThru) { return $d }
+}
+
+# The two versions of `share/delta.bin` of the delta rows (M12 step 7): 256 KiB of incompressible
+# bytes, the same in both but for 16 bytes in the middle, so a patch from one to the other is a few
+# dozen bytes against a frame of the file's size.
+function New-DeltaFiles {
+    $bytes = New-Object byte[] 262144
+    (New-Object System.Random 7).NextBytes($bytes)
+    $one = Join-Path $work 'delta-1.bin'
+    [IO.File]::WriteAllBytes($one, $bytes)
+    foreach ($i in 0..15) { $bytes[131072 + $i] = [byte]($bytes[131072 + $i] -bxor 0x5A) }
+    $two = Join-Path $work 'delta-2.bin'
+    [IO.File]::WriteAllBytes($two, $bytes)
+    return @{ One = $one; Two = $two }
+}
+
+# The runtime writes at most ten progress lines a second (and a phase's last one), so a small file's
+# own `stage` line may be missing: the download's size says whether a patch or a frame came, and any
+# line that is there must name the expected source.
+function Download-Bytes([object[]]$lines) {
+    $done = -1
+    foreach ($l in $lines) {
+        if ("$l".StartsWith('{"schema":1,"type":"progress","phase":"download","done":')) { $done = [long](("$l" | ConvertFrom-Json).done) }
+    }
+    return $done
+}
+
+# The `source` of every `stage` progress line of a runtime's `--json` output that names `$path`.
+function Stage-Sources([object[]]$lines, [string]$path) {
+    $sources = @()
+    foreach ($l in $lines) {
+        if ("$l" -like '*"phase":"stage"*' -and "$l" -like "*`"file`":{`"path`":`"$path`",*") { $sources += ("$l" | ConvertFrom-Json).file.source }
+    }
+    return $sources
 }
 
 function Wait-Updated($app, [string]$to) {
@@ -742,6 +779,12 @@ try {
             Publish-Version $A '1.5.0' @{ Flags = @('exit-without-confirm'); Timeout = 120 }
             Publish-Version $A '1.6.0' @{ Name = "$($A.BaseName) Renamed" }
             $null = Build-Setup $A '1.6.0'
+            # The delta row (3d): the second release changes 16 bytes of a file of the first, and the
+            # packer writes the delta from it.
+            $deltaFiles = New-DeltaFiles
+            Publish-Version $A '1.6.1' @{ Files = @{ 'share/delta.bin' = $deltaFiles.One } }
+            Publish-Version $A '1.6.2' @{ Files = @{ 'share/delta.bin' = $deltaFiles.Two } }
+            Require (Test-Path -LiteralPath (Join-Path $A.Rel '1.6.2\windows-x86_64.from-1.6.1.delta')) 'the packer wrote the delta from 1.6.1'
             Publish-Version $B '1.1.0'
             Publish-Version $B '1.2.0'
             $longInput = Join-Path $C.Dir ('in-1.0.0\' + ($C.EntryRel -replace '/', '\'))
@@ -950,6 +993,27 @@ try {
                 Stop-Under (Join-Path $programs $moved)
                 Rename-Item -LiteralPath (Join-Path $programs $moved) -NewName $oldName
             }
+        }
+
+        Row '3d (update by delta: share/delta.bin arrives as a patch; the update confirms)' {
+            $deltaFiles = New-DeltaFiles
+            # 1.6.1 brings the file whole; 1.6.2 changes 16 bytes of it.
+            Publish-Version $A '1.6.1' @{ Files = @{ 'share/delta.bin' = $deltaFiles.One } }
+            $o = New-Out 'row3d1'
+            Update-ViaRuntime $A '1.6.0' '1.6.1' -NoUi -restartArgs @('--after-update')
+            Expect-Lines $o @('1.6.1 start', '1.6.1 arg after-update', '1.6.1 event updated 1.6.0', '1.6.1 event first_run', '1.6.1 confirmed')
+            Wait-Updated $A '1.6.1'
+            Publish-Version $A '1.6.2' @{ Files = @{ 'share/delta.bin' = $deltaFiles.Two } }
+            Require (Test-Path -LiteralPath (Join-Path $A.Rel '1.6.2\windows-x86_64.from-1.6.1.delta')) 'the packer wrote the delta from 1.6.1'
+            $o = New-Out 'row3d2'
+            $dl = Update-ViaRuntime $A '1.6.1' '1.6.2' -NoUi -PassThru -restartArgs @('--after-update')
+            $fetched = Download-Bytes $dl.Out
+            Require ($fetched -ge 0 -and $fetched -lt 65536) "the download fetched a patch, not the file's frame ($fetched bytes)"
+            Require (@(Stage-Sources $dl.Out 'share/delta.bin' | Where-Object { $_ -ne 'patch' }).Count -eq 0) 'every stage line of share/delta.bin names the patch'
+            Expect-Lines $o @('1.6.2 start', '1.6.2 arg after-update', '1.6.2 event updated 1.6.1', '1.6.2 event first_run', '1.6.2 confirmed')
+            Wait-Updated $A '1.6.2'
+            Same 'the updated delta.bin' (Get-FileHash -LiteralPath (Join-Path $A.Root 'app\1.6.2\share\delta.bin') -Algorithm SHA256).Hash (Get-FileHash -LiteralPath $deltaFiles.Two -Algorithm SHA256).Hash
+            Assert-Record $A '1.6.2' '1.6.1' @('1.3.0', '1.4.0', '1.5.0')
         }
 
         Row '8 (uninstall by QuietUninstallString)' {

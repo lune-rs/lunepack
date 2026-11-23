@@ -44,6 +44,9 @@
 #   10  `--all-users --silent` as the standard user: exit 30, nothing written
 #   11  a service switch serves the next update; an old tree is kept while the user runs from it and
 #       is collected after
+#   11b an update by delta through the service (protocol version 2, M12): one file changes by 16
+#       bytes, the packer writes the delta, the user's download fetches the file as a patch and the
+#       service stages it against its own tree; the update confirms
 #   12  the administrator's uninstall: refused while the user runs the app, nothing changed;
 #       complete after
 #
@@ -819,6 +822,12 @@ try {
     [IO.File]::WriteAllBytes($payloadA, $rng)
     (New-Object Random 11).NextBytes($rng)
     [IO.File]::WriteAllBytes($payloadB, $rng)
+    # The delta row's second file (M12 step 7): payload A with 16 bytes of its middle changed, so a
+    # patch from A is a few dozen bytes against a frame of the file's size.
+    $payloadDelta = Join-Path $work 'payload-delta.bin'
+    $changed = [IO.File]::ReadAllBytes($payloadA)
+    foreach ($i in 0..15) { $changed[98304 + $i] = [byte]($changed[98304 + $i] -bxor 0x5A) }
+    [IO.File]::WriteAllBytes($payloadDelta, $changed)
     Publish-Version $M '1.0.0'
     $setup = Build-Setup $M '1.0.0' (Join-Path $work 'setup-1.0.0')
 
@@ -1221,12 +1230,50 @@ try {
             SameV 'collection folders left' @(Get-ChildItem -LiteralPath (Join-Path $M.Root 'app') -Directory -Force -Filter '.gc-*').Count 0
         }
 
+        # ---- row 11b ------------------------------------------------------------------------------------------------------
+        Row '11b (an update by delta through the service, protocol version 2: the changed file arrives as a patch)' {
+            # 1.10.1 brings payload.bin whole; 1.10.2 changes 16 bytes of it.
+            Publish-Version $M '1.10.1' @{ Files = @{ 'payload.bin' = $payloadA } }
+            $o = New-Out 'row11e'
+            $null = UStart 'r11e-update' $stubM '--update --no-ui' $o
+            Expect-Lines $o (Confirmed-Lines '1.10.0' '1.10.1')
+            Wait-Updated $M '1.10.1'
+            Publish-Version $M '1.10.2' @{ Files = @{ 'payload.bin' = $payloadDelta } }
+            Require (Test-Path -LiteralPath (Join-Path $M.Rel '1.10.2\windows-x86_64.from-1.10.1.delta')) 'the packer wrote the delta from 1.10.1'
+            $rt = Join-Path $M.Root 'app\1.10.1\lunepack-runtime.exe'
+            $d = URun 'r11f-download' $rt 'download --json --expect-version 1.10.2'
+            SameV 'download exit code' $d.ExitCode 0
+            $lines = @($d.Output -split "`r?`n")
+            Require (@($lines[-1], $lines[-2]) -match '"staged":true') 'download stages the update'
+            # The runtime writes at most ten progress lines a second (and a phase's last one), so the
+            # file's own `stage` line may be missing: the download's size says it was a patch, and any
+            # line that is there names the patch.
+            $fetched = -1
+            foreach ($l in $lines) {
+                if ($l.StartsWith('{"schema":1,"type":"progress","phase":"download","done":')) { $fetched = [long]($l | ConvertFrom-Json).done }
+            }
+            Require ($fetched -ge 0 -and $fetched -lt 65536) "the download fetched a patch, not the file's frame ($fetched bytes)"
+            $notPatch = @($lines | Where-Object { $_ -like '*"phase":"stage"*' -and $_ -like '*"file":{"path":"payload.bin",*' -and $_ -notlike '*"source":"patch"*' })
+            Require ($notPatch.Count -eq 0) 'every stage line of payload.bin names the patch'
+            $want = (Get-FileHash -LiteralPath $payloadDelta -Algorithm SHA256).Hash
+            Same 'the staged payload.bin' (Get-FileHash -LiteralPath (Join-Path $M.Root 'app\1.10.2\payload.bin') -Algorithm SHA256).Hash $want
+            $o = New-Out 'row11f'
+            $a = URun 'r11f-apply' $rt 'apply-and-restart --json --expect-version 1.10.2 -- --after-update' $o
+            SameV 'apply-and-restart exit code' $a.ExitCode 0
+            Expect-Lines $o @('1.10.2 start', '1.10.2 arg after-update', '1.10.2 event updated 1.10.1', '1.10.2 event first_run', '1.10.2 confirmed')
+            Wait-Updated $M '1.10.2'
+            Same 'the updated payload.bin' (Get-FileHash -LiteralPath (Join-Path $M.Root 'app\1.10.2\payload.bin') -Algorithm SHA256).Hash $want
+            Assert-Protected (Join-Path $M.Root 'app\1.10.2') 'machine'
+        }
+
         # ---- row 12 -------------------------------------------------------------------------------------------------------
         Row '12 (the administrator''s uninstall is refused while the user runs the app and changes nothing; complete after)' {
-            $tree = Join-Path $M.Root 'app\1.10.0'
+            # The version the earlier rows ended on (row 11b moves it on).
+            $cur = (Get-Record $M.Root).current.version
+            $tree = Join-Path $M.Root "app\$cur"
             $holdOut = New-Out 'hold12'
             $null = UStart 'r12-hold' (Join-Path $tree $M.EntryFile) '--hold 900' $holdOut
-            Expect-Lines $holdOut @('1.10.0 start', '1.10.0 nothing-pending', '1.10.0 hold')
+            Expect-Lines $holdOut @("$cur start", "$cur nothing-pending", "$cur hold")
             $snapshot = {
                 [pscustomobject]@{
                     Tree = Tree-Listing $M.Root
@@ -1248,7 +1295,7 @@ try {
             Require (@(Get-ProcsUnder $tree).Count -ge 1) 'the process of the user still runs'
             $o = New-Out 'row12a'
             $null = UStart 'r12-run' $stubM '' $o
-            Expect-Lines $o @('1.10.0 start', '1.10.0 nothing-pending')
+            Expect-Lines $o @("$cur start", "$cur nothing-pending")
             # The user's processes end: the uninstall now removes everything.
             Stop-Under $M.Root
             Wait-Until { @(Get-ProcsUnder $M.Root).Count -eq 0 } 30 'the user''s processes to end'

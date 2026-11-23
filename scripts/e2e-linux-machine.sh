@@ -49,6 +49,9 @@
 #   8   the policy file: disable_self_update (33), no_update_ui, and every broken variant
 #   11  the service follows an update; an old tree is kept while the user runs from it and is
 #       collected after
+#   11b the service follows an update by delta (service protocol version 2, M12): one file changes
+#       by 16 bytes, the packer writes the delta, the user's download fetches that file as a patch
+#       and the service stages it against its own tree; the update confirms
 #   12  the administrator's uninstall: refused while the user runs the app, nothing changed;
 #       complete after (no unit, socket, link, entry, tree or uninstall folder left)
 #   9   the standard user installs through pkexec (a polkit rule for that setup path only), updates,
