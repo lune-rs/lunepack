@@ -797,6 +797,23 @@ impl UiHost {
         shared.send(msg)
     }
 
+    /// Shows the screen that says to continue in the operating system's installer (macOS,
+    /// M11-D8). `true` when the UI took it, so the screen can be asked about; a headless host and
+    /// a lost UI return `false` and nothing is shown. As [`UiHost::admin_command`], the call first
+    /// reports the operation's phase, so the order holds whatever the run's queued events have
+    /// delivered.
+    pub fn hand_off_to_installer(&self) -> bool {
+        let Some(shared) = &self.shared else {
+            return false;
+        };
+        shared.send(EngineMsg::Progress {
+            phase: Phase::Install,
+            done: 0,
+            total: 0,
+        });
+        shared.send(EngineMsg::HandedOffToInstaller)
+    }
+
     /// Tells the UI how the operation ended.
     pub fn outcome(&self, outcome: Outcome) {
         if let Some(shared) = &self.shared {

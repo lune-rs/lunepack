@@ -650,6 +650,10 @@ mod native {
             host_the_administrator_command_screen_is_shown_and_its_answer_ends_it,
         ),
         (
+            "host_the_hand_off_to_installer_screen_is_shown_and_its_answer_ends_it",
+            host_the_hand_off_to_installer_screen_is_shown_and_its_answer_ends_it,
+        ),
+        (
             "host_stops_reading_while_frames_flow_never_blocks",
             host_stops_reading_while_frames_flow_never_blocks,
         ),
@@ -1242,6 +1246,33 @@ mod native {
             headless.prompt(PromptKind::AdminCommand, &events, &mut |_| {}),
             ChoiceValue::Close
         );
+    }
+
+    /// M11-D8: the install handed to the operating system's installer is a screen of its own in
+    /// the install flow, closed by the user; an update flow has no such screen.
+    fn host_the_hand_off_to_installer_screen_is_shown_and_its_answer_ends_it() {
+        let lab = HostLab::new(Some("answers=proceed+close"));
+        let ui = lab.start(Flow::Install);
+        let events = lab.events(&ui);
+        assert_eq!(welcome(&ui, &events), ChoiceValue::Proceed);
+        assert!(ui.hand_off_to_installer());
+        let got = ui.prompt(PromptKind::HandedOff, &events, &mut |_| {});
+        assert_eq!(got, ChoiceValue::Close);
+        assert!(ui.outcome_acknowledged());
+        assert_eq!(ui.stopped(), None);
+        ui.close(&events);
+        assert!(notes(&lab.out).contains("ui got prompt HandedOff"));
+        let headless = UiHost::headless(Flow::Install);
+        assert!(!headless.hand_off_to_installer());
+
+        let lab = HostLab::new(Some("answers=proceed"));
+        let ui = lab.start(Flow::Update);
+        let events = lab.events(&ui);
+        assert!(
+            !ui.hand_off_to_installer(),
+            "no such screen in the update flow"
+        );
+        ui.close(&events);
     }
 
     fn host_stops_reading_while_frames_flow_never_blocks() {

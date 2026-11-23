@@ -150,6 +150,8 @@ fn main() -> ExitCode {
         // elsewhere). They build their own adapters and read no environment variable.
         Mode::MachineRepair(args) => machine_repair_mode(&args),
         Mode::MachineUninstall(phase) => machine_uninstall_mode(&phase),
+        // macOS: the installer package's postinstall (M11-D8); anywhere else a usage error.
+        Mode::MachinePkg => machine_pkg_mode(),
         // Windows: phase 2, from the uninstaller's own temp copy only; anywhere else a usage
         // error before any action (M7-D5).
         Mode::UninstallHandOff(args) => run(|ad| hand_off_phase_2(ad, &args)),
@@ -704,6 +706,62 @@ fn with_machine_base(
     };
     let ops = machine::native::NativeOps { enter: enter_dir };
     f(&base, &ops, &process, &exe)
+}
+
+/// The hidden `machine-install --pkg` mode (macOS, M11-D8): the engine's first install from the
+/// payload the installer package placed, run by its postinstall as root. It builds its few
+/// adapters itself and reads no environment variable, no temporary directory, no working
+/// directory and nothing of a user's profile. The result is the one JSON line on stdout and the
+/// events on stderr, which Installer's log keeps; the exit code is what the package shows.
+#[cfg(target_os = "macos")]
+fn machine_pkg_mode() -> Kind {
+    use lunepack_core::Elevation as _;
+
+    // Only root's process goes further: nothing is looked at before that.
+    let standing = lunepack_os_macos::MacElevation.standing();
+    if standing == lunepack_core::Standing::Standard {
+        eprintln!("{USAGE_LINE}");
+        return Kind::Usage;
+    }
+    let (Ok(home), Ok(apps_dir), Ok(image)) = (
+        machine::native_macos::machine_home(),
+        machine::native_macos::apps_dir(),
+        machine::native_macos::own_image(),
+    ) else {
+        return headless_fail(setup::COMMAND, Kind::Fs);
+    };
+    let adapters = machine::native_macos::Adapters::new();
+    let installer = machine::native_macos::MacInstaller { apps_dir };
+    let events = stderr_events();
+    let kind = machine::run_pkg_mode(
+        &machine::PkgRun {
+            base: adapters.base(&home),
+            stat: &machine::native_macos::MacStat,
+            installer: &installer,
+            repairer: &machine::native_macos::MacRepairer,
+            standing,
+            image: &image,
+            kernel_path: &machine::native_macos::named,
+            scheme: lunepack_core::MachineScheme::MACOS,
+        },
+        &events,
+    );
+    let last = match kind {
+        Kind::Ok => Event::Result {
+            command: setup::COMMAND,
+            tree_version: None,
+            outcome: setup::OUTCOME,
+            version: None,
+        },
+        kind => setup::failed(kind, None),
+    };
+    conclude(events, &last);
+    kind
+}
+
+#[cfg(not(target_os = "macos"))]
+fn machine_pkg_mode() -> Kind {
+    Kind::Usage
 }
 
 /// The hidden modes exist on Windows only; the grammar refuses them elsewhere.
@@ -1449,7 +1507,24 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
                 Ok(prepared) => prepared.with_apps_dir(apps_dir),
                 Err(refused) => return fail(refused.kind, refused.name.as_deref()),
             };
-        let (app, details) = setup::welcome(&prepared, None);
+        // The all-users install is the installer package the app carries (M11-D8): offered when
+        // the app has one, opened in Installer (never run by this process, which is never root).
+        // An install of the app in the machine home stops a per-user one either way (M10-D14).
+        let pkg = installer_package(ad, &exe);
+        let machine_ctx = setup::Machine {
+            home: std::path::Path::new(lunepack_core::layout::MACHINE_HOME_MACOS),
+            scheme: lunepack_core::MachineScheme::MACOS,
+            transfer: setup::Transfer::Package(machine::PackageHandOff {
+                process: &*ad.process,
+                pkg: pkg.as_deref(),
+            }),
+            offered: pkg.is_some(),
+            forced: false,
+        };
+        let all_users_location = pkg
+            .is_some()
+            .then(|| machine::native_macos::APPS_DIR.to_owned());
+        let (app, details) = setup::welcome(&prepared, all_users_location);
         let env = |name: &str| std::env::var_os(name);
         let ui = match how {
             InstallerRun::Silent => UiHost::headless(Flow::Install),
@@ -1483,7 +1558,7 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         };
         let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
         ui.report(&events);
-        let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui, None);
+        let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui, Some(&machine_ctx));
         let seen = ui.outcome_acknowledged();
         ui.close(&events);
         conclude_to(events, &last, !ui_stdio);
@@ -1491,6 +1566,23 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         kind
     }))
 }
+
+/// The installer package inside the installer app `exe` belongs to
+/// (`<I>/Contents/Resources/lunepack-all-users.pkg`), canonical, when it is a regular file: the
+/// app's own resource, never a path a caller gave.
+#[cfg(target_os = "macos")]
+fn installer_package(ad: &modes::Adapters, exe: &std::path::Path) -> Option<PathBuf> {
+    let contents = exe.parent()?.parent()?;
+    let pkg = contents.join("Resources").join(ALL_USERS_PKG);
+    match ad.fs.symlink_metadata(&pkg) {
+        Ok(Some(meta)) if meta.kind == lunepack::FileKind::File => std::fs::canonicalize(&pkg).ok(),
+        _ => None,
+    }
+}
+
+/// The installer package's file name in the installer app's resources (the packager's constant).
+#[cfg(target_os = "macos")]
+const ALL_USERS_PKG: &str = "lunepack-all-users.pkg";
 
 /// Whether a macOS installer run is quiet for the notice (F14): only a run a person started may
 /// get one, which is no argument (a double-click on the installer's runtime) or the installer

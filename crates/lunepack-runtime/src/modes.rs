@@ -527,6 +527,10 @@ pub enum Mode {
     MachineRepair(MachineArgs),
     /// Windows only, hidden: the two phases of the elevated machine uninstall (M10 step 18).
     MachineUninstall(MachineUninstall),
+    /// macOS only, hidden: `machine-install --pkg`, the first all-users install from the payload
+    /// the installer package placed beside this runtime (M11-D8). It takes nothing from its
+    /// caller: no other argument, no environment variable.
+    MachinePkg,
 }
 
 /// The phases of the hidden `machine-uninstall` mode.
@@ -584,6 +588,11 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
             parse_machine_install(rest).map(Mode::MachineRepair)
         }
         Some(MACHINE_UNINSTALL) if MACHINE_MODES => parse_machine_uninstall(rest),
+        // The installer package's postinstall runs exactly this and nothing else (M11-D8).
+        Some(MACHINE_INSTALL) if PKG_MODE => match rest {
+            [flag] if flag == PKG_FLAG => Ok(Mode::MachinePkg),
+            _ => Err(UsageError),
+        },
         Some(word) => match crate::cli::args::Command::named(word) {
             Some(command) => crate::cli::args::parse(command, rest).map(Mode::Command),
             None => Err(UsageError),
@@ -737,6 +746,12 @@ pub(crate) fn parse_machine_install(args: &[OsString]) -> Result<MachineArgs, Us
 
 /// Whether the hidden elevated modes of a machine install exist: Windows only (M10).
 const MACHINE_MODES: bool = cfg!(windows);
+
+/// Whether the hidden `machine-install --pkg` mode exists: macOS only (M11-D8).
+const PKG_MODE: bool = cfg!(target_os = "macos");
+
+/// The only argument of the `--pkg` mode.
+pub const PKG_FLAG: &str = "--pkg";
 
 /// `machine-uninstall`: phase 1's `--events <id> --for-sid <SID>`, or phase 2's `--wait-pid <u32>
 /// --wait-start <u64>` and nothing else, each once.
@@ -1315,6 +1330,30 @@ mod tests {
             parse(&os(&["machine-install", "--events", "stdout"])),
             Err(UsageError)
         );
+    }
+
+    /// M11-D8: `machine-install --pkg` is a word of the macOS grammar, with nothing beside it.
+    #[test]
+    fn the_pkg_mode_is_the_flag_alone_on_macos_and_no_word_elsewhere() {
+        let ok = os(&["machine-install", "--pkg"]);
+        if cfg!(target_os = "macos") {
+            assert_eq!(parse(&ok), Ok(Mode::MachinePkg));
+        } else {
+            assert_eq!(parse(&ok), Err(UsageError));
+        }
+        for bad in [
+            os(&["machine-install"]),
+            os(&["machine-install", "--pkg", "/"]),
+            os(&["machine-install", "--pkg", "--pkg"]),
+            os(&["machine-install", "--pkg=1"]),
+            os(&["machine-install", "--PKG"]),
+            os(&["machine-install", "/tmp/x", "--pkg"]),
+            os(&["--pkg"]),
+            os(&["pkg"]),
+            os(&["machine-install", "--events", "stdout"]),
+        ] {
+            assert_eq!(parse(&bad), Err(UsageError), "{bad:?}");
+        }
     }
 
     #[test]

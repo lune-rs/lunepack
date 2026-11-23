@@ -67,6 +67,10 @@ use crate::ui_host::{self, UiHost};
 pub const COMMAND: &str = "setup";
 /// The result's outcome.
 pub const OUTCOME: &str = "installed";
+/// The result's outcome of an all-users install handed to the operating system's installer
+/// (macOS, M11-D8): nothing is installed yet, the installer package goes on.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const OUTCOME_HANDED_OFF: &str = "handed_off";
 /// The prefix of the UI directories a setup makes under the app's cache.
 pub const UI_DIR_PREFIX: &str = "setup-ui-";
 /// The marker file inside such a directory.
@@ -157,11 +161,25 @@ pub fn detect_installer(
     let payload = lunepack_core::update_config::MACOS_INSTALLER_PAYLOAD
         .split('/')
         .fold(installer.to_path_buf(), |dir, name| dir.join(name));
-    match fs.symlink_metadata(&payload) {
+    detect_payload_file(fs, &payload, hasher, verifier)
+}
+
+/// A payload file (FORMAT.md 14.4, no runtime part) at `payload`: [`Detect::None`] when it is not
+/// a regular file (a link included), [`Detect::Malformed`] when it cannot be read or parsed, else
+/// the setup it holds. The installer app's own file ([`detect_installer`]) and the one the
+/// installer package places beside the runtime (`machine-install --pkg`, M11-D8) are read here.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn detect_payload_file(
+    fs: &dyn Fs,
+    payload: &Path,
+    hasher: &dyn Hasher,
+    verifier: &dyn Verifier,
+) -> Detect {
+    match fs.symlink_metadata(payload) {
         Ok(Some(meta)) if meta.kind == lunepack::FileKind::File => {}
         _ => return Detect::None,
     }
-    let Ok(file) = fs.open_read(&payload) else {
+    let Ok(file) = fs.open_read(payload) else {
         return Detect::Malformed;
     };
     match lunepack_core::setup::parse_payload_file(file.as_ref(), hasher, verifier) {
@@ -691,6 +709,10 @@ pub enum Transfer<'a> {
     /// Linux (M11-D9): an elevated copy through pkexec, its progress on its standard output.
     #[cfg(unix)]
     Stdout(crate::machine::StdoutHandOff<'a>),
+    /// macOS (M11-D8): the installer package the app carries, opened in Installer; the rest of
+    /// the install is Installer's and the package's postinstall.
+    #[cfg(target_os = "macos")]
+    Package(crate::machine::PackageHandOff<'a>),
 }
 
 /// The all-users install a setup can hand off to (M10 step 16, M11): what it needs besides the
@@ -753,6 +775,13 @@ pub fn run_setup(
                 Err(AllUsersEnd::NeedsAdministrator(command)) => {
                     show_admin_command(ui, events, command);
                     return report(prepared, Err(Kind::ElevationRequired));
+                }
+                // Installer has the package: the window says to go on there, this run is over.
+                Err(AllUsersEnd::HandedOff) => {
+                    if ui.hand_off_to_installer() {
+                        let _ = ui.prompt(PromptKind::HandedOff, events, &mut |_| {});
+                    }
+                    return report_handed_off(prepared);
                 }
             },
             Some(m) => install_user_unless_machine(ad, prepared, events, m),
@@ -820,6 +849,10 @@ enum AllUsersEnd {
     /// The command to run as an administrator instead, when one can be shown (M11-D9).
     #[cfg_attr(not(unix), allow(dead_code))]
     NeedsAdministrator(Option<String>),
+    /// The installer package was opened in Installer, which goes on (macOS, M11-D8): the window
+    /// says to continue there, and this run ends with nothing installed yet.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    HandedOff,
 }
 
 impl From<Kind> for AllUsersEnd {
@@ -858,6 +891,30 @@ fn install_all_users(
         #[cfg(windows)]
         Transfer::Pipe(hand_off) => {
             crate::machine::hand_off_unless(hand_off, events, &user_install_there, &installed)?;
+        }
+        #[cfg(target_os = "macos")]
+        Transfer::Package(hand_off) => {
+            // The refusals of the unelevated side come first, as on Windows (M10-D14): an install
+            // of the installing user, then of anyone (the machine record).
+            if user_install_there() {
+                return Err(Kind::AlreadyInstalled.into());
+            }
+            if crate::machine::blocks_user_install(&crate::machine::find_in(
+                &*ad.fs,
+                &*ad.hasher,
+                machine.home,
+                prepared.app_id(),
+                prepared.name(),
+                machine.scheme,
+            )) {
+                return Err(Kind::AlreadyInstalled.into());
+            }
+            events.emit(&Event::phase(Phase::Install, Some(&version)));
+            // `open` is started only for a package this app carries, by its absolute path.
+            if !crate::machine::open_package(hand_off) {
+                return Err(Kind::Process.into());
+            }
+            return Err(AllUsersEnd::HandedOff);
         }
         #[cfg(unix)]
         Transfer::Stdout(hand_off) => {
@@ -947,6 +1004,21 @@ pub fn failed(kind: Kind, version: Option<Version>) -> Event {
         exit_code: kind.code(),
         reason: kind.reason(),
     }
+}
+
+/// The end of a run that opened the installer package (macOS): exit 0, nothing installed by this
+/// process; the result says so.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn report_handed_off(prepared: &Prepared) -> (Kind, Event) {
+    (
+        Kind::Ok,
+        Event::Result {
+            command: COMMAND,
+            tree_version: Some(prepared.version().clone()),
+            outcome: OUTCOME_HANDED_OFF,
+            version: None,
+        },
+    )
 }
 
 fn report(prepared: &Prepared, result: Result<Version, Kind>) -> (Kind, Event) {

@@ -334,6 +334,11 @@ impl Staged<'_> {
     pub fn version(&self) -> &Version {
         &self.setup.config.version
     }
+
+    /// The app's id, from the verified config.
+    pub fn app_id(&self) -> &AppId {
+        &self.setup.config.app_id
+    }
 }
 
 /// A file of the copied payload: the key set and the manifest from memory, the pack from its copy,
@@ -647,6 +652,17 @@ pub fn install_staged(
     home: &Path,
     staged: &Staged<'_>,
 ) -> Result<Installed, Kind> {
+    install_staged_in(ports, home, None, staged)
+}
+
+/// [`install_staged`] with the apps folder the live bundle goes in (macOS: `/Applications`, which
+/// must exist and is never created or changed; `None` elsewhere).
+pub fn install_staged_in(
+    ports: Ports<'_>,
+    home: &Path,
+    apps_dir: Option<&Path>,
+    staged: &Staged<'_>,
+) -> Result<Installed, Kind> {
     install(
         ports,
         &InstallRequest {
@@ -656,7 +672,7 @@ pub fn install_staged(
             keyset_version: staged.keyset_version,
             payload_dir: &staged.dir.path,
             pack: &staged.pack,
-            apps_dir: None,
+            apps_dir,
         },
     )
     .map_err(kind_of)
@@ -753,6 +769,253 @@ pub fn run_stdout_mode(
     match result {
         Ok(_) => Kind::Ok,
         Err(kind) => kind,
+    }
+}
+
+// ---- the macOS installer package's mode (M11-D8) ----------------------------------------------
+
+/// The folder of the machine home that holds the payload the installer package placed.
+#[cfg(unix)]
+pub const INSTALLER_DIR: &str = ".installer";
+/// The runtime's file name in that folder (the package's postinstall runs it).
+#[cfg(unix)]
+pub const PKG_RUNTIME: &str = "lunepack-runtime";
+/// The payload file's name beside it (FORMAT.md 14.4).
+#[cfg(unix)]
+pub const PKG_PAYLOAD: &str = "lunepack-setup.payload";
+
+/// What `lstat` says about a path, for the checks of the `--pkg` mode.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatFacts {
+    /// The kind, a link not followed.
+    pub kind: FileKind,
+    /// The owner's uid.
+    pub uid: u32,
+    /// The mode bits (`st_mode`).
+    pub mode: u32,
+}
+
+/// `lstat` (a fake in tests).
+#[cfg(unix)]
+pub trait Stat: Send + Sync {
+    /// The facts of `path`, a link not followed; `None` when nothing is there.
+    fn lstat(&self, path: &Path) -> io::Result<Option<StatFacts>>;
+}
+
+/// The engine's `repair` of an install that is there (a fake in tests).
+#[cfg(unix)]
+pub trait Repairer: Send + Sync {
+    /// Re-registers the service of the install at `root` and re-checks it; the registered version.
+    fn repair(&self, root: &Path) -> Result<Version, Kind>;
+}
+
+/// What `machine-install --pkg` runs over (M11-D8): the engine's ports through [`Base`], the
+/// facts only a real file system gives, and this process's own image.
+#[cfg(unix)]
+pub struct PkgRun<'a> {
+    /// The ports of the copy and its verification; `base.home` is the machine home as the kernel
+    /// names it.
+    pub base: Base<'a>,
+    /// Owners, modes and kinds.
+    pub stat: &'a dyn Stat,
+    /// The first install over a staged payload.
+    pub installer: &'a dyn Installer,
+    /// The repair of an install of this very version.
+    pub repairer: &'a dyn Repairer,
+    /// This process's standing.
+    pub standing: Standing,
+    /// This process's executable as the kernel names it (`proc_pidpath`).
+    pub image: &'a Path,
+    /// A path as the kernel names it (`F_GETPATH`), the form `image` is in.
+    pub kernel_path: &'a dyn Fn(&Path) -> io::Result<PathBuf>,
+    /// The scheme of the OS's machine installs (macOS).
+    pub scheme: MachineScheme,
+}
+
+/// Whether `dir` and every ancestor of it is a real directory that grants search to others: the
+/// users who run the app and the service's clients must reach what is below it.
+#[cfg(unix)]
+fn searchable(stat: &dyn Stat, dir: &Path) -> bool {
+    dir.ancestors()
+        .filter(|d| !d.as_os_str().is_empty())
+        .all(|d| {
+            matches!(
+                stat.lstat(d),
+                Ok(Some(f)) if f.kind == FileKind::Dir && f.mode & 0o001 != 0
+            )
+        })
+}
+
+/// The hidden `machine-install --pkg` mode, run by the installer package's postinstall as root
+/// from the payload the package placed (M11-D8). It takes nothing from its caller: no argument but
+/// `--pkg`, no environment variable, none of Installer's arguments.
+///
+/// Before anything is written: the process is root's; its own image is exactly
+/// `<home>/.installer/<app id>/lunepack-runtime` as the kernel names it, which names the app; the
+/// machine home and every ancestor are protected and grant search to others; `.installer` and the
+/// app's folder are admin-only; the payload file beside the runtime is a regular file owned by
+/// root that neither its group nor others can write. A folder Installer made is never re-moded: a
+/// failing one is `not_protected` and nothing is removed (nothing under it is trusted). Past those
+/// checks every outcome removes the app's `.installer/<app id>/` folder, which holds only what the
+/// package placed.
+///
+/// Then the payload is copied from that root-only file into an admin-only staging folder under
+/// the machine home and verified there under the trailer's own root ([`stage_payload_own_image`]),
+/// and the engine installs it. An install of the same version is repaired instead (exit 0); one of
+/// another version is `already_installed`, so the package fails visibly. An install over a
+/// per-user install of any user cannot be seen from here: that check is the installer window's.
+#[cfg(unix)]
+pub fn run_pkg_mode(run: &PkgRun<'_>, events: &Events) -> Kind {
+    if run.standing == Standing::Standard {
+        return Kind::Usage;
+    }
+    let home = run.base.home;
+    // The app is named by where the image stands: `<home>/.installer/<app id>/lunepack-runtime`.
+    let Ok(rel) = run.image.strip_prefix(home) else {
+        return Kind::Usage;
+    };
+    let names: Option<Vec<&str>> = rel.components().map(|c| c.as_os_str().to_str()).collect();
+    let Some([dir, id, file]) = names.as_deref() else {
+        return Kind::Usage;
+    };
+    let (INSTALLER_DIR, PKG_RUNTIME) = (*dir, *file) else {
+        return Kind::Usage;
+    };
+    let Ok(app_id) = AppId::parse(id) else {
+        return Kind::Usage;
+    };
+    let installer_dir = home.join(INSTALLER_DIR);
+    let leaf = installer_dir.join(id);
+    match (run.kernel_path)(&leaf.join(PKG_RUNTIME)) {
+        Ok(named) if named == run.image => {}
+        Ok(_) => return Kind::Usage,
+        Err(_) => return Kind::Fs,
+    }
+
+    // The folders, as Installer left them (nothing is created, re-moded or removed here).
+    let protect = run.base.protect;
+    let protected = protect.check(home, DirClass::MachineTree).is_ok()
+        && searchable(run.stat, home)
+        && protect.check(&installer_dir, DirClass::AdminOnly).is_ok()
+        && protect.check(&leaf, DirClass::AdminOnly).is_ok();
+    if !protected {
+        return Kind::NotProtected;
+    }
+
+    let kind = pkg_install(run, &app_id, &leaf, events);
+    // The folder holds what the package placed and nothing else; it goes on every outcome.
+    let _ = run.base.fs.remove_dir_all_nofollow(&leaf);
+    kind
+}
+
+/// [`run_pkg_mode`] past the checks of the folders: reads the payload file, stages it, installs.
+#[cfg(unix)]
+fn pkg_install(run: &PkgRun<'_>, app_id: &AppId, leaf: &Path, events: &Events) -> Kind {
+    use crate::setup::{Detect, detect_payload_file};
+
+    let base = &run.base;
+    let payload = leaf.join(PKG_PAYLOAD);
+    // A regular file of root's that no one else can write, checked before it is read.
+    let trusted = matches!(
+        run.stat.lstat(&payload),
+        Ok(Some(f)) if f.kind == FileKind::File && f.uid == 0 && f.mode & 0o022 == 0
+    );
+    if !trusted {
+        return Kind::NotProtected;
+    }
+    let found = match detect_payload_file(base.fs, &payload, base.hasher, base.verifier) {
+        Detect::Setup(found) => found,
+        Detect::None | Detect::Malformed => return Kind::Verify,
+    };
+    if found.trailer.root.app_id() != app_id {
+        return Kind::Verify;
+    }
+    let staged = match stage_payload_own_image(base, &found, events) {
+        Ok(staged) => staged,
+        Err(kind) => return kind,
+    };
+    if staged.app_id() != app_id {
+        return Kind::Verify;
+    }
+    match find_in(
+        base.fs,
+        base.hasher,
+        base.home,
+        app_id,
+        staged.name(),
+        run.scheme,
+    ) {
+        Machine::Present(root, Some(current)) => {
+            // Re-running the package of the installed version repairs it; any other version is
+            // an update's business, and the package says so by failing.
+            if current == *staged.version() {
+                drop(staged);
+                return match run.repairer.repair(&root) {
+                    Ok(_) => Kind::Ok,
+                    Err(kind) => kind,
+                };
+            }
+            Kind::AlreadyInstalled
+        }
+        Machine::Unreadable => Kind::AlreadyInstalled,
+        Machine::Present(_, None) | Machine::Absent => {
+            match run.installer.install(base.home, &staged) {
+                Ok(_) => Kind::Ok,
+                Err(kind) => kind,
+            }
+        }
+    }
+}
+
+// ---- the installer window's hand-off to the package (macOS, M11-D8) ---------------------------
+
+/// How long `/usr/bin/open` may take to hand the package to Installer.
+#[cfg(target_os = "macos")]
+pub const OPEN_LIMIT: Duration = Duration::from_secs(15);
+/// The system's `open`.
+#[cfg(target_os = "macos")]
+pub const OPEN: &str = "/usr/bin/open";
+
+/// What the installer window hands the all-users install off with (M11-D8): the installer package
+/// its app carries. The window never runs as root and never starts Installer with privileges:
+/// `open` shows the package in Installer, whose own prompt asks for the administrator.
+#[cfg(target_os = "macos")]
+pub struct PackageHandOff<'a> {
+    /// Starts `open`.
+    pub process: &'a dyn Process,
+    /// The package: the app's own resource, a canonical absolute path (never a caller's argument);
+    /// `None` when the app carries none, which is also when the choice is not offered.
+    pub pkg: Option<&'a Path>,
+}
+
+/// Opens the package in Installer: `/usr/bin/open <pkg>` as a child (no shell), waited for up to
+/// [`OPEN_LIMIT`]; `open` ends as soon as Installer has the file. `true` when it started and
+/// exited with 0.
+#[cfg(target_os = "macos")]
+pub fn open_package(h: &PackageHandOff<'_>) -> bool {
+    use lunepack::{ExitKind, SpawnSpec};
+
+    let Some(pkg) = h.pkg else {
+        return false;
+    };
+    let mut spec = SpawnSpec::new(OPEN);
+    spec.args.push(pkg.as_os_str().to_owned());
+    let Ok(mut child) = h.process.spawn_child(&spec) else {
+        return false;
+    };
+    let until = std::time::Instant::now() + OPEN_LIMIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(exit)) => return matches!(exit, ExitKind::Success),
+            Ok(None) if std::time::Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.terminate(Duration::from_secs(1));
+                return false;
+            }
+        }
     }
 }
 
@@ -1874,6 +2137,179 @@ pub mod native_linux {
     }
 }
 
+// ---- the macOS adapters ----------------------------------------------------------------------
+
+/// The macOS adapters of the all-users install (M11): the engine's ports over launchd, the
+/// protected directories and the machine autostart, and the machine home and apps folder as the
+/// kernel names them.
+#[cfg(target_os = "macos")]
+pub mod native_macos {
+    use std::io;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+
+    use lunepack::SystemClock;
+    use lunepack_codec_lzma::LzmaCodec;
+    use lunepack_core::engine::{Engine, Installed, Ports};
+    use lunepack_core::layout::MACHINE_HOME_MACOS;
+    use lunepack_core::{FileKind, MachineScheme};
+    use lunepack_crypto::{Ed25519Verifier, OsRng, Sha256Hasher};
+    use lunepack_fs::StdFs;
+    use lunepack_os_macos::libproc::{exe_path, kernel_path};
+    use lunepack_os_macos::{
+        FilePolicy, LaunchdRegistrar, MacMachineIntegration, MacProcess, MacProtect,
+        MacPublisherCheck,
+    };
+
+    use super::{Installer, Repairer, Staged, Stat, StatFacts, install_staged_in, kind_of};
+    use crate::modes::Kind;
+
+    /// The apps folder the live bundle goes in.
+    pub const APPS_DIR: &str = "/Applications";
+
+    /// The machine home as the kernel names it (`F_GETPATH`): the form `proc_pidpath` reports
+    /// images in, so a comparison is exact. Nothing from the environment; a home that does not
+    /// exist is an error.
+    pub fn machine_home() -> io::Result<PathBuf> {
+        kernel_path(Path::new(MACHINE_HOME_MACOS))
+    }
+
+    /// The apps folder as the kernel names it.
+    pub fn apps_dir() -> io::Result<PathBuf> {
+        kernel_path(Path::new(APPS_DIR))
+    }
+
+    /// This process's own executable as the kernel names it (`proc_pidpath`).
+    pub fn own_image() -> io::Result<PathBuf> {
+        exe_path(std::process::id())?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    /// `path` as the kernel names it.
+    pub fn named(path: &Path) -> io::Result<PathBuf> {
+        kernel_path(path)
+    }
+
+    /// Every adapter the engine's ports name.
+    pub struct Adapters {
+        fs: StdFs,
+        codec: LzmaCodec,
+        hasher: Sha256Hasher,
+        verifier: Ed25519Verifier,
+        clock: SystemClock,
+        rng: OsRng,
+        integration: MacMachineIntegration,
+        publisher: MacPublisherCheck,
+        protect: MacProtect,
+        policy: FilePolicy,
+        registrar: LaunchdRegistrar,
+        process: MacProcess,
+    }
+
+    impl Adapters {
+        /// The adapters over the system's own directories. The bundle identifier of signed install
+        /// metadata is not known to the runtime: the plist is written without
+        /// `AssociatedBundleIdentifiers`, as the service's re-registration writes it.
+        pub fn new() -> Adapters {
+            Adapters {
+                fs: StdFs::new(),
+                codec: LzmaCodec,
+                hasher: Sha256Hasher,
+                verifier: Ed25519Verifier,
+                clock: SystemClock,
+                rng: OsRng,
+                integration: MacMachineIntegration::new(),
+                publisher: MacPublisherCheck,
+                protect: MacProtect::new(),
+                policy: FilePolicy::new(),
+                registrar: LaunchdRegistrar::new(None),
+                process: MacProcess::new(),
+            }
+        }
+
+        /// The engine's ports.
+        pub fn ports(&self) -> Ports<'_> {
+            Ports {
+                fs: &self.fs,
+                codec: &self.codec,
+                hasher: &self.hasher,
+                verifier: &self.verifier,
+                clock: &self.clock,
+                rng: &self.rng,
+                integration: &self.integration,
+                publisher: &self.publisher,
+                protect: &self.protect,
+                policy: &self.policy,
+                registrar: &self.registrar,
+                process: &self.process,
+                scheme: MachineScheme::MACOS,
+            }
+        }
+
+        /// The base of the copy and its verification over the machine home `home`.
+        pub fn base<'a>(&'a self, home: &'a Path) -> super::Base<'a> {
+            super::Base::of(&self.ports(), home)
+        }
+    }
+
+    impl Default for Adapters {
+        fn default() -> Self {
+            Adapters::new()
+        }
+    }
+
+    /// The engine over the macOS adapters, the live bundle going into `apps_dir`.
+    pub struct MacInstaller {
+        /// The apps folder.
+        pub apps_dir: PathBuf,
+    }
+
+    impl Installer for MacInstaller {
+        fn install(&self, home: &Path, staged: &Staged<'_>) -> Result<Installed, Kind> {
+            install_staged_in(Adapters::new().ports(), home, Some(&self.apps_dir), staged)
+        }
+    }
+
+    /// The engine's `repair` over the macOS adapters.
+    pub struct MacRepairer;
+
+    impl Repairer for MacRepairer {
+        fn repair(&self, root: &Path) -> Result<lunepack::Version, Kind> {
+            let adapters = Adapters::new();
+            let engine = Engine::open(adapters.ports(), root)
+                .map_err(|e| kind_of(lunepack_core::engine::MachineOpError::from(e)))?;
+            engine.repair().map_err(kind_of)
+        }
+    }
+
+    /// `lstat` through the standard library.
+    pub struct MacStat;
+
+    impl Stat for MacStat {
+        fn lstat(&self, path: &Path) -> io::Result<Option<StatFacts>> {
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) => {
+                    let kind = if meta.file_type().is_symlink() {
+                        FileKind::Symlink
+                    } else if meta.is_dir() {
+                        FileKind::Dir
+                    } else if meta.is_file() {
+                        FileKind::File
+                    } else {
+                        FileKind::Other
+                    };
+                    Ok(Some(StatFacts {
+                        kind,
+                        uid: meta.uid(),
+                        mode: meta.mode(),
+                    }))
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1927,6 +2363,7 @@ mod tests {
                 version,
                 service,
                 (TARGET, "app.exe", lunepack_core::SERVICE_FILE),
+                1000,
             )
         }
 
@@ -1943,6 +2380,25 @@ mod tests {
                     "app",
                     lunepack_core::layout::SERVICE_FILE_UNIX,
                 ),
+                1000,
+            )
+        }
+
+        /// A macOS payload file (FORMAT.md 14.4: the payload and trailer without a runtime part),
+        /// as the installer package places it; `file` holds exactly its bytes.
+        #[cfg(unix)]
+        fn payload_file(version: &str, service: bool) -> Built {
+            Built::build(
+                0,
+                0,
+                version,
+                service,
+                (
+                    Target::MacosAarch64,
+                    "Contents/MacOS/app",
+                    "Contents/MacOS/lunepack-service",
+                ),
+                0,
             )
         }
 
@@ -1954,6 +2410,7 @@ mod tests {
             version: &str,
             service: bool,
             (target, entry, service_file): (Target, &str, &str),
+            runtime_len: usize,
         ) -> Built {
             let fx = ChainFixture::fake();
             let root: TrustedRoot = fx.trusted_root(1, 1, &[root_seed]);
@@ -1974,7 +2431,12 @@ mod tests {
             if service {
                 pack.file(fx.hasher, service_file, b"service", CodecId::Lzma2);
             }
-            pack.file(fx.hasher, UPDATE_CONFIG_FILE, &config, CodecId::Stored);
+            pack.file(
+                fx.hasher,
+                lunepack_core::update_config::config_path(target),
+                &config,
+                CodecId::Stored,
+            );
             let keys = fx.envelope(
                 PayloadKind::Keys,
                 &fx.keyset_document(1, 1, None, 1, &[5]).to_payload(),
@@ -1985,7 +2447,7 @@ mod tests {
                 &fx.manifest_document(version, target, &pack).to_payload(),
                 &[5],
             );
-            let mut file = vec![0x4du8; 1000];
+            let mut file = vec![0x4du8; runtime_len];
             let place = |file: &mut Vec<u8>, bytes: &[u8]| {
                 while !file.len().is_multiple_of(8) {
                     file.push(0);
@@ -3937,6 +4399,7 @@ mod tests {
                     "app",
                     lunepack_core::layout::SERVICE_FILE_UNIX,
                 ),
+                1000,
             )
         }
 
@@ -4456,6 +4919,581 @@ mod tests {
                 Machine::Absent
             );
             let _ = app();
+        }
+    }
+
+    // ---- the macOS installer package's mode (M11-D8) ------------------------------------------
+
+    #[cfg(unix)]
+    mod pkg {
+        use super::*;
+
+        use std::collections::BTreeMap;
+
+        const HOME: &str = "/Library/Application Support/lunepack";
+        const ID: &str = lunepack_testkit::SUITE_APP_ID;
+
+        /// `lstat` answers a test sets.
+        #[derive(Default)]
+        struct FakeStat(Mutex<BTreeMap<PathBuf, StatFacts>>);
+
+        impl FakeStat {
+            fn set(&self, path: &Path, kind: FileKind, uid: u32, mode: u32) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert(path.to_path_buf(), StatFacts { kind, uid, mode });
+            }
+
+            fn forget(&self, path: &Path) {
+                self.0.lock().unwrap().remove(path);
+            }
+        }
+
+        impl Stat for FakeStat {
+            fn lstat(&self, path: &Path) -> io::Result<Option<StatFacts>> {
+                Ok(self.0.lock().unwrap().get(path).copied())
+            }
+        }
+
+        /// The engine over the host's fakes, the bundle going into `/Applications`.
+        struct MacInstaller<'h>(&'h Host);
+
+        impl Installer for MacInstaller<'_> {
+            fn install(&self, home: &Path, staged: &Staged<'_>) -> Result<Installed, Kind> {
+                install_staged_in(
+                    self.0.ports(),
+                    home,
+                    Some(&abs_path("/Applications")),
+                    staged,
+                )
+            }
+        }
+
+        /// A repair that records where it ran.
+        #[derive(Default)]
+        struct Repairs(Mutex<Vec<PathBuf>>);
+
+        impl Repairer for Repairs {
+            fn repair(&self, root: &Path) -> Result<lunepack::Version, Kind> {
+                self.0.lock().unwrap().push(root.to_path_buf());
+                Ok(lunepack::Version::parse("1.0.0").unwrap())
+            }
+        }
+
+        /// A machine home as the installer package leaves it, with every port faked.
+        struct Mac {
+            host: Host,
+            stat: FakeStat,
+            repairs: Repairs,
+            leaf: PathBuf,
+            payload: Vec<u8>,
+        }
+
+        impl Mac {
+            fn new(id: &str, payload: &Built) -> Mac {
+                let host = Host::under(HOME, MachineScheme::MACOS);
+                host.mem.create_dir_all(&abs_path("/Applications")).unwrap();
+                let stat = FakeStat::default();
+                let dir = |p: &Path, mode: u32| stat.set(p, FileKind::Dir, 0, mode);
+                for ancestor in host.home.ancestors().filter(|a| a.parent().is_some()) {
+                    dir(ancestor, 0o755);
+                }
+                dir(Path::new("/"), 0o755);
+                host.protect.mark(&host.home, DirClass::MachineTree);
+                let installer_dir = host.home.join(INSTALLER_DIR);
+                let leaf = installer_dir.join(id);
+                host.protect
+                    .create_dir(&installer_dir, DirClass::AdminOnly)
+                    .unwrap();
+                host.protect.create_dir(&leaf, DirClass::AdminOnly).unwrap();
+                dir(&installer_dir, 0o700);
+                dir(&leaf, 0o700);
+                let mac = Mac {
+                    host,
+                    stat,
+                    repairs: Repairs::default(),
+                    leaf,
+                    payload: payload.file.clone(),
+                };
+                mac.place_payload();
+                let runtime = mac.leaf.join(PKG_RUNTIME);
+                let mut w = mac.host.mem.create_new(&runtime).unwrap();
+                w.write_all(b"runtime").unwrap();
+                mac.stat.set(&runtime, FileKind::File, 0, 0o700);
+                mac
+            }
+
+            fn place_payload(&self) {
+                let path = self.leaf.join(PKG_PAYLOAD);
+                let mut w = self.host.mem.create_new(&path).unwrap();
+                w.write_all(&self.payload).unwrap();
+                self.stat.set(&path, FileKind::File, 0, 0o600);
+            }
+
+            fn image(&self) -> PathBuf {
+                self.leaf.join(PKG_RUNTIME)
+            }
+
+            fn run_as(&self, standing: Standing, image: &Path) -> Kind {
+                let installer = MacInstaller(&self.host);
+                let (events, _) = collecting();
+                run_pkg_mode(
+                    &PkgRun {
+                        base: self.host.base(),
+                        stat: &self.stat,
+                        installer: &installer,
+                        repairer: &self.repairs,
+                        standing,
+                        image,
+                        kernel_path: &|p| Ok(p.to_path_buf()),
+                        scheme: MachineScheme::MACOS,
+                    },
+                    &events,
+                )
+            }
+
+            fn run(&self) -> Kind {
+                self.run_as(Standing::Admin, &self.image())
+            }
+
+            fn leaf_exists(&self) -> bool {
+                self.host
+                    .mem
+                    .symlink_metadata(&self.leaf)
+                    .unwrap()
+                    .is_some()
+            }
+
+            /// Nothing was installed or staged.
+            fn assert_untouched(&self) {
+                assert!(self.host.payload_dirs().is_empty());
+                assert_eq!(self.host.machine(), Machine::Absent);
+                assert!(self.repairs.0.lock().unwrap().is_empty());
+                let apps = lunepack_core::Fs::list_dir(&self.host.mem, &abs_path("/Applications"))
+                    .unwrap();
+                assert!(apps.is_empty(), "{apps:?}");
+            }
+        }
+
+        fn mac() -> Mac {
+            Mac::new(ID, &Built::payload_file("1.0.0", true))
+        }
+
+        #[test]
+        fn the_package_installs_from_its_payload_and_removes_it() {
+            let mac = mac();
+            assert_eq!(mac.run(), Kind::Ok);
+            assert!(!mac.leaf_exists(), "the folder the package placed is gone");
+            assert!(
+                mac.host.payload_dirs().is_empty(),
+                "the staging copy is gone"
+            );
+            let root = mac.host.home.join(ID);
+            assert_eq!(
+                mac.host.machine(),
+                Machine::Present(root, Some(lunepack::Version::parse("1.0.0").unwrap()))
+            );
+            // The live bundle is in the apps folder, named after the app; the staging folder was
+            // made admin-only under the machine home, the `.installer` folders only checked.
+            assert!(
+                mac.host
+                    .mem
+                    .symlink_metadata(&abs_path("/Applications/Hello.app"))
+                    .unwrap()
+                    .is_some()
+            );
+            let made = mac.host.protect.created();
+            let staging: Vec<_> = made
+                .iter()
+                .filter(|(p, _)| {
+                    p.parent() == Some(mac.host.home.as_path())
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with(PAYLOAD_PREFIX))
+                })
+                .collect();
+            assert_eq!(staging.len(), 1, "{made:?}");
+            assert_eq!(staging[0].1, DirClass::AdminOnly);
+            assert!(mac.repairs.0.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_standard_users_process_or_an_image_elsewhere_changes_nothing() {
+            let mac = mac();
+            // Not root: usage, and the folder stays (nothing is trusted yet).
+            assert_eq!(mac.run_as(Standing::Standard, &mac.image()), Kind::Usage);
+            let home = mac.host.home.clone();
+            let elsewhere = [
+                PathBuf::from("/tmp/x/lunepack-runtime"),
+                home.join(".installer")
+                    .join(ID)
+                    .join("lunepack-setup.payload"),
+                home.join(".other").join(ID).join(PKG_RUNTIME),
+                home.join(".installer").join(PKG_RUNTIME),
+                home.join(".installer")
+                    .join(ID)
+                    .join("sub")
+                    .join(PKG_RUNTIME),
+                home.join(".installer").join("Not An Id").join(PKG_RUNTIME),
+                home.join(".installer").join("").join(PKG_RUNTIME),
+                home.clone(),
+            ];
+            for image in elsewhere {
+                assert_eq!(
+                    mac.run_as(Standing::Admin, &image),
+                    Kind::Usage,
+                    "{image:?}"
+                );
+            }
+            assert!(mac.leaf_exists());
+            mac.assert_untouched();
+        }
+
+        #[test]
+        fn the_kernels_name_of_the_image_must_be_the_images() {
+            let mac = mac();
+            let installer = MacInstaller(&mac.host);
+            let (events, _) = collecting();
+            let go = |named: &dyn Fn(&Path) -> io::Result<PathBuf>| {
+                run_pkg_mode(
+                    &PkgRun {
+                        base: mac.host.base(),
+                        stat: &mac.stat,
+                        installer: &installer,
+                        repairer: &mac.repairs,
+                        standing: Standing::Admin,
+                        image: &mac.image(),
+                        kernel_path: named,
+                        scheme: MachineScheme::MACOS,
+                    },
+                    &events,
+                )
+            };
+            // Another name for the same path (a link, a case or a normalization difference): no.
+            assert_eq!(
+                go(&|p| Ok(p.with_file_name("Lunepack-Runtime"))),
+                Kind::Usage
+            );
+            assert_eq!(
+                go(&|_| Err(io::Error::from(io::ErrorKind::NotFound))),
+                Kind::Fs
+            );
+            assert!(mac.leaf_exists());
+            mac.assert_untouched();
+        }
+
+        #[test]
+        fn a_folder_that_is_not_protected_is_not_protected_and_nothing_is_removed_or_written() {
+            type Break = Box<dyn Fn(&Mac)>;
+            let cases: [(&str, Break); 8] = [
+                (
+                    "the machine home",
+                    Box::new(|m| m.host.protect.set_unprotected(&m.host.home, true)),
+                ),
+                (
+                    "an ancestor without search for others",
+                    Box::new(|m| {
+                        m.stat.set(Path::new("/Library"), FileKind::Dir, 0, 0o750);
+                    }),
+                ),
+                (
+                    "the home without search for others",
+                    Box::new(|m| m.stat.set(&m.host.home, FileKind::Dir, 0, 0o700)),
+                ),
+                (
+                    "an ancestor that is a link",
+                    Box::new(|m| {
+                        m.stat
+                            .set(Path::new("/Library"), FileKind::Symlink, 0, 0o755);
+                    }),
+                ),
+                (
+                    "an ancestor that cannot be read",
+                    Box::new(|m| m.stat.forget(Path::new("/Library/Application Support"))),
+                ),
+                (
+                    ".installer",
+                    Box::new(|m| {
+                        m.host
+                            .protect
+                            .set_unprotected(&m.host.home.join(INSTALLER_DIR), true);
+                    }),
+                ),
+                (
+                    "the app's folder",
+                    Box::new(|m| m.host.protect.set_unprotected(&m.leaf, true)),
+                ),
+                (
+                    "the app's folder, marked as another class",
+                    Box::new(|m| m.host.protect.mark(&m.leaf, DirClass::MachineTree)),
+                ),
+            ];
+            for (what, spoil) in cases {
+                let mac = mac();
+                spoil(&mac);
+                assert_eq!(mac.run(), Kind::NotProtected, "{what}");
+                assert!(
+                    mac.leaf_exists(),
+                    "{what}: nothing under it is trusted or removed"
+                );
+                mac.assert_untouched();
+            }
+        }
+
+        #[test]
+        fn a_payload_file_that_is_not_root_s_regular_file_is_refused_before_it_is_read() {
+            type Break = Box<dyn Fn(&Mac)>;
+            let cases: [(&str, Break); 5] = [
+                (
+                    "a link",
+                    Box::new(|m| {
+                        m.stat
+                            .set(&m.leaf.join(PKG_PAYLOAD), FileKind::Symlink, 0, 0o600)
+                    }),
+                ),
+                (
+                    "another user's",
+                    Box::new(|m| {
+                        m.stat
+                            .set(&m.leaf.join(PKG_PAYLOAD), FileKind::File, 501, 0o600)
+                    }),
+                ),
+                (
+                    "writable by its group",
+                    Box::new(|m| {
+                        m.stat
+                            .set(&m.leaf.join(PKG_PAYLOAD), FileKind::File, 0, 0o620)
+                    }),
+                ),
+                (
+                    "writable by anyone",
+                    Box::new(|m| {
+                        m.stat
+                            .set(&m.leaf.join(PKG_PAYLOAD), FileKind::File, 0, 0o666)
+                    }),
+                ),
+                (
+                    "a directory",
+                    Box::new(|m| {
+                        m.stat
+                            .set(&m.leaf.join(PKG_PAYLOAD), FileKind::Dir, 0, 0o700)
+                    }),
+                ),
+            ];
+            for (what, spoil) in cases {
+                let mac = mac();
+                spoil(&mac);
+                assert_eq!(mac.run(), Kind::NotProtected, "{what}");
+                assert!(
+                    !mac.leaf_exists(),
+                    "{what}: the folder the package placed goes"
+                );
+                mac.assert_untouched();
+            }
+            // Nothing there at all.
+            let mac = mac();
+            mac.stat.forget(&mac.leaf.join(PKG_PAYLOAD));
+            assert_eq!(mac.run(), Kind::NotProtected);
+            assert!(!mac.leaf_exists());
+            mac.assert_untouched();
+        }
+
+        #[test]
+        fn a_payload_that_is_not_a_signed_payload_of_that_app_is_refused_and_nothing_stays() {
+            // Not a payload file at all.
+            let mut mac = mac();
+            mac.payload = b"not a payload".to_vec();
+            lunepack_core::Fs::remove_file(&mac.host.mem, &mac.leaf.join(PKG_PAYLOAD)).unwrap();
+            mac.place_payload();
+            assert_eq!(mac.run(), Kind::Verify);
+            assert!(!mac.leaf_exists());
+            mac.assert_untouched();
+
+            // Not signed under the trailer's root.
+            let forged = Built::build(
+                0,
+                9,
+                "1.0.0",
+                true,
+                (
+                    Target::MacosAarch64,
+                    "Contents/MacOS/app",
+                    "Contents/MacOS/lunepack-service",
+                ),
+                0,
+            );
+            let mac = Mac::new(ID, &forged);
+            assert_eq!(mac.run(), Kind::Verify);
+            assert!(!mac.leaf_exists());
+            mac.assert_untouched();
+
+            // A flipped byte in each part.
+            let good = Built::payload_file("1.0.0", true);
+            for part in [good.trailer.keys, good.trailer.manifest, good.trailer.pack] {
+                let mut b = Built::payload_file("1.0.0", true);
+                b.file[(part.offset + part.length / 2) as usize] ^= 1;
+                let mac = Mac::new(ID, &b);
+                assert_eq!(mac.run(), Kind::Verify, "{part:?}");
+                assert!(!mac.leaf_exists());
+                mac.assert_untouched();
+            }
+
+            // The folder names another app than the payload does.
+            let mac = Mac::new("org.example.other", &Built::payload_file("1.0.0", true));
+            assert_eq!(mac.run(), Kind::Verify);
+            assert!(!mac.leaf_exists());
+            mac.assert_untouched();
+
+            // No service in the release: it installs per user only, and the package fails.
+            let mac = Mac::new(ID, &Built::payload_file("1.0.0", false));
+            assert_eq!(mac.run(), Kind::PerMachineUnavailable);
+            assert!(!mac.leaf_exists());
+            mac.assert_untouched();
+        }
+
+        #[test]
+        fn an_install_of_the_same_version_is_repaired_and_another_version_fails_visibly() {
+            let mac = mac();
+            assert_eq!(mac.run(), Kind::Ok);
+            let root = mac.host.home.join(ID);
+            // The package of the installed version again: repaired, nothing else done.
+            mac.place_payload_again(&Built::payload_file("1.0.0", true));
+            assert_eq!(mac.run(), Kind::Ok);
+            assert_eq!(*mac.repairs.0.lock().unwrap(), vec![root.clone()]);
+            assert!(!mac.leaf_exists());
+            assert!(mac.host.payload_dirs().is_empty());
+            // Another version's package: `already_installed`, the record is the old one.
+            mac.place_payload_again(&Built::payload_file("2.0.0", true));
+            assert_eq!(mac.run(), Kind::AlreadyInstalled);
+            assert!(!mac.leaf_exists());
+            assert_eq!(
+                mac.host.machine(),
+                Machine::Present(root, Some(lunepack::Version::parse("1.0.0").unwrap()))
+            );
+            assert_eq!(mac.repairs.0.lock().unwrap().len(), 1);
+        }
+
+        impl Mac {
+            /// Puts the package's folder and files back, with `payload` (a later run of a package).
+            fn place_payload_again(&self, payload: &Built) {
+                use lunepack_core::Fs as _;
+                let installer_dir = self.host.home.join(INSTALLER_DIR);
+                if self
+                    .host
+                    .mem
+                    .symlink_metadata(&installer_dir)
+                    .unwrap()
+                    .is_none()
+                {
+                    self.host
+                        .protect
+                        .create_dir(&installer_dir, DirClass::AdminOnly)
+                        .unwrap();
+                }
+                self.host
+                    .protect
+                    .create_dir(&self.leaf, DirClass::AdminOnly)
+                    .unwrap();
+                let runtime = self.leaf.join(PKG_RUNTIME);
+                self.host.mem.create_new(&runtime).unwrap();
+                self.stat.set(&runtime, FileKind::File, 0, 0o700);
+                let path = self.leaf.join(PKG_PAYLOAD);
+                let mut w = self.host.mem.create_new(&path).unwrap();
+                w.write_all(&payload.file).unwrap();
+                self.stat.set(&path, FileKind::File, 0, 0o600);
+            }
+        }
+
+        #[test]
+        fn a_foreign_entry_at_the_bundles_name_is_never_replaced() {
+            use lunepack_core::Fs as _;
+            let mac = mac();
+            let foreign = abs_path("/Applications/Hello.app");
+            mac.host.mem.create_dir_all(&foreign).unwrap();
+            let mut marker = mac.host.mem.create_new(&foreign.join("mine")).unwrap();
+            marker.write_all(b"someone else's").unwrap();
+            drop(marker);
+            // FORMAT 17.1: the bundle takes the app's fallback name; the entry that was there is
+            // untouched.
+            assert_eq!(mac.run(), Kind::Ok);
+            assert!(
+                mac.host
+                    .mem
+                    .symlink_metadata(&abs_path("/Applications/Hello (org.example.hello).app"))
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                mac.host.mem.read_capped(&foreign.join("mine"), 64).unwrap(),
+                b"someone else's"
+            );
+            assert!(!mac.leaf_exists());
+        }
+
+        #[test]
+        fn a_cut_off_staging_folder_under_the_macos_home_is_swept_and_a_live_one_stays() {
+            use lunepack_core::Fs as _;
+            let host = Host::under(HOME, MachineScheme::MACOS);
+            let folder = |n: u8| host.home.join(format!("{PAYLOAD_PREFIX}{}", hex(&[n; 16])));
+            for n in [1u8, 2] {
+                host.mem.create_dir_all(&folder(n)).unwrap();
+                drop(host.mem.create_new(&folder(n).join(PAYLOAD_LOCK)).unwrap());
+            }
+            let held = host
+                .mem
+                .try_lock(&folder(2).join(PAYLOAD_LOCK))
+                .unwrap()
+                .unwrap();
+            // The package's own folder and another app's are never looked at.
+            let installer = host.home.join(INSTALLER_DIR);
+            host.mem.create_dir_all(&installer).unwrap();
+            sweep_payload_dirs(&host.base());
+            let exists = |p: &Path| host.mem.symlink_metadata(p).unwrap().is_some();
+            assert!(!exists(&folder(1)));
+            assert!(exists(&folder(2)));
+            assert!(exists(&installer));
+            drop(held);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn the_package_is_opened_by_the_systems_open_and_nothing_else() {
+            use lunepack_testkit::ChildScript;
+            let pkg = abs_path(
+                "/Applications/Install Hello.app/Contents/Resources/lunepack-all-users.pkg",
+            );
+            for (script, want) in [
+                (ChildScript::exits(2, lunepack::ExitKind::Success), true),
+                (ChildScript::exits(0, lunepack::ExitKind::Failure(1)), false),
+                (ChildScript::exits(0, lunepack::ExitKind::Signal(9)), false),
+            ] {
+                let process = FakeProcess::new(abs_path("/x"));
+                process.script_child(script);
+                let h = PackageHandOff {
+                    process: &process,
+                    pkg: Some(&pkg),
+                };
+                assert_eq!(open_package(&h), want);
+                let spawns = process.spawns();
+                assert_eq!(spawns.len(), 1);
+                assert!(!spawns[0].detached);
+                assert_eq!(spawns[0].program, PathBuf::from("/usr/bin/open"));
+                assert_eq!(spawns[0].args, [pkg.as_os_str().to_owned()]);
+            }
+            // A spawn that fails, and an app with no package: nothing is opened.
+            let process = FakeProcess::new(abs_path("/x"));
+            process.fail_spawns(Some(lunepack_core::ProcessErrorKind::NotFound));
+            assert!(!open_package(&PackageHandOff {
+                process: &process,
+                pkg: Some(&pkg)
+            }));
+            let process = FakeProcess::new(abs_path("/x"));
+            assert!(!open_package(&PackageHandOff {
+                process: &process,
+                pkg: None
+            }));
+            assert!(process.spawns().is_empty());
         }
     }
 }

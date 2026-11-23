@@ -34,6 +34,9 @@ fn machine_install_is_not_a_mode_of_an_ordinary_runtime() {
     let mut cases: Vec<Vec<&str>> = vec![
         [&["machine-install"][..], &events[..]].concat(),
         vec!["machine-install"],
+        // macOS has this mode, for root only; a process that is not root's, and every other
+        // system, answer with the same fixed line.
+        vec!["machine-install", "--pkg"],
         vec!["--all-users"],
         vec!["--all-users", "--silent"],
         vec!["setup", "--all-users"],
@@ -257,8 +260,9 @@ fn callers_of(text: &str, needle: &str) -> Vec<String> {
 }
 
 /// M11-D9, P3: what is installed from the setup's own image is installed by exactly the two Linux
-/// root modes (the elevated copy and `--all-users` as root, both of a process whose euid is 0) and,
-/// in step 10, the macOS `--pkg` mode: no other function constructs that trust.
+/// root modes (the elevated copy and `--all-users` as root, both of a process whose euid is 0) and
+/// the macOS `--pkg` mode, which stages only after its euid, image, app id and folder checks
+/// (`run_pkg_mode` -> `pkg_install`): no other function constructs that trust.
 #[cfg(unix)]
 #[test]
 fn only_the_root_modes_install_from_the_own_image() {
@@ -271,7 +275,7 @@ fn only_the_root_modes_install_from_the_own_image() {
     // The one constructor of the trust is called by the shared install and nothing else.
     assert_eq!(
         callers_of(&machine, "stage_payload_own_image("),
-        ["install_all_own_image"]
+        ["install_all_own_image", "pkg_install"]
     );
     for (name, text) in [
         ("main.rs", &main),
@@ -302,4 +306,69 @@ fn only_the_root_modes_install_from_the_own_image() {
             && finishers.iter().any(|f| f == "run_stdout_mode"),
         "{finishers:?}"
     );
+}
+
+/// M11-D8: the macOS `--pkg` mode reads no environment variable, no working directory and nothing
+/// of a user's profile, takes no argument but its flag, and starts no window; its checks come
+/// before `stage_payload_own_image` is reached.
+#[cfg(unix)]
+#[test]
+fn the_pkg_mode_has_no_ambient_input_and_checks_before_it_stages() {
+    let main = source("main.rs");
+    let needles = [
+        ["std::", "env"].concat(),
+        ["env", "::var"].concat(),
+        ["temp", "_dir"].concat(),
+        ["current", "_dir"].concat(),
+        ["data", "_home("].concat(),
+        ["ui", "_for("].concat(),
+        ["UiHost", "::start"].concat(),
+        ["Platform", "::native"].concat(),
+        ["env", "::args"].concat(),
+    ];
+    let body = function_of(
+        &main,
+        "fn machine_pkg_mode() -> Kind {\n    use lunepack_core::Elevation as _;",
+    );
+    for needle in &needles {
+        assert!(
+            !body.contains(needle.as_str()),
+            "machine_pkg_mode mentions `{needle}`"
+        );
+    }
+    // The checks of `run_pkg_mode` come first, in this order, then `pkg_install` stages.
+    let machine = source("machine.rs");
+    let code = machine
+        .split("\n#[cfg(test)]\nmod tests")
+        .next()
+        .expect("code before the tests");
+    let run = &code[code.find("pub fn run_pkg_mode(").expect("run_pkg_mode")..];
+    let run = &run[..run.find("\nfn pkg_install(").expect("pkg_install")];
+    let order = [
+        "Standing::Standard",
+        "strip_prefix(home)",
+        "(run.kernel_path)(",
+        "DirClass::MachineTree",
+        "searchable(",
+        "DirClass::AdminOnly",
+        "pkg_install(run",
+        "remove_dir_all_nofollow(&leaf)",
+    ];
+    let mut at = 0;
+    for word in order {
+        let found = run[at..]
+            .find(word)
+            .unwrap_or_else(|| panic!("`{word}` out of order"));
+        at += found;
+    }
+    assert!(
+        !run.contains("stage_payload_own_image"),
+        "the checks stage nothing"
+    );
+    // And the payload file's own checks come before it is read.
+    let install = &code[code.find("\nfn pkg_install(").expect("pkg_install")..];
+    let trusted = install.find("f.uid == 0").expect("owner check");
+    let read = install.find("detect_payload_file(").expect("the read");
+    let stage = install.find("stage_payload_own_image(").expect("the stage");
+    assert!(trusted < read && read < stage);
 }
