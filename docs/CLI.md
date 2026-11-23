@@ -379,7 +379,8 @@ the whole `--memory-budget-mib` is not run: the file keeps its frame and its rep
 earlier releases and the feeds in the directory; given those, the output is byte for byte the same
 for any `--jobs`. A large changed file costs about 20 s per candidate at a 64 MiB window (up to
 about a minute at the cap), with up to two candidates per base and three bases by default; lower
-`--deltas` to pack faster.
+`--deltas` to pack faster. Measured on real 30 to 32 MB executables with one base and the defaults, the whole
+`pack` took 41 to 68 s and peaked at about 1.8 GB of process memory (DECISIONS.md D8).
 
 Upload order: the pack and the delta files first, then the manifest, then the feed (`feed add`), so a
 client never sees a manifest whose files are missing.

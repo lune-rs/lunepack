@@ -91,7 +91,7 @@ With `--json`, stdout holds only UTF-8 JSON Lines, one object per line, each wit
 `progress`: `phase` is one of `check`, `scan`, `download`, `stage` and, in a macOS adoption, `adopt` (and, in the runtime's own log,
 `install`, `wait`, `apply`, `launch`, `confirm`, `rollback`, `uninstall`); `done` and `total` are
 non-negative integers (bytes, 0 when unknown); `file` is null or `{path, done, total, source}` with
-`path` the signed relative path and `source` one of `unchanged`, `range`, `full_pack`. At most ten
+`path` the signed relative path and `source` one of `unchanged`, `range`, `full_pack` and (M12, additive within schema 1) `patch`, the file rebuilt from a delta patch. A `scan` phase line may also carry `patch` while the installed file that a patch starts from is hashed; which file ended as a patch is told by the `stage` lines. At most ten
 progress lines a second are written, and every phase shows. Without `--json`, progress is at most one
 line a second on stderr and the final line is one human line on stdout (an error goes to stderr).
 

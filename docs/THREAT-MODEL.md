@@ -4,7 +4,7 @@ Status: **draft**, awaiting approval together with `docs/FORMAT.md`.
 
 What lunepack's update and install path defends against, and what it does not. The format rules
 referred to here are in `docs/FORMAT.md`; the decisions in `docs/DECISIONS.md` (D7, D17, D21, D24,
-D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12, M7-D1 to M7-D22, M8-D1 to M8-D20, M10-D1 to M10-D20, M11-D1 to M11-D16).
+D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12, M7-D1 to M7-D22, M8-D1 to M8-D20, M10-D1 to M10-D20, M11-D1 to M11-D16, M12-D1 to M12-D11).
 
 ## Assets
 
@@ -1135,6 +1135,57 @@ Background Task Management entry are unproven, and the scripts themselves are re
 FORMAT.md 20.7) are left; the uninstalling user's is removed. On Linux the socket file `/run/lunepack/<app id>.sock`
 goes with the units; lunepack only reads the policy file, an administrator's.
 
+## Delta patches (M12)
+
+A patch rebuilds a changed file from the client's own copy of the earlier file (the base) and a small
+signed-by-reference patch (`docs/FORMAT.md` 9.3; D8, M12-D1 to M12-D7). It adds three things an attacker could
+aim at: a new field set in the manifest, a decoder fed with bytes of a delta file, and, on a per-machine install, a
+new message to the privileged engine.
+
+- **Same trust as a frame.** The manifest's `deltas` are inside the signed manifest, and the delta file is bound by
+  its size and SHA-256 there; a patch is bound by its own offset, length and SHA-256. Feeding the patch decoder
+  crafted input needs a release key (class 2) or the publisher (class 6), exactly as for a frame (Decoder
+  exposure above). The decoder is the one `lzma-rust2` decoder of the frames; no new codec or dependency.
+- **Hash before decode, base before use.** In order: exactly the signed `length` bytes of the patch are read; the
+  patch's hash is checked before a decoder sees a byte; the base file must have exactly `base_size` bytes and the
+  signed SHA-256 before it is used (the digest pass that finds the candidates reads only a regular file of that size, reached
+  through real directories, and follows no symlink); the output is capped at the entry's size, the stream must
+  be consumed exactly, and the output hash is checked before the file is placed. Any failure discards the output and
+  the file is fetched from its frame; a failed patch is never retried in the same call. A patch never changes
+  which bytes are installed: only the signed entry hash does.
+- **The window is a memory bound set by the release key.** The LZMA2 window of a patch is not a field; it is the
+  base size plus the file size, rounded up to 4 KiB, and a reader checks it, at most 128 MiB, from the signed sizes
+  before allocating. That is eight times the 16 MiB frame dictionary cap, so a hostile release key holder can make a
+  client allocate more per job than before (class 2 is the only way to it). Staging charges a patch job
+  `length + base_size + decoder memory + 256 KiB` against the staging budget, with the decoder counted as two windows
+  plus the codec's constant, and a job over the whole budget runs only when nothing else does, as a large frame does;
+  a measurement test of the codec crate keeps the charge above what the decoder really allocates.
+- **A patch is only as good as the base on disk.** The client hashes its own current file; a user-writable copy that
+  was changed simply fails the base check and falls back. For a per-user install this is the user's own tree
+  (class 4 changes nothing they could not change anyway). For a machine install, a patch is decoded by the
+  privileged engine against the engine's own current tree under `R` (root- or SYSTEM-owned, protected by the
+  existing rule, M10, M11), never against a path or bytes from the client.
+- **Protocol version 2.** The only new message is `put{kind:"patch"}`. The engine accepts it only when the verified
+  manifest has a delta whose `from` equals the machine record's current version text and that lists a patch of
+  exactly that hash and size (`not_in_manifest` otherwise, `size_mismatch` for a wrong size, `malformed` for a repeat),
+  so a local user can upload only bytes the signed manifest already names, and an uploaded frame or pack always
+  wins over a patch. No message carries a file-system path, a base digest the client did not have from the manifest,
+  or a new error code. A version-1 session answers `malformed` to the new kind and ends; a version-2 client against a
+  version-1 service uploads no patch (cross-version contract, D28). What a local user can ask of the engine
+  stays bounded by the signed patches and the staging memory budget (class 5; the same budget and
+  one-connection rule as before).
+- **The packer.** `lunepack pack` reads earlier releases from the release directory, which it trusts as it trusts
+  the directory it writes to: every base is opened through the verification `verify` uses and its pack must match
+  its manifest, a base that fails is skipped with a report line, and every patch is round-tripped through the
+  client's decoder before it is placed. The delta set depends on `--memory-budget-mib` (a candidate over the whole
+  budget is not run), which changes bandwidth, never correctness.
+- **Fuzz surfaces for M13.** Three new inputs belong to the libFuzzer run: the manifest's `deltas` parser (the
+  `manifest` target; seeds `ok-two-deltas`, `ok-delta-from-build-metadata`, `bad-delta-patch-stored`,
+  `bad-delta-window-over-128-mib` replay in the gate), the patch decoder through `Codec::decode_patch` and
+  `decode_patch_verified` (a target with a base and a patch as inputs; not yet written), and protocol version 2's
+  `put` (the `service` target; seeds `ok-client-v2-hello`, `ok-server-v2-put-patch`, `bad-server-v1-put-patch`).
+  libFuzzer itself has not run for any of them.
+
 ## Denial-of-service bounds
 
 | Resource | Bound |
@@ -1147,6 +1198,7 @@ goes with the units; lunepack only reads the policy file, an administrator's.
 | Range requests | one at a time; at most 64 runs, else the full pack; a `200` to a Range request becomes the full-pack download, never a second request (M4-D8) |
 | Install-state records | at most 1 MiB each; at most three kept after a commit |
 | Decoder memory | the signed dictionary per LZMA2 stream, at most 16 MiB (three for BCJ2), checked before allocation; concurrent decoders limited by a memory budget |
+| Patch decoder memory (M12) | the window from the signed sizes, at most 128 MiB, checked before allocation; at most two windows plus the codec's constant per patch, charged to the same budget; a patch's bytes are read only to the signed `length` and hashed before decoding |
 | Decoder output | exactly the signed size; decoding stops as soon as it would exceed it |
 | Root walk | each step needs signatures from both roots, so its length is bounded by real rotations; a check also stops after 1024 steps |
 | Freeze | feed and key-set expiry turn a silent freeze into a reported error |
