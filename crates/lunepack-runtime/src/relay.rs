@@ -24,8 +24,10 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use lunepack::{Phase, Progress};
@@ -200,6 +202,124 @@ pub enum Attempt {
 pub trait EventConnector: Send + Sync {
     /// One attempt for the pipe of child `id`, waiting at most `wait` for it to appear.
     fn connect(&self, id: &str, wait: Duration) -> Result<Box<dyn Duplex>, Attempt>;
+}
+
+/// How many chunks the pump of a [`StreamConnector`] queues before it waits for the reader.
+const PUMP_QUEUE: usize = 8;
+
+/// The elevated child's standard output as the relay's channel (Linux, M11-D9): the one stream
+/// there is, taken by the first [`connect`](EventConnector::connect) and by no later one. There is
+/// no pipe to name or check: the stream is the pipe pkexec was started with, which only the child
+/// writes into. Its reads are bounded by a pump thread, so [`Duplex::set_read_deadline`] holds
+/// over a stream that has none; the pump goes on reading (and drops what it reads) after the
+/// relay has stopped, so a child that keeps writing is never stalled by a reader that gave up.
+pub struct StreamConnector {
+    stream: Mutex<Option<Box<dyn Read + Send>>>,
+}
+
+impl StreamConnector {
+    /// A connector over `stream`.
+    pub fn new(stream: Box<dyn Read + Send>) -> StreamConnector {
+        StreamConnector {
+            stream: Mutex::new(Some(stream)),
+        }
+    }
+}
+
+impl EventConnector for StreamConnector {
+    fn connect(&self, _id: &str, _wait: Duration) -> Result<Box<dyn Duplex>, Attempt> {
+        let stream = self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or(Attempt::Refused)?;
+        PumpedStream::start(stream)
+            .map(|p| Box::new(p) as Box<dyn Duplex>)
+            .ok_or(Attempt::Refused)
+    }
+}
+
+/// A [`Read`] stream behind a pump thread: chunks arrive through a bounded queue.
+struct PumpedStream {
+    chunks: Receiver<Vec<u8>>,
+    pending: Vec<u8>,
+    deadline: Option<Duration>,
+}
+
+impl PumpedStream {
+    fn start(mut stream: Box<dyn Read + Send>) -> Option<PumpedStream> {
+        let (tx, chunks) = mpsc::sync_channel::<Vec<u8>>(PUMP_QUEUE);
+        std::thread::Builder::new()
+            .name("relay-pump".to_owned())
+            .spawn(move || {
+                let mut buf = [0u8; 512];
+                let mut listening = true;
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if listening && tx.send(buf[..n].to_vec()).is_err() {
+                                // The reader is gone: read on, so the writer never blocks.
+                                listening = false;
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+            .ok()?;
+        Some(PumpedStream {
+            chunks,
+            pending: Vec::new(),
+            deadline: None,
+        })
+    }
+}
+
+impl Read for PumpedStream {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.pending.is_empty() {
+            let next = match self.deadline {
+                Some(wait) => self.chunks.recv_timeout(wait),
+                None => self
+                    .chunks
+                    .recv()
+                    .map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            match next {
+                Ok(chunk) => self.pending = chunk,
+                Err(RecvTimeoutError::Timeout) => return Err(ErrorKind::TimedOut.into()),
+                // The stream ended: what was queued before it has all been read.
+                Err(RecvTimeoutError::Disconnected) => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.pending.len());
+        out[..n].copy_from_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        Ok(n)
+    }
+}
+
+impl Write for PumpedStream {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(ErrorKind::Unsupported.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Duplex for PumpedStream {
+    fn set_read_deadline(&mut self, deadline: Option<Duration>) -> std::io::Result<()> {
+        self.deadline = deadline;
+        Ok(())
+    }
 }
 
 /// Reads the child's lines into `events` until the pipe ends, `done` is set and nothing more
@@ -671,5 +791,92 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(10));
         drop(child);
+    }
+    // ---- the child's standard output as the channel (Linux, M11-D9) ---------------------------
+
+    fn stream_pair() -> (StreamConnector, std::io::PipeWriter) {
+        let (reader, writer) = std::io::pipe().expect("a pipe");
+        (StreamConnector::new(Box::new(reader)), writer)
+    }
+
+    #[test]
+    fn a_child_stdout_relays_its_lines_and_ends_with_the_stream() {
+        let (events, seen) = collecting();
+        let (connector, mut writer) = stream_pair();
+        let writer = std::thread::spawn(move || {
+            for chunk in [
+                &b"phase inst"[..],
+                b"all
+progress install 10 20
+",
+            ] {
+                writer.write_all(chunk).unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let done = AtomicBool::new(false);
+        assert_eq!(relay(&connector, "stdout", &events, &done), 2);
+        writer.join().unwrap();
+        events.finish(Duration::from_secs(2));
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_stream_is_taken_once() {
+        let (connector, _writer) = stream_pair();
+        assert!(connector.connect("stdout", SLICE).is_ok());
+        assert!(matches!(
+            connector.connect("stdout", SLICE),
+            Err(Attempt::Refused)
+        ));
+    }
+
+    #[test]
+    fn a_malformed_line_ends_the_relay_and_the_writer_is_never_stalled() {
+        let (events, seen) = collecting();
+        let (connector, mut writer) = stream_pair();
+        // Well past a pipe's buffer after the bad line: a reader that stopped must not block it.
+        let child = std::thread::spawn(move || {
+            writer
+                .write_all(
+                    b"phase install
+/home/x/secret
+",
+                )
+                .unwrap();
+            for _ in 0..4096 {
+                writer.write_all(&[b'x'; 256]).unwrap();
+            }
+        });
+        let done = AtomicBool::new(false);
+        assert_eq!(relay(&connector, "stdout", &events, &done), 1);
+        child.join().expect("the writer finished every write");
+        events.finish(Duration::from_secs(2));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Event::phase(Phase::Install, None)]
+        );
+    }
+
+    #[test]
+    fn a_silent_stream_is_left_when_the_child_has_ended() {
+        let (events, _seen) = collecting();
+        let (connector, writer) = stream_pair();
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                done.store(true, Ordering::Release);
+            });
+            assert_eq!(relay(&connector, "stdout", &events, &done), 0);
+        });
+        drop(writer);
+    }
+
+    #[test]
+    fn the_stream_channel_cannot_be_written_to() {
+        let (connector, _writer) = stream_pair();
+        let mut channel = connector.connect("stdout", SLICE).expect("a channel");
+        assert!(channel.write(b"x").is_err());
     }
 }

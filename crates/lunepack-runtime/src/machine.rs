@@ -36,14 +36,19 @@ use lunepack_core::setup::{
 use lunepack_core::state::MachineStore;
 use lunepack_core::{
     AppId, Clock, ClockReading, Codec, DirClass, Elevated, Elevation, Fs, FsError, FsErrorKind,
-    Hasher, LayoutScheme, MachineLayout, PolicySource, Protect, ReadAt, Rng, RootChoice, Scope,
-    ServiceConnector, Standing, Verifier, resolve_root_scoped, root_valid_for_uninstall,
+    Hasher, LayoutScheme, MachineLayout, MachineScheme, PolicySource, Protect, ReadAt, Rng,
+    RootChoice, Scope, ServiceConnector, Standing, Verifier, resolve_root_scoped,
+    root_valid_for_uninstall,
 };
+#[cfg(unix)]
+use lunepack_core::{ElevationError, RollbackFloor, setup::verify_setup, verify_key_set};
 
 use crate::events::{Event, Events};
 use crate::modes::{
     Kind, MACHINE_INSTALL, MACHINE_REPAIR, MACHINE_UNINSTALL, MachineArgs, SetupArgs,
 };
+#[cfg(unix)]
+use crate::relay::StreamConnector;
 use crate::relay::{EventConnector, RelaySink};
 use crate::setup::Found;
 
@@ -174,18 +179,23 @@ pub enum Machine {
 /// The install of `app_id` named `name` under `home` (the Program Files known folder): looked up
 /// in the machine record only.
 pub fn find(fs: &dyn Fs, hasher: &dyn Hasher, home: &Path, app_id: &AppId, name: &str) -> Machine {
-    match resolve_root_scoped(
-        fs,
-        hasher,
-        home,
-        app_id,
-        name,
-        LayoutScheme::WINDOWS,
-        Scope::Machine,
-    ) {
+    find_in(fs, hasher, home, app_id, name, MachineScheme::WINDOWS)
+}
+
+/// [`find`] under the machine `scheme` of an OS: the layout names and the machine home differ per
+/// OS (M11-D6); the lookup is the same (the machine record only, never a per-user one).
+pub fn find_in(
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    home: &Path,
+    app_id: &AppId,
+    name: &str,
+    scheme: MachineScheme,
+) -> Machine {
+    match resolve_root_scoped(fs, hasher, home, app_id, name, scheme.view, Scope::Machine) {
         Ok(RootChoice::Existing(root)) => {
             let store = MachineStore {
-                dir: MachineLayout::new(&root).state_dir(),
+                dir: MachineLayout::with_scheme(&root, scheme).state_dir(),
                 app_id: app_id.clone(),
             };
             match store.load(fs, hasher) {
@@ -385,6 +395,38 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// What a payload is bound to before it is installed (M10-D4, M11-D9): the one place the trust of
+/// every machine install is decided. A payload is never installed from bytes no root-side check
+/// bound.
+#[derive(Clone, Copy)]
+enum PayloadTrust<'a> {
+    /// Windows: the digests the started image carries of its own payload; the trailer block must be
+    /// the one the anchor names before anything is copied.
+    Anchor(&'a SetupAnchor),
+    /// Unix: the bytes of the process's own executed image (Linux: the file `/proc/self/exe`
+    /// opened once) or of a root-only file reached through admin-only folders (macOS); verified
+    /// under the trailer's own root, over the copy.
+    #[cfg(unix)]
+    OwnImage,
+}
+
+impl<'a> PayloadTrust<'a> {
+    /// The anchor of the Windows trust, when this is it.
+    fn anchor(&self) -> Option<&'a SetupAnchor> {
+        match *self {
+            PayloadTrust::Anchor(anchor) => Some(anchor),
+            #[cfg(unix)]
+            PayloadTrust::OwnImage => None,
+        }
+    }
+}
+
+/// The payload's verification result and the key set's version (a floor of a first record).
+struct Bound {
+    setup: VerifiedSetup,
+    keyset_version: u64,
+}
+
 /// Copies the payload of the setup `found` into a new admin-only folder under the machine home and
 /// verifies it there against `anchor` (M10-D4): the trailer block, the key set and the manifest by
 /// their digests, then the whole payload as [`verify_setup_anchored`] does, over the copy only.
@@ -395,8 +437,49 @@ pub fn stage_payload<'a>(
     anchor: &SetupAnchor,
     events: &Events,
 ) -> Result<Staged<'a>, Kind> {
-    // The block must be the one the anchor names before anything is copied.
-    if anchor.is_placeholder() || base.hasher.sha256(&found.block) != anchor.trailer {
+    stage(base, found, PayloadTrust::Anchor(anchor), events)
+}
+
+/// [`stage_payload`] on a unix system (M11-D9, M11-D8): the payload is bound to the image it was
+/// read from. The caller guarantees that `found`'s file is the process's own executed image, opened
+/// once (Linux, `machine-install --events stdout` and `--all-users` as root), or a root-only file
+/// reached through admin-only folders (macOS, `machine-install --pkg`); this is the only
+/// constructor of the unix trust, and no other caller exists. The key set and the manifest are read
+/// once into memory, the pack is copied into the admin-only folder, and [`verify_setup`] (the key
+/// set under the trailer's root, the manifest, the whole pack, the update config) runs over exactly
+/// those bytes. A payload not signed under the trailer's root is [`Kind::Verify`] with no folder
+/// left.
+#[cfg(unix)]
+pub fn stage_payload_own_image<'a>(
+    base: &Base<'a>,
+    found: &Found,
+    events: &Events,
+) -> Result<Staged<'a>, Kind> {
+    stage(base, found, PayloadTrust::OwnImage, events)
+}
+
+/// [`stage_payload_own_image`], then the engine's first install of what it staged (M11-D9).
+#[cfg(unix)]
+pub fn install_all_own_image(
+    base: &Base<'_>,
+    installer: &dyn Installer,
+    found: &Found,
+    events: &Events,
+) -> Result<Installed, Kind> {
+    let staged = stage_payload_own_image(base, found, events)?;
+    installer.install(base.home, &staged)
+}
+
+fn stage<'a>(
+    base: &Base<'a>,
+    found: &Found,
+    trust: PayloadTrust<'_>,
+    events: &Events,
+) -> Result<Staged<'a>, Kind> {
+    // With an anchor, the block must be the one it names before anything is copied.
+    if let Some(anchor) = trust.anchor()
+        && (anchor.is_placeholder() || base.hasher.sha256(&found.block) != anchor.trailer)
+    {
         return Err(Kind::Verify);
     }
     let trailer = &found.trailer;
@@ -455,8 +538,16 @@ pub fn stage_payload<'a>(
     out.sync().map_err(|_| Kind::Fs)?;
     drop(out);
 
+    // A payload file (macOS) has no end of setup data: its parts end where its pack does.
+    let end = match trust {
+        PayloadTrust::Anchor(_) => found.end,
+        #[cfg(unix)]
+        PayloadTrust::OwnImage => found
+            .end
+            .max(trailer.pack.offset.saturating_add(trailer.pack.length)),
+    };
     let copied = CopiedPayload {
-        end: found.end,
+        end,
         keys: (trailer.keys.offset, keys),
         manifest: (trailer.manifest.offset, manifest),
         pack: (
@@ -466,23 +557,70 @@ pub fn stage_payload<'a>(
         ),
     };
     let clock = ClockReading::read(base.clock, None);
-    let anchored = verify_setup_anchored(
-        anchor,
-        &found.block,
-        &copied,
-        found.end,
-        &clock,
-        base.codec,
-        base.hasher,
-        base.verifier,
-    )
-    .map_err(|e| Kind::of(&lunepack::Error::from(e)))?;
+    let bound = bind(base, found, trust, &copied, &clock)?;
     Ok(Staged {
         dir,
         pack: pack_path,
-        setup: anchored.setup,
-        keyset_version: anchored.keyset_version,
+        setup: bound.setup,
+        keyset_version: bound.keyset_version,
     })
+}
+
+/// The verification of the copy under `trust`.
+fn bind(
+    base: &Base<'_>,
+    found: &Found,
+    trust: PayloadTrust<'_>,
+    copied: &CopiedPayload,
+    clock: &ClockReading,
+) -> Result<Bound, Kind> {
+    let refused = |e: lunepack_core::Error| Kind::of(&lunepack::Error::from(e));
+    match trust {
+        PayloadTrust::Anchor(anchor) => {
+            let anchored = verify_setup_anchored(
+                anchor,
+                &found.block,
+                copied,
+                found.end,
+                clock,
+                base.codec,
+                base.hasher,
+                base.verifier,
+            )
+            .map_err(refused)?;
+            Ok(Bound {
+                setup: anchored.setup,
+                keyset_version: anchored.keyset_version,
+            })
+        }
+        #[cfg(unix)]
+        PayloadTrust::OwnImage => {
+            // The key set's version is a floor of the first record (as the anchored path takes it
+            // from the same bytes); the checks of `verify_setup` follow over the same copy.
+            let keyset = verify_key_set(
+                &found.trailer.root,
+                &copied.keys.1,
+                &RollbackFloor::default(),
+                clock,
+                base.hasher,
+                base.verifier,
+            )
+            .map_err(refused)?;
+            let setup = verify_setup(
+                &found.trailer,
+                copied,
+                clock,
+                base.codec,
+                base.hasher,
+                base.verifier,
+            )
+            .map_err(refused)?;
+            Ok(Bound {
+                setup,
+                keyset_version: keyset.version(),
+            })
+        }
+    }
 }
 
 /// What a machine-install failure is, as an exit kind.
@@ -587,6 +725,37 @@ pub fn run_mode(
     }
 }
 
+/// The hidden `machine-install --events stdout` mode of a Linux setup (M11-D9): refused (usage)
+/// unless the process is root's (`standing` is not `Standard`); installs from the process's own
+/// executed image ([`install_all_own_image`]: copied into an admin-only folder under the machine
+/// home and verified there) with its progress as relay lines into `out`, the child's standard
+/// output; and returns the exit kind, which is the whole result. The mode takes nothing from the
+/// caller but `found`, the image it was started from, opened once: no argument value, no
+/// environment variable, no path. A reader that is slow, gone or never came changes nothing.
+#[cfg(unix)]
+pub fn run_stdout_mode(
+    base: &Base<'_>,
+    installer: &dyn Installer,
+    standing: Standing,
+    found: &Found,
+    out: Box<dyn Write + Send>,
+) -> Kind {
+    if standing == Standing::Standard {
+        return Kind::Usage;
+    }
+    let events = Events::new(
+        None,
+        Some(Box::new(RelaySink::new(out)) as Box<dyn crate::events::Sink>),
+    );
+    let result = install_all_own_image(base, installer, found, &events);
+    // Drains the relay: the reader sees the end of the stream when the process exits.
+    events.finish(Duration::from_secs(2));
+    match result {
+        Ok(_) => Kind::Ok,
+        Err(kind) => kind,
+    }
+}
+
 // ---- the unelevated side ---------------------------------------------------------------------
 
 /// What the unelevated setup hands the work off with.
@@ -656,6 +825,87 @@ pub fn hand_off_unless(
         return Err(Kind::AlreadyInstalled);
     }
     hand_off(h, events, installed)
+}
+
+/// What the unelevated Linux setup hands the work off with (M11-D9).
+#[cfg(unix)]
+pub struct StdoutHandOff<'a> {
+    /// Starts the elevated copy (pkexec); its standard output is the copy's events.
+    pub elevation: &'a dyn Elevation,
+    /// The setup file's canonical absolute path: the program the elevated copy runs.
+    pub setup: &'a Path,
+}
+
+/// How a hand-off through pkexec ended when it did not install.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandOffEnd {
+    /// The copy's exit kind, or `elevation_declined` for a dismissed prompt.
+    Failed(Kind),
+    /// No agent can ask the administrator (no pkexec, or pkexec's 127): show the command to run
+    /// as an administrator instead ([`admin_command`]).
+    NeedsAdministrator,
+}
+
+/// Starts the elevated copy (`machine-install --events stdout`) through `h.elevation`, relays its
+/// progress from its standard output into `events` while it runs and returns when it has ended. As
+/// [`hand_off`]: the result is the copy's exit code and, for `0`, `installed`, the machine
+/// record's own answer (never a line from the stream). A prompt dismissed is `elevation_declined`
+/// (pkexec's 126); no way to ask is [`HandOffEnd::NeedsAdministrator`]. The copy reads this
+/// process's environment, working directory and files never: it runs from its own image only.
+#[cfg(unix)]
+pub fn hand_off_stdout(
+    h: &StdoutHandOff<'_>,
+    events: &Events,
+    installed: &dyn Fn() -> bool,
+) -> Result<(), HandOffEnd> {
+    let args = [
+        MACHINE_INSTALL.to_owned(),
+        "--events".to_owned(),
+        crate::modes::EVENTS_STDOUT.to_owned(),
+    ];
+    let mut child = match h.elevation.run_elevated(h.setup, &args) {
+        Ok(Elevated::Started(child)) => child,
+        Ok(Elevated::Declined) | Err(ElevationError::Declined) => {
+            return Err(HandOffEnd::Failed(Kind::ElevationDeclined));
+        }
+        Err(ElevationError::NoAgent) => return Err(HandOffEnd::NeedsAdministrator),
+        Err(_) => return Err(HandOffEnd::Failed(Kind::Process)),
+    };
+    let connector = child.take_output().map(StreamConnector::new);
+    let ended = AtomicBool::new(false);
+    let code = std::thread::scope(|scope| {
+        if let Some(connector) = &connector {
+            scope.spawn(|| {
+                crate::relay::relay(connector, crate::modes::EVENTS_STDOUT, events, &ended)
+            });
+        }
+        let code = child.wait();
+        ended.store(true, Ordering::Release);
+        code
+    });
+    match code {
+        Ok(code) => match Kind::from_exit_code(code) {
+            Kind::Ok if installed() => Ok(()),
+            // A child that says it installed, with no record to show for it.
+            Kind::Ok => Err(HandOffEnd::Failed(Kind::State)),
+            kind => Err(HandOffEnd::Failed(kind)),
+        },
+        Err(ElevationError::Declined) => Err(HandOffEnd::Failed(Kind::ElevationDeclined)),
+        Err(ElevationError::NoAgent) => Err(HandOffEnd::NeedsAdministrator),
+        Err(_) => Err(HandOffEnd::Failed(Kind::Process)),
+    }
+}
+
+/// The command an administrator runs in a terminal to install for all users when no prompt can ask
+/// (M11-D9): `sudo '<setup path>' --all-users`, the path single-quoted with each `'` written as
+/// `'\''`. `None` when the path is not text or the command does not fit what the UI shows
+/// ([`lunepack_core::ui::MAX_ADMIN_COMMAND`]). The UI shows it verbatim and never runs it.
+#[cfg(unix)]
+pub fn admin_command(setup: &Path) -> Option<String> {
+    let quoted = setup.to_str()?.replace('\'', "'\\''");
+    let command = format!("sudo '{quoted}' --all-users");
+    (command.len() <= lunepack_core::ui::MAX_ADMIN_COMMAND).then_some(command)
 }
 
 // ---- repair and uninstall of an installed machine tree (M10 step 18) -------------------------
@@ -1518,6 +1768,112 @@ pub mod native {
     }
 }
 
+// ---- the Linux adapters ----------------------------------------------------------------------
+
+/// The Linux adapters of the all-users install (M11): the engine's ports over systemd, the
+/// protected directories and the system-wide integration, and the machine home `/opt`.
+#[cfg(target_os = "linux")]
+pub mod native_linux {
+    use std::path::{Path, PathBuf};
+
+    use lunepack::SystemClock;
+    use lunepack_codec_lzma::LzmaCodec;
+    use lunepack_core::MachineScheme;
+    use lunepack_core::engine::{Installed, Ports};
+    use lunepack_crypto::{Ed25519Verifier, OsRng, Sha256Hasher};
+    use lunepack_fs::StdFs;
+    use lunepack_os_linux::{
+        FilePolicy, LinuxProcess, LinuxProtect, MachineIntegration, NoPublisherCheck,
+        SystemdRegistrar,
+    };
+
+    use super::{Installer, Staged, install_staged};
+    use crate::modes::Kind;
+
+    /// The machine home: the constant of the Linux scheme (`/opt`), resolved the way the kernel
+    /// names image paths, as the service resolves it. Nothing from the environment.
+    pub fn machine_home() -> Option<PathBuf> {
+        MachineScheme::LINUX
+            .home
+            .and_then(|home| std::fs::canonicalize(home).ok())
+    }
+
+    /// Every adapter the engine's ports name.
+    pub struct Adapters {
+        fs: StdFs,
+        codec: LzmaCodec,
+        hasher: Sha256Hasher,
+        verifier: Ed25519Verifier,
+        clock: SystemClock,
+        rng: OsRng,
+        integration: MachineIntegration,
+        publisher: NoPublisherCheck,
+        protect: LinuxProtect,
+        policy: FilePolicy,
+        registrar: SystemdRegistrar,
+        process: LinuxProcess,
+    }
+
+    impl Adapters {
+        /// The adapters over the system's own directories.
+        pub fn new() -> Adapters {
+            Adapters {
+                fs: StdFs::new(),
+                codec: LzmaCodec,
+                hasher: Sha256Hasher,
+                verifier: Ed25519Verifier,
+                clock: SystemClock,
+                rng: OsRng,
+                integration: MachineIntegration::new(),
+                publisher: NoPublisherCheck,
+                protect: LinuxProtect::new(),
+                policy: FilePolicy::new(),
+                registrar: SystemdRegistrar::new(),
+                process: LinuxProcess::new(),
+            }
+        }
+
+        /// The engine's ports.
+        pub fn ports(&self) -> Ports<'_> {
+            Ports {
+                fs: &self.fs,
+                codec: &self.codec,
+                hasher: &self.hasher,
+                verifier: &self.verifier,
+                clock: &self.clock,
+                rng: &self.rng,
+                integration: &self.integration,
+                publisher: &self.publisher,
+                protect: &self.protect,
+                policy: &self.policy,
+                registrar: &self.registrar,
+                process: &self.process,
+                scheme: MachineScheme::LINUX,
+            }
+        }
+
+        /// The base of the copy and its verification over the machine home `home`.
+        pub fn base<'a>(&'a self, home: &'a Path) -> super::Base<'a> {
+            super::Base::of(&self.ports(), home)
+        }
+    }
+
+    impl Default for Adapters {
+        fn default() -> Self {
+            Adapters::new()
+        }
+    }
+
+    /// The engine over the Linux adapters.
+    pub struct LinuxInstaller;
+
+    impl Installer for LinuxInstaller {
+        fn install(&self, home: &Path, staged: &Staged<'_>) -> Result<Installed, Kind> {
+            install_staged(Adapters::new().ports(), home, staged)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1539,9 +1895,9 @@ mod tests {
     const ID: &str = "0123456789abcdef0123456789abcdef";
     const SID: &str = "S-1-5-21-1-2-3-1001";
 
-    fn meta() -> InstallMeta {
+    fn meta(entry: &str) -> InstallMeta {
         InstallMeta {
-            entry: RelPath::parse("app.exe").unwrap(),
+            entry: RelPath::parse(entry).unwrap(),
             name: "Hello".into(),
             comment: None,
             icon: None,
@@ -1565,39 +1921,68 @@ mod tests {
 
     impl Built {
         fn new(root_seed: u8, version: &str, service: bool) -> Built {
+            Built::build(
+                root_seed,
+                root_seed,
+                version,
+                service,
+                (TARGET, "app.exe", lunepack_core::SERVICE_FILE),
+            )
+        }
+
+        /// A Linux setup (`app`, `lunepack-service`).
+        #[cfg(unix)]
+        fn linux(version: &str, service: bool) -> Built {
+            Built::build(
+                0,
+                0,
+                version,
+                service,
+                (
+                    Target::LinuxX86_64,
+                    "app",
+                    lunepack_core::layout::SERVICE_FILE_UNIX,
+                ),
+            )
+        }
+
+        /// `root_seed` makes the trailer's root, `signer_seed` signs the key set: they differ in a
+        /// payload not signed under the root the trailer names.
+        fn build(
+            root_seed: u8,
+            signer_seed: u8,
+            version: &str,
+            service: bool,
+            (target, entry, service_file): (Target, &str, &str),
+        ) -> Built {
             let fx = ChainFixture::fake();
             let root: TrustedRoot = fx.trusted_root(1, 1, &[root_seed]);
             let config = UpdateConfig::new(
                 &root,
                 lunepack::Version::parse(version).unwrap(),
-                TARGET,
+                target,
                 "https://updates.example.org/hello/",
                 Channel::parse("stable").unwrap(),
                 60,
-                meta(),
+                meta(entry),
             )
             .unwrap()
             .to_bytes()
             .unwrap();
             let mut pack = PackBuilder::new();
-            pack.file(fx.hasher, "app.exe", b"entry", CodecId::Lzma2);
+            pack.file(fx.hasher, entry, b"entry", CodecId::Lzma2);
             if service {
-                pack.file(
-                    fx.hasher,
-                    lunepack_core::SERVICE_FILE,
-                    b"service",
-                    CodecId::Lzma2,
-                );
+                pack.file(fx.hasher, service_file, b"service", CodecId::Lzma2);
             }
             pack.file(fx.hasher, UPDATE_CONFIG_FILE, &config, CodecId::Stored);
             let keys = fx.envelope(
                 PayloadKind::Keys,
                 &fx.keyset_document(1, 1, None, 1, &[5]).to_payload(),
-                &[root_seed],
+                &[signer_seed],
             );
             let manifest = fx.envelope(
                 PayloadKind::Manifest,
-                &fx.manifest_document(version, TARGET, &pack).to_payload(),
+                &fx.manifest_document(version, target, &pack).to_payload(),
                 &[5],
             );
             let mut file = vec![0x4du8; 1000];
@@ -1621,7 +2006,7 @@ mod tests {
             let trailer = SetupTrailer {
                 root,
                 version: lunepack::Version::parse(version).unwrap(),
-                target: TARGET,
+                target,
                 keys: k,
                 manifest: m,
                 pack: p,
@@ -1671,12 +2056,23 @@ mod tests {
         clock: FakeClock,
         codec: FakeCodec,
         home: PathBuf,
+        scheme: MachineScheme,
     }
 
     impl Host {
         fn new() -> Host {
+            Host::under("/pf", MachineScheme::WINDOWS)
+        }
+
+        /// A Linux machine home (`/opt`).
+        #[cfg(unix)]
+        fn linux() -> Host {
+            Host::under("/opt", MachineScheme::LINUX)
+        }
+
+        fn under(home: &str, scheme: MachineScheme) -> Host {
             let mem = MemFs::new();
-            let home = abs_path("/pf");
+            let home = abs_path(home);
             mem.create_dir_all(&home).unwrap();
             Host {
                 protect: FakeProtect::new(&mem),
@@ -1689,6 +2085,7 @@ mod tests {
                 clock: FakeClock::new(SUITE_T0 + 3600),
                 codec: FakeCodec::new(),
                 home,
+                scheme,
                 mem,
             }
         }
@@ -1707,7 +2104,7 @@ mod tests {
                 policy: &self.policy,
                 registrar: &self.registrar,
                 process: &self.process,
-                scheme: lunepack_core::MachineScheme::WINDOWS,
+                scheme: self.scheme,
             }
         }
 
@@ -1727,12 +2124,13 @@ mod tests {
         }
 
         fn machine(&self) -> Machine {
-            find(
+            find_in(
                 &self.mem,
                 &FakeHasher,
                 &self.home,
                 &AppId::parse(lunepack_testkit::SUITE_APP_ID).unwrap(),
                 "Hello",
+                self.scheme,
             )
         }
     }
@@ -3511,5 +3909,553 @@ mod tests {
             no_update_ui: false,
         });
         assert!(!no_update_ui(true, &policy, &app_id()));
+    }
+
+    // ---- the Linux install from the setup's own image (M11-D9) ------------------------------
+
+    #[cfg(unix)]
+    mod own_image {
+        use super::*;
+        use std::io::Read;
+
+        use lunepack_core::ElevatedChild;
+        use lunepack_core::error::ElevationError;
+
+        fn app() -> AppId {
+            AppId::parse(lunepack_testkit::SUITE_APP_ID).unwrap()
+        }
+
+        fn forged() -> Built {
+            // The trailer names root 0; the key set is signed by another key.
+            Built::build(
+                0,
+                9,
+                "1.0.0",
+                true,
+                (
+                    Target::LinuxX86_64,
+                    "app",
+                    lunepack_core::layout::SERVICE_FILE_UNIX,
+                ),
+            )
+        }
+
+        #[test]
+        fn a_payload_of_the_own_image_is_copied_verified_under_its_root_and_installed() {
+            let host = Host::linux();
+            let b = Built::linux("1.0.0", true);
+            let (events, seen) = collecting();
+            let staged =
+                stage_payload_own_image(&host.base(), &b.found(), &events).expect("staged");
+            let dirs = host.payload_dirs();
+            assert_eq!(dirs.len(), 1, "{dirs:?}");
+            assert_eq!(
+                host.protect.class_of(&host.home.join(&dirs[0])),
+                Some(DirClass::AdminOnly)
+            );
+            assert_eq!(staged.name(), "Hello");
+            // The key set's version is the floor of the first record, as the anchored path has it.
+            assert_eq!(staged.keyset_version, 1);
+            let installed = install_staged(host.ports(), &host.home, &staged).expect("installed");
+            assert_eq!(installed.version.to_string(), "1.0.0");
+            assert_eq!(
+                installed.root,
+                host.home.join(lunepack_testkit::SUITE_APP_ID)
+            );
+            assert!(host.payload_dirs().is_empty(), "the copy was removed");
+            // The projection of the Linux scheme: `R/current` names the installed version.
+            assert_eq!(
+                lunepack_core::Fs::read_link(&host.mem, &installed.root.join("current")).unwrap(),
+                "app/1.0.0"
+            );
+            assert!(
+                matches!(host.machine(), Machine::Present(_, Some(v)) if v.to_string() == "1.0.0")
+            );
+            // The one visible install: a per-user install is refused while this one is there.
+            assert!(blocks_user_install(&host.machine()));
+            drop(staged);
+            events.finish(Duration::from_secs(1));
+            let seen = seen.lock().unwrap();
+            assert!(
+                matches!(seen.first(), Some(Event::Phase { .. })),
+                "{seen:?}"
+            );
+        }
+
+        #[test]
+        fn a_payload_not_signed_under_the_trailers_root_is_refused_and_nothing_stays() {
+            let host = Host::linux();
+            let (events, _) = collecting();
+            let b = forged();
+            let got = stage_payload_own_image(&host.base(), &b.found(), &events);
+            assert!(matches!(got, Err(Kind::Verify)), "{:?}", got.err());
+            assert!(host.payload_dirs().is_empty());
+            assert_eq!(host.machine(), Machine::Absent);
+
+            // A byte flipped in each part after the image was made: the key set and the manifest
+            // fail their signatures, the pack its signed hash, all over the copy that was read.
+            let good = Built::linux("1.0.0", true);
+            for part in [good.trailer.keys, good.trailer.manifest, good.trailer.pack] {
+                let mut b = Built::linux("1.0.0", true);
+                let at = (part.offset + part.length / 2) as usize;
+                b.file[at] ^= 1;
+                let got = stage_payload_own_image(&host.base(), &b.found(), &events);
+                assert!(
+                    matches!(got, Err(Kind::Verify)),
+                    "{part:?}: {:?}",
+                    got.err()
+                );
+                assert!(host.payload_dirs().is_empty(), "{part:?}");
+            }
+            assert_eq!(host.machine(), Machine::Absent);
+            // The Linux home holds nothing else: no record, no root.
+            assert!(
+                lunepack_core::Fs::list_dir(&host.mem, &host.home)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn the_anchor_gate_of_the_windows_flow_is_unchanged_beside_it() {
+            // The anchored function still refuses the placeholder (before any folder) and a
+            // payload another image's anchor does not name, whatever the own-image function takes.
+            let host = Host::linux();
+            let (events, _) = collecting();
+            let b = Built::linux("1.0.0", true);
+            let placeholder = SetupAnchor::parse(&SetupAnchor::PLACEHOLDER).unwrap();
+            let got = stage_payload(&host.base(), &b.found(), &placeholder, &events);
+            assert!(matches!(got, Err(Kind::Verify)));
+            let other = Built::linux("2.0.0", true);
+            let got = stage_payload(&host.base(), &b.found(), &other.anchor(), &events);
+            assert!(matches!(got, Err(Kind::Verify)));
+            assert!(host.payload_dirs().is_empty());
+        }
+
+        #[test]
+        fn a_cut_off_staging_folder_under_the_linux_home_is_swept_and_a_live_one_stays() {
+            use lunepack_core::Fs as _;
+            let host = Host::linux();
+            let folder = |n: u8| host.home.join(format!("{PAYLOAD_PREFIX}{}", hex(&[n; 16])));
+            for n in [1u8, 2] {
+                host.mem.create_dir_all(&folder(n)).unwrap();
+                drop(host.mem.create_new(&folder(n).join(PAYLOAD_LOCK)).unwrap());
+            }
+            let held = host
+                .mem
+                .try_lock(&folder(2).join(PAYLOAD_LOCK))
+                .unwrap()
+                .unwrap();
+            // Another directory of `/opt` (a package's own) is never looked at.
+            let other = host.home.join("google");
+            host.mem.create_dir_all(&other).unwrap();
+            sweep_payload_dirs(&host.base());
+            let exists = |p: &Path| host.mem.symlink_metadata(p).unwrap().is_some();
+            assert!(!exists(&folder(1)));
+            assert!(exists(&folder(2)));
+            assert!(exists(&other));
+            drop(held);
+        }
+
+        fn child_stdout(mem: &MemFs, built: &Built) -> (Kind, String) {
+            let host = Host::linux();
+            let _ = mem;
+            let (reader, writer) = std::io::pipe().unwrap();
+            let kind = run_stdout_mode(
+                &host.base(),
+                &FakeInstaller(&host),
+                Standing::Admin,
+                &built.found(),
+                Box::new(writer),
+            );
+            let mut text = String::new();
+            let mut reader = reader;
+            reader.read_to_string(&mut text).unwrap();
+            (kind, text)
+        }
+
+        #[test]
+        fn the_stdout_mode_is_for_root_installs_and_writes_only_relay_lines() {
+            let host = Host::linux();
+            let b = Built::linux("1.0.0", true);
+            // A standard user's process: usage; nothing written, nothing read, nothing made.
+            let (reader, writer) = std::io::pipe().unwrap();
+            let kind = run_stdout_mode(
+                &host.base(),
+                &FakeInstaller(&host),
+                Standing::Standard,
+                &b.found(),
+                Box::new(writer),
+            );
+            assert_eq!(kind, Kind::Usage);
+            let mut text = String::new();
+            let mut reader = reader;
+            reader.read_to_string(&mut text).unwrap();
+            assert_eq!(text, "");
+            assert!(host.payload_dirs().is_empty());
+            assert_eq!(host.machine(), Machine::Absent);
+
+            for standing in [Standing::Admin, Standing::UacElevated] {
+                let host = Host::linux();
+                let (reader, writer) = std::io::pipe().unwrap();
+                let kind = run_stdout_mode(
+                    &host.base(),
+                    &FakeInstaller(&host),
+                    standing,
+                    &b.found(),
+                    Box::new(writer),
+                );
+                assert_eq!(kind, Kind::Ok);
+                let mut text = String::new();
+                let mut reader = reader;
+                reader.read_to_string(&mut text).unwrap();
+                assert!(text.starts_with("phase install\n"), "{text}");
+                assert!(
+                    text.lines().all(|l| crate::relay::decode(l).is_some()),
+                    "{text}"
+                );
+                assert!(matches!(host.machine(), Machine::Present(_, Some(_))));
+                assert!(host.payload_dirs().is_empty());
+            }
+        }
+
+        #[test]
+        fn the_stdout_mode_answers_with_its_exit_kind_and_leaves_no_copy() {
+            // Not signed under the root: verify, no line but the first phase, no folder.
+            let (kind, text) = child_stdout(&MemFs::new(), &forged());
+            assert_eq!(kind, Kind::Verify);
+            assert!(!text.contains("installed"), "{text}");
+            // No service in the release: 34, nothing installed.
+            let host = Host::linux();
+            let b = Built::linux("1.0.0", false);
+            let (_reader, writer) = std::io::pipe().unwrap();
+            let kind = run_stdout_mode(
+                &host.base(),
+                &FakeInstaller(&host),
+                Standing::Admin,
+                &b.found(),
+                Box::new(writer),
+            );
+            assert_eq!(kind, Kind::PerMachineUnavailable);
+            assert!(host.payload_dirs().is_empty());
+            assert_eq!(host.machine(), Machine::Absent);
+            // An install that is there: 23.
+            let host = Host::linux();
+            let b = Built::linux("1.0.0", true);
+            let (events, _) = collecting();
+            install_all_own_image(&host.base(), &FakeInstaller(&host), &b.found(), &events)
+                .expect("first");
+            let (_reader, writer) = std::io::pipe().unwrap();
+            let kind = run_stdout_mode(
+                &host.base(),
+                &FakeInstaller(&host),
+                Standing::Admin,
+                &b.found(),
+                Box::new(writer),
+            );
+            assert_eq!(kind, Kind::AlreadyInstalled);
+            assert!(host.payload_dirs().is_empty());
+        }
+
+        #[test]
+        fn a_reader_that_is_gone_changes_nothing_about_the_stdout_mode() {
+            let host = Host::linux();
+            let b = Built::linux("1.0.0", true);
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(reader);
+            let kind = run_stdout_mode(
+                &host.base(),
+                &FakeInstaller(&host),
+                Standing::Admin,
+                &b.found(),
+                Box::new(writer),
+            );
+            assert_eq!(kind, Kind::Ok);
+            assert!(matches!(host.machine(), Machine::Present(_, Some(_))));
+        }
+
+        // ---- the unelevated side ------------------------------------------------------------
+
+        /// A child whose answers are fixed.
+        struct Scripted {
+            wait: Option<Result<i32, ElevationError>>,
+            output: Option<Box<dyn Read + Send>>,
+        }
+
+        impl ElevatedChild for Scripted {
+            fn wait(&mut self) -> Result<i32, ElevationError> {
+                self.wait.take().expect("waited once")
+            }
+
+            fn take_output(&mut self) -> Option<Box<dyn Read + Send>> {
+                self.output.take()
+            }
+        }
+
+        /// An [`Elevation`] whose start is `start(program, args)`.
+        struct Pkexec<F>(F, Mutex<Vec<(PathBuf, Vec<String>)>>);
+
+        impl<F> Pkexec<F>
+        where
+            F: Fn(&Path, &[String]) -> Result<Elevated, ElevationError> + Send + Sync,
+        {
+            fn new(start: F) -> Pkexec<F> {
+                Pkexec(start, Mutex::new(Vec::new()))
+            }
+        }
+
+        impl<F> Elevation for Pkexec<F>
+        where
+            F: Fn(&Path, &[String]) -> Result<Elevated, ElevationError> + Send + Sync,
+        {
+            fn standing(&self) -> Standing {
+                Standing::Standard
+            }
+
+            fn run_elevated(
+                &self,
+                exe: &Path,
+                args: &[String],
+            ) -> Result<Elevated, ElevationError> {
+                self.1
+                    .lock()
+                    .unwrap()
+                    .push((exe.to_path_buf(), args.to_vec()));
+                (self.0)(exe, args)
+            }
+        }
+
+        fn started(
+            wait: Result<i32, ElevationError>,
+            lines: &'static [u8],
+        ) -> Result<Elevated, ElevationError> {
+            Ok(Elevated::Started(Box::new(Scripted {
+                wait: Some(wait),
+                output: Some(Box::new(lines)),
+            })))
+        }
+
+        fn recorded(host: &Host) -> impl Fn() -> bool + '_ {
+            move || matches!(host.machine(), Machine::Present(_, Some(v)) if v.to_string() == "1.0.0")
+        }
+
+        #[test]
+        fn a_hand_off_runs_the_mode_with_its_fixed_arguments_and_relays_its_stdout() {
+            let host = Host::linux();
+            let b = Built::linux("1.0.0", true);
+            // The elevated copy, run in place: the mode over the host's fakes writes into the
+            // pipe pkexec would have kept, and exits with its kind.
+            let pkexec = Pkexec::new(|_, args| {
+                let os: Vec<std::ffi::OsString> =
+                    args.iter().map(std::ffi::OsString::from).collect();
+                assert_eq!(
+                    crate::modes::parse_setup_command_unix(&os),
+                    Ok(crate::modes::SetupCommand::MachineInstallStdout)
+                );
+                let (reader, writer) = std::io::pipe().unwrap();
+                let kind = run_stdout_mode(
+                    &host.base(),
+                    &FakeInstaller(&host),
+                    Standing::Admin,
+                    &b.found(),
+                    Box::new(writer),
+                );
+                Ok(Elevated::Started(Box::new(Scripted {
+                    wait: Some(Ok(i32::from(kind.code()))),
+                    output: Some(Box::new(reader)),
+                })))
+            });
+            let setup = abs_path("/home/u/Setup-1.0.0.bin");
+            let h = StdoutHandOff {
+                elevation: &pkexec,
+                setup: &setup,
+            };
+            let (events, seen) = collecting();
+            hand_off_stdout(&h, &events, &recorded(&host)).expect("installed");
+            events.finish(Duration::from_secs(1));
+            let calls = pkexec.1.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, setup);
+            assert_eq!(calls[0].1, ["machine-install", "--events", "stdout"]);
+            let seen = seen.lock().unwrap();
+            assert!(
+                matches!(seen.first(), Some(Event::Phase { .. })),
+                "{seen:?}"
+            );
+            assert!(seen.len() >= 2, "{seen:?}");
+        }
+
+        #[test]
+        fn the_exit_code_decides_the_result_and_a_malformed_line_changes_nothing_about_it() {
+            let setup = abs_path("/home/u/Setup.bin");
+            let host = Host::linux();
+            let b = Built::linux("1.0.0", true);
+            let (events, seen) = collecting();
+            // A child that lies about installing: its code is 0, no record shows it.
+            let pkexec = Pkexec::new(|_, _| started(Ok(0), b"phase install\n"));
+            let h = StdoutHandOff {
+                elevation: &pkexec,
+                setup: &setup,
+            };
+            assert_eq!(
+                hand_off_stdout(&h, &events, &recorded(&host)),
+                Err(HandOffEnd::Failed(Kind::State))
+            );
+            // Its code, when it is not 0: 23 here.
+            let pkexec = Pkexec::new(|_, _| started(Ok(23), b""));
+            let h = StdoutHandOff {
+                elevation: &pkexec,
+                setup: &setup,
+            };
+            assert_eq!(
+                hand_off_stdout(&h, &events, &recorded(&host)),
+                Err(HandOffEnd::Failed(Kind::AlreadyInstalled))
+            );
+            // A line outside the grammar ends the relay; the exit code and the record decide.
+            install_all_own_image(&host.base(), &FakeInstaller(&host), &b.found(), &events)
+                .expect("installed");
+            let pkexec =
+                Pkexec::new(|_, _| started(Ok(0), b"phase install\n/home/x/secret\nphase stage\n"));
+            let h = StdoutHandOff {
+                elevation: &pkexec,
+                setup: &setup,
+            };
+            let before = seen.lock().unwrap().len();
+            assert_eq!(hand_off_stdout(&h, &events, &recorded(&host)), Ok(()));
+            events.finish(Duration::from_secs(1));
+            // Only the first valid line came through.
+            let after: Vec<Event> = seen.lock().unwrap()[before..].to_vec();
+            assert_eq!(after, vec![Event::phase(Phase::Install, None)]);
+        }
+
+        #[test]
+        fn a_declined_prompt_is_declined_and_no_agent_is_the_command_screen() {
+            let setup = abs_path("/home/u/Setup.bin");
+            let host = Host::linux();
+            let (events, _) = collecting();
+            type Start = Box<dyn Fn() -> Result<Elevated, ElevationError> + Send + Sync>;
+            let cases: [(Start, Result<(), HandOffEnd>); 7] = [
+                // pkexec's 126 (the adapter's mapping of the exit code, at wait).
+                (
+                    Box::new(|| {
+                        Ok(Elevated::Started(Box::new(Scripted {
+                            wait: Some(Err(ElevationError::Declined)),
+                            output: Some(Box::new(&b""[..])),
+                        })))
+                    }),
+                    Err(HandOffEnd::Failed(Kind::ElevationDeclined)),
+                ),
+                (
+                    Box::new(|| Ok(Elevated::Declined)),
+                    Err(HandOffEnd::Failed(Kind::ElevationDeclined)),
+                ),
+                // 127 at wait, or no pkexec at all.
+                (
+                    Box::new(|| {
+                        Ok(Elevated::Started(Box::new(Scripted {
+                            wait: Some(Err(ElevationError::NoAgent)),
+                            output: Some(Box::new(&b""[..])),
+                        })))
+                    }),
+                    Err(HandOffEnd::NeedsAdministrator),
+                ),
+                (
+                    Box::new(|| Err(ElevationError::NoAgent)),
+                    Err(HandOffEnd::NeedsAdministrator),
+                ),
+                (
+                    Box::new(|| Err(ElevationError::Declined)),
+                    Err(HandOffEnd::Failed(Kind::ElevationDeclined)),
+                ),
+                (
+                    Box::new(|| Err(ElevationError::Failed("start pkexec"))),
+                    Err(HandOffEnd::Failed(Kind::Process)),
+                ),
+                // A child with no output stream still ends by its code.
+                (
+                    Box::new(|| {
+                        Ok(Elevated::Started(Box::new(Scripted {
+                            wait: Some(Ok(19)),
+                            output: None,
+                        })))
+                    }),
+                    Err(HandOffEnd::Failed(Kind::Process)),
+                ),
+            ];
+            for (n, (start, want)) in cases.into_iter().enumerate() {
+                let pkexec = Pkexec::new(move |_, _| start());
+                let h = StdoutHandOff {
+                    elevation: &pkexec,
+                    setup: &setup,
+                };
+                assert_eq!(
+                    hand_off_stdout(&h, &events, &recorded(&host)),
+                    want,
+                    "case {n}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_command_for_an_administrator_quotes_the_path_and_fits_the_screen() {
+            assert_eq!(
+                admin_command(Path::new("/home/ann/Downloads/Hello-1.0.0.bin")).as_deref(),
+                Some("sudo '/home/ann/Downloads/Hello-1.0.0.bin' --all-users")
+            );
+            // A quote in the path is closed, written escaped and opened again.
+            assert_eq!(
+                admin_command(Path::new("/home/o'neil/Setup")).as_deref(),
+                Some("sudo '/home/o'\\''neil/Setup' --all-users")
+            );
+            assert_eq!(
+                admin_command(Path::new("/a b/$HOME/`x`")).as_deref(),
+                Some("sudo '/a b/$HOME/`x`' --all-users")
+            );
+            // Too long for the screen: no command (the UI would refuse it).
+            let long = format!("/{}", "a".repeat(lunepack_core::ui::MAX_ADMIN_COMMAND));
+            assert_eq!(admin_command(Path::new(&long)), None);
+            // Not text.
+            use std::os::unix::ffi::OsStrExt as _;
+            let raw = Path::new(std::ffi::OsStr::from_bytes(b"/home/\xff/Setup"));
+            assert_eq!(admin_command(raw), None);
+            // What it makes is what the UI accepts, for a plain path.
+            let command = admin_command(Path::new("/home/ann/Setup")).unwrap();
+            assert!(
+                lunepack_core::ui::Message::encode(&lunepack_core::ui::EngineMsg::AdminCommand {
+                    command
+                })
+                .is_ok()
+            );
+        }
+
+        #[test]
+        fn the_linux_lookup_finds_the_app_id_folder_of_the_machine_home() {
+            let host = Host::linux();
+            let b = Built::linux("1.0.0", true);
+            let (events, _) = collecting();
+            install_all_own_image(&host.base(), &FakeInstaller(&host), &b.found(), &events)
+                .expect("installed");
+            assert_eq!(
+                host.machine(),
+                Machine::Present(
+                    host.home.join(lunepack_testkit::SUITE_APP_ID),
+                    Some(lunepack::Version::parse("1.0.0").unwrap())
+                )
+            );
+            // Another app's folder, or none, is no install of this app.
+            let other = AppId::parse("org.example.other").unwrap();
+            assert_eq!(
+                find_in(
+                    &host.mem,
+                    &FakeHasher,
+                    &host.home,
+                    &other,
+                    "Hello",
+                    MachineScheme::LINUX
+                ),
+                Machine::Absent
+            );
+            let _ = app();
+        }
     }
 }

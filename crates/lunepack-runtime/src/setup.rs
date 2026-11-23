@@ -285,8 +285,13 @@ impl Verified {
     /// Whether the release carries the update service beside its entry (M10-D7), so it can be
     /// installed for all users.
     pub fn has_service(&self) -> bool {
+        self.has_service_for(lunepack_core::MachineOs::Windows)
+    }
+
+    /// [`Verified::has_service`] for the service file name of `os` (`lunepack-service` on unix).
+    pub fn has_service_for(&self, os: lunepack_core::MachineOs) -> bool {
         let Some(service) =
-            lunepack_core::layout::service_path_in_tree(&self.setup.config.install.entry)
+            lunepack_core::layout::service_path_in_tree_for(&self.setup.config.install.entry, os)
         else {
             return false;
         };
@@ -466,8 +471,10 @@ pub fn verify(ad: &Adapters, found: Found, binding: Binding<'_>) -> Result<Verif
 /// Verifies the setup ([`verify`]), finds the per-user `R`, and, when `want_ui`, extracts the UI
 /// under `ui_home` ([`ui_home`]; M6-D7, M7-D13) with a marker naming `own` (this process). A
 /// verification failure or a refused root is its exit kind ([`Refused`]), with nothing written; a
-/// UI that cannot be extracted means a headless run.
+/// UI that cannot be extracted means a headless run. (macOS only: the other systems verify first,
+/// look at the choice of where to install and then prepare, [`Verified::into_prepared`].)
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn prepare(
     ad: &Adapters,
     found: Found,
@@ -676,13 +683,25 @@ pub fn welcome(
     (card, details)
 }
 
-/// The all-users install a Windows setup can hand off to (M10 step 16): what it needs besides the
+/// How the unelevated setup hands the all-users install off, and reads its progress.
+pub enum Transfer<'a> {
+    /// Windows: an elevated copy that writes its progress into a pipe the setup reads.
+    #[cfg(windows)]
+    Pipe(crate::machine::HandOff<'a>),
+    /// Linux (M11-D9): an elevated copy through pkexec, its progress on its standard output.
+    #[cfg(unix)]
+    Stdout(crate::machine::StdoutHandOff<'a>),
+}
+
+/// The all-users install a setup can hand off to (M10 step 16, M11): what it needs besides the
 /// per-user flow's own state.
 pub struct Machine<'a> {
-    /// The machine home (the Program Files known folder, canonical).
+    /// The machine home (the Program Files known folder, `/opt`; canonical).
     pub home: &'a Path,
+    /// The OS's machine scheme: the names under the home.
+    pub scheme: lunepack_core::MachineScheme,
     /// Starts the elevated copy and reads its progress.
-    pub hand_off: crate::machine::HandOff<'a>,
+    pub transfer: Transfer<'a>,
     /// The welcome screen offers the choice.
     pub offered: bool,
     /// The choice is taken without being asked (`--all-users` as a standard user, with a window).
@@ -726,7 +745,16 @@ pub fn run_setup(
     };
     loop {
         let result = match machine {
-            Some(m) if all_users => install_all_users(ad, prepared, events, m),
+            Some(m) if all_users => match install_all_users(ad, prepared, events, m) {
+                Ok(version) => Ok(version),
+                Err(AllUsersEnd::Kind(kind)) => Err(kind),
+                // No prompt can ask for an administrator: the window shows the command to run
+                // as one, and the run is over (M11-D9). Nothing was changed.
+                Err(AllUsersEnd::NeedsAdministrator(command)) => {
+                    show_admin_command(ui, events, command);
+                    return report(prepared, Err(Kind::ElevationRequired));
+                }
+            },
             Some(m) => install_user_unless_machine(ad, prepared, events, m),
             None => install(ad, prepared, events),
         };
@@ -772,12 +800,13 @@ fn install_user_unless_machine(
     events: &Events,
     machine: &Machine<'_>,
 ) -> Result<Version, Kind> {
-    let found = crate::machine::find(
+    let found = crate::machine::find_in(
         &*ad.fs,
         &*ad.hasher,
         machine.home,
         prepared.app_id(),
         prepared.name(),
+        machine.scheme,
     );
     if crate::machine::blocks_user_install(&found) {
         return Err(Kind::AlreadyInstalled);
@@ -785,36 +814,86 @@ fn install_user_unless_machine(
     install(ad, prepared, events)
 }
 
+/// Why an all-users install did not happen: an exit kind, or no way to ask for an administrator.
+enum AllUsersEnd {
+    Kind(Kind),
+    /// The command to run as an administrator instead, when one can be shown (M11-D9).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    NeedsAdministrator(Option<String>),
+}
+
+impl From<Kind> for AllUsersEnd {
+    fn from(kind: Kind) -> AllUsersEnd {
+        AllUsersEnd::Kind(kind)
+    }
+}
+
 /// The all-users install by hand-off: refused (`already_installed`) while the installing user has
 /// an install of their own (M10-D14: the unelevated side's check), then the elevated copy runs
-/// ([`crate::machine::hand_off`]) and its result is checked against the machine record.
+/// ([`crate::machine::hand_off`], on Linux [`crate::machine::hand_off_stdout`]) and its result is
+/// checked against the machine record.
 fn install_all_users(
     ad: &Adapters,
     prepared: &Prepared,
     events: &Events,
     machine: &Machine<'_>,
-) -> Result<Version, Kind> {
+) -> Result<Version, AllUsersEnd> {
     let version = prepared.version().clone();
     let user_install_there =
         || user_install_exists(ad, &prepared.data_home, prepared.app_id(), prepared.name());
     let installed = || {
         matches!(
-            crate::machine::find(
+            crate::machine::find_in(
                 &*ad.fs,
                 &*ad.hasher,
                 machine.home,
                 prepared.app_id(),
                 prepared.name(),
+                machine.scheme,
             ),
             crate::machine::Machine::Present(_, Some(found)) if found.to_string() == version.to_string()
         )
     };
-    crate::machine::hand_off_unless(&machine.hand_off, events, &user_install_there, &installed)?;
+    match &machine.transfer {
+        #[cfg(windows)]
+        Transfer::Pipe(hand_off) => {
+            crate::machine::hand_off_unless(hand_off, events, &user_install_there, &installed)?;
+        }
+        #[cfg(unix)]
+        Transfer::Stdout(hand_off) => {
+            if user_install_there() {
+                return Err(Kind::AlreadyInstalled.into());
+            }
+            // The window moves to its running screen, the one that takes the command to run as an
+            // administrator when no prompt can ask (and shows the copy's own progress when one does).
+            events.emit(&Event::phase(Phase::Install, Some(&version)));
+            match crate::machine::hand_off_stdout(hand_off, events, &installed) {
+                Ok(()) => {}
+                Err(crate::machine::HandOffEnd::Failed(kind)) => return Err(kind.into()),
+                Err(crate::machine::HandOffEnd::NeedsAdministrator) => {
+                    return Err(AllUsersEnd::NeedsAdministrator(
+                        crate::machine::admin_command(hand_off.setup),
+                    ));
+                }
+            }
+        }
+    }
     Ok(version)
 }
 
-/// Starts the all-users install's launcher, `R\<entry name>`, detached, with no arguments and
-/// without a health token; a failure is a warning.
+/// Shows the screen of the command to run as an administrator and waits for it to be closed. A
+/// command the UI would refuse (too long, not printable), or no UI, shows nothing.
+fn show_admin_command(ui: &UiHost, events: &Events, command: Option<String>) {
+    if let Some(command) = command
+        && ui.admin_command(command)
+    {
+        let _ = ui.prompt(PromptKind::AdminCommand, events, &mut |_| {});
+    }
+}
+
+/// Starts the all-users install's launcher, detached, with no arguments and without a health
+/// token: `R\<entry name>` on Windows, the entry through `R/current` on Linux (M11-D12); a failure
+/// is a warning.
 fn launch_machine(
     ad: &Adapters,
     prepared: &Prepared,
@@ -824,22 +903,29 @@ fn launch_machine(
 ) {
     let started = machine
         .and_then(|m| {
-            match crate::machine::find(
+            match crate::machine::find_in(
                 &*ad.fs,
                 &*ad.hasher,
                 m.home,
                 prepared.app_id(),
                 prepared.name(),
+                m.scheme,
             ) {
-                crate::machine::Machine::Present(root, _) => Some(root),
+                crate::machine::Machine::Present(root, _) => Some((root, m.scheme)),
                 _ => None,
             }
         })
-        .and_then(|root| {
-            let entry = prepared.verified.config.install.entry.as_str();
-            let name = entry.rsplit('/').next()?;
+        .and_then(|(root, scheme)| {
+            let entry = &prepared.verified.config.install.entry;
+            let program = match scheme.projection() {
+                lunepack_core::Projection::CurrentLink => entry.components().fold(
+                    root.join(lunepack_core::layout::CURRENT_LINK),
+                    |dir, part| dir.join(part),
+                ),
+                _ => root.join(entry.as_str().rsplit('/').next()?),
+            };
             let spec = SpawnSpec {
-                program: root.join(name),
+                program,
                 args: Vec::new(),
                 env_set: Vec::new(),
                 env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],

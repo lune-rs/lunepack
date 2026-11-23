@@ -804,15 +804,27 @@ fn fail(command: &'static str, kind: Kind) -> Kind {
     kind
 }
 
-/// Setup mode (M6 step 7, M7): `None` when this executable carries no setup trailer (the ordinary
-/// runtime), else the run's exit kind. A trailer that is malformed is `verify`; a command line
-/// other than nothing or `--silent` is a usage error.
+/// Setup mode (M6 step 7, M7, M11): `None` when this executable carries no setup trailer (the
+/// ordinary runtime), else the run's exit kind. A trailer that is malformed is `verify`; a command
+/// line other than `--silent` and `--all-users` once each, or exactly `machine-install --events
+/// stdout`, is a usage error.
+///
+/// A process that runs as root reads the image it was started from through one open of
+/// `/proc/self/exe` (not through a path that may name another file by the time it is opened), and
+/// reads no environment variable and starts no window (M11-D9): it installs for all users in
+/// this process (`--all-users`) or as the elevated copy of a setup an unelevated user started
+/// (`machine-install --events stdout`, run by pkexec), and refuses anything else with one line.
 #[cfg(target_os = "linux")]
 fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
     use lunepack::Process as _;
 
     let process = lunepack_os_linux::LinuxProcess::new();
-    let exe = process.current_exe().ok()?;
+    let root = lunepack_os_linux::effective_uid() == 0;
+    let exe = if root {
+        PathBuf::from("/proc/self/exe")
+    } else {
+        process.current_exe().ok()?
+    };
     let found = match setup::detect(
         &lunepack_fs::StdFs::new(),
         &exe,
@@ -833,74 +845,231 @@ fn setup_mode(args: &[std::ffi::OsString]) -> Option<Kind> {
         }
         setup::Detect::Setup(found) => found,
     };
-    let Ok(silent) = modes::parse_setup(args) else {
+    let Ok(command) = modes::parse_setup_command_unix(args) else {
         eprintln!("{USAGE_LINE}");
         return Some(Kind::Usage);
     };
-    Some(run(|ad| {
-        let data_home = match data_home() {
-            Ok(dir) => dir,
-            Err(kind) => {
-                let kind = headless_fail(setup::COMMAND, kind);
-                notice(silent, false, SETUP_TITLE, Operation::Setup, kind);
-                return kind;
+    match command {
+        // The elevated copy of a setup, started by pkexec: its events on its standard output, its
+        // exit code its whole result. Not `run`: that reads the environment.
+        modes::SetupCommand::MachineInstallStdout => {
+            if !root {
+                eprintln!("{USAGE_LINE}");
+                return Some(Kind::Usage);
             }
-        };
-        let env = |name: &str| std::env::var_os(name);
-        let want_ui = ui_host::ui_wanted(silent, &env);
-        let own = process.process_id(std::process::id()).ok().flatten();
-        clear_temp_dirs(ad);
-        let ui_home = setup::ui_home(&env);
-        let prepared = match setup::prepare(
-            ad,
-            found,
-            setup::Binding::TrailerRoot,
-            &data_home,
-            ui_home.as_deref(),
-            want_ui,
-            own,
-            &alive,
-        ) {
+            Some(linux_machine_install_mode(&found))
+        }
+        modes::SetupCommand::Run(run_args) if root => Some(linux_root_setup(found, run_args)),
+        modes::SetupCommand::Run(run_args) => Some(run(|ad| {
+            linux_user_setup(ad, &process, &exe, found, run_args)
+        })),
+        // The Windows form of the mode is no word of the Linux grammar.
+        modes::SetupCommand::MachineInstall(_) => {
+            eprintln!("{USAGE_LINE}");
+            Some(Kind::Usage)
+        }
+    }
+}
+
+/// The hidden `machine-install --events stdout` mode: the engine's first install in the elevated
+/// copy of the setup, from the one open of its own executed image, its progress on its standard
+/// output. Its exit code is its whole result. It builds its few adapters itself and reads no
+/// environment variable, no working directory and nothing of a user's profile.
+#[cfg(target_os = "linux")]
+fn linux_machine_install_mode(found: &setup::Found) -> Kind {
+    use lunepack_core::Elevation as _;
+
+    let Some(home) = machine::native_linux::machine_home() else {
+        return Kind::Fs;
+    };
+    let adapters = machine::native_linux::Adapters::new();
+    machine::run_stdout_mode(
+        &adapters.base(&home),
+        &machine::native_linux::LinuxInstaller,
+        lunepack_os_linux::PkexecElevation::new().standing(),
+        found,
+        Box::new(std::io::stdout()),
+    )
+}
+
+/// The fixed line a setup run as root without `--all-users` prints: it never shows a window as root.
+#[cfg(target_os = "linux")]
+const ROOT_SETUP_TEXT: &str = "This installer does not run as root. Start it as your own user and \
+choose \"For all users\", or start it as root with --all-users.";
+
+/// `--all-users` as root (`sudo <setup> --all-users`): the payload copied from the image, verified
+/// there and installed in this process, with no window and no environment variable read. The
+/// result is the one JSON line on stdout. Without `--all-users`, one line and exit 2.
+#[cfg(target_os = "linux")]
+fn linux_root_setup(found: setup::Found, args: modes::SetupArgs) -> Kind {
+    if !args.all_users {
+        eprintln!("{ROOT_SETUP_TEXT}");
+        return Kind::Usage;
+    }
+    let version = found.trailer.version.clone();
+    let events = stderr_events();
+    let result = match machine::native_linux::machine_home() {
+        Some(home) => {
+            let adapters = machine::native_linux::Adapters::new();
+            machine::install_all_own_image(
+                &adapters.base(&home),
+                &machine::native_linux::LinuxInstaller,
+                &found,
+                &events,
+            )
+            .map(|installed| installed.version)
+        }
+        None => Err(Kind::Fs),
+    };
+    let (kind, last) = match result {
+        Ok(installed) => (
+            Kind::Ok,
+            Event::Result {
+                command: setup::COMMAND,
+                tree_version: Some(version),
+                outcome: setup::OUTCOME,
+                version: Some(installed),
+            },
+        ),
+        Err(kind) => (kind, setup::failed(kind, Some(version))),
+    };
+    conclude(events, &last);
+    kind
+}
+
+/// A setup run by a user without administrator rights: per user by default, for all users when the
+/// release carries the update service and the user chooses it (the window's "For all users", or
+/// `--all-users`), through pkexec ([`machine::hand_off_stdout`]) or, when nothing can ask, the
+/// `sudo` command on a screen of its own (M11-D9). The per-user install and the all-users one
+/// exclude each other (M10-D14).
+#[cfg(target_os = "linux")]
+fn linux_user_setup(
+    ad: &modes::Adapters,
+    process: &lunepack_os_linux::LinuxProcess,
+    exe: &std::path::Path,
+    found: setup::Found,
+    run_args: modes::SetupArgs,
+) -> Kind {
+    use lunepack_core::{MachineOs, MachineScheme, Standing};
+
+    let silent = run_args.silent;
+    let data_home = match data_home() {
+        Ok(dir) => dir,
+        Err(kind) => {
+            let kind = headless_fail(setup::COMMAND, kind);
+            notice(silent, false, SETUP_TITLE, Operation::Setup, kind);
+            return kind;
+        }
+    };
+    let verified = match setup::verify(ad, found, setup::Binding::TrailerRoot) {
+        Ok(verified) => verified,
+        Err(refused) => {
+            let kind = headless_fail(setup::COMMAND, refused.kind);
+            notice(silent, false, SETUP_TITLE, Operation::Setup, kind);
+            return kind;
+        }
+    };
+    let name = verified.name().to_owned();
+    let (offer, forced) = match machine::decide(
+        Standing::Standard,
+        run_args,
+        verified.has_service_for(MachineOs::Linux),
+        &|| {
+            Ok(setup::user_install_exists(
+                ad,
+                &data_home,
+                verified.app_id(),
+                &name,
+            ))
+        },
+    ) {
+        machine::Decision::Exit(kind) => {
+            let kind = headless_fail(setup::COMMAND, kind);
+            notice(silent, false, &name, Operation::Install, kind);
+            return kind;
+        }
+        machine::Decision::Window { offer, forced } => (offer, forced),
+        // Only a process that holds a full token gets these.
+        machine::Decision::Notice | machine::Decision::InProcess => {
+            return headless_fail(setup::COMMAND, Kind::Usage);
+        }
+    };
+
+    let env = |name: &str| std::env::var_os(name);
+    let want_ui = ui_host::ui_wanted(silent, &env);
+    let own = process.process_id(std::process::id()).ok().flatten();
+    clear_temp_dirs(ad);
+    let ui_home = setup::ui_home(&env);
+    let prepared =
+        match verified.into_prepared(ad, &data_home, ui_home.as_deref(), want_ui, own, &alive) {
             Ok(prepared) => prepared,
             Err(refused) => {
                 let kind = headless_fail(setup::COMMAND, refused.kind);
-                // A refused root comes after the payload was verified: the notice names the app.
-                match refused.name.as_deref() {
-                    Some(name) => notice(silent, false, name, Operation::Install, kind),
-                    None => notice(silent, false, SETUP_TITLE, Operation::Setup, kind),
-                }
+                notice(
+                    silent,
+                    false,
+                    refused.name.as_deref().unwrap_or(SETUP_TITLE),
+                    Operation::Install,
+                    kind,
+                );
                 return kind;
             }
         };
-        let (app, details) = setup::welcome(&prepared, None);
-        let ui = match prepared.ui_dir() {
-            // The UI was read out of the verified pack into this run's own directory (M6-D7); the
-            // host starts it from there as it starts the one beside an installed runtime.
-            Some(dir) => UiHost::start(
-                &ui_host::Start {
-                    process: std::sync::Arc::clone(&ad.process),
-                    fs: &*ad.fs,
-                    runtime_exe: &dir.join("lunepack-runtime"),
-                    env: &env,
-                    quiet: silent,
-                    elevated: uac_elevated(),
-                },
-                Flow::Install,
-                app,
-                details,
-            ),
-            None => UiHost::headless(Flow::Install),
-        };
-        let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
-        ui.report(&events);
-        let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui, None);
-        let seen = ui.outcome_acknowledged();
-        ui.close(&events);
+    // The all-users install needs the machine home and this setup's own path (what pkexec runs);
+    // without them the choice is not offered (and a run that asked for it fails).
+    let home = machine::native_linux::machine_home();
+    let setup_path = std::fs::canonicalize(exe).ok();
+    let elevation = lunepack_os_linux::PkexecElevation::new();
+    let machine_ctx = match (&home, &setup_path) {
+        (Some(home), Some(setup_path)) => Some(setup::Machine {
+            home,
+            scheme: MachineScheme::LINUX,
+            transfer: setup::Transfer::Stdout(machine::StdoutHandOff {
+                elevation: &elevation,
+                setup: setup_path,
+            }),
+            offered: offer,
+            forced,
+        }),
+        _ => None,
+    };
+    if machine_ctx.is_none() && forced {
         prepared.cleanup(&*ad.fs);
-        conclude(events, &last);
-        notice(silent, seen, prepared.name(), Operation::Install, kind);
-        kind
-    }))
+        return headless_fail(setup::COMMAND, Kind::Process);
+    }
+    let all_users_location = machine_ctx.as_ref().filter(|m| m.offered).and_then(|m| {
+        shown_path(m.home.join(prepared.app_id().as_str()))
+            .to_str()
+            .map(str::to_owned)
+    });
+    let (app, details) = setup::welcome(&prepared, all_users_location);
+    let ui = match prepared.ui_dir() {
+        // The UI was read out of the verified pack into this run's own directory (M6-D7); the
+        // host starts it from there as it starts the one beside an installed runtime.
+        Some(dir) => UiHost::start(
+            &ui_host::Start {
+                process: std::sync::Arc::clone(&ad.process),
+                fs: &*ad.fs,
+                runtime_exe: &dir.join("lunepack-runtime"),
+                env: &env,
+                quiet: silent,
+                elevated: uac_elevated(),
+            },
+            Flow::Install,
+            app,
+            details,
+        ),
+        None => UiHost::headless(Flow::Install),
+    };
+    let events = Events::new(Some(Box::new(StderrSink)), ui.sink());
+    ui.report(&events);
+    let (kind, last) = setup::run_setup(ad, &prepared, &events, &ui, machine_ctx.as_ref());
+    let seen = ui.outcome_acknowledged();
+    ui.close(&events);
+    prepared.cleanup(&*ad.fs);
+    conclude(events, &last);
+    notice(silent, seen, prepared.name(), Operation::Install, kind);
+    kind
 }
 
 /// Setup mode on Windows (M10 step 16): the Linux flow plus the all-users install. `None` when this
@@ -1107,13 +1276,14 @@ fn windows_setup(
     let machine_ctx = match (&home, &sid) {
         (Some(home), Some(sid)) => Some(setup::Machine {
             home,
-            hand_off: machine::HandOff {
+            scheme: lunepack_core::MachineScheme::WINDOWS,
+            transfer: setup::Transfer::Pipe(machine::HandOff {
                 elevation,
                 connector: &connector,
                 rng: &*ad.rng,
                 own_exe: exe,
                 sid,
-            },
+            }),
             offered: offer,
             forced,
         }),

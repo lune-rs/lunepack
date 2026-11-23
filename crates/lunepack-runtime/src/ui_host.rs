@@ -279,30 +279,33 @@ impl Shared {
 
     /// Applies `msg` to the reducer and hands it to the writer. A message the reducer refuses is
     /// not sent (the engine's own order decides; nothing is shown out of order). A full channel is
-    /// a stall. Never blocks on the UI.
-    fn send(&self, msg: EngineMsg) {
+    /// a stall. Never blocks on the UI. `true` when the message was queued.
+    fn send(&self, msg: EngineMsg) -> bool {
         let mut conv = self.conv();
         if conv.stop.is_some() {
-            return;
+            return false;
         }
         if conv.state.apply(&msg).is_err() {
-            return;
+            return false;
         }
         let result = match guard(&self.tx).as_ref() {
             Some(tx) => tx.try_send(msg),
-            None => return,
+            None => return false,
         };
         match result {
             Ok(()) => {
                 self.queued.fetch_add(1, Ordering::AcqRel);
+                true
             }
             Err(TrySendError::Full(_)) => {
                 drop(conv);
                 self.stop(UiStop::Stalled, None);
+                false
             }
             Err(TrySendError::Disconnected(_)) => {
                 drop(conv);
                 self.stop_gone();
+                false
             }
         }
     }
@@ -765,6 +768,35 @@ impl UiHost {
         }
     }
 
+    /// Shows the screen of the command to run as an administrator (M11-D9, D14). `true` when the
+    /// UI took it, so the screen can be asked about; a headless host, a lost UI and a command the
+    /// UI protocol refuses (too long, not printable) return `false` and nothing is shown. The UI
+    /// shows the text and never runs it.
+    ///
+    /// The screen follows the running one: the call first reports the operation's phase, so the
+    /// order holds whatever the run's own (queued) events have delivered so far; a later event of
+    /// the same phase finds the window past it and is dropped.
+    pub fn admin_command(&self, command: String) -> bool {
+        let Some(shared) = &self.shared else {
+            return false;
+        };
+        let msg = EngineMsg::AdminCommand { command };
+        // A text the protocol refuses is never sent, whatever the screen.
+        if ui::Message::encode(&msg).is_err() {
+            return false;
+        }
+        let phase = match self.flow {
+            Flow::Uninstall => Phase::Uninstall,
+            _ => Phase::Install,
+        };
+        shared.send(EngineMsg::Progress {
+            phase,
+            done: 0,
+            total: 0,
+        });
+        shared.send(msg)
+    }
+
     /// Tells the UI how the operation ended.
     pub fn outcome(&self, outcome: Outcome) {
         if let Some(shared) = &self.shared {
@@ -846,7 +878,9 @@ impl UiHost {
                     shared.stop(UiStop::Hung, None);
                     return lost();
                 }
-                Some(Some(n)) => shared.send(EngineMsg::Ping { n }),
+                Some(Some(n)) => {
+                    shared.send(EngineMsg::Ping { n });
+                }
                 None => {}
             }
             match choices.recv_timeout(PROMPT_TICK) {

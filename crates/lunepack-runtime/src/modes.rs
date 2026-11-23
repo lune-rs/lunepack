@@ -643,6 +643,31 @@ pub enum SetupCommand {
     Run(SetupArgs),
     /// `machine-install --events <id> --for-sid <SID>`: the elevated copy's mode.
     MachineInstall(MachineArgs),
+    /// `machine-install --events stdout` (Linux, M11-D9): the elevated copy's mode, its events on
+    /// its standard output, which the unelevated setup reads through pkexec.
+    #[cfg(unix)]
+    MachineInstallStdout,
+}
+
+/// The value of `--events` that names the elevated copy's standard output (M11-D9).
+#[cfg(unix)]
+pub const EVENTS_STDOUT: &str = "stdout";
+
+/// Parses the command line of a setup file on a unix system with per-machine installs (Linux):
+/// the run's options ([`parse_setup_command_with`], `--silent` and `--all-users`, each once, in
+/// any order) or exactly `machine-install --events stdout`. The Windows form of the mode (a pipe
+/// id and a SID) is no word of this grammar.
+#[cfg(unix)]
+pub fn parse_setup_command_unix(args: &[OsString]) -> Result<SetupCommand, UsageError> {
+    if args.first().is_some_and(|a| a == MACHINE_INSTALL) {
+        return match &args[1..] {
+            [name, value] if name == "--events" && value == EVENTS_STDOUT => {
+                Ok(SetupCommand::MachineInstallStdout)
+            }
+            _ => Err(UsageError),
+        };
+    }
+    parse_setup_command_with(args, true)
 }
 
 /// [`parse_setup_command_with`] for this system: per-machine options exist on Windows only.
@@ -1234,6 +1259,60 @@ mod tests {
         // The ordinary runtime has no such mode.
         assert_eq!(
             parse(&os(&["machine-install", "--events", id, "--for-sid", sid])),
+            Err(UsageError)
+        );
+    }
+
+    /// M11-D9: a setup on Linux takes `--silent` and `--all-users` once each, or exactly
+    /// `machine-install --events stdout`; the Windows form of the mode is no word of its grammar.
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_setup_grammar_has_the_stdout_form_of_the_mode_and_not_the_pipe_form() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let sid = "S-1-5-21-1004336348-1177238915-682003330-1001";
+        let ok = |a: &[&str]| parse_setup_command_unix(&os(a));
+        assert_eq!(
+            ok(&["machine-install", "--events", "stdout"]),
+            Ok(SetupCommand::MachineInstallStdout)
+        );
+        assert_eq!(
+            ok(&["--all-users", "--silent"]),
+            Ok(SetupCommand::Run(SetupArgs {
+                silent: true,
+                all_users: true
+            }))
+        );
+        assert_eq!(
+            ok(&[]),
+            Ok(SetupCommand::Run(SetupArgs {
+                silent: false,
+                all_users: false
+            }))
+        );
+        for bad in [
+            vec!["machine-install"],
+            vec!["machine-install", "--events"],
+            vec!["machine-install", "--events", "Stdout"],
+            vec!["machine-install", "--events", "stdout", "--silent"],
+            vec![
+                "machine-install",
+                "--events",
+                "stdout",
+                "--events",
+                "stdout",
+            ],
+            vec!["machine-install", "--events=stdout"],
+            vec!["machine-install", "--events", id, "--for-sid", sid],
+            vec!["machine-install", "--for-sid", sid, "--events", "stdout"],
+            vec!["--all-users", "machine-install", "--events", "stdout"],
+            vec!["--silent", "machine-install", "--events", "stdout"],
+            vec!["/S"],
+        ] {
+            assert_eq!(ok(&bad), Err(UsageError), "{bad:?}");
+        }
+        // The ordinary runtime has no such mode either.
+        assert_eq!(
+            parse(&os(&["machine-install", "--events", "stdout"])),
             Err(UsageError)
         );
     }

@@ -350,6 +350,10 @@ mod cases {
     struct Twist {
         /// The config names a root other than the one the trailer and the key set use.
         config_root_other: bool,
+        /// Linux: the release carries the update service beside the entry (M10-D7), so it can be
+        /// installed for all users.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        service: bool,
         /// Windows: what the setup's runtime image carries of its payload's anchor (M10-D4).
         #[cfg_attr(not(windows), allow(dead_code))]
         anchor: AnchorTwist,
@@ -618,6 +622,10 @@ mod cases {
             ];
             #[cfg(windows)]
             files.push((STUB_FILE, b"lunepack test stub".to_vec(), true));
+            #[cfg(target_os = "linux")]
+            if twist.service {
+                files.push(("bin/lunepack-service", b"service".to_vec(), true));
+            }
             let mut layout = ReleaseLayout::new(app_id(), V100, TARGET).expect("layout");
             for (path, bytes, exec) in &files {
                 let packed = pack_file(bytes, &StoreOnly, &FakeCodec::new(), &Sha256Hasher)
@@ -1361,6 +1369,106 @@ mod cases {
             assert_eq!(run.stderr.trim(), "lunepack-runtime: usage error");
         }
         lab.assert_nothing_installed();
+    }
+
+    /// Whether this test process runs as root (the container the gate's Docker stage uses does).
+    #[cfg(target_os = "linux")]
+    fn running_as_root() -> bool {
+        Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
+    }
+
+    /// M11-D9, D35: a setup run as root never installs per user and never starts a window: without
+    /// `--all-users` it exits 2 with one fixed line, whatever a display or a UI could do, and
+    /// nothing is installed or extracted. The Windows form of the elevated mode is no word of the
+    /// grammar. (What root's `--all-users` and the elevated `machine-install --events stdout`
+    /// install is the Linux machine suite's: they write under the real `/opt`.) Runs only as root;
+    /// every other Linux case runs only as a user, since a root setup is never per user.
+    #[cfg(target_os = "linux")]
+    fn a_setup_run_as_root_without_all_users_exits_2_with_one_line_and_starts_no_ui() {
+        const ID: &str = "0123456789abcdef0123456789abcdef";
+        let lab = Lab::new(Twist::default());
+        for (args, ui) in [
+            (&["--silent"][..], None),
+            (&[][..], None),
+            (&[][..], Some("proceed")),
+            (&["--silent"][..], Some("proceed")),
+            (
+                &["machine-install", "--events", ID, "--for-sid", "S-1-5-21-1"][..],
+                Some("proceed"),
+            ),
+        ] {
+            let run = lab.run(args, ui);
+            assert_eq!(run.code, EXIT_USAGE, "{args:?} {ui:?}: {run:?}");
+            assert_eq!(run.stdout, "", "{args:?}: {run:?}");
+            assert_eq!(run.stderr.trim().lines().count(), 1, "{args:?}: {run:?}");
+            assert!(lab.noted("ui-dir").is_empty(), "a UI was started");
+            lab.assert_nothing_installed();
+            run.assert_no_path(&lab);
+        }
+    }
+
+    /// M11-D9: a user's `--all-users` with `--silent` never asks for anything: a release with the
+    /// service says 30 (`elevation_required`), one without it 34 (`per_machine_unavailable`), an
+    /// existing per-user install 23, each before a window, a prompt or a write. (The prompt, the
+    /// command screen and the install itself are the Linux machine suite's.) Runs as a user.
+    #[cfg(target_os = "linux")]
+    fn a_users_all_users_silent_asks_for_nothing_and_says_why_not() {
+        let with_service = Lab::new(Twist {
+            service: true,
+            ..Twist::default()
+        });
+        let run = with_service.run(&["--all-users", "--silent"], Some("proceed"));
+        assert_eq!(run.code, 30, "{run:?}");
+        assert!(
+            run.stdout.contains("\"kind\":\"elevation_required\""),
+            "{run:?}"
+        );
+        assert!(with_service.noted("ui-dir").is_empty(), "a UI was started");
+        with_service.assert_nothing_installed();
+        run.assert_no_path(&with_service);
+        // The user's own install comes first: `already_installed`.
+        let first = with_service.run(&["--silent"], None);
+        assert_eq!(first.code, EXIT_OK, "{first:?}");
+        let again = with_service.run(&["--all-users", "--silent"], None);
+        assert_eq!(again.code, EXIT_ALREADY_INSTALLED, "{again:?}");
+        // A window over a release with the service: the choice is offered, "only for me" (the
+        // fake UI's `proceed`) installs per user as before.
+        let windowed = Lab::new(Twist {
+            service: true,
+            ..Twist::default()
+        });
+        let run = windowed.run(&[], Some("proceed"));
+        assert_eq!(run.code, EXIT_OK, "{run:?}");
+        windowed.assert_installed();
+        // No service in the release: it installs per user only, whoever asks.
+        let plain = Lab::new(Twist::default());
+        for args in [&["--all-users", "--silent"][..], &["--all-users"]] {
+            let run = plain.run(args, None);
+            assert_eq!(run.code, 34, "{args:?}: {run:?}");
+            assert!(
+                run.stdout.contains("\"kind\":\"per_machine_unavailable\""),
+                "{run:?}"
+            );
+            plain.assert_nothing_installed();
+        }
+        // The grammar: one each, and the elevated mode's word is not a user's.
+        for args in [
+            &["--all-users", "--all-users"][..],
+            &["--all-users=1"],
+            &["--all-users", "install"],
+            &["machine-install"],
+            &["machine-install", "--events", "stdout"],
+            &["machine-install", "--events", "stdout", "--silent"],
+        ] {
+            let run = plain.run(args, None);
+            assert_eq!(run.code, EXIT_USAGE, "{args:?}: {run:?}");
+            assert_eq!(run.stderr.trim(), "lunepack-runtime: usage error");
+        }
+        plain.assert_nothing_installed();
     }
 
     fn arguments_other_than_silent_are_a_usage_error() {
@@ -2224,6 +2332,16 @@ mod cases {
             ),
             #[cfg(target_os = "linux")]
             (
+                "a_users_all_users_silent_asks_for_nothing_and_says_why_not",
+                a_users_all_users_silent_asks_for_nothing_and_says_why_not,
+            ),
+            #[cfg(target_os = "linux")]
+            (
+                "a_setup_run_as_root_without_all_users_exits_2_with_one_line_and_starts_no_ui",
+                a_setup_run_as_root_without_all_users_exits_2_with_one_line_and_starts_no_ui,
+            ),
+            #[cfg(target_os = "linux")]
+            (
                 "stale_ui_directories_go_only_with_a_dead_owners_marker",
                 stale_ui_directories_go_only_with_a_dead_owners_marker,
             ),
@@ -2355,6 +2473,23 @@ mod cases {
                     common::OS_NAME
                 );
                 continue;
+            }
+            // A setup run as root is never a per-user install (M11-D9): the cases of the per-user
+            // flow need a user's process; the root case needs root.
+            #[cfg(target_os = "linux")]
+            {
+                let for_root = name.starts_with("a_setup_run_as_root");
+                if for_root != running_as_root() {
+                    println!(
+                        "test {name} ... skipped ({})",
+                        if for_root {
+                            "runs only as root"
+                        } else {
+                            "a setup run as root never installs per user; runs in a user's process"
+                        }
+                    );
+                    continue;
+                }
             }
             ran += 1;
             let ok = std::panic::catch_unwind(case).is_ok();

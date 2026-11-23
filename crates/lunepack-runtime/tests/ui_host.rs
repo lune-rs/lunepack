@@ -646,6 +646,10 @@ mod native {
             host_a_user_reading_a_screen_is_not_a_hang,
         ),
         (
+            "host_the_administrator_command_screen_is_shown_and_its_answer_ends_it",
+            host_the_administrator_command_screen_is_shown_and_its_answer_ends_it,
+        ),
+        (
             "host_stops_reading_while_frames_flow_never_blocks",
             host_stops_reading_while_frames_flow_never_blocks,
         ),
@@ -1206,6 +1210,38 @@ mod native {
         assert!(wait_until(Duration::from_secs(2), || notes(&lab.out)
             .contains("ui got close")));
         assert!(!lab.lines(events).contains("ui_stopped"));
+    }
+
+    /// M11-D9: the command to run as an administrator reaches the UI as a screen of its own, the
+    /// UI's close ends it (acknowledged), and a text the protocol refuses is never sent.
+    fn host_the_administrator_command_screen_is_shown_and_its_answer_ends_it() {
+        let lab = HostLab::new(Some("answers=proceed+close"));
+        let ui = lab.start(Flow::Install);
+        let events = lab.events(&ui);
+        assert_eq!(welcome(&ui, &events), ChoiceValue::Proceed);
+        // Refused texts: a newline, a bidirectional override, nothing at all, too long.
+        for bad in [
+            "sudo '/a'\n--all-users".to_owned(),
+            "sudo '/a\u{202E}b' --all-users".to_owned(),
+            String::new(),
+            format!("sudo '/{}' --all-users", "a".repeat(1100)),
+        ] {
+            assert!(!ui.admin_command(bad.clone()), "{bad:?}");
+        }
+        assert!(ui.admin_command("sudo '/home/ann/Setup' --all-users".to_owned()));
+        let got = ui.prompt(PromptKind::AdminCommand, &events, &mut |_| {});
+        assert_eq!(got, ChoiceValue::Close);
+        assert!(ui.outcome_acknowledged());
+        assert_eq!(ui.stopped(), None);
+        ui.close(&events);
+        assert!(notes(&lab.out).contains("ui got prompt AdminCommand"));
+        // A headless host shows nothing and says so.
+        let headless = UiHost::headless(Flow::Install);
+        assert!(!headless.admin_command("sudo '/a' --all-users".to_owned()));
+        assert_eq!(
+            headless.prompt(PromptKind::AdminCommand, &events, &mut |_| {}),
+            ChoiceValue::Close
+        );
     }
 
     fn host_stops_reading_while_frames_flow_never_blocks() {
