@@ -267,6 +267,34 @@ fn unix_target_paths_are_slash_separated_on_every_host() {
         ] {
             got.push((text(&path), want));
         }
+        // The machine view composes the same way, so a byte comparison with the machine layout's
+        // own paths holds on a Windows host too.
+        let view = l.view();
+        let mut views = vec![
+            (view.versions_dir(), format!("{r}/app")),
+            (view.state_dir(), format!("{r}/.lunepack/state")),
+            (view.logs_dir(), format!("{r}/.lunepack/logs")),
+            (view.version_dir(&ver), format!("{r}/app/1.2.3")),
+            (view.swap_slot(), format!("{r}/app/.swap")),
+            (view.out_slot(), format!("{r}/app/.out")),
+            (
+                view.version_config_path(&ver),
+                format!("{r}/app/1.2.3/{}", scheme.view.config),
+            ),
+        ];
+        views.extend(view.current_link().map(|p| (p, format!("{r}/current"))));
+        views.extend(view.bundle_link().map(|p| (p, format!("{r}/bundle"))));
+        views.extend(view.bundle_id_path().map(|p| (p, format!("{r}/bundle.id"))));
+        assert!(views.len() >= 8, "every view builder is checked");
+        for (path, want) in &views {
+            assert_eq!(&text(path), want);
+        }
+        assert_eq!(view.versions_dir(), l.app_dir());
+        assert_eq!(
+            view.versions_dir().as_os_str(),
+            l.app_dir().as_os_str(),
+            "byte equality with the machine layout"
+        );
     }
     got.push((
         text(&machine_user_home(Path::new("<data home>"), &app)),

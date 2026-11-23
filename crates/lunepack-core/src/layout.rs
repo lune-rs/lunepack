@@ -317,13 +317,38 @@ fn join_names_unix(base: &Path, rel: &str) -> PathBuf {
 pub struct UserLayout {
     root: PathBuf,
     scheme: LayoutScheme,
+    /// Whether the paths it returns are joined with `/` on every host ([`MachineLayout::view`]
+    /// under a unix scheme, M12-D11) instead of the host's separator.
+    slash: bool,
 }
 
 impl UserLayout {
     /// The layout under the install root `root` (already canonical; nothing is checked here) with
     /// `scheme`'s names.
     pub fn from_root(root: PathBuf, scheme: LayoutScheme) -> UserLayout {
-        UserLayout { root, scheme }
+        UserLayout {
+            root,
+            scheme,
+            slash: false,
+        }
+    }
+
+    /// `base` joined with the plain name `name`, as the layout's separator says.
+    fn join(&self, base: &Path, name: &str) -> PathBuf {
+        if self.slash {
+            join_unix(base, name)
+        } else {
+            base.join(name)
+        }
+    }
+
+    /// `base` joined with each `/`-separated name of `rel`, as [`UserLayout::join`].
+    fn join_rel(&self, base: &Path, rel: &str) -> PathBuf {
+        if self.slash {
+            join_names_unix(base, rel)
+        } else {
+            join_names(base, rel)
+        }
     }
 
     /// The layout whose state and versions directories are exactly `state_dir` and
@@ -363,50 +388,51 @@ impl UserLayout {
 
     /// The version trees' directory (`R/versions`, Windows `R\app`).
     pub fn versions_dir(&self) -> PathBuf {
-        join_names(&self.root, self.scheme.versions)
+        self.join_rel(&self.root, self.scheme.versions)
     }
 
     /// The install-state directory (`R/state`, Windows `R\.lunepack\state`).
     pub fn state_dir(&self) -> PathBuf {
-        join_names(&self.root, self.scheme.state)
+        self.join_rel(&self.root, self.scheme.state)
     }
 
     /// The download cache (`R/cache`, Windows `R\.lunepack\cache`).
     pub fn cache_dir(&self) -> PathBuf {
-        join_names(&self.root, self.scheme.cache)
+        self.join_rel(&self.root, self.scheme.cache)
     }
 
     /// The log directory (`R/logs`, Windows `R\.lunepack\logs`).
     pub fn logs_dir(&self) -> PathBuf {
-        join_names(&self.root, self.scheme.logs)
+        self.join_rel(&self.root, self.scheme.logs)
     }
 
     /// `R/current`, only under [`Projection::CurrentLink`].
     pub fn current_link(&self) -> Option<PathBuf> {
         match self.scheme.projection {
-            Projection::CurrentLink => Some(self.root.join(CURRENT_LINK)),
+            Projection::CurrentLink => Some(self.join(&self.root, CURRENT_LINK)),
             Projection::None | Projection::Bundle => None,
         }
     }
 
     /// `R/bundle`, the pointer to the live bundle, only under [`Projection::Bundle`].
     pub fn bundle_link(&self) -> Option<PathBuf> {
-        (self.scheme.projection == Projection::Bundle).then(|| self.root.join(BUNDLE_LINK))
+        (self.scheme.projection == Projection::Bundle).then(|| self.join(&self.root, BUNDLE_LINK))
     }
 
     /// `R/bundle.id`, the live bundle's identity, only under [`Projection::Bundle`].
     pub fn bundle_id_path(&self) -> Option<PathBuf> {
-        (self.scheme.projection == Projection::Bundle).then(|| self.root.join(BUNDLE_ID_FILE))
+        (self.scheme.projection == Projection::Bundle)
+            .then(|| self.join(&self.root, BUNDLE_ID_FILE))
     }
 
     /// The swap slot, `<versions>/.swap`.
     pub fn swap_slot(&self) -> PathBuf {
-        self.versions_dir().join(SWAP_SLOT)
+        self.join(&self.versions_dir(), SWAP_SLOT)
     }
 
     /// The out slot of the two-rename path, `<versions>/.out`.
     pub fn out_slot(&self) -> PathBuf {
-        self.versions_dir().join(OUT_SLOT)
+        self.join(&self.versions_dir(), OUT_SLOT)
     }
 
     /// The live bundle `B` that `R/bundle` names (M8-D1): `None` when the layout projects no
@@ -443,13 +469,13 @@ impl UserLayout {
 
     /// The tree of `version` (`R/versions/<version>`, Windows `R\app\<version>`).
     pub fn version_dir(&self, version: &Version) -> PathBuf {
-        self.versions_dir().join(version.to_string())
+        self.join(&self.versions_dir(), &version.to_string())
     }
 
     /// The update config of `version`'s tree (the scheme's config path inside it), where the
     /// applier reads another version's config with no walk (M5-D17).
     pub fn version_config_path(&self, version: &Version) -> PathBuf {
-        join_names(&self.version_dir(version), self.scheme.config)
+        self.join_rel(&self.version_dir(version), self.scheme.config)
     }
 
     /// The live tree the facade's `Layout::User` names without reading the disk: `None`, because
@@ -2134,7 +2160,10 @@ impl MachineLayout {
     /// The machine view of `R` as a [`UserLayout`] under the scheme's view, for the projection
     /// (`R/current` on Linux, the bundle on macOS) and the version trees' config paths.
     pub fn view(&self) -> UserLayout {
-        UserLayout::from_root(self.root.clone(), self.scheme.view)
+        let mut view = UserLayout::from_root(self.root.clone(), self.scheme.view);
+        // A unix scheme's paths are `/`-joined on every host, the machine layout's own (M12-D11).
+        view.slash = self.scheme.os.unix().is_some();
+        view
     }
 
     /// `base` joined with the plain name `name`: with `/` on every host under a unix scheme
