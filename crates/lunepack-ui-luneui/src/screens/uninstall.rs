@@ -29,6 +29,7 @@ pub(crate) fn main(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
             "Uninstall failed",
             false,
         ),
+        Screen::AdminCommand => super::admin::command(ui, d),
         _ => Out::default(),
     }
 }

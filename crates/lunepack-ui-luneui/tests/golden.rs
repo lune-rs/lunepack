@@ -187,6 +187,38 @@ fn scenes() -> Vec<Scene> {
         scenario::install_failed(OS, 1000, 4000, 9),
         5500,
     );
+    // The two screens that end an operation elsewhere (M11 step 8): the administrator command
+    // (short, long, and exactly the cap; an uninstall's) and the hand-off to Installer.
+    still(
+        "install-admin-command",
+        Flow::Install,
+        scenario::install_admin_command(OS, 1000, 4000, scenario::ADMIN_COMMAND),
+        5500,
+    );
+    still(
+        "install-admin-command-long",
+        Flow::Install,
+        scenario::install_admin_command(OS, 1000, 4000, scenario::ADMIN_COMMAND_LONG),
+        5500,
+    );
+    still(
+        "install-admin-command-max",
+        Flow::Install,
+        scenario::install_admin_command(OS, 1000, 4000, &scenario::admin_command_max()),
+        5500,
+    );
+    still(
+        "uninstall-admin-command",
+        Flow::Uninstall,
+        scenario::uninstall_admin_command(OS, 1000, 4000, scenario::ADMIN_COMMAND_UNINSTALL),
+        5500,
+    );
+    still(
+        "install-handed-off",
+        Flow::Install,
+        scenario::install_handed_off(OS, 1000, 4000),
+        5500,
+    );
     still(
         "update-waiting",
         Flow::Update,
@@ -437,12 +469,14 @@ fn reachable(screen: Screen) -> bool {
         | Screen::UninstallConfirm
         | Screen::Uninstalling
         | Screen::UninstallDone
-        | Screen::UninstallFailed => true,
+        | Screen::UninstallFailed
+        | Screen::AdminCommand
+        | Screen::HandedOff => true,
     }
 }
 
 /// Every screen the reducer can reach, listed once.
-const ALL_SCREENS: [Screen; 15] = [
+const ALL_SCREENS: [Screen; 17] = [
     Screen::Idle,
     Screen::InstallWelcome,
     Screen::Installing,
@@ -457,6 +491,8 @@ const ALL_SCREENS: [Screen; 15] = [
     Screen::Uninstalling,
     Screen::UninstallDone,
     Screen::UninstallFailed,
+    Screen::AdminCommand,
+    Screen::HandedOff,
     Screen::Closed,
 ];
 

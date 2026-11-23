@@ -1,6 +1,7 @@
 //! The screens of the three flows. Each draws the main area (right of the rail) for one screen of
 //! a [`View`] and reports what the user did.
 
+pub(crate) mod admin;
 pub(crate) mod install;
 pub(crate) mod uninstall;
 pub(crate) mod update;

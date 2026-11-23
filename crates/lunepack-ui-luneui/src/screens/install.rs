@@ -22,6 +22,8 @@ pub(crate) fn main(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
         Screen::Installing => installing(ui, d),
         Screen::InstallDone => done(ui, d),
         Screen::InstallFailed => failed(ui, d),
+        Screen::AdminCommand => super::admin::command(ui, d),
+        Screen::HandedOff => super::admin::handed_off(ui, d),
         _ => Out::default(),
     }
 }

@@ -120,10 +120,16 @@ pub(crate) fn step_bit(item: StepItem) -> u16 {
 fn rail_index(flow: Option<Flow>, screen: Screen) -> usize {
     match (flow, screen) {
         (Some(Flow::Install), Screen::InstallWelcome) => 0,
-        (Some(Flow::Install), Screen::Installing | Screen::InstallFailed) => 1,
+        (
+            Some(Flow::Install),
+            Screen::Installing | Screen::InstallFailed | Screen::AdminCommand | Screen::HandedOff,
+        ) => 1,
         (Some(Flow::Install), Screen::InstallDone) => 2,
         (Some(Flow::Uninstall), Screen::UninstallConfirm) => 0,
-        (Some(Flow::Uninstall), Screen::Uninstalling | Screen::UninstallFailed) => 1,
+        (
+            Some(Flow::Uninstall),
+            Screen::Uninstalling | Screen::UninstallFailed | Screen::AdminCommand,
+        ) => 1,
         (Some(Flow::Uninstall), Screen::UninstallDone) => 2,
         _ => 0,
     }
@@ -132,7 +138,11 @@ fn rail_index(flow: Option<Flow>, screen: Screen) -> usize {
 fn glow_kind(screen: Screen, outcome: Option<&Outcome>) -> GlowKind {
     match screen {
         Screen::Idle | Screen::Closed => GlowKind::Idle,
-        Screen::InstallWelcome | Screen::UninstallConfirm => GlowKind::Idle,
+        // Nothing ran and nothing failed: the command and the hand-off wait for the person.
+        Screen::InstallWelcome
+        | Screen::UninstallConfirm
+        | Screen::AdminCommand
+        | Screen::HandedOff => GlowKind::Idle,
         Screen::Installing
         | Screen::UpdateWaiting
         | Screen::UpdateApplying
@@ -161,6 +171,8 @@ pub struct UiModel {
     pub(crate) location: Option<String>,
     pub(crate) all_users_location: Option<String>,
     pub(crate) size_bytes: Option<u64>,
+    /// The command of [`EngineMsg::AdminCommand`], shown verbatim and never run.
+    pub(crate) admin_command: Option<String>,
     pub(crate) icon: Option<ImageData>,
     steps: u16,
     caption: Option<(u64, u64)>,
@@ -198,6 +210,7 @@ impl UiModel {
             location: None,
             all_users_location: None,
             size_bytes: None,
+            admin_command: None,
             icon: None,
             steps: 0,
             caption: None,
@@ -348,6 +361,7 @@ impl UiModel {
                     }
                 }
             }
+            EngineMsg::AdminCommand { command } => self.admin_command = Some(command.clone()),
             EngineMsg::Outcome(Outcome::Updated) => self.closing_since = Some(t),
             EngineMsg::Outcome(Outcome::Uninstalled { .. }) => self.dim_since = Some(t),
             _ => {}
@@ -500,6 +514,8 @@ impl UiModel {
                     // button (which the update window lacks) and Enter acknowledge it.
                     K::RolledBack if finish_ok => vec![c(ChoiceValue::Acknowledge)],
                     K::RolledBack => vec![],
+                    // The only thing to answer; Esc and the window's close button close it.
+                    K::AdminCommand | K::HandedOff => vec![c(ChoiceValue::Close)],
                 }
             }
             None => vec![UiMsg::Cancel],

@@ -101,6 +101,37 @@ pub fn install_failed_note(os: Os) -> String {
     format!("Nothing was changed on this {}.", os.machine())
 }
 
+/// The title of the screen that shows the command to run as an administrator (M11-D9, D14).
+pub fn admin_command_title() -> &'static str {
+    "Finish in a terminal"
+}
+
+/// The line under that title: what the command does, by flow (`install` is true for an install).
+pub fn admin_command_note(install: bool, name: &str) -> String {
+    if install {
+        format!(
+            "Run this command in a terminal as an administrator to install {name} for all users."
+        )
+    } else {
+        format!("Run this command in a terminal as an administrator to uninstall {name}.")
+    }
+}
+
+/// The label of the button that copies the administrator command.
+pub fn admin_command_copy() -> &'static str {
+    "Copy command"
+}
+
+/// The title of the screen that says the install went on in the system's installer (M11-D8).
+pub fn handed_off_title() -> &'static str {
+    "Continue in Installer"
+}
+
+/// The line under that title.
+pub fn handed_off_note(name: &str) -> String {
+    format!("Installer has opened to install {name} for all users. You can close this window.")
+}
+
 /// What an exit code of the runtime (docs/RUNTIME.md, "Exit codes") means to a person.
 pub fn failure_reason(code: u32, name: &str) -> String {
     match code {

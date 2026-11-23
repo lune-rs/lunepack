@@ -6,10 +6,14 @@ generated sample icon (`scenario::sample_icon_png`). A name is `<scene>.png` for
 `<transition>-<tier>-t<ms>.png` for a frame of a strip, `<ms>` counted from the instant of the change.
 `install-welcome-scope` and `install-welcome-scope-all` show the welcome screen with the all-users
 choice offered (D38), unticked and ticked by a click.
+`install-admin-command` (the command to run in a terminal as an administrator, M11-D9), its `-long` (spaces,
+an escaped quote, one long file name) and `-max` (exactly the 1024-byte cap, scrolled to its top inside the
+card) variants, `uninstall-admin-command` (M11-D14) and `install-handed-off` ("Continue in Installer", M11-D8)
+are the screens of the two events that end an operation elsewhere; they have no transition strips.
 
 ## One set per OS
 
-Each OS compares against its own set of the same 90 frames, because the adapters do not agree: the
+Each OS compares against its own set of the same 95 frames, because the adapters do not agree: the
 frames of Metal differ from the ones of lavapipe by at most 3 per channel, but in 11 of the 88 earlier frames
 (the transition strips, where glow, blur and fades are on screen) on 10.35 to 23.94 % of the
 pixels, over the 10 % the cross-adapter bound allows. The bound was not loosened; the sets were split.
@@ -56,7 +60,7 @@ Re-seed on the set's own machine class, then look at what changed:
    table with `LUNEPACK_WRITE_GOLDENS=1` added (the golden test then writes the set instead of
    comparing).
 2. `git status` and `git diff --stat crates/lunepack-ui-luneui/tests/golden`: only the frames of the
-   screen that changed on purpose may differ. A set holds exactly the 90 frames and nothing else.
+   screen that changed on purpose may differ. A set holds exactly the 95 frames and nothing else.
 3. Run `cargo test -p lunepack-ui-luneui --locked --test golden` (the plain test checks the names), look
    at the frames that changed, and commit the set.
 
