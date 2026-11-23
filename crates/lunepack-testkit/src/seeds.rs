@@ -1405,11 +1405,14 @@ fn service_msg(body: &[u8]) -> Vec<u8> {
     service_frame(service::KIND_MESSAGE, body)
 }
 
-/// A server-side input (byte 0 even): the client's hello, then `frames`.
+/// A server-side input (byte 0 even): the client's hello for version 1, then `frames`.
 fn server_stream(frames: &[Vec<u8>]) -> Vec<u8> {
-    let hello = service::ClientHello { min: 1, max: 1 }
-        .encode()
-        .expect("hello");
+    server_stream_range(1, 1, frames)
+}
+
+/// A server-side input whose client offers `min..=max`, then `frames`.
+fn server_stream_range(min: u32, max: u32, frames: &[Vec<u8>]) -> Vec<u8> {
+    let hello = service::ClientHello { min, max }.encode().expect("hello");
     let mut out = vec![0u8];
     out.extend(service_msg(&hello));
     for f in frames {
@@ -1418,9 +1421,16 @@ fn server_stream(frames: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-/// A client-side input (byte 0 odd): the server's hello, then `frames`.
+/// A client-side input (byte 0 odd): the server's hello for version 1, then `frames`.
 fn client_stream(frames: &[Vec<u8>]) -> Vec<u8> {
-    let hello = service::ServerHello::Version(1).encode().expect("hello");
+    client_stream_version(1, frames)
+}
+
+/// A client-side input whose server answers `version`, then `frames`.
+fn client_stream_version(version: u32, frames: &[Vec<u8>]) -> Vec<u8> {
+    let hello = service::ServerHello::Version(version)
+        .encode()
+        .expect("hello");
     let mut out = vec![1u8];
     out.extend(service_msg(&hello));
     for f in frames {
@@ -1539,11 +1549,29 @@ fn service_seeds(out: &mut Out) {
     );
     let mut unsupported = vec![0u8];
     unsupported.extend(service_msg(
-        &service::ClientHello { min: 2, max: 3 }
+        &service::ClientHello { min: 3, max: 4 }
             .encode()
             .expect("hello"),
     ));
     out.ok("service", "server-unsupported", unsupported);
+
+    // Version 2 (M12-D6): `put` of a patch, accepted at version 2 and malformed at version 1.
+    let put_patch = request(Request::Put {
+        kind: ObjectKind::Patch,
+        sha256: digest,
+        size: 6,
+    });
+    out.ok(
+        "service",
+        "server-v2-put-patch",
+        server_stream_range(1, 2, &[put_patch.clone(), data(6, 3)]),
+    );
+    out.bad(
+        "service",
+        "server-v1-put-patch",
+        server_stream(&[put_patch, data(6, 3)]),
+    );
+    out.ok("service", "client-v2-hello", client_stream_version(2, &[]));
 
     // Client side: one accepted stream per answer type.
     let answers: Vec<(&str, Response)> = vec![

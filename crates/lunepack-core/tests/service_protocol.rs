@@ -831,6 +831,14 @@ fn malformed_requests_end_the_session() {
         ),
         ("a data frame", encode_frame(KIND_DATA, b"x").unwrap()),
         ("a second hello", client_hello()),
+        // M12-D6: `patch` is a kind of version 2; this session speaks version 1.
+        (
+            "a patch in a version-1 session",
+            raw_msg(&format!(
+                r#"{{"type":"put","app":"org.example.hello","kind":"patch","sha256":"{}","size":1}}"#,
+                "ab".repeat(32)
+            )),
+        ),
     ];
     for (what, frame) in bad {
         let (r, script) = first_request(std::slice::from_ref(&frame));
@@ -924,11 +932,11 @@ fn negotiation_picks_the_highest_common_version() {
 }
 
 #[test]
-fn a_client_offering_two_to_three_gets_unsupported_one_to_one() {
-    let input = msg(&ClientHello { min: 2, max: 3 }.encode().unwrap());
+fn a_client_offering_three_to_four_gets_unsupported_one_to_two() {
+    let input = msg(&ClientHello { min: 3, max: 4 }.encode().unwrap());
     let script = Script::new(input);
     let r = ServerSession::accept(script, app());
-    assert_eq!(r.err(), Some(ServiceError::Unsupported { min: 2, max: 3 }));
+    assert_eq!(r.err(), Some(ServiceError::Unsupported { min: 3, max: 4 }));
     // The server's answer, read by a client that offered 2..=3.
     let mut client_in = msg(&ServerHello::Unsupported { min: 1, max: 1 }
         .encode()
@@ -945,7 +953,7 @@ fn a_client_offering_two_to_three_gets_unsupported_one_to_one() {
 
 #[test]
 fn the_server_writes_unsupported_with_its_range() {
-    let input = msg(&ClientHello { min: 2, max: 3 }.encode().unwrap());
+    let input = msg(&ClientHello { min: 3, max: 4 }.encode().unwrap());
     let mut script = Script::new(input);
     // Accept consumes the script; check the bytes through a second run on a shared buffer.
     let _ = ServerSession::accept(&mut script as &mut Script, app());
@@ -955,7 +963,7 @@ fn the_server_writes_unsupported_with_its_range() {
     };
     assert_eq!(
         ServerHello::decode(&body).unwrap(),
-        ServerHello::Unsupported { min: 1, max: 1 }
+        ServerHello::Unsupported { min: 1, max: 2 }
     );
     assert_eq!(read_frame(&mut out).unwrap(), None, "and nothing else");
 }
@@ -1457,7 +1465,7 @@ fn a_whole_conversation_over_a_duplex() {
     let (client_end, server_end) = pipe_pair();
     let server = serve(server_end);
     let mut c = ClientSession::connect(client_end, app(), timeouts()).unwrap();
-    assert_eq!(c.version(), 1);
+    assert_eq!(c.version(), 2);
     assert_eq!(c.status().unwrap(), status_full());
     let manifest = vec![7u8; MAX_DATA + 10];
     let documents = [
@@ -1652,4 +1660,49 @@ fn the_harness_accepts_exactly_valid_streams() {
         "nothing may follow unsupported"
     );
     assert!(!harness(0, &[]));
+}
+
+// ---- version 2 (M12-D6) --------------------------------------------------------------------------
+
+/// A client offering 1..=2 gets version 2 and may `put` a patch; a client limited to version 1
+/// gets version 1 from this server, and its own `put` of a patch is refused before any byte is
+/// sent; a server limited to version 1 answers a 1..=2 client with version 1.
+#[test]
+fn version_2_adds_put_of_a_patch_and_version_1_stays() {
+    let sha = Sha256Digest::from_bytes([0xab; 32]);
+    let put = req(Request::Put {
+        kind: ObjectKind::Patch,
+        sha256: sha,
+        size: 1,
+    })
+    .encode()
+    .unwrap();
+    let mut input = msg(&ClientHello { min: 1, max: 2 }.encode().unwrap());
+    input.extend_from_slice(&msg(&put));
+    let mut s = ServerSession::accept(Script::new(input), app()).expect("hello");
+    assert_eq!(s.version(), 2);
+    assert_eq!(
+        s.next_request(),
+        Ok(Some(Request::Put {
+            kind: ObjectKind::Patch,
+            sha256: sha,
+            size: 1
+        }))
+    );
+
+    // A version-1 server (an older build) answers a 1..=2 client with version 1.
+    let input = msg(&ClientHello { min: 1, max: 2 }.encode().unwrap());
+    let s = ServerSession::accept_range(Script::new(input), app(), 1, 1).expect("hello");
+    assert_eq!(s.version(), 1);
+
+    // A client of version 1 never sends a patch: refused before a byte goes out.
+    let mut c =
+        ClientSession::connect_range(Script::new(server_hello()), app(), no_timeouts(), 1, 1)
+            .expect("connect");
+    assert_eq!(c.version(), 1);
+    let r = c.put(ObjectKind::Patch, sha, 1, &mut &[0u8][..]);
+    assert!(matches!(r, Err(ServiceError::Malformed(_))), "{r:?}");
+    let script = c.into_inner();
+    let hello_len = msg(&ClientHello { min: 1, max: 1 }.encode().unwrap()).len();
+    assert_eq!(script.output.len(), hello_len, "only the hello was written");
 }

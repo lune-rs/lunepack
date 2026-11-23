@@ -117,7 +117,7 @@ struct Host {
     process: FakeProcess,
     rng: FakeRng,
     clock: FakeClock,
-    codec: FakeCodec,
+    codec: Arc<dyn lunepack_core::Codec>,
     root: PathBuf,
     monotonic: AtomicU64,
     connects: AtomicUsize,
@@ -127,7 +127,7 @@ impl Host {
     fn ports(&self) -> Ports<'_> {
         Ports {
             fs: &self.fs,
-            codec: &self.codec,
+            codec: &*self.codec,
             hasher: &FakeHasher,
             verifier: &FakeVerifier,
             clock: &self.clock,
@@ -235,10 +235,47 @@ struct Rig {
     facade_integration: FakeIntegration,
     /// The service's accept queue.
     server: Mutex<mpsc::Sender<(lunepack_testkit::MemDuplex, lunepack_core::AppId)>>,
+    /// Incompressible release files, real LZMA frames and patches (M12-D6).
+    noise: bool,
+}
+
+/// The release files of `v`: compressible ones, or (`noise`) incompressible ones edited a little
+/// from release to release, so a delta patch is far shorter than its frame.
+fn release_files(world: &World, v: &str, noise: bool) -> Vec<(&'static str, Vec<u8>)> {
+    let config = config_for(&world.root(), v)
+        .to_bytes()
+        .expect("config bytes");
+    if !noise {
+        return vec![
+            ("app.exe", format!("entry of {v}").repeat(20).into_bytes()),
+            ("readme.txt", b"unchanged readme".repeat(8)),
+            (SERVICE_FILE, format!("service of {v}").into_bytes()),
+            (UPDATE_CONFIG_FILE, config),
+        ];
+    }
+    let edits = if v == V100 { 0 } else { 1 };
+    let edited = |mut bytes: Vec<u8>| {
+        for k in 0..edits * 4 {
+            let at = bytes.len() / 5 * (k + 1);
+            bytes[at] ^= 0x5A;
+        }
+        bytes
+    };
+    vec![
+        ("app.exe", edited(common::noise(30_000, 1))),
+        ("readme.txt", b"unchanged readme".repeat(8)),
+        (SERVICE_FILE, edited(common::noise(20_000, 2))),
+        (UPDATE_CONFIG_FILE, config),
+    ]
 }
 
 impl Rig {
     fn new() -> Rig {
+        Rig::with(2, false)
+    }
+
+    /// A rig whose service speaks protocol versions `1..=server_max`, with `noise` release files.
+    fn with(server_max: u32, noise: bool) -> Rig {
         let world = World::new();
         let fs = world.fs.clone();
         let home = abs_path("/pf");
@@ -252,7 +289,11 @@ impl Rig {
             process: FakeProcess::new(root.join("app/1.0.0/app.exe")),
             rng: FakeRng::new(7),
             clock: FakeClock::new(SUITE_T0 + 3600),
-            codec: FakeCodec::new(),
+            codec: if noise {
+                Arc::new(lunepack_codec_lzma::LzmaCodec)
+            } else {
+                Arc::new(FakeCodec::new())
+            },
             root: root.clone(),
             monotonic: AtomicU64::new(1000),
             connects: AtomicUsize::new(0),
@@ -272,6 +313,7 @@ impl Rig {
             attempts: Arc::new(Mutex::new(Vec::new())),
             facade_process: FakeProcess::new("/unused"),
             facade_integration: FakeIntegration::new(),
+            noise,
         };
         rig.write_tree(V100);
         let store = rig.host.store();
@@ -295,7 +337,7 @@ impl Rig {
         thread::spawn(move || {
             let mut engine: Option<Engine<'_>> = None;
             for (io, app) in rx {
-                let Ok(session) = ServerSession::accept(io, app) else {
+                let Ok(session) = ServerSession::accept_range(io, app, 1, server_max) else {
                     continue;
                 };
                 if engine.is_none() {
@@ -316,25 +358,56 @@ impl Rig {
     }
 
     fn write_tree(&self, v: &str) {
-        let pack = release_pack(&self.world, v);
         let dir = self.root().join("app").join(v);
         self.world.fs.create_dir_all(&dir).expect("dir");
-        for (name, bytes) in [
-            ("app.exe", format!("entry of {v}").repeat(20).into_bytes()),
-            ("readme.txt", b"unchanged readme".repeat(8)),
-            (SERVICE_FILE, format!("service of {v}").into_bytes()),
-            (
-                UPDATE_CONFIG_FILE,
-                config_for(&self.world.root(), v)
-                    .to_bytes()
-                    .expect("config"),
-            ),
-        ] {
+        for (name, bytes) in release_files(&self.world, v, self.noise) {
             let mut w = self.world.fs.create_new(&dir.join(name)).expect("create");
             w.write_all(&bytes).expect("write");
             w.sync().expect("sync");
         }
-        drop(pack);
+    }
+
+    /// Publishes `v` as feed `seq`, laid out by the real writer with real LZMA frames and one delta
+    /// from `from` (a patch for every file that changed); returns the delta file's name.
+    fn publish_with_delta(&self, seq: u64, v: &str, from: &str) -> String {
+        use lunepack_core::{PayloadKind, ReleaseLayout, encode_patch_checked, pack_file};
+        let codec = lunepack_codec_lzma::LzmaCodec;
+        let old = release_files(&self.world, from, true);
+        let mut layout = ReleaseLayout::new(app_id(), v, common::TARGET).expect("layout");
+        let mut patches = Vec::new();
+        for (name, bytes) in release_files(&self.world, v, true) {
+            let rel = RelPath::parse(name).expect("path");
+            let packed = pack_file(&bytes, &codec, &codec, &FakeHasher).expect("pack");
+            layout.add_file(rel.clone(), false, &packed).expect("add");
+            let base = &old.iter().find(|(n, _)| *n == name).expect("base").1;
+            if *base != bytes {
+                let patch = encode_patch_checked(
+                    &rel,
+                    CodecId::Lzma2,
+                    base,
+                    &bytes,
+                    &codec,
+                    &codec,
+                    &FakeHasher,
+                )
+                .expect("patch");
+                patches.push((rel, patch));
+            }
+        }
+        layout.add_delta(from, patches).expect("delta");
+        let release = layout
+            .finish_release(SUITE_T0, &FakeHasher)
+            .expect("finish");
+        let w = &self.world;
+        let manifest =
+            w.fx.envelope(PayloadKind::Manifest, &release.manifest.to_payload(), &[1]);
+        w.origin.put(&common::manifest_path(v), manifest.clone());
+        w.origin.put(&common::pack_path(v), release.pack.clone());
+        let delta = release.deltas[0].path.clone();
+        w.origin.put(&delta, release.deltas[0].bytes.clone());
+        let doc = w.fx.release(v, &[(common::TARGET, &manifest)], None);
+        w.publish_feed(seq, vec![doc]);
+        delta
     }
 
     /// The connector of this machine's service. One engine serves every connection, as the
@@ -403,7 +476,7 @@ impl Rig {
         inst.updater_builder()
             .expect("builder")
             .transport(Arc::clone(&self.world.transport))
-            .codec(Arc::new(FakeCodec::new()))
+            .codec(Arc::clone(&self.host.codec))
             .clock(Arc::clone(&self.world.clock) as Arc<dyn lunepack_core::Clock>)
             .fetch_policy(policy)
             .workers(2)
@@ -1424,5 +1497,87 @@ fn a_cancelled_stage_makes_no_connection() {
     ));
     assert_eq!(rig.host.connects.load(Ordering::SeqCst), connects);
     assert!(rig.host.record().staged.is_none());
+    rig.assert_read_only();
+}
+
+// ---- delta patches over the service (M12-D6) ------------------------------------------------------
+
+/// The request names under the fake origin since `from`, with their `Range` headers.
+fn requests_since(rig: &Rig, from: usize) -> Vec<(String, Option<String>)> {
+    rig.world.origin.requests()[from..]
+        .iter()
+        .map(|r| {
+            (
+                r.url
+                    .strip_prefix(lunepack_testkit::FAKE_BASE_URL)
+                    .unwrap_or(&r.url)
+                    .trim_start_matches('/')
+                    .to_owned(),
+                r.range_header.clone(),
+            )
+        })
+        .collect()
+}
+
+fn assert_staged_files(rig: &Rig, tree: &Path, v: &str) {
+    for (name, bytes) in release_files(&rig.world, v, true) {
+        assert_eq!(
+            rig.host
+                .fs
+                .read_capped(&tree.join(name), 1 << 20)
+                .expect("read"),
+            bytes,
+            "{name}"
+        );
+    }
+}
+
+/// A version-2 service takes the patches: the download fetches the delta file and no frame of the
+/// pack, the stage uploads the patches, and the engine rebuilds the files from its own tree.
+#[test]
+fn a_version_2_service_stages_from_uploaded_patches() {
+    let rig = Rig::with(2, true);
+    let delta = rig.publish_with_delta(2, V110, V100);
+    let inst = rig.open(V100, None);
+    let updater = rig.updater(&inst);
+    let before = rig.world.origin.requests().len();
+    let (_, downloaded) = check_and_download(&rig, &updater);
+    let staged = block_on(updater.stage(downloaded)).expect("stage");
+    let reqs = requests_since(&rig, before);
+    assert!(reqs.iter().any(|(n, _)| *n == delta), "{reqs:?}");
+    assert!(
+        reqs.iter().all(|(n, _)| *n != common::pack_path(V110)),
+        "no frame of the patched files: {reqs:?}"
+    );
+    assert_eq!(staged.version(), &version(V110));
+    assert_staged_files(&rig, staged.tree(), V110);
+    rig.assert_read_only();
+}
+
+/// A version-1 service takes no patch: before its first commit the client fetches the frames of
+/// the patched files by Range, and the update completes.
+#[test]
+fn a_version_1_service_gets_frames_fetched_before_the_first_commit() {
+    let rig = Rig::with(1, true);
+    let delta = rig.publish_with_delta(2, V110, V100);
+    let inst = rig.open(V100, None);
+    let updater = rig.updater(&inst);
+    let (_, downloaded) = check_and_download(&rig, &updater);
+    let before = rig.world.origin.requests().len();
+    let connects = rig.host.connects.load(Ordering::SeqCst);
+    let staged = block_on(updater.stage(downloaded)).expect("stage");
+    let reqs = requests_since(&rig, before);
+    assert!(reqs.iter().all(|(n, _)| *n != delta), "{reqs:?}");
+    assert!(
+        reqs.iter().any(|(n, _)| *n == common::pack_path(V110)),
+        "the patched files' frames: {reqs:?}"
+    );
+    assert_eq!(
+        rig.host.connects.load(Ordering::SeqCst) - connects,
+        2,
+        "one connection learns the version, one stages"
+    );
+    assert_eq!(staged.version(), &version(V110));
+    assert_staged_files(&rig, staged.tree(), V110);
     rig.assert_read_only();
 }

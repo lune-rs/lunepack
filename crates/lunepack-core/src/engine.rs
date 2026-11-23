@@ -40,7 +40,9 @@ use crate::layout::{
     service_path_in_tree_for, set_bundle_pointer, tombstone_name, tree_identity,
 };
 use crate::lifecycle::{AttemptOutcome, ConfirmOutcome, gc_keep, machine};
-use crate::manifest::{VerifiedEntry, VerifiedManifest, verify_manifest};
+use crate::manifest::{
+    VerifiedDelta, VerifiedEntry, VerifiedManifest, VerifiedPatch, verify_manifest,
+};
 use crate::policy::select_candidate;
 use crate::process::Process;
 use crate::progress::Progress;
@@ -50,7 +52,7 @@ use crate::service::{
     ObjectKind, PendingStatus, Request, Response, ServerSession, StatusReport, Token, VerifyClass,
 };
 use crate::setup::VerifiedSetup;
-use crate::stage::{PARTIAL_SUFFIX, SourceFor, StageEnv, StageInput, scan, stage};
+use crate::stage::{PARTIAL_SUFFIX, PatchSource, SourceFor, StageEnv, StageInput, scan, stage};
 use crate::state::{
     Floors, InstallState, Loaded, MAX_BAD_VERSIONS, MachineStore, Scope, StagedRef, load_any,
 };
@@ -634,8 +636,9 @@ impl<'a> Engine<'a> {
         Ok(dir)
     }
 
-    /// `put`, before any byte: the object must be the manifest's pack or one of its frames, of
-    /// that size, and not uploaded before in this session (a repeat is `malformed`).
+    /// `put`, before any byte: the object must be the manifest's pack, one of its frames, or (M12-D6)
+    /// a patch of the delta whose `from` is the machine record's current version text, of that
+    /// size, and not uploaded before in this session (a repeat is `malformed`).
     pub fn put_check(
         &self,
         session: &StageSession<'_>,
@@ -654,6 +657,12 @@ impl<'a> Engine<'a> {
                     Some(f.length())
                 }
                 _ => None,
+            }),
+            ObjectKind::Patch => current_delta(session).and_then(|d| {
+                d.patches()
+                    .iter()
+                    .find(|p| p.sha256() == *sha256)
+                    .map(|p| p.length())
             }),
         };
         let want = want.ok_or(EngineError::of(ErrorCode::NotInManifest))?;
@@ -774,17 +783,38 @@ impl<'a> Engine<'a> {
             .objects
             .get(session.manifest.pack().sha256().as_bytes())
             .cloned();
+        // M12-D6: a patch uploaded for an entry is its last choice; its base is the file at the
+        // entry's path in this engine's own current tree, never anything the client named.
+        let patches: BTreeMap<&crate::path::RelPath, &VerifiedPatch> = current_delta(session)
+            .map(|d| d.patches().iter().map(|p| (p.path(), p)).collect())
+            .unwrap_or_default();
         let mut sources = Vec::with_capacity(unchanged.len());
         let mut missing = Vec::new();
         for (entry, same_file) in session.manifest.entries().iter().zip(unchanged) {
             let source = match entry {
                 VerifiedEntry::File { frame: Some(f), .. } => {
+                    let patch = patches.get(entry.path()).and_then(|p| {
+                        session
+                            .objects
+                            .get(p.sha256().as_bytes())
+                            .map(|object| (object, *p))
+                    });
                     if let Some(p) = same_file {
                         SourceFor::Unchanged(p)
                     } else if let Some(p) = session.objects.get(f.sha256().as_bytes()) {
                         SourceFor::Frame(p.clone())
                     } else if let Some(p) = &pack {
                         SourceFor::Pack(p.clone())
+                    } else if let Some((object, desc)) = patch {
+                        let mut base = current_tree.clone();
+                        for c in entry.path().components() {
+                            base.push(c);
+                        }
+                        SourceFor::Patch(PatchSource {
+                            patch: object.clone(),
+                            base,
+                            desc: desc.clone(),
+                        })
                     } else {
                         // No source for this file: listed, and asked for below before any
                         // stage runs.
@@ -2227,6 +2257,17 @@ fn end_malformed<D: Duplex>(
 ) -> Result<(), ServiceError> {
     let _ = session.reply(&Response::error(ErrorCode::Malformed));
     Err(ServiceError::Malformed(why))
+}
+
+/// The delta of `session`'s manifest whose `from` is, byte for byte, the text of the machine
+/// record's current version (FORMAT.md 9.3, M12-D6).
+fn current_delta<'s>(session: &'s StageSession<'_>) -> Option<&'s VerifiedDelta> {
+    let current = session.current.to_string();
+    session
+        .manifest
+        .deltas()
+        .iter()
+        .find(|d| d.from_text() == current)
 }
 
 /// Serves one connection: maps each request to the engine and answers it. A request out of order

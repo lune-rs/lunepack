@@ -1527,14 +1527,12 @@ async fn download(
         let manifest = Arc::clone(&info.manifest);
         let frames = frames_of(&manifest);
         // M12-D5: the delta whose `from` is the installed version's text, byte for byte (build
-        // metadata included). Per-user installs only: a machine stage uploads frames (step 6).
-        let delta_at = match (&inner.layout, &current) {
-            (Layout::User { .. }, Some(v)) => {
-                let text = v.to_string();
-                manifest.deltas().iter().position(|d| d.from_text() == text)
-            }
-            _ => None,
-        };
+        // metadata included). A machine install's stage uploads the patches to a version-2
+        // service, and the frames instead to a version-1 one (M12-D6).
+        let delta_at = current.as_ref().and_then(|v| {
+            let text = v.to_string();
+            manifest.deltas().iter().position(|d| d.from_text() == text)
+        });
 
         // Cache entries the plan does not name go first (M4-D17).
         let keep_frames: HashSet<Sha256Digest> = frames.iter().map(|(_, f)| f.sha256).collect();
@@ -2253,7 +2251,8 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
 }
 
 /// What `stage` of a machine layout sends the service for `downloaded`: every frame the download
-/// holds and, when some file still has no frame, the pack it holds. (The service chooses its own
+/// holds, the patch of each file it holds no frame for (M12-D6; only kept for a version-2
+/// service) and, when some file still has neither, the pack it holds. (The service chooses its own
 /// sources: the unchanged files of its tree first.)
 fn offers(downloaded: &Downloaded) -> Vec<Offer> {
     let manifest = &downloaded.info.manifest;
@@ -2263,8 +2262,9 @@ fn offers(downloaded: &Downloaded) -> Vec<Offer> {
         if downloaded.unchanged.get(i).is_some_and(Option::is_some) {
             continue;
         }
-        match downloaded.frames.get(&need.sha256) {
-            Some(path) => {
+        let patch = downloaded.patches.get(i).and_then(Option::as_ref);
+        match (downloaded.frames.get(&need.sha256), patch) {
+            (Some(path), _) => {
                 if !out.iter().any(|o: &Offer| o.sha256 == need.sha256) {
                     out.push(Offer {
                         kind: lunepack_core::service::ObjectKind::Frame,
@@ -2274,7 +2274,18 @@ fn offers(downloaded: &Downloaded) -> Vec<Offer> {
                     });
                 }
             }
-            None => needs_pack = true,
+            (None, Some(p)) => {
+                let sha256 = p.desc.sha256();
+                if !out.iter().any(|o: &Offer| o.sha256 == sha256) {
+                    out.push(Offer {
+                        kind: lunepack_core::service::ObjectKind::Patch,
+                        sha256,
+                        size: p.desc.length(),
+                        path: p.patch.clone(),
+                    });
+                }
+            }
+            (None, None) => needs_pack = true,
         }
     }
     if let (true, Some(pack)) = (needs_pack, downloaded.pack.as_ref()) {
@@ -2312,8 +2323,9 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
         unchanged,
         mut frames,
         mut pack,
+        patches,
+        delta,
         mut options,
-        ..
     } = downloaded;
     let cancel = options.cancel.clone().unwrap_or_default();
     let (sink, mut pump) = progress(Phase::Stage, 0);
@@ -2328,38 +2340,67 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
             unchanged: unchanged.clone(),
             frames: frames.clone(),
             pack: pack.clone(),
-            patches: Vec::new(),
-            delta: None,
+            patches,
+            delta,
             options: DownloadOptions::default(),
         };
-        let first = offers(&held);
-        let docs = Arc::clone(&info.docs);
-        let channel = inner.channel.clone();
-        let app_id = inner.app_id.clone();
-        let progress_sink = sink.clone();
-        // One job opens the session, uploads and commits; the session lives on between jobs.
-        let (session, mut round) = on_job(
+        let drop_patches: Vec<Sha256Digest> = held
+            .patches
+            .iter()
+            .flatten()
+            .map(|p| p.desc.sha256())
+            .collect();
+        let first = first_round(
             &inner,
-            Some(&lock),
+            &lock,
             &cancel,
-            "service-stage",
-            move |inner, cancel| {
-                let session = machine::open_session(&*connector, &app_id)?;
-                let (mut stage, version) = StageSession::begin(session, &channel, &docs)?;
-                let Some(version) = version else {
-                    // The service sees no update where the check found one: it is stale.
-                    return Err(Error::Stale);
-                };
-                if version != info.version {
-                    return Err(Error::Stale);
-                }
-                stage.upload(&*inner.fs, &first, cancel)?;
-                let rejected = drop_rejected(inner, &mut stage);
-                let outcome = commit(&mut stage, &progress_sink)?;
-                Ok((stage, (outcome, rejected)))
-            },
+            &sink,
+            &connector,
+            FirstRound::of(&held),
         )
         .await?;
+        let (session, mut round) = match first {
+            Some(first) => first,
+            None => {
+                // M12-D6: a version-1 service takes no patch, so the patched files' frames are
+                // fetched now, before the first commit, and the stage runs without patches.
+                let need: Vec<FrameNeed> = all_frames
+                    .iter()
+                    .filter(|(i, f)| {
+                        held.patches.get(*i).is_some_and(Option::is_some)
+                            && !frames.contains_key(&f.sha256)
+                    })
+                    .map(|(_, f)| f.clone())
+                    .collect();
+                held.patches = Vec::new();
+                let ctx = fetch_ctx(&inner, &lock, &cancel, &sink);
+                sink.set_phase(Phase::Download, 0);
+                let fetched = fetch::download(&ctx, &info.pack, &need).await?;
+                for f in &need {
+                    if let Some(p) = fetched.frame(&f.sha256) {
+                        frames.insert(f.sha256, p.to_path_buf());
+                    }
+                }
+                if let Some(p) = fetched.pack() {
+                    pack = Some(p.to_path_buf());
+                }
+                held.frames = frames.clone();
+                held.pack = pack.clone();
+                sink.set_phase(Phase::Stage, 0);
+                first_round(
+                    &inner,
+                    &lock,
+                    &cancel,
+                    &sink,
+                    &connector,
+                    FirstRound::of(&held),
+                )
+                .await?
+                .ok_or(Error::Config(
+                    "a version-1 service refused a stage without patches",
+                ))?
+            }
+        };
         let session = Arc::new(std::sync::Mutex::new(Some(session)));
         let (mut range_tried, mut pack_tried) = (false, false);
         let staged_version = loop {
@@ -2372,6 +2413,13 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
                         frames.remove(&sha);
                     }
                     lunepack_core::service::ObjectKind::Pack => pack = None,
+                    lunepack_core::service::ObjectKind::Patch => {
+                        for p in &mut held.patches {
+                            if p.as_ref().is_some_and(|p| p.desc.sha256() == sha) {
+                                *p = None;
+                            }
+                        }
+                    }
                 }
             }
             let paths = match outcome {
@@ -2395,6 +2443,10 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
             // an object now.
             for &i in &failed {
                 if let Some(slot) = held.unchanged.get_mut(i) {
+                    *slot = None;
+                }
+                // A failed patch is never offered again in this call (D27); its frame follows.
+                if let Some(slot) = held.patches.get_mut(i) {
                     *slot = None;
                 }
             }
@@ -2479,7 +2531,13 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
                 for sha in &drop_frames {
                     let _ = cache.remove_entry(CacheKind::Frame, sha);
                 }
+                for sha in &drop_patches {
+                    let _ = cache.remove_entry(CacheKind::Patch, sha);
+                }
                 let _ = cache.remove_entry(CacheKind::Pack, &pack_sha);
+                if let Some(sha) = &delta {
+                    let _ = cache.remove_entry(CacheKind::Delta, sha);
+                }
                 Ok(StagedVersion {
                     version,
                     target: staged.target,
@@ -2491,6 +2549,81 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
         .await?;
         Ok(staged)
     })
+    .await
+}
+
+/// What one upload-and-commit round of a machine stage ends with: the commit's outcome and the
+/// objects the service refused.
+type Round = (
+    CommitOutcome,
+    Vec<(lunepack_core::service::ObjectKind, Sha256Digest)>,
+);
+
+/// What [`first_round`] sends, taken from the held download.
+struct FirstRound {
+    offers: Vec<Offer>,
+    with_patches: bool,
+    docs: Arc<SignedDocs>,
+    version: Version,
+}
+
+impl FirstRound {
+    fn of(held: &Downloaded) -> FirstRound {
+        FirstRound {
+            offers: offers(held),
+            with_patches: held.patches.iter().any(Option::is_some),
+            docs: Arc::clone(&held.info.docs),
+            version: held.info.version.clone(),
+        }
+    }
+}
+
+/// The first round of a machine stage: opens the session, begins the stage with the verified
+/// documents, uploads what `held` offers and commits. `Ok(None)` when `held` has patches and the
+/// service speaks only version 1 (M12-D6): the connection is closed before `stage_begin`, so the
+/// caller fetches the frames and calls again without patches.
+async fn first_round(
+    inner: &Arc<Inner>,
+    lock: &OpLock,
+    cancel: &CancelToken,
+    sink: &ProgressSink,
+    connector: &Arc<dyn lunepack_core::ServiceConnector>,
+    plan: FirstRound,
+) -> Result<Option<(StageSession, Round)>, Error> {
+    let FirstRound {
+        offers,
+        with_patches,
+        docs,
+        version,
+    } = plan;
+    let channel = inner.channel.clone();
+    let app_id = inner.app_id.clone();
+    let progress_sink = sink.clone();
+    let connector = Arc::clone(connector);
+    on_job(
+        inner,
+        Some(lock),
+        cancel,
+        "service-stage",
+        move |inner, cancel| {
+            let session = machine::open_session(&*connector, &app_id)?;
+            if with_patches && session.version() < lunepack_core::service::PROTOCOL_PATCH {
+                return Ok(None);
+            }
+            let (mut stage, offered) = StageSession::begin(session, &channel, &docs)?;
+            let Some(offered) = offered else {
+                // The service sees no update where the check found one: it is stale.
+                return Err(Error::Stale);
+            };
+            if offered != version {
+                return Err(Error::Stale);
+            }
+            stage.upload(&*inner.fs, &offers, cancel)?;
+            let rejected = drop_rejected(inner, &mut stage);
+            let outcome = commit(&mut stage, &progress_sink)?;
+            Ok(Some((stage, (outcome, rejected))))
+        },
+    )
     .await
 }
 
@@ -2508,6 +2641,7 @@ fn drop_rejected(
         let kind = match kind {
             lunepack_core::service::ObjectKind::Frame => CacheKind::Frame,
             lunepack_core::service::ObjectKind::Pack => CacheKind::Pack,
+            lunepack_core::service::ObjectKind::Patch => CacheKind::Patch,
         };
         let _ = cache.remove_entry(kind, sha);
     }
