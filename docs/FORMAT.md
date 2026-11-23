@@ -2123,8 +2123,11 @@ build meets the other at the highest version both speak.
   a patch with that `sha256`; otherwise `not_in_manifest`. `size` must be the patch's `length`
   (`size_mismatch`); a repeat is `malformed`, as for every object.
 - The service never takes a base from the client: at `stage_commit` it reads the base of each patch from
-  its own current tree, at the entry's path (the walk of `scan`, no link followed), and checks and decodes
-  it as 9.3 says. Its sources per file are, in order: the unchanged current file, an uploaded frame, the
+  its own current tree, joined from the entry's path under the protected current tree, and checks and
+  decodes it as 9.3 says: the open checks only the last component for a regular file of `base_size`
+  (an intermediate link is not refused, and the tree's links come only from a signed manifest and are
+  confined to the tree), and the base is hash-checked against the signed manifest before decode and the
+  output against the entry's hash, so the binding is the hash check, not the walk. Its sources per file are, in order: the unchanged current file, an uploaded frame, the
   uploaded pack, an uploaded patch; so a frame or the pack a client sends after a failed patch always
   wins, and a patch that fails is answered as that path in `need_fetch`, like a missing frame.
 - No message carries a file-system path or a base digest the manifest does not already hold, and no

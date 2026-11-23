@@ -313,10 +313,16 @@ fn a_missing_delta_file_falls_back_to_frames() {
     let w = World::new();
     install(&w, FROM, &old_files());
     let (_, delta) = publish(&w, 1, TO, &new_files(), FROM, &old_files(), false);
-    let u = updater(&w, FetchPolicy::default());
+    // Range runs, so the planned run bytes are in the total before the 404 comes.
+    let ranges = FetchPolicy {
+        full_ratio: 101,
+        ..FetchPolicy::default()
+    };
+    let u = updater(&w, ranges);
     let info = block_on(u.check()).expect("check").expect("update");
     let before = w.origin.requests().len();
-    let downloaded = block_on(u.download(&info, DownloadOptions::default())).expect("download");
+    let (events, options) = recorder();
+    let downloaded = block_on(u.download(&info, options)).expect("download");
     let reqs = requests(&w, before);
     assert_eq!(
         reqs.iter().filter(|(n, _)| *n == delta).count(),
@@ -324,6 +330,15 @@ fn a_missing_delta_file_falls_back_to_frames() {
         "{reqs:?}"
     );
     assert!(reqs.iter().any(|(n, _)| *n == pack_path(TO)), "{reqs:?}");
+    // The delta bytes that never arrived are not left in the total (F5).
+    let events = events.lock().expect("events");
+    let last = events
+        .iter()
+        .rev()
+        .find(|p| p.phase == Phase::Download)
+        .expect("a download event");
+    assert!(last.total > 0 && last.done == last.total, "{last:?}");
+    drop(events);
     let staged = block_on(u.stage(downloaded)).expect("stage");
     assert_staged(&w, staged.tree(), &new_files());
     workers_stopped();

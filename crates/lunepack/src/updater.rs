@@ -1819,6 +1819,7 @@ async fn fetch_patches(
             });
         }
     }
+    let before = ctx.progress.as_ref().map(|p| p.totals());
     let fetched = match fetch::download_in(ctx, target, &needs, fetch::Kinds::DELTA).await {
         Ok(fetched) => fetched,
         Err(e @ (Error::Cancelled | Error::Incomplete | Error::Fs(_) | Error::WorkerPanicked)) => {
@@ -1826,6 +1827,12 @@ async fn fetch_patches(
         }
         Err(e) => {
             tracing::warn!(error = %e, "the delta file cannot be fetched; frames instead");
+            // Give back the planned bytes that never arrived, so the total keeps agreeing with
+            // `done` (F5): bytes that did arrive stay in both.
+            if let (Some(p), Some((total, done))) = (&ctx.progress, before) {
+                let (_, now_done) = p.totals();
+                p.set_total(total.saturating_add(now_done.saturating_sub(done)));
+            }
             patches.iter_mut().for_each(|p| *p = None);
             return Ok(());
         }
