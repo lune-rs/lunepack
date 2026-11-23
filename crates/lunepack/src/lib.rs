@@ -110,6 +110,7 @@ mod feed_rule;
 mod fetch;
 mod installation;
 mod lifecycle;
+mod machine;
 mod pipe;
 mod progress;
 mod task;
@@ -118,7 +119,7 @@ mod worker_transport;
 
 pub mod blocking;
 
-pub use error::Error;
+pub use error::{Error, ServiceReason};
 pub use executor::block_on;
 pub use feed_rule::check_config_feed;
 pub use installation::{HEALTH_TOKEN_VAR, Installation, Platform};
@@ -151,6 +152,12 @@ pub use lunepack_core::{
     Transport, TransportError, TransportErrorKind, TrustedRoot, UpdateConfig, UpdateConfigError,
     UserLayout, Validator, Verifier, Version, WaitOutcome,
 };
+// The adapter traits of a per-machine install (M10): how its update service is reached and where
+// the administrator's policy is read, for an app or a test that replaces either.
+pub use lunepack_core::service::Duplex;
+pub use lunepack_core::{
+    ConnectError, MachineLayout, MachinePolicy, PolicySource, ServiceConnector,
+};
 
 /// Plumbing that tests and sibling crates use; not part of the supported API and free to change in
 /// any release.
@@ -163,6 +170,7 @@ pub mod unstable_internals {
         acquire_op_lock, download, fetch_artifact_doc, fetch_document, fetch_pack, fetch_root_doc,
         fetch_run,
     };
+    pub use crate::machine::{connect_error, hello_error, service_error};
     pub use crate::pipe::{
         AsyncReceiver, AsyncSender, BLOCKING_RECHECK, BlockingReceiver, BlockingSender, Closed,
         DEFAULT_CAPACITY, RecvFuture, SendFuture, from_async, to_async,

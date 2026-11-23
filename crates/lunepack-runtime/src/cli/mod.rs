@@ -1,5 +1,6 @@
 //! The app-facing command line (C4, D42, M5-D11, M5-D12): `check`, `download`, `startup`,
-//! `confirm` and `apply-and-restart`, run by any program as a child process. Each is a thin layer over the facade
+//! `confirm`, `apply-and-restart` and, on a machine install, `repair`, run by any program as a
+//! child process. Each is a thin layer over the facade
 //! ([`commands`]); [`execute`] is their one entry, and the only place that decides what is printed.
 //!
 //! Order of events, which the tests pin: the grammar is parsed first ([`args`]; a bad line is a
@@ -20,6 +21,7 @@ use lunepack::{CancelToken, Installation, ProcessId, Version};
 use self::args::Parsed;
 use self::json::{Body, error_line, human_error, human_result, result_line};
 use self::progress::{FinalLine, Output};
+use crate::machine::Host;
 use crate::modes::{Adapters, Kind};
 
 /// The one schema this build speaks (D28).
@@ -34,8 +36,13 @@ pub type WaitTarget = Result<ProcessId, Kind>;
 
 /// Runs a parsed command on `ad`, prints its output and returns the exit kind. `wait` is the
 /// wait target of `apply-and-restart`, `None` for the other commands.
-pub fn execute(ad: &Adapters, parsed: &Parsed, wait: Option<WaitTarget>) -> Kind {
-    execute_with(ad, parsed, wait, || {
+pub fn execute(
+    ad: &Adapters,
+    host: Option<&Host<'_>>,
+    parsed: &Parsed,
+    wait: Option<WaitTarget>,
+) -> Kind {
+    execute_with(ad, host, parsed, wait, || {
         (Box::new(std::io::stdout()), Box::new(std::io::stderr()))
     })
 }
@@ -43,6 +50,7 @@ pub fn execute(ad: &Adapters, parsed: &Parsed, wait: Option<WaitTarget>) -> Kind
 /// [`execute`] over chosen output streams.
 pub fn execute_with(
     ad: &Adapters,
+    host: Option<&Host<'_>>,
     parsed: &Parsed,
     wait: Option<WaitTarget>,
     streams: impl FnOnce() -> (
@@ -55,7 +63,7 @@ pub fn execute_with(
     let output = Output::start(stdout, stderr, parsed.json, cancel.clone());
     let command = parsed.command.name();
 
-    let (tree, outcome) = run_checked(ad, parsed, &output, &cancel, wait);
+    let (tree, outcome) = run_checked(ad, host, parsed, &output, &cancel, wait);
     let (line, mut kind) = match &outcome {
         Ok(body) => {
             let tree = tree.as_ref();
@@ -101,6 +109,7 @@ pub fn execute_with(
 /// command's result.
 fn run_checked(
     ad: &Adapters,
+    host: Option<&Host<'_>>,
     parsed: &Parsed,
     output: &Output,
     cancel: &CancelToken,
@@ -116,6 +125,6 @@ fn run_checked(
     let tree = inst.tree_version().clone();
     (
         Some(tree),
-        commands::run(&inst, parsed, output, cancel, wait),
+        commands::run(ad, host, &inst, parsed, output, cancel, wait),
     )
 }

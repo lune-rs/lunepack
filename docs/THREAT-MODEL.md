@@ -4,7 +4,7 @@ Status: **draft**, awaiting approval together with `docs/FORMAT.md`.
 
 What lunepack's update and install path defends against, and what it does not. The format rules
 referred to here are in `docs/FORMAT.md`; the decisions in `docs/DECISIONS.md` (D7, D17, D21, D24,
-D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12, M7-D1 to M7-D22, M8-D1 to M8-D20).
+D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12, M7-D1 to M7-D22, M8-D1 to M8-D20, M10-D1 to M10-D20, M11-D1 to M11-D16).
 
 ## Assets
 
@@ -128,17 +128,19 @@ the download cache and the version trees are writable by that user, so such a pr
 
 Stopped:
 - Per-user installs live in the user's own profile, which other users cannot write.
-- Per-machine installs: the privileged engine takes only an app id and payload handles the caller
-  opened itself, copies the payload into an admin-only staging directory, and only then verifies
-  the whole chain (copy, then verify: no time-of-check/time-of-use window). It never follows a
-  caller-supplied path or URL, never runs payload code before verification, and never acts for an
-  app id without a protected install record. Machine-scope floors are kept by the engine; the
-  non-elevated library also keeps its own floors and enforces the higher of the two.
+- Per-machine installs: the privileged engine (on Windows, the update service, "Windows per-machine (M10)"
+  below) takes only the bytes a client streams over its pipe, copies them into an admin-only staging
+  directory, and only then verifies the whole chain (copy, then verify: no time-of-check/time-of-use
+  window). It never opens a file in a user's namespace, never calls an impersonation API, never follows a
+  caller-supplied path or URL, never runs payload code before verification, and never acts for an app id
+  other than its own install's.
 - The library never writes the machine install's state (M4, FORMAT.md 12.6): it reads the machine
   record and the tree through the layout, and writes only this user's `install-counters` records,
   cache and lock in the user's own directories. Another user cannot lower this user's floors, and
-  this user's counters cannot lower the machine record's: a check uses the field-wise higher of the
-  two. A counters record whose install id differs from the machine record's stops the load.
+  this user's counters cannot lower the machine record's: the key-set version and the feed `seq` of a
+  check are the higher of the two. The **root** is never taken from a user's record (M4-SEC-obs1,
+  M10-D17): it is the machine record's, or the installed tree's own configuration's. A counters record
+  whose install id differs from the machine record's stops the load.
 
 Not stopped: denying service to other users' updates by holding resources, within OS limits.
 
@@ -403,8 +405,8 @@ token; the command line's planted-secrets test checks every stream, M5 step 14).
 is compared in constant time. Same-user processes can read another process's environment, so the
 token is not a defence against class 4. It tells the record that this start was the supervised one:
 a per-user install also lets a start with no token confirm the pending version (M5-D5), so the token
-protects nothing a local process could not do anyway. Per-machine installs, which arrive later,
-always need it (C8).
+protects nothing a local process could not do anyway. Per-machine installs always need it (C8): there the
+token is what keeps another user from confirming or rolling back someone else's pending update.
 
 **The attempt counter (M5-D5).** An unsupervised start of the pending version counts one attempt in
 the record and the fourth rolls back, so an app that never confirms (a crash on start, or a program
@@ -678,7 +680,7 @@ rather than deletes, and fails toward keeping the app.
   volume than `R/versions`, is not owned by the user or whose folder the user cannot write, is refused with
   exit 28 and a reason from a closed set before anything is read, written or fetched, so such a copy
   can neither fail halfway nor be updated from an image. A root-owned `B` is a machine install by ownership
-  (D10) and is refused `machine_scope`, exit 17; a per-machine install is a later milestone. The facts come from `statfs`, `stat` and
+  (D10) and is refused `machine_scope`, exit 17; a per-machine install on macOS is a later milestone. The facts come from `statfs`, `stat` and
   `faccessat` through `Fs::place`; the translocation test is the mount type and the path component, which are
   what the system uses. A real translocated app needs a notarized one; `scripts/macos-sign-check.sh` runs
   that row with the developer's own identity (it is not part of the gate or of CI), so until it has been
@@ -885,6 +887,253 @@ app offline.
 runtime on the runtime and UI, stapling, translocation of a notarized app, Gatekeeper's verdicts) is shown
 only by a person running `scripts/macos-sign-check.sh` with their own identity; CI proves the mechanics with
 ad-hoc and throwaway self-signed identities. Windows install rows with real signatures run on CI runners.
+
+## Windows per-machine (M10)
+
+An app installed for all users lives in `Program Files`, where a standard user cannot write. To update it
+with no prompt per update, the install registers one small Windows service per app, running as LocalSystem,
+that any local user's copy of the app may start and talk to over a named pipe (FORMAT.md 18 and 19; D12,
+M10-D1 to M10-D20). The service is therefore a local-privilege boundary: it is fed by every user of the
+machine and holds the rights of the machine. This section says what it trusts, what a local user can and
+cannot do through it, and what is not covered.
+
+**What the service trusts.** Its own image path (from which it finds the install root), the files and the
+machine record under `Program Files\<App>` (writable by administrators only; it checks the owner and every
+entry of `R`, `R\app`, `R\.lunepack`, `R\.lunepack\state` and `R\.lunepack\machine` at the start of every
+operation and refuses with `not_protected` when anyone else holds a write-class right), and the publisher's
+root key and the floors in the machine record. It reads no environment variable and no current directory,
+and takes no path, URL or app id from a caller.
+
+**What it does not trust.** Anything a user sends. The client streams the signed documents and the update's
+bytes; the service writes them into a folder only administrators can reach (`R\.lunepack\machine\incoming`),
+hashes them as they are written, and verifies the whole chain there (root, key set, feed, manifest, every
+file's hash) before it builds anything. It checks that the update is newer than what is installed, not marked
+bad, for this app and this channel (the channel named in the installed tree's own signed configuration, never
+one a caller names, M10-D18), and selects the candidate itself from the feed it verified, with the same core
+functions the library uses, so there is no second parser to differ from the first. It never runs code from an
+update before that update is verified, never downloads anything, and keeps no secret a user could read.
+
+**The service never impersonates and opens no user file** (M10-D2). The client sends bytes; the service
+never opens a path in a user's namespace and calls no impersonation API, so a file or library opened by
+mistake cannot resolve through a caller's device map. The client connects at identification level (the
+service can learn who the caller is and cannot act as it), and, before it sends a byte, checks that the pipe
+is owned by LocalSystem, so a process that created the pipe name first cannot receive the update or answer
+for the service.
+
+**What a local user can do** through the service: trigger any update the publisher signed for this app and
+channel that is newer than what is installed (anyone who can run the app can); report a version healthy or
+broken while they are the one applying it (they hold its token); make the update fail, or roll it back, by
+being the one who applies it and then exiting or crashing the app, the same power the user has over their own
+install; deny service to other users by holding the pipe for the length of one connection (the service serves one
+connection at a time, with 5 s, 30 s and 30 min deadlines), by holding the engine's lock during an operation,
+or by being first to apply and then rolling back; and read the machine record, which is world-readable and
+holds no secret (the token is stored only as its SHA-256). **What they cannot do**: install anything not
+signed by the publisher's keys, install an older or a bad-marked version, write or read anything as
+LocalSystem, confirm or roll back someone else's pending update during its health window (they lack the
+token), change the service's configuration, the descriptors or the policy (an administrator's HKLM key), or
+add a second instance of the pipe and receive its clients (no entry for a non-administrator holds the right
+to create an instance; the first instance is created with the first-instance flag, and a name that exists
+is an error). The token and the supervision lease keep **bystanders** out of someone else's health window;
+they do not keep the user who applies a version from making it roll back or stick, and are not meant to.
+
+**The pipe is untrusted input.** Frames and messages are length-prefixed and capped before any allocation;
+a message is one strict JSON object with a closed member set; anything malformed ends the connection; the
+codec is pure core code with a fuzz harness (`fuzz/fuzz_targets/service.rs`, seeds replayed by the gate) and
+a golden file that pins the wire bytes (FORMAT.md 19.7). No message carries a path, an operating-system
+error text, an install id, a token digest or key material. A flaw in this parser or in the staging code
+reached through it would be a local privilege escalation, which is why the security review of M10 tests
+parser differentials against the golden file.
+
+**Root rotations.** The machine learns a root rotation only when an update is staged by the engine (its own
+check verifies the chain from the machine's root forward). Until then the machine record keeps the older
+root, and a user's check walks forward from it; a user's counters can never move the machine's root
+(M4-SEC-obs1).
+
+**The first install and the anchor.** `Setup.exe` sits in a folder the installing user can write, and the
+elevated engine reads its payload after an administrator consented to a User Account Control prompt. The
+setup file carries digests of its own payload in a resource of its runtime image (FORMAT.md 14.5); the
+elevated copy reads them from its own mapped image, which the administrator consented to and a process
+cannot change afterwards, copies the payload into an administrator-only folder and verifies it there, so a
+payload swapped **after** the prompt fails the check before anything is written. It does not help against a
+whole file swapped **before** the prompt: only an Authenticode signature (M9) lets the administrator tell a
+genuine `Setup.exe` from a swapped one, because the prompt then names the publisher. **An unsigned
+`Setup.exe` shows "Unknown publisher" at the prompt, for the genuine file and a swapped one alike.** Sign
+the installer of an app that installs for all users.
+
+**The elevated modes** (`machine-install`, `machine-repair`, `machine-uninstall`) run as an administrator
+after consent, started by the same build's unelevated side. They read no environment variable, make no
+temporary directory, look at no current directory, start no window and open no network connection, take no
+path from their command line (only a progress-pipe id and the SID of the one account that may read it), and
+derive the install root from their own image's path or from the setup file's own image. The hand-off pipe is
+owned by Administrators, readable by that one account and outbound only: the elevated side reads nothing from
+the unelevated one. The unelevated side decides success from the machine record and the exit code, never
+from a line that came through the pipe. The UI never runs elevated (D35, M10-D15): the runtime starts no UI
+from a process holding a UAC elevation's full token, and an uninstall started from such a process (or with UAC
+off) skips the copy in the user's temporary directory, which that user's unelevated processes could replace,
+and runs its first phase from the runtime under Program Files. The packaged binaries are
+hardened against DLL planting as the runtime is (the loader searches System32 only), and the end-to-end suite
+starts the service, its self-test and Setup's elevated mode beside files named like DLLs.
+
+**Where the boundary is the platform's.** With UAC switched off, or when the administrator's account is the
+built-in Administrator, an administrator's process holds the full token, so there is no elevation boundary
+to defend between that user's processes and the machine: such a process can do what the service does. The
+boundary this section describes is between standard users, and an administrator's own unelevated processes,
+and the machine.
+
+**The policy** (`HKLM\SOFTWARE\Policies\lunepack\<app id>`, FORMAT.md 18.4) is read only; only an
+administrator can write it. An unreadable, mistyped or unknown value counts as "on", so a damaged policy
+errs toward no update. A service an administrator disabled stops updates for standard users until `repair` or
+re-enabling; that is an administrator's deliberate choice on that machine and not something a standard user
+routes around (M10-D13).
+
+**The removal guard on Windows** (M10-D20). Every deletion the engine makes under `R` (a version tree, a
+leftover `.gc-` folder, a service folder, `R` itself at uninstall) is decided by one question asked twice: once before the
+rename that takes the path away from new launches, once on the renamed path right before the deletion. On
+Windows the answer is the process scan **or** a file-system probe that opens every file of the tree for
+write and delete and every directory and reparse point for delete, all with full sharing and each closed at
+once; an open that fails for any reason means "in use", and only a clean "not in use" lets the engine delete.
+The probe sees what the rename does not (a running executable, a DLL loaded by any process, whether the scan could
+inspect that process or not) and what the scan does not (a working directory, a held file). **A rename is not
+an in-use check on Windows** (measured on Windows 11): a folder can be renamed while a program runs from an
+executable inside it and while a process outside it has a DLL from it loaded; it fails only when a working
+directory is inside or a file is held without delete sharing. So the engine's rename only keeps new
+launches out; the probe is the guard. Known gaps, each failing toward leaving a folder: a file mapped as data
+after its handle was closed is not seen (its deletion then fails and the folder stays, though files deleted
+before that one are gone); a process that maps a tree file through a handle it opened with full sharing
+before the rename, after the second check; and a file with the read-only attribute makes its tree count as in
+use for good (lunepack never sets it). The per-user in-use scan of `Process::tree_in_use` on Windows still
+skips a process it cannot open (a parked follow-up that this milestone does not change), so the per-machine guard, which does not depend on
+opening other processes, is stricter than the per-user one; the two differ. A refused machine uninstall puts
+back what it had done before the refusal and leaves the install as it was.
+
+**What survives an uninstall.** Other users' per-user homes (`<LocalAppData>\lunepack\<app id>`, FORMAT.md
+18.5: their counters, cache and logs) are left in place; the uninstalling user's home is removed. They hold
+no secret and no root, and a later reinstall reads the counters again.
+
+## Linux and macOS per-machine (M11)
+
+An app installed for all users on Linux or macOS lives where a standard user cannot write (`/opt/<app id>`;
+`/Applications` and `/Library/Application Support/lunepack/<app id>`), and one small root daemon per app, started
+on demand by the init system, updates it for every user (FORMAT.md 20 and 19.8; D12, M11-D1 to M11-D16). The
+daemon is the same engine as the Windows service, over protocol version 1, so "Windows per-machine (M10)" applies
+word for word to what it trusts and does not trust, to what a local user can and cannot do through it, to the
+token and the supervision lease, to root rotations, to the policy's fail-toward-no-update rule and to the untrusted
+frames (the parser is the same code and the same golden file). This section is what differs: a unix socket in
+place of a pipe, an ownership and mode rule in place of descriptors, a first install that is a `pkexec` hand-off
+or an Installer package, and what is not proven yet.
+
+**The socket** (M11-D4, M11-D5). Mode 0666: any local user may connect, as Windows grants Users the pipe; the
+server decides nothing from who connects and keeps no list. Its directory is made by the init system as root
+(`/run/lunepack`, 0755; on macOS the system's `/var/run`, root:daemon 0775: the `daemon` group holds system
+services only, which is accepted, not verified per machine). A local user can therefore neither replace the
+socket nor create one at its name. The client, **before it sends a byte**, requires that the directory is a real
+directory owned by uid 0 that no one but root's group (macOS: and `daemon`'s) can write, that the path is a
+socket owned by uid 0, and that the peer's effective uid is 0 (`SO_PEERCRED`, `getpeereid`); anything else is
+`service_unavailable`, reason `untrusted`, with nothing sent, so a process that bound the name first (before the
+service ever ran, or when the unit is gone) receives no update and no document. Descriptors never cross the socket
+(M11-D2): the client streams bytes and the daemon copies them into `R/.lunepack/machine/incoming`, so it never
+reads from a file, FIFO, device or socket a user chose. A user can hold the socket for one connection (the daemon
+serves one at a time, with the deadlines of FORMAT.md 19.6; a second client waits in the queue and its hello
+times out at ten seconds, which the client reports as `busy`), which is the same denial the Windows pipe allows.
+
+**The tree and its ancestors** (M11-D7). The engine does not trust the default umask or inheritance: it creates
+each directory with mode 0700, sets owner 0:0 and the exact mode, syncs it and checks it. That covers the
+protected directories only: everything else a root process creates (the version tree, the record's files, the
+integration entries) takes the process's file-creation mask, and `pkexec` keeps the caller's. So every process
+of the runtime and the service that stands as root on Linux or macOS sets its mask to `0o022` as its first action
+(`lunepack_os_linux::set_root_umask`, `lunepack_os_macos::set_root_umask`), whatever the session that started it
+carried: a permissive one (`umask 0`) does not leave a tree another user can overwrite, and a hardened one
+(`umask 077`) does not leave one the other users cannot read. At the start of every
+operation it checks `R`, `R/app`, `R/.lunepack`, `R/.lunepack/state` and `R/.lunepack/machine` and **every
+directory above `R` up to `/`**: owned by uid 0, no write for others, group write only for gid 0 (macOS: and
+gid 80, `admin`, because macOS ships group-writable folders in the path, such as `/Applications`), no access
+control list, never a link, and the sticky bit does not stand in for a missing write bit. A group- or
+world-writable `/opt` stops the engine with `not_protected`.
+An administrator on macOS (the `admin` group) can already become root with `sudo`, so the group's write access
+there is no new boundary; nothing else gets any.
+
+**The first install on Linux and the consent** (M11-D9). The setup file sits in a folder the installing user can
+write, and `pkexec` asks the administrator to approve **a path**: its prompt names the program, not a publisher.
+So no anchor of the Windows kind exists (M10-D4's reason does not carry over): a digest of the payload bound to
+the image would not tell the administrator a genuine file from a swapped one. What the design does: root copies
+the payload out of **its own executed image** (it opens `/proc/self/exe` once, at its start, and reads the payload from
+nowhere else), into an admin-only staging folder, and verifies the copy under the
+trailer's root, so a payload altered **after** the prompt is read from the image the administrator approved and a
+byte flipped in it fails the signature check before anything is created. **A whole setup file swapped before
+the prompt is not detected**, genuine or not: the prompt looks the same. Mitigations are the user's, as on Windows
+for an unsigned file: fetch the installer from the publisher's own channel, check the file with the publisher's
+checksum, and prefer the printed command `sudo '<path>' --all-users`, which shows the path the administrator then
+runs. The root copy reads no environment variable, no current directory and no path from its parent
+(`pkexec` itself resets the environment and closes every descriptor above 2), starts no window and opens no
+network connection; the unelevated parent decides success from the exit code and the machine record, never from the
+progress lines that arrived on the child's standard output, and a line that is not well formed ends the relay
+without stalling the child. `pkexec` and the polkit agent are the platform's: this milestone adds no polkit
+rule (D12, revised) and no helper, and the end-to-end suite drives it with a rule of its own in a container.
+
+**The first install on macOS** (M11-D8). The anchor is Installer. The `.pkg` is signed with a Developer ID
+**Installer** identity (a separate certificate from the Application one), notarized and stapled when the packager
+is configured so; Installer checks the package's signature itself before it runs anything of it, and its
+payload goes into folders only root can read or change (`.installer` and the app's folder 0700, the runtime 0700,
+the payload 0600). The `postinstall` is one fixed line that takes no argument and no environment variable, and the
+mode it runs refuses unless it runs as root, from exactly that path as the kernel names it, with the folders
+admin-only and the payload file a regular file owned by root that neither group nor others may write; then it
+copies the payload, verifies the copy under the trailer's root and installs through the engine (copy-then-verify as
+on Linux). An **unsigned** package has no anchor but the trailer's root, which an attacker who can replace the whole
+package also controls: the unsigned caveat of M10-D4 applies, and `docs/CLI.md` says to sign it. The installer app
+opens the package with `/usr/bin/open` and no privileges of its own (D38 (a)); it never asks for a password, so
+there is no password prompt of ours to imitate or to harvest. A process a user starts cannot run the root mode: it
+exits unless it is root and standing in the root-owned folder.
+
+**Root reading the user's world**. The service reads no file in a user's namespace and the elevated modes read
+none of the caller's; the one unelevated exception is the uninstall's copy of the runtime in the user's own home,
+made and run by that user, which is not elevated and is never trusted: the elevated uninstall is always started from
+the root-owned runtime inside `R` (Linux: `pkexec` of that exact path), copies itself into an admin-only folder in
+the machine home and finishes from there.
+
+**The removal guard** (M11-D13). Every deletion under `R` is decided by `Process::tree_in_use_strict`, asked before
+and after the rename that takes the path from new launches. On Linux and macOS it is the per-user scan with one
+difference: no process is skipped for belonging to another user, so a root cleanup does not remove a tree another
+user runs. The exceptions of M5-D9 (a kernel thread is skipped; a process the kernel refuses `exe`, `cwd`, `fd` or
+`maps` is judged by its command line; one that vanishes while read is re-read) and of M8-D19 (macOS: a protected
+daemon is judged by what is readable; a deleted executable by its working directory and files) stay, for every
+user; any other unreadable process counts as in use. So the guard fails toward keeping a tree. As a caller that is
+not root the macOS strict scan answers "in use" for every process of another user (the kernel refuses its details),
+which only blocks a cleanup that a non-root caller could not make anyway; the root answer is what the service and
+the elevated modes use, and it is proven only by the macOS suite below.
+
+**Policy** (FORMAT.md 20.6, M11-D11) is a root-owned JSON file read through the descriptor it opened without
+following a link; a missing file is off, and anything damaged, writable by anyone but root, or in a writable
+directory counts as on, so a tampered policy errs toward no update.
+
+**New `unsafe`** lives in `lunepack-os-linux` and `lunepack-os-macos` only, each block with a `// SAFETY:`
+comment: `SO_PEERCRED`, `getpeereid`, the descriptor taken from systemd (descriptor 3, checked to be a listening
+unix stream socket at the expected path) and from `launch_activate_socket` (checked to be exactly one unix stream
+socket), the owner, mode and ACL reads, and `chown` of the directories the engine creates. The service binary has
+none and reads no environment variable. The boundary check lets `lunepack-service` depend on the two unix adapters
+as it does on the Windows one and on nothing with HTTP, TLS or UI code in it.
+
+**What a person can do on macOS that a user cannot**: an administrator can switch the daemon off in System
+Settings (Login Items & Extensions) or with `launchctl disable`, which stops updates for standard users until it
+is re-enabled or `repair` runs; that is an administrator's deliberate choice, like a disabled Windows service
+(M10-D13), and is reported to the app as `service_unavailable`. The Background Task Management notice and entry
+are the system's and not something lunepack can suppress or confirm; the person check records them.
+
+**Not proven by the gate or CI.** The Linux machine suite (`scripts/e2e-linux-machine.sh`, a privileged container
+with systemd, a polkit rule of its own, a standard user) is local and runs on a machine with Docker; the real
+`pkexec` agent prompt and the launcher entry are shown only by a person (`scripts/linux-machine-user-check.sh`).
+On macOS, the premises the root side stands on were measured by the probe P-M3, run twice on a GitHub-hosted macOS runner (a
+system LaunchDaemon started on demand serving a standard user, the root `postinstall`, the bundle swap from both, a
+signed copy of the service verifying); its negative control reported one extra daemon start, unexplained, and the
+verdict was recorded as invalid-by-control with every premise confirmed. The suite itself
+(`sudo scripts/e2e-macos-machine.sh --disposable`) and the person check (`scripts/macos-machine-user-check.sh`)
+need a disposable Mac or macOS VM with an administrator and have not been run; until they are, a real Installer
+run, the daemon in the system domain with its socket, the strict scan as root, a root bundle swap and the
+Background Task Management entry are unproven, and the scripts themselves are reviewed only by reading,
+`shellcheck` and `bash -n`. A signed `.pkg` has not been built with a real Installer identity (M9-D11 (b)).
+
+**What survives an uninstall.** As on Windows: other users' per-user homes (`<data home>/.lunepack/<app id>`,
+FORMAT.md 20.7) are left; the uninstalling user's is removed. On Linux the socket file `/run/lunepack/<app id>.sock`
+goes with the units; lunepack only reads the policy file, an administrator's.
 
 ## Denial-of-service bounds
 

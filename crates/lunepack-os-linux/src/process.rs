@@ -242,6 +242,13 @@ impl Process for LinuxProcess {
         let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
         procfs::tree_in_use(&tree, exclude).map_err(|e| unreadable("in use", e))
     }
+
+    /// Every user's processes (M11-D13): the root engine must not delete a tree another user
+    /// runs. The rules are the per-user scan's, without its skip of other uids.
+    fn tree_in_use_strict(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
+        let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
+        procfs::tree_in_use_strict(&tree, exclude).map_err(|e| unreadable("in use", e))
+    }
 }
 
 /// A child started by [`LinuxProcess::spawn_child`].

@@ -46,7 +46,7 @@ pub struct Startup {
 }
 
 impl Startup {
-    fn go_on(events: Vec<LifecycleEvent>, pending: bool) -> Startup {
+    pub(crate) fn go_on(events: Vec<LifecycleEvent>, pending: bool) -> Startup {
         Startup {
             events,
             action: StartupAction::Continue,
@@ -116,13 +116,13 @@ impl ApplyScheduled {
 }
 
 /// The health token this process was started with.
-enum Token {
+pub(crate) enum Token {
     Absent,
     WellFormed([u8; 32]),
     Malformed,
 }
 
-fn read_token(token: Option<&OsString>) -> Token {
+pub(crate) fn read_token(token: Option<&OsString>) -> Token {
     let Some(token) = token else {
         return Token::Absent;
     };
@@ -278,7 +278,11 @@ fn is_pending(record: &InstallState, own: &Version) -> bool {
 /// The start of the running app: [`startup_for`] its own installation with its own arguments.
 pub fn startup() -> Result<Startup, Error> {
     let inst = Installation::from_current_exe()?;
-    startup_for(&inst, std::env::args_os().skip(1).collect())
+    let started = startup_for(&inst, std::env::args_os().skip(1).collect());
+    // A per-machine install's `attempt` may have issued this process a token (M10-D3): the
+    // `confirm_healthy` that follows builds an installation of its own.
+    crate::machine::export_kept(&inst);
+    started
 }
 
 /// Gives this process the app id as its app user model id before anything can show a window
@@ -309,6 +313,9 @@ fn set_process_aumid(inst: &Installation) {
 /// events.
 pub fn startup_for(inst: &Installation, args: Vec<OsString>) -> Result<Startup, Error> {
     set_process_aumid(inst);
+    if let Some(machine) = inst.machine_install() {
+        return crate::machine::startup(inst, machine, args);
+    }
     let Some(layout) = inst.layout() else {
         return Ok(Startup::go_on(Vec::new(), false));
     };
@@ -417,6 +424,7 @@ fn roll_back(
 /// The running app confirms its health: [`confirm_for`] its own installation.
 pub fn confirm_healthy() -> Result<ConfirmOutcome, Error> {
     let inst = Installation::from_current_exe()?;
+    crate::machine::import_kept(&inst);
     confirm_for(&inst)
 }
 
@@ -427,6 +435,9 @@ pub fn confirm_healthy() -> Result<ConfirmOutcome, Error> {
 /// changes nothing. A tree that is not installed, or a version that is not pending, is
 /// [`ConfirmOutcome::NothingPending`].
 pub fn confirm_for(inst: &Installation) -> Result<ConfirmOutcome, Error> {
+    if let Some(machine) = inst.machine_install() {
+        return crate::machine::confirm(inst, machine);
+    }
     let p = &inst.platform;
     let check = match read_token(p.health_token.as_ref()) {
         Token::Absent => TokenCheck::Absent,
@@ -472,6 +483,12 @@ pub fn apply_and_restart_for(
     inst: &Installation,
     options: ApplyOptions,
 ) -> Result<ApplyScheduled, Error> {
+    // M10-D12: reported before anything is started; the service would refuse the apply anyway.
+    if inst.machine_install().is_some()
+        && inst.platform.policy_for(inst.app_id()).self_update_disabled
+    {
+        return Err(Error::DisabledByPolicy);
+    }
     let version = staged_version(inst)?;
     if let Some(expected) = &options.expect_version
         && !same_version(expected, &version)
@@ -516,6 +533,9 @@ pub fn apply_and_restart_for(
 /// The usable staged version of `inst`'s install, with its tree in place and `staged_issued`
 /// bound; [`Error::NothingStaged`] otherwise. Takes no lock (as `Updater::staged`).
 fn staged_version(inst: &Installation) -> Result<Version, Error> {
+    if let Some(machine) = inst.machine_install() {
+        return crate::machine::staged_version(inst, machine);
+    }
     let layout = inst.layout().ok_or(Error::NothingStaged)?;
     let p = &inst.platform;
     let loaded = store_of(inst, layout).load(&*p.fs, &*p.hasher)?;

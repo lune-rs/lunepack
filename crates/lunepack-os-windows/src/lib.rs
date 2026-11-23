@@ -11,21 +11,44 @@
 //! declares) with [`remove_stub_leftovers`] for the GC; and the launcher stub's two helpers
 //! ([`raw_command_line`], [`ignore_console_interrupts`]).
 //! [`WinPublisherCheck`] (M9 step 6) is the core's `PublisherCheck` over `WinVerifyTrust`.
+//! [`WindowsProtect`] (M10 step 7) is the core's `Protect` over explicit security descriptors, with
+//! the descriptor reader, the token queries ([`standing`], [`current_user_sid`]) and the per-machine
+//! known folders ([`program_files`], [`common_start_menu_programs`], [`local_app_data`]).
+//! [`PipeServer`] and [`PipeClient`] (M10 step 8) are the named pipe's two ends, each a
+//! `service::Duplex` with read deadlines; the client checks the pipe's owner before it sends.
+//! [`WindowsRegistrar`], [`WindowsConnector`] and [`run_service`] (M10 step 9) are the Service
+//! Control Manager side: the service's registration with its descriptor, the client's start of the
+//! service and connection to its pipe, and the service's dispatcher.
+//! [`WinScope::machine`] (M10 step 10) is the all-users scope of [`WindowsIntegration`] (HKLM and
+//! the common Start menu); [`RegistryPolicy`] is the core's `PolicySource` over the policy key,
+//! [`WindowsElevation`] its `Elevation` over `ShellExecuteExW` with `runas`, and [`own_resource`]
+//! reads an `RT_RCDATA` resource of the process's own image.
 //! The public API is safe and builds on every OS; off Windows the helpers are no-ops or
 //! `Unsupported`.
 
 #[cfg(windows)]
 mod classes;
+#[cfg(any(windows, test))]
+mod elevate;
 mod harden;
 #[cfg(windows)]
 mod integration;
 mod launcher;
+#[cfg(any(windows, test))]
+mod pipe;
+#[cfg(windows)]
+mod policy;
 #[cfg(windows)]
 mod process;
 #[cfg(windows)]
 mod publisher;
 #[cfg(windows)]
 mod registry;
+mod resource;
+#[cfg(any(windows, test))]
+mod scm;
+#[cfg(any(windows, test))]
+mod security;
 mod shell;
 #[cfg(windows)]
 mod shortcut;
@@ -34,16 +57,47 @@ mod stub_place;
 #[cfg(any(windows, test))]
 mod trust_status;
 
+#[cfg(windows)]
+pub use elevate::WindowsElevation;
+#[cfg(any(windows, test))]
+pub use elevate::{join_args, quote_arg};
 pub use harden::harden_dll_search;
 #[cfg(windows)]
 pub use integration::{MARKER_VALUE, UNINSTALL_KEY, WinScope, WindowsIntegration};
 pub use launcher::{ignore_console_interrupts, raw_command_line};
+#[cfg(any(windows, test))]
+pub use pipe::{
+    ExpectedOwner, FILE_CREATE_PIPE_INSTANCE, PEER_MASK, PipeAccess, PipeError,
+    SERVER_WRITE_TIMEOUT,
+};
+#[cfg(windows)]
+pub use pipe::{PipeCanceller, PipeClient, PipeServer, pipe_descriptor};
+#[cfg(windows)]
+pub use policy::RegistryPolicy;
 #[cfg(windows)]
 pub use process::WindowsProcess;
 #[cfg(windows)]
 pub use publisher::WinPublisherCheck;
+pub use resource::own_resource;
+#[cfg(windows)]
+pub use scm::{HostError, ServiceControl, WindowsConnector, WindowsRegistrar, run_service};
+#[cfg(any(windows, test))]
+pub use scm::{
+    NON_ADMIN_ALLOWED, USERS_ENTRY, USERS_MASK, display_name, judge_service_descriptor, pipe_name,
+    quote_image, service_name, unquote_image, with_users_entry,
+};
+#[cfg(any(windows, test))]
+pub use security::{
+    ACE_ALLOWED, ACE_ALLOWED_CALLBACK, ACE_DENIED, ACE_DENIED_CALLBACK, Ace, CheckError,
+    Descriptor, INHERIT_ONLY_ACE, READ_CLASS, SID_ADMINISTRATORS, SID_ALL_APP_PACKAGES,
+    SID_CREATOR_GROUP, SID_CREATOR_OWNER, SID_EVERYONE, SID_SYSTEM, SID_TRUSTED_INSTALLER,
+    SID_USERS, judge,
+};
+#[cfg(windows)]
+pub use security::{WindowsProtect, check_dir, current_user_sid, read_descriptor, standing};
 pub use shell::{
-    MessageKind, allow_set_foreground, message_box, process_aumid, set_process_aumid,
+    MessageKind, allow_set_foreground, common_start_menu_programs, delete_at_restart,
+    local_app_data, message_box, process_aumid, program_files, set_process_aumid,
     start_menu_programs, user_program_files,
 };
 #[cfg(windows)]

@@ -235,14 +235,48 @@ impl LayoutScheme {
         config: UPDATE_CONFIG_PATH_MACOS,
     };
 
+    /// The Linux machine view (M11-D6): `R = /opt/<app id>` with the machine tree's names
+    /// (`app/<ver>`, `.lunepack/state`, `.lunepack/logs`) and the projection `R/current` →
+    /// `app/<ver>`. Not in the per-user recognition list: a machine tree is never recognised from
+    /// its directories.
+    pub const MACHINE_LINUX: LayoutScheme = LayoutScheme {
+        root: RootNaming::AppId,
+        versions: "app",
+        state: ".lunepack/state",
+        cache: ".lunepack/cache",
+        logs: ".lunepack/logs",
+        projection: Projection::CurrentLink,
+        config: UPDATE_CONFIG_FILE,
+    };
+
+    /// The macOS machine view (M11-D6): `R = /Library/Application Support/lunepack/<app id>`
+    /// with the machine tree's names and the bundle projection (`R/bundle`, `R/bundle.id`, the
+    /// slots `R/app/.swap` and `R/app/.out`); the trees are bundles. Not in the per-user
+    /// recognition list.
+    pub const MACHINE_MACOS: LayoutScheme = LayoutScheme {
+        root: RootNaming::AppId,
+        versions: "app",
+        state: ".lunepack/state",
+        cache: ".lunepack/cache",
+        logs: ".lunepack/logs",
+        projection: Projection::Bundle,
+        config: UPDATE_CONFIG_PATH_MACOS,
+    };
+
     /// Every scheme this build knows, for recognising a layout from its directories. XDG and MACOS
     /// name the same directories, so [`UserLayout::from_dirs`] finds XDG for both; a caller that
-    /// knows its scheme uses [`UserLayout::from_dirs_as`].
+    /// knows its scheme uses [`UserLayout::from_dirs_as`]. The machine views are left out.
     const ALL: [LayoutScheme; 3] = [
         LayoutScheme::XDG,
         LayoutScheme::WINDOWS,
         LayoutScheme::MACOS,
     ];
+
+    /// The text a [`Projection::CurrentLink`] link holds for `version` under this scheme:
+    /// `<versions>/<version>` (`versions/<v>` under XDG, `app/<v>` under the Linux machine view).
+    pub fn current_target(&self, version: &Version) -> String {
+        format!("{}/{version}", self.versions)
+    }
 }
 
 /// `base` joined with each `/`-separated name of `rel`.
@@ -556,7 +590,7 @@ pub fn version_config_path(root: &Path, version: &Version) -> PathBuf {
 
 /// The text `R/current` holds for `version` under [`LayoutScheme::XDG`]: `versions/<version>`.
 pub fn current_target(version: &Version) -> String {
-    format!("{VERSIONS_DIR}/{version}")
+    LayoutScheme::XDG.current_target(version)
 }
 
 /// [`LayoutScheme::XDG`]'s projection: makes `root/current` a symlink to `versions/<current>` of
@@ -737,6 +771,7 @@ fn holds(
     dir: &Path,
     app_id: &AppId,
     scheme: LayoutScheme,
+    scope: Scope,
 ) -> Holds {
     let mut at = dir.to_path_buf();
     if !is_real_dir(fs, &at) {
@@ -749,7 +784,7 @@ fn holds(
         }
     }
     match load_any::<InstallState>(fs, &at, hasher) {
-        Ok(Some(record)) if record.app_id == *app_id && record.scope == Scope::User => Holds::Ours,
+        Ok(Some(record)) if record.app_id == *app_id && record.scope == scope => Holds::Ours,
         Ok(Some(record)) if record.app_id == *app_id => Holds::Unreadable,
         Ok(_) => Holds::Other,
         Err(_) => Holds::Unreadable,
@@ -795,6 +830,64 @@ fn is_unfinished_install(
     only_ours && matches!(load_any::<InstallState>(fs, &at, hasher), Ok(None))
 }
 
+/// Whether `dir` is what a per-machine first install cut off before its first record leaves (F1):
+/// a real directory holding at most `app` (empty) and `.lunepack`, which holds at most `state`
+/// (only the lock and record-named files, no whole record) and `machine` (at most the engine's
+/// lock file), each a real directory and each file a regular file. Read only; a read failure is
+/// "no".
+fn is_unfinished_machine_install(fs: &dyn Fs, hasher: &dyn Hasher, dir: &Path) -> bool {
+    // Every entry of `at` is one of `allowed`, of that kind.
+    let only = |at: &Path, allowed: &[(&str, FileKind)]| match fs.list_dir(at) {
+        Ok(listing) => listing.iter().all(|e| {
+            allowed
+                .iter()
+                .any(|(name, kind)| e.name.as_os_str() == OsStr::new(name) && e.kind == *kind)
+        }),
+        Err(_) => false,
+    };
+    let layout = MachineLayout::new(dir);
+    let state_name = LayoutScheme::WINDOWS
+        .state
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    let exists = |p: &Path| matches!(fs.symlink_metadata(p), Ok(Some(_)));
+    let shape = only(
+        dir,
+        &[
+            (LayoutScheme::WINDOWS.versions, FileKind::Dir),
+            (MACHINE_LUNEPACK_DIR, FileKind::Dir),
+        ],
+    ) && (!exists(&layout.app_dir()) || only(&layout.app_dir(), &[]))
+        && (!exists(&layout.lunepack_dir())
+            || only(
+                &layout.lunepack_dir(),
+                &[
+                    (state_name, FileKind::Dir),
+                    (MACHINE_ADMIN_DIR, FileKind::Dir),
+                ],
+            ))
+        && (!exists(&layout.machine_dir())
+            || only(&layout.machine_dir(), &[(LOCK_FILE, FileKind::File)]));
+    if !shape {
+        return false;
+    }
+    let state = layout.state_dir();
+    if !exists(&state) {
+        return true;
+    }
+    let Ok(listing) = fs.list_dir(&state) else {
+        return false;
+    };
+    let only_ours = listing.iter().all(|e| {
+        e.kind == FileKind::File
+            && e.name
+                .to_str()
+                .is_some_and(|n| n == LOCK_FILE || is_record_name(n))
+    });
+    only_ours && matches!(load_any::<InstallState>(fs, &state, hasher), Ok(None))
+}
+
 /// Whether `path` is a real directory (not a symlink or reparse point). A read failure is "no".
 fn is_real_dir(fs: &dyn Fs, path: &Path) -> bool {
     matches!(fs.symlink_metadata(path), Ok(Some(meta)) if meta.kind == FileKind::Dir)
@@ -828,6 +921,8 @@ fn same_folder_name(a: &OsStr, b: &str) -> bool {
 ///    state directory with only the lock and record-named files, no whole record: resumed);
 ///    anything else there (a file, a link or reparse point, a non-empty directory,
 ///    another app's install) is taken and never touched. Both taken: [`LayoutError::FolderTaken`].
+///    With [`Scope::Machine`] a folder holding only what a per-machine first install makes before
+///    its first record is resumed the same way (F1).
 ///
 /// Errors carry no path or name.
 pub fn resolve_root(
@@ -838,8 +933,27 @@ pub fn resolve_root(
     name: &str,
     scheme: LayoutScheme,
 ) -> Result<RootChoice, LayoutError> {
+    resolve_root_scoped(fs, hasher, data_home, app_id, name, scheme, Scope::User)
+}
+
+/// [`resolve_root`] for the install of `scope`: a folder matches when its record is this app's
+/// and of `scope` (a record of the app in the other scope counts as unreadable). The privileged
+/// engine resolves a per-machine install's root with [`Scope::Machine`] over the machine home
+/// (M10-D8) and [`LayoutScheme::WINDOWS`], whose directory names the machine tree shares.
+pub fn resolve_root_scoped(
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    data_home: &Path,
+    app_id: &AppId,
+    name: &str,
+    scheme: LayoutScheme,
+    scope: Scope,
+) -> Result<RootChoice, LayoutError> {
     if scheme.root == RootNaming::AppId {
         let root = data_home.join(app_id.as_str());
+        if scope == Scope::Machine {
+            return resolve_machine_app_id_root(fs, hasher, root, app_id, scheme);
+        }
         return Ok(if is_real_dir(fs, &root) {
             RootChoice::Existing(root)
         } else {
@@ -862,7 +976,7 @@ pub fn resolve_root(
             continue;
         }
         let dir = data_home.join(&entry.name);
-        match holds(fs, hasher, &dir, app_id, scheme) {
+        match holds(fs, hasher, &dir, app_id, scheme, scope) {
             Holds::Ours if found.is_some() => return Err(LayoutError::InstallAmbiguous),
             Holds::Ours => found = Some(dir),
             Holds::Unreadable
@@ -901,8 +1015,51 @@ pub fn resolve_root(
             {
                 return Ok(RootChoice::New(path));
             }
+            // The same for a per-machine first install, whose directories differ (F1).
+            Some(meta)
+                if meta.kind == FileKind::Dir
+                    && scope == Scope::Machine
+                    && is_unfinished_machine_install(fs, hasher, &path) =>
+            {
+                return Ok(RootChoice::New(path));
+            }
             Some(_) => {}
         }
+    }
+    Err(LayoutError::FolderTaken)
+}
+
+/// [`resolve_root_scoped`] for a per-machine root named by the app id (`/opt/<app id>`, M11-D6):
+/// nothing there is `New`; a real directory holding this app's machine record is `Existing`; one
+/// holding an unreadable record of the app, or its record of the other scope, is
+/// [`LayoutError::InstallUnreadable`]; an empty real directory, or one holding only what a
+/// per-machine first install cut off before its first record leaves (F1), is `New` (adopted or
+/// resumed); anything else at that name (a file, a link, another app's tree) is taken and never
+/// touched, [`LayoutError::FolderTaken`].
+fn resolve_machine_app_id_root(
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    root: PathBuf,
+    app_id: &AppId,
+    scheme: LayoutScheme,
+) -> Result<RootChoice, LayoutError> {
+    let meta = match fs.symlink_metadata(&root) {
+        Ok(meta) => meta,
+        Err(e) if e.kind == FsErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    match meta {
+        None => return Ok(RootChoice::New(root)),
+        Some(meta) if meta.kind == FileKind::Dir => {}
+        Some(_) => return Err(LayoutError::FolderTaken),
+    }
+    match holds(fs, hasher, &root, app_id, scheme, Scope::Machine) {
+        Holds::Ours => return Ok(RootChoice::Existing(root)),
+        Holds::Unreadable => return Err(LayoutError::InstallUnreadable),
+        Holds::Other => {}
+    }
+    if fs.list_dir(&root)?.is_empty() || is_unfinished_machine_install(fs, hasher, &root) {
+        return Ok(RootChoice::New(root));
     }
     Err(LayoutError::FolderTaken)
 }
@@ -1234,15 +1391,37 @@ pub fn resolve_bundle_target(
     name: &str,
     app_id: &AppId,
 ) -> Result<PathBuf, LayoutError> {
+    bundle_target(fs, apps_dir, name, app_id, true)
+}
+
+/// [`resolve_bundle_target`] for a per-machine install (M11-D6): the same names in `apps_dir`
+/// (`/Applications`), which must exist as a real directory and is never created or changed
+/// ([`LayoutError::NotCanonical`] otherwise).
+pub fn resolve_machine_bundle_target(
+    fs: &dyn Fs,
+    apps_dir: &Path,
+    name: &str,
+    app_id: &AppId,
+) -> Result<PathBuf, LayoutError> {
+    bundle_target(fs, apps_dir, name, app_id, false)
+}
+
+fn bundle_target(
+    fs: &dyn Fs,
+    apps_dir: &Path,
+    name: &str,
+    app_id: &AppId,
+    create: bool,
+) -> Result<PathBuf, LayoutError> {
     ensure_canonical(fs, apps_dir)?;
     let parent = apps_dir.parent().ok_or(LayoutError::NotCanonical)?;
     match lstat(fs, apps_dir)? {
-        None => {
+        None if create => {
             fs.create_dir_private(apps_dir)?;
             fs.sync_dir(parent)?;
         }
         Some(meta) if meta.kind == FileKind::Dir => {}
-        Some(_) => return Err(LayoutError::NotCanonical),
+        _ => return Err(LayoutError::NotCanonical),
     }
     let stem = if macos_name_ok(name).is_ok() {
         name
@@ -1554,6 +1733,16 @@ fn tree_of(fs: &dyn Fs, scheme: LayoutScheme, path: &Path) -> Result<Option<Tree
     }))
 }
 
+/// The app id and version of the tree at `path` by its own config under `scheme` (nothing
+/// followed): `None` when nothing is there, an error when anything but a readable tree is.
+pub fn tree_identity(
+    fs: &dyn Fs,
+    scheme: LayoutScheme,
+    path: &Path,
+) -> Result<Option<(AppId, Version)>, LayoutError> {
+    Ok(tree_of(fs, scheme, path)?.map(|t| (t.app_id, t.version)))
+}
+
 /// One move of [`reconcile_bundle`].
 enum Move {
     /// Rename the first path to the second (which is free).
@@ -1706,4 +1895,325 @@ pub fn reconcile_bundle(
     }
     // Every move takes the disk closer to the end state; this many means it changed under us.
     Err(LayoutError::BundleMissing)
+}
+
+// ---- the machine layout (M10-D8) ------------------------------------------------------------------
+
+/// The update service's binary name on Windows (M10-D7), placed beside the entry in a release tree
+/// and in `R\.lunepack\machine\service\<version>\`.
+pub const SERVICE_FILE: &str = "lunepack-service.exe";
+/// The update service's binary name on Linux and macOS (M11-D6).
+pub const SERVICE_FILE_UNIX: &str = "lunepack-service";
+/// The machine home on Linux (M11-D6): `R = /opt/<app id>`.
+pub const MACHINE_HOME_LINUX: &str = "/opt";
+/// The machine home on macOS (M11-D6): `R = /Library/Application Support/lunepack/<app id>`.
+pub const MACHINE_HOME_MACOS: &str = "/Library/Application Support/lunepack";
+/// The directory under a data home that holds the per-user homes of machine installs (M11-D10).
+pub const MACHINE_USER_HOME_DIR: &str = ".lunepack";
+/// The machine tree's private directory under `R`.
+pub const MACHINE_LUNEPACK_DIR: &str = ".lunepack";
+/// The admin-only directory under `R\.lunepack`.
+pub const MACHINE_ADMIN_DIR: &str = "machine";
+/// The upload staging directory under `R\.lunepack\machine`.
+pub const MACHINE_INCOMING_DIR: &str = "incoming";
+/// The service binaries' directory under `R\.lunepack\machine`.
+pub const MACHINE_SERVICE_DIR: &str = "service";
+/// Prefix of a version tree renamed for removal by the machine GC (`.gc-<16 hex>`).
+pub const GC_PREFIX: &str = ".gc-";
+
+/// The operating system a machine install's names are for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MachineOs {
+    /// Windows (M10).
+    Windows,
+    /// Linux (M11).
+    Linux,
+    /// macOS (M11).
+    Macos,
+}
+
+/// A unix [`MachineOs`]: the endpoint names and the protection rule differ only between these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnixOs {
+    /// Linux.
+    Linux,
+    /// macOS.
+    Macos,
+}
+
+impl MachineOs {
+    /// The unix OS this is; `None` on Windows.
+    pub const fn unix(self) -> Option<UnixOs> {
+        match self {
+            MachineOs::Windows => None,
+            MachineOs::Linux => Some(UnixOs::Linux),
+            MachineOs::Macos => Some(UnixOs::Macos),
+        }
+    }
+
+    /// The OS of `target`'s machine installs.
+    pub const fn of_target(target: crate::target::Target) -> MachineOs {
+        if target.is_windows() {
+            MachineOs::Windows
+        } else if target.is_macos() {
+            MachineOs::Macos
+        } else {
+            MachineOs::Linux
+        }
+    }
+}
+
+/// The update service's binary name on `os`: [`SERVICE_FILE`] on Windows, [`SERVICE_FILE_UNIX`]
+/// elsewhere (M11-D6).
+pub const fn service_file(os: MachineOs) -> &'static str {
+    match os {
+        MachineOs::Windows => SERVICE_FILE,
+        MachineOs::Linux | MachineOs::Macos => SERVICE_FILE_UNIX,
+    }
+}
+
+/// The names of a per-machine install on one OS (M10-D8, M11-D6): one directory layout on every
+/// OS, three projections. The composition root picks one; the core holds no platform switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineScheme {
+    /// The OS the names are for.
+    pub os: MachineOs,
+    /// The machine view: how `R` is named in the machine home, the directories under `R`, the
+    /// projection and the update config's path in a tree.
+    pub view: LayoutScheme,
+    /// The service binary's file name.
+    pub service_file: &'static str,
+    /// The fixed machine home (`R`'s parent) on unix; `None` on Windows, where the composition
+    /// root resolves Program Files.
+    pub home: Option<&'static str>,
+}
+
+impl MachineScheme {
+    /// Windows (M10-D8): `R = <Program Files>\<display name>`, no projection,
+    /// `lunepack-service.exe`.
+    pub const WINDOWS: MachineScheme = MachineScheme {
+        os: MachineOs::Windows,
+        view: LayoutScheme::WINDOWS,
+        service_file: SERVICE_FILE,
+        home: None,
+    };
+
+    /// Linux (M11-D6): `R = /opt/<app id>`, the projection `R/current` → `app/<ver>`,
+    /// `lunepack-service` with the stable link.
+    pub const LINUX: MachineScheme = MachineScheme {
+        os: MachineOs::Linux,
+        view: LayoutScheme::MACHINE_LINUX,
+        service_file: SERVICE_FILE_UNIX,
+        home: Some(MACHINE_HOME_LINUX),
+    };
+
+    /// macOS (M11-D6): `R = /Library/Application Support/lunepack/<app id>`, the bundle
+    /// projection, `lunepack-service` with the stable link.
+    pub const MACOS: MachineScheme = MachineScheme {
+        os: MachineOs::Macos,
+        view: LayoutScheme::MACHINE_MACOS,
+        service_file: SERVICE_FILE_UNIX,
+        home: Some(MACHINE_HOME_MACOS),
+    };
+
+    /// The scheme of `os`.
+    pub const fn of_os(os: MachineOs) -> MachineScheme {
+        match os {
+            MachineOs::Windows => MachineScheme::WINDOWS,
+            MachineOs::Linux => MachineScheme::LINUX,
+            MachineOs::Macos => MachineScheme::MACOS,
+        }
+    }
+
+    /// What is projected from the machine record.
+    pub const fn projection(&self) -> Projection {
+        self.view.projection
+    }
+
+    /// How `R` is named in the machine home.
+    pub const fn root_naming(&self) -> RootNaming {
+        self.view.root
+    }
+
+    /// The update config's path inside a version tree (`/`-separated).
+    pub const fn config(&self) -> &'static str {
+        self.view.config
+    }
+
+    /// Whether the service is started through the stable link
+    /// `R/.lunepack/machine/lunepack-service` (unix, M11-D6).
+    pub const fn has_stable_link(&self) -> bool {
+        !matches!(self.os, MachineOs::Windows)
+    }
+}
+
+/// The per-user home of a machine install of `app_id` (M11-D10):
+/// `<data home>/.lunepack/<app id>`, holding that user's `state`, `cache` and `logs`. The data
+/// home is the caller's (`$XDG_DATA_HOME` or `~/.local/share` on Linux,
+/// `~/Library/Application Support` on macOS); the core looks nothing up. An app id never starts
+/// with `.`, so this never meets a per-user `R = <data home>/<app id>`.
+pub fn machine_user_home(data_home: &Path, app_id: &AppId) -> PathBuf {
+    data_home.join(MACHINE_USER_HOME_DIR).join(app_id.as_str())
+}
+
+/// The directories of a per-machine install (M10-D8, M11-D6): `app/<ver>`, `.lunepack/state`
+/// (the machine record), `.lunepack/logs` and the admin-only `.lunepack/machine` with the
+/// engine's lock, `incoming/`, `service/<ver>/` and, on unix, the stable service link. The names
+/// are the same on every OS; the [`MachineScheme`] adds the service file name and the projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineLayout {
+    root: PathBuf,
+    scheme: MachineScheme,
+}
+
+impl MachineLayout {
+    /// The Windows layout of the install root `root` ([`MachineScheme::WINDOWS`]).
+    pub fn new(root: &Path) -> MachineLayout {
+        MachineLayout::with_scheme(root, MachineScheme::WINDOWS)
+    }
+
+    /// The layout of the install root `root` under `scheme`.
+    pub fn with_scheme(root: &Path, scheme: MachineScheme) -> MachineLayout {
+        MachineLayout {
+            root: root.to_path_buf(),
+            scheme,
+        }
+    }
+
+    /// `R`.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The scheme the layout names its files with.
+    pub fn scheme(&self) -> MachineScheme {
+        self.scheme
+    }
+
+    /// The machine view of `R` as a [`UserLayout`] under the scheme's view, for the projection
+    /// (`R/current` on Linux, the bundle on macOS) and the version trees' config paths.
+    pub fn view(&self) -> UserLayout {
+        UserLayout::from_root(self.root.clone(), self.scheme.view)
+    }
+
+    /// `R\app`.
+    pub fn app_dir(&self) -> PathBuf {
+        join_names(&self.root, self.scheme.view.versions)
+    }
+
+    /// `R\app\<version>`.
+    pub fn version_dir(&self, version: &Version) -> PathBuf {
+        self.app_dir().join(version.to_string())
+    }
+
+    /// `R\.lunepack`.
+    pub fn lunepack_dir(&self) -> PathBuf {
+        self.root.join(MACHINE_LUNEPACK_DIR)
+    }
+
+    /// `R\.lunepack\state`, the machine record's directory.
+    pub fn state_dir(&self) -> PathBuf {
+        join_names(&self.root, self.scheme.view.state)
+    }
+
+    /// `R\.lunepack\logs`.
+    pub fn logs_dir(&self) -> PathBuf {
+        join_names(&self.root, self.scheme.view.logs)
+    }
+
+    /// `R\.lunepack\machine`, admin-only.
+    pub fn machine_dir(&self) -> PathBuf {
+        self.lunepack_dir().join(MACHINE_ADMIN_DIR)
+    }
+
+    /// The engine's lock file.
+    pub fn lock_path(&self) -> PathBuf {
+        self.machine_dir().join(LOCK_FILE)
+    }
+
+    /// `R\.lunepack\machine\incoming`.
+    pub fn incoming_dir(&self) -> PathBuf {
+        self.machine_dir().join(MACHINE_INCOMING_DIR)
+    }
+
+    /// `R\.lunepack\machine\service`.
+    pub fn service_dir(&self) -> PathBuf {
+        self.machine_dir().join(MACHINE_SERVICE_DIR)
+    }
+
+    /// `R\.lunepack\machine\service\<version>`.
+    pub fn service_version_dir(&self, version: &Version) -> PathBuf {
+        self.service_dir().join(version.to_string())
+    }
+
+    /// The service binary of `version`: `service\<version>\lunepack-service.exe` on Windows,
+    /// `service/<version>/lunepack-service` on unix.
+    pub fn service_image(&self, version: &Version) -> PathBuf {
+        self.service_version_dir(version)
+            .join(self.scheme.service_file)
+    }
+
+    /// The stable service link `R/.lunepack/machine/lunepack-service` (unix, M11-D6): the path
+    /// the init system starts, a symlink to `service/<ver>/lunepack-service` switched by an
+    /// atomic rename of a new link over it. `None` on Windows, where the registration names the
+    /// image itself.
+    pub fn stable_service_link(&self) -> Option<PathBuf> {
+        self.scheme
+            .has_stable_link()
+            .then(|| self.machine_dir().join(self.scheme.service_file))
+    }
+
+    /// The inverse of [`MachineLayout::service_image`] under [`MachineScheme::WINDOWS`]: the root
+    /// and version of an image path of that exact shape (the version directory named by its
+    /// canonical version text), else `None`.
+    pub fn of_service_image(image: &Path) -> Option<(MachineLayout, Version)> {
+        MachineLayout::of_service_image_as(image, MachineScheme::WINDOWS)
+    }
+
+    /// The inverse of [`MachineLayout::service_image`] under `scheme`: the layout (with `scheme`)
+    /// and version of an image path of exactly `R/.lunepack/machine/service/<v>/<service file>`
+    /// with `<v>` the canonical version text, else `None`.
+    pub fn of_service_image_as(
+        image: &Path,
+        scheme: MachineScheme,
+    ) -> Option<(MachineLayout, Version)> {
+        let name = |p: &Path| p.file_name().and_then(OsStr::to_str).map(str::to_owned);
+        if name(image)? != scheme.service_file {
+            return None;
+        }
+        let ver_dir = image.parent()?;
+        let text = name(ver_dir)?;
+        let version = Version::parse(&text).ok()?;
+        if version.to_string() != text {
+            return None;
+        }
+        let service = ver_dir.parent()?;
+        let machine = service.parent()?;
+        let lunepack = machine.parent()?;
+        let root = lunepack.parent()?;
+        let shape = name(service)? == MACHINE_SERVICE_DIR
+            && name(machine)? == MACHINE_ADMIN_DIR
+            && name(lunepack)? == MACHINE_LUNEPACK_DIR;
+        shape.then(|| (MachineLayout::with_scheme(root, scheme), version))
+    }
+}
+
+/// The Windows service binary's path in a release tree whose entry is `entry`: beside the entry
+/// ([`service_path_in_tree_for`] with [`MachineOs::Windows`]).
+pub fn service_path_in_tree(entry: &crate::path::RelPath) -> Option<crate::path::RelPath> {
+    service_path_in_tree_for(entry, MachineOs::Windows)
+}
+
+/// The service binary's path ([`service_file`] of `os`) in a release tree whose entry is `entry`:
+/// beside the entry.
+pub fn service_path_in_tree_for(
+    entry: &crate::path::RelPath,
+    os: MachineOs,
+) -> Option<crate::path::RelPath> {
+    let file = service_file(os);
+    let path = match entry.as_str().rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{file}"),
+        None => file.to_owned(),
+    };
+    crate::path::RelPath::parse(&path).ok()
 }

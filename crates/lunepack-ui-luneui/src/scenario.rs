@@ -6,6 +6,7 @@ use lunepack_core::ui::{
     AppCard, ChoiceValue, Details, EngineMsg, Flow, Outcome, PromptKind, StepItem, build_id,
 };
 
+use crate::look;
 use crate::render::{Step, Timed, at};
 use crate::strings::Os;
 
@@ -140,8 +141,34 @@ pub fn install_hello(os: Os, name: &str, icon: bool) -> EngineMsg {
         details: Details {
             location: Some(location(os)),
             size_bytes: Some(TOTAL_BYTES),
+            all_users_location: None,
         },
     }
+}
+
+/// Where the demo installs for all users (the offer exists on Windows only, so the path is one
+/// whatever `os` the scene runs on).
+pub const ALL_USERS_LOCATION: &str = "C:\\Program Files\\Lunegit";
+
+/// The welcome screen with the all-users choice offered, open at 0 ms.
+pub fn install_welcome_offering_all_users(os: Os, name: &str, icon: bool) -> Vec<Timed> {
+    let mut s = install_welcome(os, name, icon);
+    if let Step::Engine(EngineMsg::Hello { details, .. }) = &mut s[0].step {
+        details.all_users_location = Some(ALL_USERS_LOCATION.to_owned());
+    }
+    s
+}
+
+/// The all-users welcome screen with the checkbox ticked by a click at `click_ms` (the pointer
+/// leaves at `click_ms + 50`, so no hover shows).
+pub fn install_welcome_all_users_ticked(os: Os, click_ms: u64) -> Vec<Timed> {
+    let mut s = install_welcome_offering_all_users(os, APP_NAME, true);
+    s.push(at(
+        click_ms,
+        Step::Click(look::CONTENT_X + 8.0, look::CONTENT_BOTTOM - 16.0),
+    ));
+    s.push(at(click_ms + 50, Step::PointerAway));
+    s
 }
 
 /// The welcome screen, open at 0 ms.
@@ -223,6 +250,97 @@ pub fn install_failed(os: Os, proceed_ms: u64, fail_ms: u64, code: u32) -> Vec<T
     s
 }
 
+/// The Linux fallback command of an install for all users (M11-D9): what the engine shows when
+/// there is no polkit agent.
+pub const ADMIN_COMMAND: &str =
+    "sudo '/home/alice/Downloads/lunegit-1.4.0-linux-x86_64-setup' --all-users";
+
+/// A command with spaces, a `'\''` escape and one long unbroken file name (199 bytes).
+pub const ADMIN_COMMAND_LONG: &str = "sudo '/media/alice/USB Drive/Shared with me/Team'\\''s builds/Lunegit/release candidates/2026-11/linux/x86_64/signed and checked/please test before Friday/lunegit-1.4.0-linux-x86_64-setup' --all-users";
+
+/// The unelevated uninstall's fallback command (M11-D14).
+pub const ADMIN_COMMAND_UNINSTALL: &str =
+    "sudo '/opt/lunegit/app/1.4.0/lunepack-runtime' uninstall";
+
+/// A command of exactly [`lunepack_core::ui::MAX_ADMIN_COMMAND`] bytes (the cap): numbered folder
+/// names between a home folder and the setup file, the first folder's name padded to the length.
+pub fn admin_command_max() -> String {
+    const HEAD: &str = "sudo '/home/alice/";
+    const TAIL: &str = "lunegit-1.4.0-linux-x86_64-setup' --all-users";
+    let cap = lunepack_core::ui::MAX_ADMIN_COMMAND;
+    let folder = |i: usize| format!("release-candidate-{i:03}/");
+    let mut folders = Vec::new();
+    let mut len = HEAD.len() + TAIL.len();
+    while len + folder(folders.len() + 1).len() <= cap {
+        folders.push(folder(folders.len() + 1));
+        len += folders[folders.len() - 1].len();
+    }
+    // The room left goes into the first folder's name.
+    let pad = "x".repeat(cap - len);
+    folders[0] = format!("release-candidate-001{pad}/");
+    let command = format!("{HEAD}{}{TAIL}", folders.concat());
+    assert_eq!(command.len(), cap, "the maximum command is exactly the cap");
+    command
+}
+
+/// The welcome screen offering all users, the user's "for all users" Install at `proceed_ms`, then
+/// the engine's `command` at `cmd_ms` with its prompt.
+pub fn install_admin_command(os: Os, proceed_ms: u64, cmd_ms: u64, command: &str) -> Vec<Timed> {
+    let mut s = install_welcome_offering_all_users(os, APP_NAME, true);
+    s.push(at(proceed_ms, Step::Choose(ChoiceValue::ProceedAllUsers)));
+    s.push(at(
+        cmd_ms,
+        Step::Engine(EngineMsg::AdminCommand {
+            command: command.to_owned(),
+        }),
+    ));
+    s.push(at(
+        cmd_ms,
+        Step::Engine(EngineMsg::Prompt {
+            id: 2,
+            kind: PromptKind::AdminCommand,
+        }),
+    ));
+    s
+}
+
+/// The welcome screen offering all users, the user's Install at `proceed_ms`, then the hand-off to
+/// the system's installer at `off_ms` with its prompt.
+pub fn install_handed_off(os: Os, proceed_ms: u64, off_ms: u64) -> Vec<Timed> {
+    let mut s = install_welcome_offering_all_users(os, APP_NAME, true);
+    s.push(at(proceed_ms, Step::Choose(ChoiceValue::ProceedAllUsers)));
+    s.push(at(off_ms, Step::Engine(EngineMsg::HandedOffToInstaller)));
+    s.push(at(
+        off_ms,
+        Step::Engine(EngineMsg::Prompt {
+            id: 2,
+            kind: PromptKind::HandedOff,
+        }),
+    ));
+    s
+}
+
+/// The confirm screen, the user's Uninstall at `proceed_ms`, then the engine's `command` at
+/// `cmd_ms` with its prompt.
+pub fn uninstall_admin_command(os: Os, proceed_ms: u64, cmd_ms: u64, command: &str) -> Vec<Timed> {
+    let mut s = uninstall_confirm(os);
+    s.push(at(proceed_ms, Step::Choose(ChoiceValue::Proceed)));
+    s.push(at(
+        cmd_ms,
+        Step::Engine(EngineMsg::AdminCommand {
+            command: command.to_owned(),
+        }),
+    ));
+    s.push(at(
+        cmd_ms,
+        Step::Engine(EngineMsg::Prompt {
+            id: 2,
+            kind: PromptKind::AdminCommand,
+        }),
+    ));
+    s
+}
+
 /// The version an update goes to.
 pub const NEW_VERSION: &str = "1.5.0";
 
@@ -241,6 +359,7 @@ pub fn update_hello() -> EngineMsg {
         details: Details {
             location: None,
             size_bytes: None,
+            all_users_location: None,
         },
     }
 }
@@ -340,6 +459,7 @@ pub fn uninstall_hello(os: Os) -> EngineMsg {
         details: Details {
             location: Some(location(os)),
             size_bytes: None,
+            all_users_location: None,
         },
     }
 }

@@ -31,7 +31,11 @@ is `<data home>/<app id>` with the data home `~/Library/Application Support`, th
 in `versions/<version>/`, and the app itself is a bundle `B` in `~/Applications` that `R/bundle` points at; an
 app finds its runtime as `lunepack-runtime` in `Contents/MacOS` beside its entry, from its own resolved
 executable path, and the configuration it reads is `Contents/Resources/lunepack-update.json` of that bundle
-(`docs/FORMAT.md` 17, and "macOS" below).
+(`docs/FORMAT.md` 17, and "macOS" below). On a per-machine install `R` is `<Program Files>\<name>` on Windows
+(above), `/opt/<app id>` on Linux and `/Library/Application Support/lunepack/<app id>` on macOS, with the trees in
+`app/<version>/` (on macOS the live bundle `B` is in `/Applications`; `docs/FORMAT.md` 18 and 20). The rule for
+finding the runtime does not change: the app's own resolved executable path, never the link `R/current`, the command
+link or the desktop entry, which go through `current` for people.
 
 A runtime speaks exactly one schema version, and a runtime belongs to one version tree (D28): every
 final object names that tree in `tree_version`, so an app can tell when it reached another version's
@@ -50,6 +54,7 @@ lunepack-runtime <command> [options] [-- <args>]
 | `startup` | `-- <args>` | Delivers the lifecycle events queued for this version and says whether to go on. |
 | `confirm` | none | Confirms that this version works. |
 | `apply-and-restart` | `--wait-pid <pid>`, `--expect-version <version>`, `--no-ui`, `--background`, `-- <args>` | Starts the applier for the staged version, which applies it and starts the new version with `<args>` once the waited-for process has exited. With `--no-ui` the applier shows no update window. With `--background` (macOS only; no effect elsewhere) the new version is started without being brought to the front. |
+| `repair` | `--silent` | (a machine install) Re-creates the update service's registration from the confirmed current version, after one administrator approval; an administrator's own process needs none. On Windows that is the service, its descriptor and its demand start; on Linux the units and the stable service link; on macOS the LaunchDaemon and the link ("Per-machine installs (Linux and macOS, M11)" below). With `--silent`, or where nothing can ask (macOS, Linux without `pkexec`), a standard user's run exits 30 and asks nothing. On any install that is not per machine it is a usage error. |
 
 Global options, accepted by every command: `--json` (output JSON Lines instead of text) and
 `--expect-schema <N>` (the schema the caller understands; anything but `1` is the error
@@ -115,7 +120,7 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 0 | | success |
 | 2 | `usage` | the command line is outside the grammar |
 | 3 | `not_installed` | the tree is not an installed version (a development or bootstrap tree), or there is no install state |
-| 4 | `busy` | another lunepack operation holds the install lock |
+| 4 | `busy` | another lunepack operation holds the install lock, or (a machine install) the update service is serving another connection and did not greet this one in time |
 | 5 | `cancelled` | the operation was cancelled, or stdout stopped accepting output |
 | 6 | `stale` | the update is no longer applicable |
 | 7 | `verify` | a document, hash or signature was refused; on macOS also a bundle that is not byte for byte the release its configuration names (adoption) |
@@ -128,7 +133,7 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 14 | `update_config` | the tree's update configuration is missing, invalid, or its feed breaks the feed rule |
 | 15 | `unexpected_version` | the version found is not the one expected |
 | 16 | `token_mismatch` | the health token is malformed or does not match |
-| 17 | `machine_scope` | the install is per machine |
+| 17 | `machine_scope` | the install is per machine and the operation is not one a per-machine install supports: macOS adoption, and `install` run from inside a machine tree. (On every OS `check`, `download`, `apply-and-restart`, `startup`, `confirm`, `repair` and `uninstall` work on a per-machine install: "Per-machine installs" below) |
 | 18 | `unsupported` | not supported on this platform |
 | 19 | `process` | a process operation failed |
 | 20 | `rolled_back` | (apply) the new version failed its health check and was rolled back |
@@ -141,6 +146,12 @@ One code per error class, the same number as in the object's `kind`. They are st
 | 27 | `no_release` | (install) the channel offers no release for this install yet (none, none whose rollout admits it, or none at or above the bootstrap's own version); nothing was installed, retry later. (macOS adoption) the feed lists no release of the version and target the bundle's own configuration names; nothing was adopted |
 | 28 | `unsupported_location` | (macOS, every mode) the running app or the install's bundle is somewhere lunepack does not update: the error object carries `reason`, one of `translocated`, `read_only`, `other_volume`, `not_owned`, `not_writable`; move the app to the Applications folder of the user and open it from there |
 | 29 | `publisher_mismatch` | (download) the installed version's publisher policy (`enforce`) refused the update: the error object carries `reason`, one of `different`, `installed_invalid`, `candidate_unsigned`, `candidate_invalid`, `os`; nothing was staged. On `different`, `candidate_unsigned` and `candidate_invalid` the version is marked bad and never offered again; on `installed_invalid` and `os` nothing is marked and a later `download` checks again |
+| 30 | `elevation_required` | (setup, `repair`, `uninstall`; a per-machine install) the work needs administrator rights, and the run cannot ask for them: Windows, `--all-users --silent` as a standard user; Linux, the same, or no `pkexec` to ask with (the window shows the `sudo` command); macOS, an `uninstall` or `repair` of a standard user (no prompt of our own; the window of `uninstall` shows the `sudo` command); nothing was changed |
+| 31 | `elevation_declined` | (setup, `repair`, `uninstall`; a per-machine install) the user declined the administrator prompt (Linux: `pkexec` exit 126); nothing was changed |
+| 32 | `service_unavailable` | (a machine install) the update service cannot be used: the error object carries `reason`, one of `not_installed`, `disabled`, `start_failed`, `untrusted`, `timeout`, `protocol`, `unsupported`; the app keeps running its current version. An administrator's `repair` (or re-enabling the service) fixes `not_installed` and `disabled` |
+| 33 | `disabled_by_policy` | (a machine install) an administrator's policy switched self-update off; nothing was requested or changed |
+| 34 | `per_machine_unavailable` | (setup) the release carries no update service, so it installs per user only |
+| 35 | `not_protected` | (setup) a directory of the all-users install is not protected as it must be (Linux and macOS: a folder or an ancestor of `R` that anyone but root may change, or that carries an access control list); nothing was changed |
 | 70 | `internal` | anything else (a worker panic, a library error this build does not know) |
 
 The table lives in one place in the runtime (`crates/lunepack-runtime/src/modes.rs`) and is pinned
@@ -189,8 +200,9 @@ bundle's designated requirement (an ad-hoc signature counts as unsigned on eithe
 check. Only a definitive statement about the candidate's own bytes or signature can mark a version bad: any
 other operating-system status, and every file error while reading the tree, is `os`.
 
-A per-machine install keeps returning `machine_scope` (17); the check is added to the per-machine engine
-with M10.
+On a per-machine install on Windows the check runs inside the update service's engine, between verifying the
+upload and recording the staged version, under the installed version's policy exactly as above; a refusal
+reaches the caller as exit 29. On a per-machine install on macOS the same check runs in the service's engine (the root daemon wires the macOS check); on Linux it answers "not applicable" there too.
 
 ## Apply and restart
 
@@ -246,7 +258,8 @@ in "macOS" below.
 
 ## Internal modes
 
-The runtime also has three modes for lunepack's own use: `apply`, `install` and `uninstall`. They
+The runtime also has three modes for lunepack's own use: `apply`, `install` and `uninstall` (and, on
+Windows, the hidden elevated modes of a per-machine install, below). They
 are not part of the app-facing command line and carry no promise to callers: they are **same build
 only** (D28). Only the build that started a mode may rely on its arguments, its output or its exit
 codes, and a different version's runtime may run them differently. An app does not call them; it
@@ -257,6 +270,27 @@ calls `apply-and-restart`, which starts `apply` itself.
 | `apply --wait-pid <pid> --wait-start <ticks> --version <version> [--no-ui] [--background] [-- <args>]` | `apply-and-restart` (detached) | Waits for the process, commits the staged version, flips `current`, starts the new tree's entry with a health token and `<args>`, supervises its health check, rolls back on failure and then collects old trees. An apply that fails after the wait changes nothing and starts the version that exited again (without the token), unless the state moved on (another version current or pending, or the version to apply marked bad): then another applier, such as a second instance's, or a rollback has started the app already. Exit codes 20 to 22 are its own. |
 | `install [--silent]` | the first-install flow, from a bootstrap tree | Installs the newest release the tree's own channel offers (M5-D8): the root, feed and channel come only from that tree's update configuration. Exit codes 23, 24, 26 and 27 are its own. |
 | `uninstall [--silent]` | the uninstall flow, from a tree of the install | Removes the install this runtime stands in and the desktop integration lunepack made (M5-D10): the install root leaves its path in one rename before it is deleted, so a cut-off uninstall leaves it whole or gone, and the next install or uninstall deletes what is left. Exit codes 24, 25 and 26 are its own. |
+
+On Windows three more modes exist, started only by the same build's unelevated runtime or Setup through the
+system's elevation prompt, for a per-machine install: `machine-install --events <id> --for-sid <SID>` (inside
+`Setup.exe`), `machine-repair --events <id> --for-sid <SID>` and `machine-uninstall` (phase 1 with the same
+two options, phase 2 with `--wait-pid <pid> --wait-start <ticks>` and nothing else). `<id>` is 32 lowercase
+hex characters naming the outbound progress pipe the elevated copy creates (`lunepack-setup-<id>`) and
+`<SID>` the one account that may read it; neither is a place or a path. An elevated mode reads no environment
+variable, makes no temporary directory, looks at no current directory, starts no window and opens no network
+connection, and takes the install root from its own image's path (or, for the first install, from the
+setup file's own image); nothing in its command line names a location. Their results are exit codes and the
+machine record; the progress pipe carries phase lines only ("Per-machine installs" below).
+
+On Linux and macOS the hidden modes of a per-machine install are, again, started only by the same build: Linux
+`machine-install --events stdout` (inside the setup file, as root), macOS `machine-install --pkg` (as root, by the
+installer package's `postinstall`, and nothing else on its command line), and, on both, `machine-repair --events
+stdout`, `machine-uninstall --events stdout` (phase 1) and `machine-uninstall --second [--events stdout]` (phase 2),
+and `uninstall --user-copy [--silent]` (the unelevated uninstall's second run, below). `--events stdout` names the
+child's own standard output, which `pkexec` leaves in place; a unix elevated mode has no pipe id and no account in its
+command line either. It reads no environment variable and no current directory, makes no temporary directory, starts
+no window and opens no network connection, and takes the install root from its own image's path (or, for the first
+install, from the setup file's own executed image, or from the `.pkg`'s payload folder).
 
 `install` and `uninstall` take one option, `--silent` (no window and no question; on Windows also `/S`),
 and, for `uninstall` on Windows, the hand-off options below, and nothing else that names a place: the install root is derived from the runtime's own resolved path and the environment,
@@ -278,8 +312,10 @@ it runs as described above, unchanged. With the magic it is a setup file:
 
 - A trailer that does not parse (FORMAT.md 14.2) ends the run with `verify` (7) and one `error`
   object on stdout; it never falls back to another mode.
-- The command line is empty or `--silent`; anything else is a usage error (2). (On macOS the installer
-  is an app, not a file, and its runtime also takes the internal `--ui-stdio`: "macOS" below.)
+- The command line is empty or `--silent`; anything else is a usage error (2). (On Linux the line also takes
+  `--all-users`, each option once, in any order, and the hidden `machine-install --events stdout`: "Per-machine
+  installs (Linux and macOS, M11)" below. On macOS the installer is an app, not a file, and its runtime also takes
+  the internal `--ui-stdio`: "macOS" below.)
 - The payload is verified under the trailer's root before anything is shown or written: the key
   set, the manifest with no feed (release keys valid now), the whole pack, and the update
   configuration read out of the pack, which must name exactly that root. A failure is `verify`
@@ -313,6 +349,12 @@ it runs as described above, unchanged. With the magic it is a setup file:
   renames of a self-replace, or an entry the user deleted, is restored this way. An entry that is not
   lunepack's is left alone, and the exit code stays 23; any other failure of the repair is that error. The
   rerun never changes which version is installed, whatever version the Setup file carries.
+- Linux, for all users: the command line also takes `--all-users`; a setup file run as root installs for all users
+  and never per user, and takes no anchor (its payload is copied out of its own executed image and verified under
+  its trailer's root, "Per-machine installs (Linux and macOS, M11)" below).
+- Windows, for all users: the command line also takes `--all-users` ("Per-machine installs" below). A Windows
+  setup file carries the anchor of `docs/FORMAT.md` 14.5 and checks its payload against it before anything is
+  shown or written.
 
 ## Windows
 
@@ -372,11 +414,247 @@ total; the last error is reported unchanged.
 the renamed folder, but its Start-menu shortcut no longer points at the install, and updates report the
 shortcut as a conflict until the app is reinstalled.
 
+## Per-machine installs (Windows, M10)
+
+An app packed with the update service (`pack --service`, CLI.md) can be installed **for all users**: its tree
+lives under `Program Files` (`docs/FORMAT.md` 18), where a standard user cannot write, and a small
+LocalSystem service updates it, health-checks it, rolls it back and removes old versions with no prompt per
+update (`docs/FORMAT.md` 19; D12, M10-D1). A release packed without `--service` installs per user only and
+its installer offers no choice.
+
+**Scope is by location** (M10-D14). An install is per machine when the running executable is inside
+`<Program Files>\<name>\app\<version>\` and the newest record under that `<name>\.lunepack\state` is of
+scope `machine` and names the app. Never an argument, an environment variable or a registry value. One
+install is visible at a time: Setup refuses (`already_installed`, 23) to install for all users while the
+installing user has a per-user install of the app, and per user while a per-machine install exists.
+
+**Choosing it.** The window's welcome screen offers a tick box, "Install for all users", when the release
+carries the service and the process does not hold an administrator's full token. The same Setup file serves
+both; the window never runs elevated (M10-D15). What a run does is decided from who runs it and what it was
+asked:
+
+| Who runs `Setup.exe` | Without `--all-users` | With `--all-users` |
+|---|---|---|
+| a standard user, or an administrator in an ordinary window with UAC on (a filtered token) | the window, per user, with the tick box | `--silent`: exit 30 `elevation_required`, no prompt, nothing written; with a window: the choice is taken, and proceeding shows the system's prompt (a credential prompt for a standard user, a consent prompt for an administrator) |
+| an administrator with no split token (UAC off, the built-in Administrator account) | the window, per user, with the tick box | installs for all users in this process, with no window (`--silent` or not) |
+| a process holding the full token of an elevation ("Run as administrator") | one fixed message box titled `Setup` ("This installer does not run with administrator rights. Start it normally and choose "Install for all users", or start it with --all-users from an administrator prompt."), then exit 2 | installs for all users in this process, headless |
+
+A release without the service asked to install for all users is exit 34 `per_machine_unavailable`. When the
+tick box is used the unelevated Setup starts a copy of itself elevated (`machine-install`; also when the user
+is an administrator with no split token, so the hand-off is the same everywhere), the system asks once when
+it needs to, and the copy writes its
+progress into an outbound pipe the window reads; the install's result is the copy's exit code and the
+machine record, never what came through the pipe. Declining is exit 31 `elevation_declined` with nothing
+changed (the window shows a retry screen); a window lost after the hand-off began does not stop the install
+(a warning, one notice, exit 0). The elevated side copies the payload out of its own image into an
+administrator-only folder under Program Files and verifies it there against the anchor of the image the
+administrator approved (`docs/FORMAT.md` 14.5) before it creates anything; a directory it created that is not
+protected as FORMAT 18.2 says stops the install (exit 35 `not_protected`).
+
+The check for "the installing user has a per-user install of this app" is made only by an **unelevated**
+process, before it elevates or installs. A process holding the full token, and every elevated mode, opens
+nothing under any user's profile; for them only the engine's own check of the machine side applies, which
+is authoritative for a per-machine install. So an administrator who runs `Setup.exe --all-users` from an
+elevated prompt while holding a per-user install of the same app ends with both installs: the per-user one
+is not touched, and its own uninstall removes it.
+
+**Updating.** `check` and `download` run as the user, with the user's own cache and lock. `download` also
+stages: the library uploads exactly the documents it verified and the objects its cache holds to the service
+(over the pipe, never a path), which verifies them again in its own storage and builds the tree. `apply-and-restart`
+starts the applier as for a user install; the applier asks the service to `apply` the staged version, which
+returns a health token, starts the new version with the token in its environment (never on a command line,
+in a log or in an event) and supervises it by reading the machine record; a crash or the health timeout
+calls `rollback`, a `not_pending` or `token_mismatch` answer means someone else resolved it and the applier
+reports what the record says, and it relaunches the launcher stub. `startup` and `confirm` use `attempt` and
+`confirm`: a start of a pending version that has no token asks `attempt`, so a supervisor that died is
+replaced by the first starts of any user (three failed leases roll the version back). The runtime and the
+library write nothing under `R`, to the machine record or to HKLM: every such change is a request to the
+service. **None of the five commands ever asks for elevation or shows a prompt** (C4); only `repair` and
+`uninstall` may, and with `--silent` they exit 30 instead.
+
+**When the service cannot be used** the command exits 32 `service_unavailable` with a closed `reason`
+(`not_installed`, `disabled`, `start_failed`, `untrusted`, `timeout`, `protocol`, `unsupported`) and the app
+keeps running its current version. When an administrator disabled the service (start type Disabled, or
+deleted by hand) standard users get no updates: the reason is `disabled` (or `not_installed`), and updates
+resume when an administrator runs `repair` or re-enables the service. This is treated like the policy
+switch below: an administrator's deliberate choice, not something a standard user routes around
+(M10-D13). An administrator's policy `DisableSelfUpdate` (`docs/FORMAT.md` 18.4) makes `check`, `download`
+and `apply-and-restart` exit 33 `disabled_by_policy` before any request or download; `NoUpdateUi` makes the
+runtime show no update window, exactly as `LUNEPACK_NO_UI` does.
+
+**`repair`** (a per-machine install only, else exit 2) re-creates the service's registration, its descriptor and
+its demand start from the confirmed current version, after one administrator approval: an administrator's
+process runs it in-process; a standard user's starts `lunepack-runtime.exe machine-repair` from
+`<name>\app\<current>\` through the elevation prompt. There is no per-update elevated apply: with one
+protocol version a broken new service binary is kept out by the self-test before the registration switches,
+and a damaged registration is what `repair` is for.
+
+**Uninstall.** Started as for a user install (the stub with `--lunepack-uninstall`, Settings' Uninstall entry,
+`lunepack-runtime uninstall`). The unelevated runtime asks in the window (or `--silent` is exit 30), then starts
+the runtime inside `<name>\app\<current>\` elevated as `machine-uninstall`. That image is always the one under
+Program Files; the install root is derived from its own path and checked against the machine record, and no
+other path is accepted. Phase 1 copies it into a new administrator-only folder `.lunepack-uninstall-<32 hex>`
+directly under Program Files and starts the copy; phase 2 reads the install to remove from a marker in its own
+folder, checks it again, and runs the engine's uninstall in this order: the service is removed, the lock
+released, the whole tree checked for use, the integration removed, the root renamed away, the renamed tree
+checked once more, then deleted. A refusal at any step puts back what came before and exits 25 `in_use` (or 24
+`integration`): a refused uninstall leaves the install as it was. The copy's folder is registered for deletion
+at the next restart. The uninstalling user's per-user home is removed; other users' homes are left.
+A process that already holds an administrator's token (run as administrator, or UAC off) never makes the
+temporary copy, which its own unelevated processes could replace, and shows no window: the runtime inside
+`<name>\app\<current>\` runs phase 1 itself, headless, and exits 0 once phase 2 is started; phase 2 waits for it
+to end, then runs as above (after waiting up to 30 seconds for a progress reader that does not come), and its
+exit code is the result. That administrator's own per-user home is left.
+
+**Events.** A per-machine install queues none; each user's `first_run` and `updated` events come from that user's
+own counters (`docs/FORMAT.md` 12.9). `installed` is not delivered.
+
+**Exit codes of this section.** 30 and 31 and 34 and 35 belong to Setup, 32 and 33 to the commands above; 17
+stays for operations a per-machine install does not support (adoption on macOS, and `install` run from inside
+a machine tree), and the table above lists all of them. Schema 1 does not change: the new `kind`s are
+additive.
+
+## Per-machine installs (Linux and macOS, M11)
+
+An app packed with the update service (`pack --service`, CLI.md) can be installed **for all users** on Linux and
+macOS as well: its tree lives where a standard user cannot write (`docs/FORMAT.md` 20: `/opt/<app id>` on Linux; on
+macOS the bundle in `/Applications` and the state under `/Library/Application Support/lunepack/<app id>`), and a
+root daemon that any local user's copy of the app starts through a unix socket updates it, health-checks it,
+rolls it back and removes old versions with no prompt per update (D12, M11-D1 to M11-D16). The protocol is the
+Windows one, version 1, unchanged (`docs/FORMAT.md` 19.8). A release packed without `--service` installs per user
+only and its installer offers no choice. Everything in "Per-machine installs (Windows, M10)" about scope by
+location, updating, the policy, events and exit codes 32 and 33 holds here, with the differences below.
+
+**Scope is by location** (M10-D14, M11-D6). An install is per machine when the running executable is in
+`<machine home>/<app id>/app/<version>/` (Linux), or is the live bundle `R/bundle` names or the old copy a swap
+parks in `R/app/<version>/` (macOS), and the newest record under `R/.lunepack/state` is of scope `machine` and
+names the app. Never an argument, an environment variable, a unit or a property list. One install is visible at a
+time: the setup refuses (`already_installed`, 23) to install for all users while the installing user has a per-user
+install of the app, and per user while a per-machine install exists. (A root process cannot see other users'
+per-user installs: an administrator who installs for all users while another user keeps a per-user install ends with
+both; the per-user one is not touched.)
+
+### Linux: the first install
+
+The same setup file serves both. The welcome screen offers the tick box "Install for all users" when the release
+carries the service and the process is not root. What a run does is decided from who runs it and what it was asked:
+
+| Who runs the setup file | Without `--all-users` | With `--all-users` |
+|---|---|---|
+| a user other than root (an administrator included) | the window, per user, with the tick box | `--silent`: exit 30 `elevation_required`, no prompt, nothing written; with a window: the choice is taken, and proceeding starts `pkexec` |
+| root (a root shell, `sudo`) | one fixed line on stderr and exit 2, no window, nothing written | installs for all users in this process, headless (no window runs as root, D35) |
+
+A release without the service asked to install for all users is exit 34. When the choice is made, the unelevated
+setup runs `/usr/bin/pkexec <the setup file, canonical absolute path> machine-install --events stdout`, with
+standard input on `/dev/null` and a pipe on standard output (M11-D9). `pkexec` asks the system's authentication
+agent once, runs the file as root with its own clean environment, keeps the pipe, closes every descriptor above 2
+and passes the exit code through. The root copy writes its progress as the same relay lines the Windows pipe
+carries, which the unelevated side relays to the window; the install's result is the copy's exit code and the
+machine record, never a line that came through the pipe. Exit 126 is the user declining (31
+`elevation_declined`, a retry screen); exit 127, or no `/usr/bin/pkexec` at all, means nothing can ask: the window
+shows the screen "Finish in a terminal" with the command
+
+```
+sudo '<the setup file, canonical absolute path>' --all-users
+```
+
+(single-quoted, each `'` in the path written `'\''`; the window shows it verbatim, offers "Copy command" and never
+runs it; a path that is not text or whose command exceeds the screen's 1024 bytes shows no command) and the run
+ends with exit 30. The root side copies the payload out of **its own executed image** (it opens `/proc/self/exe`
+once, at the start) into a new admin-only folder `.lunepack-install-<32 hex>` in `/opt`, verifies the copy under
+the trailer's root (the signed key set, the manifest and the pack) before it creates anything, and takes nothing
+from its caller: no environment variable, no current directory, no path. There is no anchor as on Windows: the
+`pkexec` prompt names a path, not a publisher, so a digest bound to the image would not tell the administrator a
+genuine file from a swapped one (`docs/THREAT-MODEL.md`).
+
+### macOS: the first install
+
+A `macos-*` release with the service has, besides the `.dmg`, the all-users `.pkg` (CLI.md, `setup`), and the
+installer app carries the same file. The window's tick box "Install for all users" is offered when it does; on
+proceeding the runtime opens the package with `/usr/bin/open` (never with privileges of its own, M11-D8), the
+window says "Continue in Installer", and the run ends with exit 0 and the `result` outcome `handed_off` (nothing
+is installed by that process; it first refuses `already_installed` for a per-user install of this user or an
+existing machine record). A person can also open the `.pkg` from the `.dmg` or from the release directory. Installer
+asks for the administrator's password, places the runtime and the payload file below
+`/Library/Application Support/lunepack/.installer/<app id>/` (root-only) and runs the package's one `postinstall`
+line as root: `lunepack-runtime machine-install --pkg`. That mode takes no other argument and reads no environment
+variable (Installer's `$1` to `$4` are never read). Before it reads anything it requires that it runs as root, that
+its own resolved path is exactly `<machine home>/.installer/<app id>/lunepack-runtime` (compared with what the
+kernel names it), that the machine home is a machine tree and searchable, and that `.installer` and the app's
+folder are admin-only; the payload file must be a regular file owned by root that neither group nor others may
+write. It copies the payload into `.lunepack-install-<32 hex>`, verifies the copy under the trailer's root, and then
+installs through the engine: the record, the trees, the bundle at `/Applications/<name>.app` (the second name
+`<name> (<app id>).app` when the first is taken; an existing entry is never touched), the LaunchDaemon and the
+integration. A rerun of the package over the installed version repairs it (the engine's `repair`, exit 0); over
+another version it is `already_installed`. The result is the exit code of the script. The system may list the
+daemon under System Settings > General > Login Items & Extensions and show a notice for a background item; what it
+shows is what the person check (`scripts/macos-machine-user-check.sh`) records, and an administrator who switches
+such an entry off would stop updates for standard users as a disabled service does on Windows (not yet observed on a
+real Mac; `docs/THREAT-MODEL.md`).
+
+### Updating, repair, the policy
+
+`check`, `download`, `startup` and `confirm` run as the user with the user's own cache and lock, `download` stages
+through the socket, `apply-and-restart` starts the applier as for a user install, and the applier asks the service
+to `apply`: the service, as root, makes the staged version current and projects it (Linux: the link `R/current`;
+macOS: the swap of the live bundle `B`, which waits for the app's own exit as the applier does), and returns the
+health token; the applier starts the new version from `R/current/<entry>` (Linux) or `B`'s entry (macOS) with the
+token in its environment, supervises it and calls `rollback` on a crash or at the health timeout (`docs/FORMAT.md`
+19.5). **None of the five commands ever asks for elevation or shows a prompt**; only `repair`, `uninstall` and the
+first install may. The service's removal guard asks the all-users in-use scan before and after each rename that
+takes a path away from new launches, and any process it cannot read counts as in use (M11-D13), so a tree another
+user runs is never deleted. `service_unavailable` carries the closed reasons of the table above: `not_installed`
+when the socket is not there (after three seconds), `disabled` when nobody listens, `untrusted` when the socket's
+owner, folder or peer is not root (`docs/FORMAT.md` 20.3). A second client that connects while the service
+serves another connection waits in the socket's queue, and a hello that does not come in ten seconds is exit 4
+`busy` on Linux and macOS, as on Windows (M11-D15; a daemon that hangs reads as busy too); `timeout` is a later
+answer that does not come. The administrator's policy file (`docs/FORMAT.md` 20.6) makes `check`, `download` and
+`apply-and-restart` exit 33 before any request or download, and `NoUpdateUi` makes the runtime show no update
+window, as on Windows.
+
+**`repair`** (a per-machine install only, else exit 2) re-creates the registration (Linux: the two units and the
+stable link; macOS: the LaunchDaemon and the link) from the confirmed current version after one administrator
+approval. As root it runs in process. As a standard user on Linux it asks `pkexec` to run
+`<R>/app/<current>/lunepack-runtime machine-repair --events stdout`, the root-owned image inside `R`, never a copy
+the user can change; with `--silent`, or without `pkexec`, it exits 30. On macOS there is no prompt of our own: it
+exits 30, and an administrator runs `sudo '<runtime path>' repair`; running the `.pkg` of the installed version
+again repairs too.
+
+### Uninstall
+
+Started as for a user install (`lunepack-runtime uninstall`). The unelevated runtime asks in the window to confirm,
+or `--silent` is exit 30.
+
+- Linux: it first copies itself (and `lunepack-ui` when that is a regular file beside it) into a new private
+  folder `lunepack-uninstall-<16 hex>` of the user's per-user home of the install (`docs/FORMAT.md` 20.7), with a
+  marker naming the app and the process, and becomes the copy (`uninstall --user-copy`), because a process of the
+  user running from `R` would make the removal guard refuse (`in_use`, 25). The copy asks `pkexec` to run `<R>/app/<current>/lunepack-runtime machine-uninstall
+  --events stdout`; no other path is accepted. Declined is 31; without `pkexec` the window shows the command
+  `sudo '<runtime path>' uninstall` and the run ends with 30.
+- macOS: no prompt of our own; the window shows the same command and the run ends with 30, nothing changed.
+- As root (`sudo '<runtime path>' uninstall`, or the elevated copy above) phase 1 derives the install from its own
+  path (on macOS from its path inside `B`) and checks it against the machine record before anything is copied,
+  copies the runtime into a new admin-only folder `.lunepack-uninstall-<16 hex>` directly in the machine home with a
+  marker, and `exec`s the copy as phase 2 (`machine-uninstall --second`), so the pipe and the process stay the same
+  and the copy's exit code is the result. Phase 2 re-validates and runs the engine's uninstall in this order: the
+  registration is removed (the units and the socket file, or the LaunchDaemon), the lock released, the whole tree
+  checked for use, the integration removed, `R` renamed to its tombstone (on macOS `B` first renamed to its
+  own, after `R`'s scan), the renamed tree checked once more, then deleted, and finally the copy's own folder. A
+  refusal at any step puts back what came before and exits 25 `in_use` (or 24 `integration`): a refused
+  uninstall leaves the install as it was. The uninstalling user's per-user home is removed; other users' homes are
+  left.
+
+**Events and exit codes.** A per-machine install queues none; each user's `first_run` and `updated` come from that
+user's own counters (`docs/FORMAT.md` 12.9). 30, 31, 34 and 35 belong to the first install and to `repair` and
+`uninstall`, 32 and 33 to the commands above, and 17 stays for what a per-machine install does not support
+(adoption on macOS, `install` run from inside a machine tree). Schema 1 does not change: no new `kind` was added,
+and the macOS installer's `result` has one new `outcome`, `handed_off`.
+
 ## macOS
 
 The macOS runtime is `lunepack-runtime` in `Contents/MacOS` beside the entry. An app that is installed per
 user lives in a bundle `B` in `~/Applications` that the install records (`docs/FORMAT.md` 17); everything
-here is per user (M8-D2), and a per-machine install is a later milestone.
+here is per user (M8-D2), except for the per-machine install ("Per-machine installs (Linux and macOS, M11)" above).
 
 **Which copy is the install.** The runtime decides from its own resolved path, before it reads any state
 or the network, and in this order:
@@ -407,8 +685,8 @@ or the network, and in this order:
 
 Before a mode moves or removes anything of an install (the applier, startup's repair of a swap, uninstall,
 the installer), the place of `B` is checked: its folder and `R/versions` on one volume (else `other_volume`),
-`B` owned by the user (else `not_owned`; a root-owned `B` is a per-machine install by ownership, D10, and is
-`machine_scope`, exit 17) and the user able to create entries in `B`'s folder (else `not_writable`; the folder need not be the
+`B` owned by the user (else `not_owned`; a root-owned `B` that is not the live bundle of a per-machine install
+of this app is `machine_scope`, exit 17; the live bundle of one is a machine install, by location) and the user able to create entries in `B`'s folder (else `not_writable`; the folder need not be the
 user's own, so an administrator's app in `/Applications` keeps updating). It is exit 28 with that `reason`,
 nothing committed and, in the applier, the app started again.
 

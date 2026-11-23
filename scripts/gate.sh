@@ -3,6 +3,7 @@
 #   ./scripts/gate.sh
 # Env: LUNEPACK_REQUIRE_SHELLCHECK=1  fail when shellcheck is missing (default: notice, skip)
 #      LUNEPACK_GATE_DOCKER=0         skip the Docker Linux suite
+#      LUNEPACK_GATE_E2E=0            skip the macOS end-to-end suite (runs only on macOS, CI unset)
 # The Docker stage runs only when `docker info` succeeds, CI is unset and LUNEPACK_GATE_DOCKER
 # is not 0 (CI has a native Linux job). It touches only its own --rm container, the image
 # `lunepack-rs-gate:<hash>` it builds from scripts/gate.Dockerfile, and two named volumes; it
@@ -98,6 +99,20 @@ else
     -w /src \
     "$image" \
     cargo test --workspace --locked
+fi
+
+stage "macos end-to-end suite (scripts/e2e-macos.sh)"
+# Local only, never in CI: it installs, updates and uninstalls real bundles under a temporary
+# root and HOME (see the script's header). The Windows per-machine suites run on a Windows machine
+# (docs/STATE.md, "Local end-to-end"), not here.
+if [ "${LUNEPACK_GATE_E2E:-}" = 0 ]; then
+  echo "gate: NOTICE macos e2e skipped: LUNEPACK_GATE_E2E=0"
+elif [ -n "${CI:-}" ]; then
+  echo "gate: NOTICE macos e2e skipped: CI is set (end-to-end suites run locally only)"
+elif [ "$(uname -s)" != Darwin ]; then
+  echo "gate: NOTICE macos e2e skipped: not macOS"
+else
+  ./scripts/e2e-macos.sh
 fi
 
 echo

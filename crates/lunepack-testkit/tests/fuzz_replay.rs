@@ -238,7 +238,9 @@ replay!(
     http,
     state,
     update_config,
-    setup
+    setup,
+    service,
+    ui
 );
 
 #[test]
@@ -258,6 +260,8 @@ fn the_replay_list_covers_every_harness() {
         "state",
         "update_config",
         "setup",
+        "service",
+        "ui",
     ]
     .into_iter()
     .collect();

@@ -1,9 +1,12 @@
 //! Pure update-framework logic and the traits behind every external or replaceable capability; depends on no adapter or I/O crate.
 
 pub mod cancel;
+pub mod chain;
 pub mod codesign;
 pub mod digest;
 pub mod encoding;
+pub mod endpoint;
+pub mod engine;
 pub mod envelope;
 pub mod error;
 pub mod feed;
@@ -27,6 +30,7 @@ pub mod policy;
 pub mod process;
 pub mod progress;
 pub mod root;
+pub mod service;
 pub mod setup;
 pub mod stage;
 pub mod state;
@@ -36,11 +40,15 @@ pub mod traits;
 pub mod transport;
 pub mod trust;
 pub mod ui;
+pub mod unix_protect;
 pub mod update_config;
 pub mod version;
 pub mod write;
 
 pub use cancel::CancelToken;
+pub use chain::{
+    Documents, KeysChain, MAX_ROOT_STEPS, RootWalk, raised_floors, verify_first_install_keys,
+};
 pub use codesign::{
     ArgvTemplate, Decision, ExpandCtx, Expanded, PlanEntry, PlanEntryKind, PublisherOutcome,
     SignItem, SignKind, SignPlanError, TemplateError, TemplateRole, decide, macho_slices_signed,
@@ -49,8 +57,9 @@ pub use codesign::{
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
 pub use error::{
-    DesktopPathError, Error, FeedRule, LayoutError, LifecycleError, PublisherError, Result,
-    StageError, StateError, UpdateConfigError,
+    ConnectError, DesktopPathError, ElevationError, Error, FeedRule, LayoutError, LifecycleError,
+    ProtectError, PublisherError, Result, ServiceError, ServiceRegError, StageError, StateError,
+    UpdateConfigError,
 };
 pub use feed::{
     ArtifactRef, CheckedRef, FeedDocument, FeedTargetEntry, ReleaseDoc, Rollout, RolloutDoc,
@@ -73,12 +82,14 @@ pub use integration::{
 };
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use layout::{
-    BundleDiscovery, BundleProbe, Discovery, LayoutScheme, LocationReason, NameRule, Projection,
-    RootChoice, RootNaming, UserLayout, bundle_orphaned, bundle_replaced, check_place, discover,
-    discover_bundle, ensure_no_foreign_record, is_tombstone_of, macos_name_ok,
+    BundleDiscovery, BundleProbe, Discovery, LayoutScheme, LocationReason, MachineLayout,
+    MachineOs, MachineScheme, NameRule, Projection, RootChoice, RootNaming, SERVICE_FILE,
+    SERVICE_FILE_UNIX, UnixOs, UserLayout, bundle_orphaned, bundle_replaced, check_place, discover,
+    discover_bundle, ensure_no_foreign_record, is_tombstone_of, machine_user_home, macos_name_ok,
     read_bundle_identity, reconcile_bundle, reconcile_current, remove_tombstones,
-    resolve_bundle_target, resolve_root, root_valid_for_uninstall, set_bundle_pointer,
-    tombstone_name, tree_candidates, version_config_path, windows_name_ok, write_bundle_identity,
+    resolve_bundle_target, resolve_root, resolve_root_scoped, root_valid_for_uninstall,
+    set_bundle_pointer, tombstone_name, tree_candidates, version_config_path, windows_name_ok,
+    write_bundle_identity,
 };
 pub use lifecycle::{
     AttemptOutcome, ConfirmOutcome, TokenCheck, apply, confirm, count_attempt, deliver_events,
@@ -91,7 +102,7 @@ pub use manifest::{
 };
 pub use pack::{
     FileClass, PackedFile, ReleaseLayout, RuntimeImageError, candidates, check_pe_stub,
-    check_runtime_image, check_ui_image, classify, pack_file,
+    check_runtime_image, check_service_image, check_ui_image, classify, pack_file,
 };
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
@@ -101,20 +112,25 @@ pub use process::{
 };
 pub use progress::{FileProgress, Phase, Progress, Source};
 pub use root::{RootDocument, TrustedRoot, advance_root};
+pub use service::{ClientSession, Duplex, ServerSession};
 pub use stage::{
     SourceFor, StageEnv, StageInput, StagedVersion, TreeDifference, TreeMismatch, scan, stage,
     verify_tree,
 };
 pub use state::{
     CurrentRef, Floors, Health, InstallCounters, InstallState, Lifecycle, LifecycleEvent, Loaded,
-    MachineScope, PendingRef, PreviousRef, Record, RootParts, Scope, StagedIssued, StagedRef,
-    UserScope,
+    MachineScope, MachineStore, PendingRef, PreviousRef, Record, RootParts, Scope, StagedIssued,
+    StagedRef, UserScope,
 };
 pub use stub::{LaunchTarget, STUB_CONTRACT_VERSION, STUB_FILE, StubError, launch_target};
 pub use target::Target;
 pub use traits::{
     Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,
     HashState, Hasher, PublisherCheck, Rng, SignatureAlg, SignedTree, Signer, StreamView, Verifier,
+};
+pub use traits::{
+    DirClass, Elevated, ElevatedChild, Elevation, MachinePolicy, PolicySource, Protect,
+    ServiceConnector, ServiceRegistrar, Standing,
 };
 pub use transport::{
     BlockingResponse, BlockingTransport, Body, BoxFuture, ByteRange, Head, Request, Response,

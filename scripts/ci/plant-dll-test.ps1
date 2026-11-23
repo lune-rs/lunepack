@@ -12,18 +12,30 @@
 #   at once: a usage error, a missing install) and passes when the process ends with an exit
 #   code that is not a loader failure.
 #
+#        plant-dll-test.ps1 -Describe
+#   Writes one object to the output and exits: `Planted` (the DLL names), `Content` (the bytes of
+#   each garbage file) and `LoaderFailures` (the exit codes that mean a loader failure, as unsigned
+#   numbers). The per-machine suite (scripts/e2e-windows-machine.ps1) and the user-run check read
+#   the list and the failure set from here, so the list lives in this one place.
+#
 # `cryptbase` is the case that once failed: the runtime imported advapi32!SystemFunction036 (through
 # getrandom 0.2 and ring), a forwarder to cryptbase.dll that the loader resolved from the
 # application directory before main. advapi32 is delay-loaded since (the packager refuses a static
 # import of it); a copy of a runtime built before that ends with 0xC000012F here.
 param(
-    [Parameter(Mandatory = $true)][string[]]$Case
+    [Parameter(ParameterSetName = 'Run', Mandatory = $true)][string[]]$Case,
+    [Parameter(ParameterSetName = 'Describe', Mandatory = $true)][switch]$Describe
 )
 $ErrorActionPreference = 'Stop'
 # DLLs no lunepack binary imports statically (step 0 (c)'s fixed list).
 $planted = 'winhttp', 'version', 'userenv', 'cryptbase', 'dwmapi', 'uxtheme', 'profapi', 'wldp', 'cryptsp', 'bcrypt', 'wtsapi32', 'secur32'
 # Loader failures, and the delay-load helper's module/procedure-not-found exceptions (C06D007E/F).
 $loaderFailures = @('C0000135', 'C0000142', 'C000007B', 'C0000139', 'C0000005', 'C000012F', 'C06D007E', 'C06D007F') | ForEach-Object { [Convert]::ToUInt32($_, 16) }
+$content = [byte[]](0x4C, 0x50, 0x2D, 0x70, 0x6C, 0x61, 0x6E, 0x74)
+if ($Describe) {
+    [pscustomobject]@{ Planted = [string[]]$planted; Content = $content; LoaderFailures = [uint32[]]$loaderFailures }
+    exit 0
+}
 $failed = 0
 
 # Starts a copy of `path` in a fresh directory holding garbage files named after `dlls`; returns the exit code.
@@ -34,7 +46,7 @@ function Start-Planted([string]$path, [string]$arguments, [string[]]$dlls) {
         $copy = Join-Path $dir (Split-Path $path -Leaf)
         Copy-Item $path $copy
         foreach ($d in $dlls) {
-            [IO.File]::WriteAllBytes((Join-Path $dir "$d.dll"), [byte[]](0x4C, 0x50, 0x2D, 0x70, 0x6C, 0x61, 0x6E, 0x74))
+            [IO.File]::WriteAllBytes((Join-Path $dir "$d.dll"), $content)
         }
         $start = @{ FilePath = $copy; PassThru = $true; WindowStyle = 'Hidden'; Wait = $true }
         if ($arguments) { $start['ArgumentList'] = $arguments }

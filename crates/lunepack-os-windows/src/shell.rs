@@ -1,6 +1,6 @@
 //! Small shell and user32 helpers the Windows integration, the runtime and the facade share
-//! (M7): known folders, a message box, the process's app user model id and the foreground right
-//! for a child. Safe wrappers; off Windows each returns `Unsupported`.
+//! (M7, M10): known folders, a message box, the process's app user model id and the foreground
+//! right for a child. Safe wrappers; off Windows each returns `Unsupported`.
 
 use std::io;
 use std::path::PathBuf;
@@ -27,6 +27,25 @@ pub fn user_program_files() -> io::Result<PathBuf> {
 /// The user's Start-menu programs folder (`FOLDERID_Programs`), where the shortcut goes (M7-D15).
 pub fn start_menu_programs() -> io::Result<PathBuf> {
     imp::known_folder(imp::Folder::Programs)
+}
+
+/// The machine's program files folder (`FOLDERID_ProgramFiles`), the parent of a per-machine
+/// install root (M10-D8). Asked of the shell by id; no environment variable is read. The path is
+/// returned unverified.
+pub fn program_files() -> io::Result<PathBuf> {
+    imp::known_folder(imp::Folder::ProgramFiles)
+}
+
+/// The all-users Start-menu programs folder (`FOLDERID_CommonPrograms`), where a per-machine
+/// install's shortcut goes (M10).
+pub fn common_start_menu_programs() -> io::Result<PathBuf> {
+    imp::known_folder(imp::Folder::CommonPrograms)
+}
+
+/// The user's local application data folder (`FOLDERID_LocalAppData`), the parent of the per-user
+/// home `lunepack\<app id>` of a machine install (M10-D8).
+pub fn local_app_data() -> io::Result<PathBuf> {
+    imp::known_folder(imp::Folder::LocalAppData)
 }
 
 /// Shows a modal message box with an OK button and no owner window, and returns when it is
@@ -61,6 +80,20 @@ pub fn allow_set_foreground(pid: u32) -> io::Result<()> {
     imp::allow_set_foreground(pid)
 }
 
+/// Registers `path` for deletion when the system next restarts (`MoveFileExW` with
+/// `MOVEFILE_DELAY_UNTIL_REBOOT`, a write to the system's pending-rename list that needs an
+/// administrator's token). A folder is deleted only when it is empty by then, so register its
+/// files first. Rejects a path that is not absolute or has an interior NUL.
+pub fn delete_at_restart(path: &std::path::Path) -> io::Result<()> {
+    if !path.is_absolute() || path.to_string_lossy().contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not an absolute path",
+        ));
+    }
+    imp::delete_at_restart(path)
+}
+
 #[cfg(windows)]
 mod imp {
     use super::MessageKind;
@@ -71,8 +104,9 @@ mod imp {
 
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{
-        FOLDERID_Programs, FOLDERID_UserProgramFiles, GetCurrentProcessExplicitAppUserModelID,
-        KF_FLAG_DONT_VERIFY, SHGetKnownFolderPath, SetCurrentProcessExplicitAppUserModelID,
+        FOLDERID_CommonPrograms, FOLDERID_LocalAppData, FOLDERID_ProgramFiles, FOLDERID_Programs,
+        FOLDERID_UserProgramFiles, GetCurrentProcessExplicitAppUserModelID, KF_FLAG_DONT_VERIFY,
+        SHGetKnownFolderPath, SetCurrentProcessExplicitAppUserModelID,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AllowSetForegroundWindow, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
@@ -82,6 +116,9 @@ mod imp {
     pub(super) enum Folder {
         UserProgramFiles,
         Programs,
+        ProgramFiles,
+        CommonPrograms,
+        LocalAppData,
     }
 
     /// A NUL-terminated UTF-16 copy of `s`.
@@ -108,6 +145,9 @@ mod imp {
         let id = match folder {
             Folder::UserProgramFiles => &FOLDERID_UserProgramFiles,
             Folder::Programs => &FOLDERID_Programs,
+            Folder::ProgramFiles => &FOLDERID_ProgramFiles,
+            Folder::CommonPrograms => &FOLDERID_CommonPrograms,
+            Folder::LocalAppData => &FOLDERID_LocalAppData,
         };
         let mut raw: *mut u16 = std::ptr::null_mut();
         // SAFETY: `id` is a valid `GUID` reference for the call; the flags are
@@ -208,6 +248,27 @@ mod imp {
     }
 
     #[allow(unsafe_code)]
+    pub(super) fn delete_at_restart(path: &std::path::Path) -> io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call; the new name is
+        // null, which with MOVEFILE_DELAY_UNTIL_REBOOT means "delete".
+        let moved = unsafe {
+            MoveFileExW(
+                wide.as_ptr(),
+                core::ptr::null(),
+                MOVEFILE_DELAY_UNTIL_REBOOT,
+            )
+        };
+        if moved == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[allow(unsafe_code)]
     pub(super) fn allow_set_foreground(pid: u32) -> io::Result<()> {
         // SAFETY: the call takes a process id by value and no pointer.
         if unsafe { AllowSetForegroundWindow(pid) } == 0 {
@@ -227,6 +288,9 @@ mod imp {
     pub(super) enum Folder {
         UserProgramFiles,
         Programs,
+        ProgramFiles,
+        CommonPrograms,
+        LocalAppData,
     }
 
     fn unsupported<T>() -> io::Result<T> {
@@ -252,6 +316,10 @@ mod imp {
     pub(super) fn allow_set_foreground(_pid: u32) -> io::Result<()> {
         unsupported()
     }
+
+    pub(super) fn delete_at_restart(_path: &std::path::Path) -> io::Result<()> {
+        unsupported()
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +340,13 @@ mod tests {
             start_menu_programs().map_err(kind),
             Err(io::ErrorKind::Unsupported)
         );
+        for folder in [
+            program_files(),
+            common_start_menu_programs(),
+            local_app_data(),
+        ] {
+            assert_eq!(folder.map_err(kind), Err(io::ErrorKind::Unsupported));
+        }
         assert_eq!(
             message_box("t", "x", MessageKind::Info).map_err(kind),
             Err(io::ErrorKind::Unsupported)
@@ -304,10 +379,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_known_folders_are_absolute_and_the_programs_folder_exists() {
-        for folder in [user_program_files(), start_menu_programs()] {
+        for folder in [
+            user_program_files(),
+            start_menu_programs(),
+            program_files(),
+            common_start_menu_programs(),
+            local_app_data(),
+        ] {
             let path = folder.expect("known folder");
             assert!(path.is_absolute(), "{path:?}");
         }
+        // The machine's program files folder is a real directory on every Windows install.
+        assert!(program_files().expect("program files").is_dir());
         // `FOLDERID_UserProgramFiles` is returned unverified: a fresh profile has no such folder yet.
         assert!(start_menu_programs().expect("programs").is_dir());
     }

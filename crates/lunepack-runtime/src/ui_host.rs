@@ -279,30 +279,33 @@ impl Shared {
 
     /// Applies `msg` to the reducer and hands it to the writer. A message the reducer refuses is
     /// not sent (the engine's own order decides; nothing is shown out of order). A full channel is
-    /// a stall. Never blocks on the UI.
-    fn send(&self, msg: EngineMsg) {
+    /// a stall. Never blocks on the UI. `true` when the message was queued.
+    fn send(&self, msg: EngineMsg) -> bool {
         let mut conv = self.conv();
         if conv.stop.is_some() {
-            return;
+            return false;
         }
         if conv.state.apply(&msg).is_err() {
-            return;
+            return false;
         }
         let result = match guard(&self.tx).as_ref() {
             Some(tx) => tx.try_send(msg),
-            None => return,
+            None => return false,
         };
         match result {
             Ok(()) => {
                 self.queued.fetch_add(1, Ordering::AcqRel);
+                true
             }
             Err(TrySendError::Full(_)) => {
                 drop(conv);
                 self.stop(UiStop::Stalled, None);
+                false
             }
             Err(TrySendError::Disconnected(_)) => {
                 drop(conv);
                 self.stop_gone();
+                false
             }
         }
     }
@@ -515,6 +518,10 @@ pub struct Start<'a> {
     pub env: &'a dyn Fn(&str) -> Option<OsString>,
     /// `--silent` or `--no-ui`.
     pub quiet: bool,
+    /// The process holds the full token of a UAC elevation (`Standing::UacElevated`): no UI is
+    /// ever started from it (M10-D15, S1). The UI binary sits in a folder this process did not
+    /// necessarily make admin-only, and the UI would run with the administrator's full token.
+    pub elevated: bool,
 }
 
 impl UiHost {
@@ -545,7 +552,7 @@ impl UiHost {
         details: Details,
     ) -> UiHost {
         let mut host = UiHost::headless(flow);
-        if !ui_wanted(start.quiet, start.env) {
+        if start.elevated || !ui_wanted(start.quiet, start.env) {
             return host;
         }
         let Some(program) = ui_program(start.fs, start.runtime_exe) else {
@@ -761,6 +768,52 @@ impl UiHost {
         }
     }
 
+    /// Shows the screen of the command to run as an administrator (M11-D9, D14). `true` when the
+    /// UI took it, so the screen can be asked about; a headless host, a lost UI and a command the
+    /// UI protocol refuses (too long, not printable) return `false` and nothing is shown. The UI
+    /// shows the text and never runs it.
+    ///
+    /// The screen follows the running one: the call first reports the operation's phase, so the
+    /// order holds whatever the run's own (queued) events have delivered so far; a later event of
+    /// the same phase finds the window past it and is dropped.
+    pub fn admin_command(&self, command: String) -> bool {
+        let Some(shared) = &self.shared else {
+            return false;
+        };
+        let msg = EngineMsg::AdminCommand { command };
+        // A text the protocol refuses is never sent, whatever the screen.
+        if ui::Message::encode(&msg).is_err() {
+            return false;
+        }
+        let phase = match self.flow {
+            Flow::Uninstall => Phase::Uninstall,
+            _ => Phase::Install,
+        };
+        shared.send(EngineMsg::Progress {
+            phase,
+            done: 0,
+            total: 0,
+        });
+        shared.send(msg)
+    }
+
+    /// Shows the screen that says to continue in the operating system's installer (macOS,
+    /// M11-D8). `true` when the UI took it, so the screen can be asked about; a headless host and
+    /// a lost UI return `false` and nothing is shown. As [`UiHost::admin_command`], the call first
+    /// reports the operation's phase, so the order holds whatever the run's queued events have
+    /// delivered.
+    pub fn hand_off_to_installer(&self) -> bool {
+        let Some(shared) = &self.shared else {
+            return false;
+        };
+        shared.send(EngineMsg::Progress {
+            phase: Phase::Install,
+            done: 0,
+            total: 0,
+        });
+        shared.send(EngineMsg::HandedOffToInstaller)
+    }
+
     /// Tells the UI how the operation ended.
     pub fn outcome(&self, outcome: Outcome) {
         if let Some(shared) = &self.shared {
@@ -842,7 +895,9 @@ impl UiHost {
                     shared.stop(UiStop::Hung, None);
                     return lost();
                 }
-                Some(Some(n)) => shared.send(EngineMsg::Ping { n }),
+                Some(Some(n)) => {
+                    shared.send(EngineMsg::Ping { n });
+                }
                 None => {}
             }
             match choices.recv_timeout(PROMPT_TICK) {
@@ -857,7 +912,13 @@ impl UiHost {
                     }
                 }
                 Ok((_, value)) => {
-                    if matches!(kind, PromptKind::Done | PromptKind::Failed) {
+                    if matches!(
+                        kind,
+                        PromptKind::Done
+                            | PromptKind::Failed
+                            | PromptKind::AdminCommand
+                            | PromptKind::HandedOff
+                    ) {
                         self.outcome_acknowledged.store(true, Ordering::Release);
                     }
                     return value;
@@ -960,7 +1021,10 @@ pub fn headless_answer(kind: PromptKind, flow: Flow) -> ChoiceValue {
     match kind {
         PromptKind::Welcome | PromptKind::Confirm => ChoiceValue::Proceed,
         PromptKind::Done if flow == Flow::Install => ChoiceValue::Finish { launch: false },
-        PromptKind::Done | PromptKind::Failed => ChoiceValue::Close,
+        PromptKind::Done
+        | PromptKind::Failed
+        | PromptKind::AdminCommand
+        | PromptKind::HandedOff => ChoiceValue::Close,
         PromptKind::RolledBack => ChoiceValue::Acknowledge,
     }
 }
@@ -1109,12 +1173,14 @@ mod tests {
                 runtime_exe: &w.exe,
                 env,
                 quiet,
+                elevated: false,
             },
             Flow::Install,
             card("App", "1.0.0", None),
             Details {
                 location: None,
                 size_bytes: None,
+                all_users_location: None,
             },
         )
     }
@@ -1141,6 +1207,33 @@ mod tests {
         let bare = world(false);
         assert!(start(&bare, false, &display).child_id().is_none());
         assert_eq!(bare.process.spawns().len(), 0);
+    }
+
+    #[test]
+    fn a_process_with_a_uac_full_token_starts_no_ui() {
+        let w = world(true);
+        w.process.script_child(ChildScript::runs());
+        let display = env_of(&[("DISPLAY", ":0")]);
+        let process: Arc<dyn Process> = Arc::new(w.process.clone());
+        let host = UiHost::start(
+            &Start {
+                process,
+                fs: &w.fs,
+                runtime_exe: &w.exe,
+                env: &display,
+                quiet: false,
+                elevated: true,
+            },
+            Flow::Uninstall,
+            card("App", "1.0.0", None),
+            Details {
+                location: None,
+                size_bytes: None,
+                all_users_location: None,
+            },
+        );
+        assert!(host.child_id().is_none());
+        assert_eq!(w.process.spawns().len(), 0, "a UI was started");
     }
 
     #[test]
@@ -1266,12 +1359,14 @@ mod tests {
                 runtime_exe: &w.exe,
                 env: &display,
                 quiet: false,
+                elevated: false,
             },
             Flow::Update,
             card("App", "2.0.0", Some("1.0.0")),
             Details {
                 location: None,
                 size_bytes: None,
+                all_users_location: None,
             },
         );
         let id = host.child_id().expect("the UI was started");
@@ -1387,6 +1482,7 @@ mod tests {
             Details {
                 location: None,
                 size_bytes: None,
+                all_users_location: None,
             },
         );
         (host, ends)

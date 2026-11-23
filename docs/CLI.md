@@ -285,7 +285,7 @@ in the release directory.
 ```
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
-    [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--config <CONFIG>]
+    [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--service <SERVICE>] [--config <CONFIG>]
 
 lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runtime <RUNTIME>
     [--ui <UI>] --assemble <DIR> [--config <CONFIG>]
@@ -308,6 +308,15 @@ lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runt
   Required for a `windows-*` target when the config has `[update]`; refused for any other target and
   without `[update]`. The console stub is needed when `install.terminal` is set, the GUI stub
   otherwise. A file over 32 MiB is refused.
+- `--service`: the update service (M10-D7, M11), placed beside the entry as `lunepack-service.exe` for a
+  `windows-*` target, and as `lunepack-service` for a `linux-*` target beside the entry or, for a
+  `macos-*` target, at `Contents/MacOS/lunepack-service` (nested code, signed before the bundle).
+  Needs `--runtime` and `[update]`, and is refused without them. Optional: without it the app installs
+  for the user only and the installer offers no "For all users" choice. The file must be an image of
+  the target that passes the checks a runtime passes (for Windows, a console-subsystem image that passes
+  the hardening checks of a Windows runtime); a file over 32 MiB is refused. The target's service name
+  (any letter case on Windows and macOS, exact on Linux) is reserved at any depth of the input tree, as
+  `lunepack-stub.exe` is for Windows, with or without `--service`.
 - `--assemble <dir>`: for a `macos-*` target with `[update]` (below): write the tree `pack` would hash to
   the new directory `<dir>` and stop, so it can be code-signed and then packed. It takes no
   `--release-dir` and no `--sign` (giving either is a usage error), reads no key and writes nothing to a
@@ -433,6 +442,23 @@ with the `sign_installer` template after it is built ("Code signing"); without i
 with Authenticode. The runtime finds the trailer in a signed file (FORMAT.md 14.3), and a byte added after
 the signature makes it refuse to run.
 
+A Windows setup file also carries the **anchor** (FORMAT.md 14.5): one resource of the runtime image holding
+SHA-256 digests of the trailer, the key-set part and the manifest part. `setup` stamps a placeholder, writes
+the payload and the trailer, patches the digests in place and reads the file back against them; the file's
+length and offsets do not change. An installer for all users checks its payload against the anchor of its own
+running image. The anchor binds the payload after an administrator consented to the prompt; before consent
+only an Authenticode signature lets the administrator tell a genuine setup file from a swapped one, so sign
+the installer of an app that installs for all users. A release packed with `--service` offers the "For all
+users" choice (RUNTIME.md, "Per-machine installs").
+
+**Linux for all users (M11-D9).** The same setup file of a `linux-*` release packed with `--service` also installs for
+all users: its window's "Install for all users" goes through `pkexec`, or shows the `sudo '<file>' --all-users`
+command to run in a terminal, and a run as root with `--all-users` installs headless (RUNTIME.md, "Per-machine
+installs (Linux and macOS, M11)"). The file carries **no anchor**: the `pkexec` prompt names a path, not a
+publisher, so there is nothing a digest in the file could tell the administrator; the root side copies the payload
+out of its own executed image and verifies it under the trailer's root (THREAT-MODEL, "Linux and macOS
+per-machine"). Distribute the file from the publisher's own channel and publish its checksum.
+
 ### macOS targets (M8)
 
 A `macos-*` pack with `[update]` packs an app bundle (`<Name>.app`'s contents) and adds files inside it,
@@ -505,7 +531,7 @@ staple = ["/usr/bin/xcrun", "stapler", "staple", "{path}"]
 | `sign` | required: signs a Windows PE file or a loose macOS Mach-O file |
 | `sign_bundle` | macOS, optional, default `sign`: nested bundles and, by default, the outer bundle |
 | `sign_outer` | macOS, optional, default `sign_bundle`: the app bundle only, where its entitlements go |
-| `sign_installer` | optional, default `sign`: what `setup` signs (`Setup.exe`, the installer app's items and the app, the `.dmg`) |
+| `sign_installer` | optional, default `sign`: what `setup` signs (`Setup.exe`, the installer app's items and the app, the `.dmg`, the all-users `.pkg`) |
 | `verify` | optional: run after a signature. Windows: on every PE file just signed; macOS: once, on the signed outer bundle |
 | `notarize`, `staple` | macOS, both or neither: after `sign_outer` and `verify`, `notarize` (with `{zip}` or `{bundle}`), then `staple` on the bundle |
 | `timeout_secs` | sign and verify, default 300, `1..=86400` |
@@ -559,7 +585,13 @@ and verified, `notarize` runs with `{zip}` or `{bundle}`, then `staple` on the b
 that `Contents/CodeResources`, the ticket stapler writes, is a regular file in the tree. All of it happens
 before hashing, so the ticket is a file of the signed release (a `staple` that writes none fails the pack).
 `setup` signs the installer app's items and the app, notarizes and staples the app, builds the image, then
-signs, notarizes and staples the `.dmg`: two notarizations. The `.zip` installer holds the bundle as
+signs, notarizes and staples the `.dmg`: two notarizations. A release with the update service has a third
+object, the all-users `.pkg` (below): it is built, signed, notarized and stapled first, then embedded in the
+installer app, so the app's own seal and notarization cover it. `sign_installer` signs the `.pkg` in place
+(`productsign` writes a second file, so call it from a small script that signs to a new file and renames it
+over `{path}`), and `notarize` and `staple` take the package as `{path}`, `{bundle}` and `{zip}` alike, as for
+the image. `setup` checks that the `xar` table of contents of the package holds a signature after
+`sign_installer`; `pkgutil --check-signature` is the real verification. The `.zip` installer holds the bundle as
 released.
 
 **Publisher continuity (M9-D6).** The pack also writes the update configuration's `publisher_check` member
@@ -728,8 +760,9 @@ the same bytes. `--at` verifies at that Unix time instead of the system clock. A
 installing when its key set expires or its release keys' windows end: build it from a current
 release.
 
-**macOS (M8-D7, M8-D9).** A `macos-*` release has no setup file. `setup` writes one of two things, by the
-same checks as above, taking every file out of the pack through its signed frame:
+**macOS (M8-D7, M8-D9, M11-D8).** A `macos-*` release has no setup file. `setup` writes one of two things (three
+with the service: the `.pkg` below is written beside the `.dmg`), by the same checks as above, taking every file out
+of the pack through its signed frame:
 
 - **The installer `.dmg`** (default; a macOS host only, because it runs the system's `hdiutil`): an
   LZMA-compressed APFS disk image (`hdiutil create -format ULMO -fs APFS`, no Spotlight index, verified with
@@ -745,6 +778,21 @@ same checks as above, taking every file out of the pack through its signed frame
   then the app), notarized and stapled when the section has `notarize` and `staple`, and only then is the
   image built, signed, notarized and stapled ("Code signing"); without the section neither is signed.
   `hdiutil` decides the image's bytes, so two runs need not give the same image.
+- **The all-users `.pkg`** (M11-D8; with the `.dmg`, for a release packed with `--service`, which holds
+  `Contents/MacOS/lunepack-service` beside the entry): a product archive built with the system's `pkgbuild` and
+  `productbuild` (a macOS host only, as the image is), named like the image with the extension `.pkg`
+  (`<app_id>-<VERSION>-<TARGET>.pkg`, beside `--out`; an existing file is not replaced, and nothing is written
+  when it exists). Its payload is the release's `lunepack-runtime` and the payload file of FORMAT.md 14.4
+  (the runtime and the key set, manifest and pack through their signed frames), installed below
+  `/Library/Application Support/lunepack/.installer/<app id>/`: every folder above `.installer` is recorded as
+  root 0755, `.installer` and the app's folder as root 0700, the runtime 0700 and the payload 0600, so nobody but
+  root can read or change them between Installer's copy and the script. The package has one script, a
+  `postinstall` whose only command is `exec "<that folder>/lunepack-runtime" machine-install --pkg`: it reads no
+  argument and no environment variable. Its distribution (identifier `<app id, with _ as ->.lunepack-machine`,
+  the installer's title the app's display name, macOS 10.15 or later) allows the local system domain only, no
+  per-user or anywhere install. The same file is embedded as `Contents/Resources/lunepack-all-users.pkg` in the
+  installer app, so that the installer window's "For all users" can hand over to Installer. A release
+  without the service gets neither, and `--zip` never builds one.
 - **The `.zip`** (`--zip`; any host, no image tool): the bundle `<bundle name>.app` exactly as released, with
   every file's data and exec bit and every symlink as the manifest has them. It is written by lunepack's own
   writer over `flate2` (deflate, level 9 when that is smaller, else stored; names in UTF-8; times fixed at

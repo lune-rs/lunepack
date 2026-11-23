@@ -1,10 +1,11 @@
-//! The Windows stub launch contract, version 1 (M7-D7): what the stub launcher at
+//! The Windows stub launch contract, version 2 (M7-D7, M10-D6): what the stub launcher at
 //! `R\<entry file name>` starts, read from the install it stands in.
 //!
 //! [`launch_target`] is the whole read path as a pure function over [`Fs`]: `R` is given (the
 //! stub takes it from its own resolved path and from nothing else), the newest whole install
 //! record under `R\.lunepack\state` names the current version (read only, no lock), and that
-//! version's `R\app\<current>\lunepack-update.json` names the entry. Every directory on the way
+//! version's `R\app\<current>\lunepack-update.json` names the entry. The record may be a
+//! per-user or a per-machine install's (version 2; version 1 refused a machine record). Every directory on the way
 //! below `R` and the entry itself are checked with `symlink_metadata`, so no symlink or reparse
 //! point is followed. `R`'s own name is never read: a renamed folder still launches.
 //!
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use crate::fs::{FileKind, Fs};
 use crate::layout::{LayoutScheme, UserLayout};
-use crate::state::{InstallState, Scope, load_any};
+use crate::state::{InstallState, load_any};
 use crate::traits::Hasher;
 use crate::update_config::{
     MAX_UPDATE_CONFIG_BYTES, UPDATE_CONFIG_FILE, UpdateConfig, runtime_file,
@@ -27,7 +28,7 @@ use crate::version::Version;
 pub const STUB_FILE: &str = "lunepack-stub.exe";
 
 /// The version of the launch contract this build implements.
-pub const STUB_CONTRACT_VERSION: u32 = 1;
+pub const STUB_CONTRACT_VERSION: u32 = 2;
 
 /// Why the stub cannot start the app. Each has a fixed exit code (90–95) and a fixed message;
 /// none carries a path or a value read from the install.
@@ -37,8 +38,8 @@ pub enum StubError {
     /// No install record, or one with no current version (exit 90).
     #[error("the app is not installed")]
     NotInstalled,
-    /// The install record cannot be read, is from a newer format, or is not a per-user one
-    /// (exit 91).
+    /// The install record cannot be read (including a scope this build does not know) or is from
+    /// a newer format (exit 91).
     #[error("the app's install state cannot be read")]
     State,
     /// The current version's update config is missing, unreadable or invalid, or does not name
@@ -123,13 +124,13 @@ fn walk_dirs<'a>(
     Ok(at)
 }
 
-/// The launch contract v1's read path (M7-D7) for the install rooted at `install_root` (the
+/// The launch contract v2's read path (M7-D7, M10-D6) for the install rooted at `install_root` (the
 /// directory of the stub's own resolved path), under [`LayoutScheme::WINDOWS`]:
 ///
 /// 1. `R\.lunepack\state` (each step a real directory; absent → [`StubError::NotInstalled`]) and
 ///    its newest whole record, whatever app id it carries, read only with no lock
-///    ([`load_any`]): none → `NotInstalled`; unreadable, newer format, or not per user →
-///    [`StubError::State`]; no current version → `NotInstalled`. `record.current` is the version
+///    ([`load_any`]): none → `NotInstalled`; unreadable or newer format → [`StubError::State`];
+///    no current version → `NotInstalled`. A record of scope `user` or `machine` is accepted. `record.current` is the version
 ///    to start, never `pending` or `previous`.
 /// 2. `R\app\<current>\lunepack-update.json`: a regular file of at most 64 KiB that the config
 ///    reader accepts, for the record's app id and exactly the current version (text-equal);
@@ -157,9 +158,6 @@ pub fn launch_target(
         Ok(None) => return Err(StubError::NotInstalled),
         Err(_) => return Err(StubError::State),
     };
-    if record.scope != Scope::User {
-        return Err(StubError::State);
-    }
     let current = record
         .current
         .as_ref()

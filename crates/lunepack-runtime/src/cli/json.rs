@@ -57,6 +57,8 @@ pub enum Body {
     Confirm(&'static str),
     /// `apply-and-restart`: the version the detached applier was started to apply.
     ApplyAndRestart(Version),
+    /// `repair`: the update service's registration was re-created (M10-D13).
+    Repair,
 }
 
 fn event(out: &mut String, e: &LifecycleEvent) {
@@ -139,6 +141,7 @@ pub fn result_line(command: &str, tree_version: &Version, body: &Body) -> String
             json_str(&mut out, &version.to_string());
             out.push_str(",\"scheduled\":true");
         }
+        Body::Repair => out.push_str(",\"repaired\":true"),
     }
     out.push('}');
     out
@@ -202,6 +205,7 @@ pub fn human_result(command: &str, body: &Body) -> String {
         ),
         Body::Confirm(outcome) => format!("{command}: {outcome}"),
         Body::ApplyAndRestart(v) => format!("{command}: scheduled {v}"),
+        Body::Repair => format!("{command}: repaired"),
     }
 }
 
@@ -385,6 +389,21 @@ mod tests {
                 publisher: Some(PublisherOutcome::InstalledUnsigned),
             },
         ));
+        // The other reasons of exit 32 (the representative in the loop above carries the first),
+        // and the result of `repair` (M10 step 18).
+        for why in crate::modes::ServiceWhy::ALL.into_iter().skip(1) {
+            lines.push(error_line(
+                Some("check"),
+                Some(&tree),
+                Kind::ServiceUnavailable(why),
+            ));
+        }
+        lines.push(result_line("repair", &tree, &Body::Repair));
+        lines.push(error_line(
+            Some("repair"),
+            Some(&tree),
+            Kind::ElevationRequired,
+        ));
         let mut text = lines.join("\n");
         text.push('\n');
         text
@@ -536,5 +555,13 @@ mod tests {
             ),
             "check: error: unsupported_location (exit 28, read_only)"
         );
+        assert_eq!(
+            human_error(
+                Some("check"),
+                Kind::ServiceUnavailable(crate::modes::ServiceWhy::Disabled)
+            ),
+            "check: error: service_unavailable (exit 32, disabled)"
+        );
+        assert_eq!(human_result("repair", &Body::Repair), "repair: repaired");
     }
 }

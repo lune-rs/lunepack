@@ -19,9 +19,12 @@
 #
 # The Docker mode builds the image `lunepack-rs-e2e:<hash>` from scripts/e2e.Dockerfile (once per
 # Dockerfile change), runs `docker run --rm --init` (a reaping PID 1, as on a desktop) with the
-# worktree read-only, and keeps its build output in two named volumes of its own
-# (lunepack-rs-e2e-target, lunepack-rs-e2e-cargo). It never prunes and never touches other
-# containers, images or volumes. bash 3.2 compatible.
+# worktree read-only, as the image's unprivileged user `e2e` (a setup run as root without
+# `--all-users` is refused by design, M11-D9, and a root run would hide a regression behind that
+# refusal), and keeps its build output in two named volumes of its own, owned by that user
+# (lunepack-rs-e2e-user-target, lunepack-rs-e2e-user-cargo: not the root-owned
+# lunepack-rs-e2e-target and -cargo of scripts/e2e-linux-machine.sh's build step). It never prunes
+# and never touches other containers, images or volumes. bash 3.2 compatible.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -84,14 +87,16 @@ if [ "$inside" -eq 0 ]; then
     docker build --quiet -t "$image" - <"$dockerfile" >/dev/null
   fi
   # RUSTUP_TOOLCHAIN makes rustup use the image's own 1.99.1 instead of installing what
-  # rust-toolchain.toml lists. No host env is passed, no capabilities, no new privileges.
+  # rust-toolchain.toml lists. No host env is passed, no capabilities, no new privileges; the
+  # suite runs as the image's user `e2e`, uid 1000, never as root.
   exec docker run --rm --init \
     --name "lunepack-rs-e2e-$$" \
+    --user 1000:1000 \
     --cap-drop ALL \
     --security-opt no-new-privileges \
     -v "$top":/src:ro \
-    -v lunepack-rs-e2e-target:/target \
-    -v lunepack-rs-e2e-cargo:/cargo-home \
+    -v lunepack-rs-e2e-user-target:/target \
+    -v lunepack-rs-e2e-user-cargo:/cargo-home \
     -e CARGO_TARGET_DIR=/target \
     -e CARGO_HOME=/cargo-home \
     -e RUSTUP_TOOLCHAIN=1.99.1 \
@@ -105,6 +110,7 @@ fi
 if [ ! -e /.dockerenv ] && [ ! -e /run/.containerenv ] && [ -z "${CI:-}" ]; then
   die "refusing to run outside a container or CI (run scripts/e2e.sh for Docker)"
 fi
+[ "$(id -u)" != 0 ] || die "refusing to run as root: the setup rows need an unprivileged user (M11-D9)"
 case $(uname -m) in
   x86_64) target=linux-x86_64 ;;
   aarch64 | arm64) target=linux-aarch64 ;;

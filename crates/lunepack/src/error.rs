@@ -4,6 +4,7 @@
 //! file names and origins, and the facade adds fixed text.
 
 use lunepack_core::codesign::PublisherOutcome;
+use lunepack_core::service::{ErrorCode as ServiceErrorCode, VerifyClass};
 use lunepack_core::{
     FsError, IntegrationError, LayoutError, LifecycleError, LocationReason, ProcessError,
     ProcessErrorKind, RangeError, RelPath, StateError, TransportError, UpdateConfigError,
@@ -133,6 +134,67 @@ pub enum Error {
         /// Why the update was refused.
         reason: PublisherOutcome,
     },
+    /// An administrator's policy switched self-update off for this per-machine install
+    /// (M10-D12). Reported before any request or download; nothing was changed.
+    #[error("self-update is disabled by policy")]
+    DisabledByPolicy,
+    /// The update service of a per-machine install cannot be used (M10-D13); the app keeps
+    /// running its current version. The reason is one of a closed set.
+    #[error("the update service is unavailable: {reason}")]
+    ServiceUnavailable {
+        /// Why.
+        reason: ServiceReason,
+    },
+    /// The update service speaks no protocol version this library does.
+    #[error("the update service speaks no protocol version this library does")]
+    ServiceUnsupported,
+    /// The update service refused a request. The code is one of the protocol's closed set; for a
+    /// refused document, `class` says which check failed.
+    #[error("the update service refused the request: {code}")]
+    ServiceRefused {
+        /// The service's error code.
+        code: ServiceErrorCode,
+        /// The verification class, for a refused document.
+        class: Option<VerifyClass>,
+    },
+}
+
+/// Why the update service of a per-machine install cannot be used: a closed set (M10-D13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ServiceReason {
+    /// No service is registered for the app (and the runtime's `repair` is the fix).
+    NotInstalled,
+    /// An administrator disabled the service.
+    Disabled,
+    /// The service could not be started.
+    StartFailed,
+    /// The service's channel is not owned by the account that must own it.
+    Untrusted,
+    /// The service did not answer in time.
+    Timeout,
+    /// The service broke the protocol, or the channel failed in the middle of an exchange.
+    Protocol,
+}
+
+impl ServiceReason {
+    /// The reason's fixed text.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ServiceReason::NotInstalled => "not installed",
+            ServiceReason::Disabled => "disabled",
+            ServiceReason::StartFailed => "start failed",
+            ServiceReason::Untrusted => "untrusted",
+            ServiceReason::Timeout => "timeout",
+            ServiceReason::Protocol => "protocol",
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Sorts a core error into the variant an app can act on: a disk failure is [`Error::Fs`] (so

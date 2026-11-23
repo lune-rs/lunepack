@@ -25,6 +25,13 @@
 //! config at `R/versions/<v>/lunepack-update.json`, never from this runtime's tree (M5-D17). The
 //! token is in the child's environment only: never in argv, an event, the log or an exit path.
 //!
+//! A machine install (M10 step 18, Windows) follows the same three windows with the service doing
+//! what the per-user lock and the record writes did: `apply{version}` commits and returns the token,
+//! the record is only read (by polling, as here), a failure calls `rollback{version, token}`, and
+//! the service refreshes the integration, projects the trees and collects the old ones. The runtime
+//! writes nothing under `R` or the registry; the token goes from the service's answer into the
+//! launched app's environment and nowhere else.
+//!
 //! With a UI (M6), the update window follows the events and never holds the operation up: the
 //! outcome is decided, any relaunch done and old trees collected before the window hears of it.
 //! On success the window closes; after a rollback (the previous version already started) or a
@@ -38,8 +45,13 @@ use lunepack::{
     Child, ChildStdio, ExitKind, FileKind, HEALTH_TOKEN_VAR, Installation, IntegrationRequest,
     LockGuard, Phase, Sha256Digest, SpawnSpec, UserLayout, Version, WaitOutcome,
 };
-use lunepack_core::state::{InstallState, Scope, UserScope};
-use lunepack_core::{LayoutError, Projection, RelPath};
+use lunepack_core::service::{
+    ClientSession, ClientTimeouts, Duplex, ErrorCode, ServiceError, Token,
+};
+use lunepack_core::state::{InstallState, MachineStore, Scope, UserScope};
+use lunepack_core::{
+    AppId, LayoutError, MachineLayout, PolicySource, Projection, RelPath, ServiceConnector,
+};
 
 use lunepack_core::ui::{ChoiceValue, Outcome, PromptKind, StepItem};
 
@@ -344,14 +356,31 @@ fn supervise(
     child: &mut dyn Child,
     deadline: Instant,
 ) -> Watch {
+    supervise_by(
+        &|| store.load(&*ad.fs, &*ad.hasher).ok().map(|l| l.record),
+        v,
+        token_sha256,
+        child,
+        deadline,
+    )
+}
+
+/// What [`supervise_by`] reads: the record, `None` when it cannot be read now.
+type Peek<'a> = &'a dyn Fn() -> Option<Option<InstallState>>;
+
+/// [`supervise`] over any way of reading the record.
+fn supervise_by(
+    peek: Peek<'_>,
+    v: &Version,
+    token_sha256: &Sha256Digest,
+    child: &mut dyn Child,
+    deadline: Instant,
+) -> Watch {
     loop {
-        let changed = match store.load(&*ad.fs, &*ad.hasher) {
-            Ok(loaded) => !loaded
-                .record
-                .as_ref()
-                .is_some_and(|r| ours(r, v, token_sha256)),
+        let changed = match peek() {
+            Some(record) => !record.as_ref().is_some_and(|r| ours(r, v, token_sha256)),
             // Unreadable now: keep watching; the decision is made under the lock anyway.
-            Err(_) => false,
+            None => false,
         };
         if changed {
             return Watch::Changed;
@@ -578,12 +607,18 @@ enum End {
 /// reports the outcome as the final event, then in `ui`. Returns the exit kind.
 pub fn run_apply(
     ad: &Adapters,
+    service: Option<&ServiceEnd<'_>>,
     inst: &Installation,
     args: &ApplyArgs,
     events: &Events,
     ui: &UiHost,
 ) -> Kind {
-    let end = apply_inner(ad, inst, args, events);
+    let end = match (inst.is_machine(), service) {
+        (false, _) => apply_inner(ad, inst, args, events),
+        (true, Some(service)) => apply_machine(ad, service, inst, args, events),
+        // A machine install with no way to reach its service is no install this build can update.
+        (true, None) => End::Failed(Kind::Unsupported),
+    };
     let kind = report(inst, args, &end, events);
     // The window hears of the outcome only now: the operation never waits for it.
     match &end {
@@ -772,6 +807,374 @@ fn apply_inner(ad: &Adapters, inst: &Installation, args: &ApplyArgs, events: &Ev
     if !matches!(end, End::Failed(_)) {
         gc(ad, inst, me, events);
     }
+    end
+}
+
+// ---- the machine install (M10 step 18) ----------------------------------------------------------
+
+/// How long the service may take to say hello.
+const SERVICE_HELLO: Duration = Duration::from_secs(10);
+/// How long the service may take to answer one request.
+const SERVICE_ANSWER: Duration = Duration::from_secs(60);
+
+/// What an apply on a machine install talks to: the install's update service and the
+/// administrator's policy. The runtime never elevates to apply (C4).
+pub struct ServiceEnd<'a> {
+    /// How the service is reached.
+    pub connector: &'a dyn ServiceConnector,
+    /// Where the policy is read.
+    pub policy: &'a dyn PolicySource,
+}
+
+fn service_kind(e: ServiceError) -> Kind {
+    Kind::of(&lunepack::unstable_internals::service_error(e))
+}
+
+/// A session with the service of `app`, hello said. Never elevates and never prompts.
+fn open_session(end: &ServiceEnd<'_>, app: &AppId) -> Result<ClientSession<Box<dyn Duplex>>, Kind> {
+    let io = end
+        .connector
+        .connect(app)
+        .map_err(|e| Kind::of(&lunepack::unstable_internals::connect_error(e)))?;
+    ClientSession::connect(
+        io,
+        app.clone(),
+        ClientTimeouts {
+            hello: Some(SERVICE_HELLO),
+            answer: Some(SERVICE_ANSWER),
+        },
+    )
+    .map_err(|e| Kind::of(&lunepack::unstable_internals::hello_error(e)))
+}
+
+fn machine_store(inst: &Installation, layout: &MachineLayout) -> MachineStore {
+    MachineStore {
+        dir: layout.state_dir(),
+        app_id: inst.app_id().clone(),
+    }
+}
+
+/// The record of a machine install as the service left it (read only: this user cannot write it).
+fn read_machine(
+    ad: &Adapters,
+    inst: &Installation,
+    layout: &MachineLayout,
+) -> Result<InstallState, Kind> {
+    machine_store(inst, layout)
+        .load(&*ad.fs, &*ad.hasher)
+        .map_err(kind_of)?
+        .record
+        .ok_or(Kind::NotInstalled)
+}
+
+/// What starts whatever version of a machine install is current, by the scheme's projection
+/// (M10-D8, M11-D6, M11-D12): the launcher stub `R\<entry file name>` on Windows, the entry
+/// through the link `R/current` on Linux, the entry of the live bundle `B` on macOS (`B` is read
+/// from `R/bundle`, never taken from where the old tree was). `None` when the bundle's place
+/// cannot be read: nothing is started from a guess.
+fn stub_of(
+    ad: &Adapters,
+    layout: &MachineLayout,
+    meta: &lunepack::InstallMeta,
+) -> Option<std::path::PathBuf> {
+    let entry_in = |tree: std::path::PathBuf| {
+        meta.entry
+            .components()
+            .fold(tree, |dir, part| dir.join(part))
+    };
+    match layout.scheme().projection() {
+        Projection::None => {
+            let name = meta.entry.as_str().rsplit('/').next()?;
+            Some(layout.root().join(name))
+        }
+        Projection::CurrentLink => Some(entry_in(
+            layout.root().join(lunepack_core::layout::CURRENT_LINK),
+        )),
+        Projection::Bundle => {
+            let bundle = layout.view().bundle_path(&*ad.fs).ok().flatten()?;
+            Some(entry_in(bundle))
+        }
+    }
+}
+
+/// Window 1 on a machine install: checks what can be read (policy, the record, the tree, the new
+/// version's config), then `apply{version}` through the service, which commits, refreshes the
+/// integration and answers with the token. Nothing is changed when it fails.
+fn commit_machine(
+    ad: &Adapters,
+    end: &ServiceEnd<'_>,
+    inst: &Installation,
+    layout: &MachineLayout,
+    v: &Version,
+    events: &Events,
+) -> Result<Applied, Refused> {
+    let record = read_machine(ad, inst, layout).map_err(Refused::unread)?;
+    let unmoved = nothing_moved_on(&record, inst.tree_version(), v);
+    let refused = |kind| Refused {
+        kind,
+        unmoved: Some(unmoved),
+    };
+    if end.policy.read(inst.app_id()).self_update_disabled {
+        return Err(refused(Kind::DisabledByPolicy));
+    }
+    if record.current.is_none() {
+        return Err(refused(Kind::NotInstalled));
+    }
+    if !record.staged.as_ref().is_some_and(|s| same(&s.version, v)) {
+        return Err(refused(Kind::NothingStaged));
+    }
+    let tree_is_dir = matches!(
+        ad.fs.symlink_metadata(&layout.version_dir(v)),
+        Ok(Some(meta)) if meta.kind == FileKind::Dir
+    );
+    if !tree_is_dir {
+        return Err(refused(Kind::NothingStaged));
+    }
+    // The new version's own config decides its entry and timeout; without a usable one nothing
+    // is asked of the service.
+    let new = inst
+        .version_installation(v)
+        .map_err(|e| refused(Kind::of(&e)))?;
+    let mut session = open_session(end, inst.app_id()).map_err(refused)?;
+    let token = session.apply(v).map_err(|e| refused(service_kind(e)))?;
+    // One connection at a time: the service's lease now runs, and the record is read from here on.
+    drop(session);
+    let raw = *token.as_bytes();
+    events.emit(&Event::phase(Phase::Apply, Some(v)));
+    Ok(Applied {
+        token: raw,
+        token_sha256: ad.hasher.sha256(&raw),
+        new,
+    })
+}
+
+/// Window 2 (no failure seen) on a machine install: decides on the record as it is now.
+fn decide_machine(
+    ad: &Adapters,
+    inst: &Installation,
+    layout: &MachineLayout,
+    v: &Version,
+    token_sha256: &Sha256Digest,
+) -> Result<Decided, Kind> {
+    let record = read_machine(ad, inst, layout)?;
+    Ok(classify(&record, v, token_sha256))
+}
+
+/// Window 2 on a failure on a machine install: ends the own child, then `rollback{version, token}`
+/// through the service. `not_pending` and `token_mismatch` mean someone else resolved the version
+/// (a bystander confirmed it, another start rolled it back): the record is read again and says
+/// which. The previous version's config must be readable first, as for a user install.
+fn roll_back_machine(
+    ad: &Adapters,
+    end: &ServiceEnd<'_>,
+    inst: &Installation,
+    layout: &MachineLayout,
+    applied: &Applied,
+    child: Option<&mut Box<dyn Child>>,
+) -> Result<RolledBack, Kind> {
+    let v = applied.new.tree_version();
+    let record = read_machine(ad, inst, layout)?;
+    if !ours(&record, v, &applied.token_sha256) {
+        return Ok(RolledBack::NotOurs(classify(
+            &record,
+            v,
+            &applied.token_sha256,
+        )));
+    }
+    if !record
+        .previous
+        .as_ref()
+        .is_some_and(|p| inst.version_installation(&p.version).is_ok())
+    {
+        return Ok(RolledBack::Unavailable);
+    }
+    if let Some(child) = child {
+        // The own child only; a child that already ended is not signalled.
+        let _ = child.terminate(TERMINATE_GRACE);
+    }
+    let mut session = open_session(end, inst.app_id())?;
+    let token = Token::from_bytes(applied.token);
+    match session.rollback(v, &token) {
+        Ok(current) => {
+            let previous = inst
+                .version_installation(&current)
+                .map_err(|e| Kind::of(&e))?;
+            Ok(RolledBack::Done(Box::new(previous)))
+        }
+        Err(ServiceError::Answered {
+            code: ErrorCode::NotPending | ErrorCode::TokenMismatch,
+            ..
+        }) => {
+            let record = read_machine(ad, inst, layout)?;
+            Ok(RolledBack::NotOurs(classify(
+                &record,
+                v,
+                &applied.token_sha256,
+            )))
+        }
+        // The service could not commit the rollback (the previous tree, its config, a write):
+        // nothing changed and the version stays pending.
+        Err(ServiceError::Answered {
+            code: ErrorCode::Internal,
+            ..
+        }) => Ok(RolledBack::Unavailable),
+        Err(e) => Err(service_kind(e)),
+    }
+}
+
+/// [`relaunch_current`] on a machine install: starts the install's launcher stub again, detached,
+/// with the restart arguments and without the health token, when the record shows nothing moved on.
+fn relaunch_machine(
+    ad: &Adapters,
+    inst: &Installation,
+    layout: &MachineLayout,
+    applying: &Version,
+    unmoved: Option<bool>,
+    args: &ApplyArgs,
+    events: &Events,
+) {
+    let unmoved = unmoved.or_else(|| {
+        read_machine(ad, inst, layout)
+            .ok()
+            .map(|record| nothing_moved_on(&record, inst.tree_version(), applying))
+    });
+    if unmoved == Some(false) {
+        return;
+    }
+    let started = stub_of(ad, layout, inst.meta()).is_some_and(|program| {
+        let spec = SpawnSpec {
+            program,
+            args: args.restart.clone(),
+            env_set: Vec::new(),
+            env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
+            stdio: ChildStdio::Null,
+        };
+        start_unsupervised(ad, &spec, args.background).is_ok()
+    });
+    if !started {
+        events.emit(&Event::warning(
+            Warning::RelaunchFailed,
+            Some(inst.tree_version()),
+        ));
+    }
+}
+
+/// The apply of a machine install: [`apply_inner`]'s three windows over the update service.
+fn apply_machine(
+    ad: &Adapters,
+    service: &ServiceEnd<'_>,
+    inst: &Installation,
+    args: &ApplyArgs,
+    events: &Events,
+) -> End {
+    let Some(layout) = inst.machine_layout().cloned() else {
+        return End::Failed(Kind::NotInstalled);
+    };
+    let v = &args.version;
+
+    events.emit(&Event::phase(Phase::Wait, Some(v)));
+    match ad.process.wait_exit(&args.wait, WAIT_MAX) {
+        Ok(WaitOutcome::Exited) => {}
+        Ok(WaitOutcome::TimedOut) => return End::Failed(Kind::WaitTimeout),
+        Err(e) => return End::Failed(kind_of(e)),
+    }
+
+    let applied = match commit_machine(ad, service, inst, &layout, v, events) {
+        Ok(applied) => applied,
+        Err(Refused { kind, unmoved }) => {
+            // The app has exited for this apply; nothing was committed, so it starts again as
+            // the version it was, unless the record moved on.
+            relaunch_machine(ad, inst, &layout, v, unmoved, args, events);
+            return End::Failed(kind);
+        }
+    };
+
+    // Launch, never through a shell: the new tree's entry from its own config, with the token in
+    // its environment only.
+    events.emit(&Event::phase(Phase::Launch, Some(v)));
+    // The new tree is where the service left it: on macOS the swap moved it into the live bundle.
+    let program = match layout.scheme().projection() {
+        Projection::Bundle => stub_of(ad, &layout, applied.new.meta()),
+        Projection::None | Projection::CurrentLink => Some(applied.new.entry_path()),
+    };
+    let spec = SpawnSpec {
+        program: program.unwrap_or_else(|| applied.new.entry_path()),
+        args: args.restart.clone(),
+        env_set: vec![(OsString::from(HEALTH_TOKEN_VAR), hex(&applied.token))],
+        env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
+        stdio: ChildStdio::Null,
+    };
+    let mut child = if args.background {
+        ad.process.spawn_app_background(&spec).ok()
+    } else {
+        ad.process.spawn_child(&spec).ok()
+    };
+    drop(spec);
+
+    let timeout_secs = applied
+        .new
+        .config()
+        .health_timeout_secs
+        .clamp(*HEALTH_TIMEOUT_SECS.start(), *HEALTH_TIMEOUT_SECS.end());
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let store = machine_store(inst, &layout);
+    events.emit(&Event::phase(Phase::Confirm, Some(v)));
+    let peek = || store.load(&*ad.fs, &*ad.hasher).ok().map(|l| l.record);
+
+    let end = loop {
+        let reason = match child.as_mut() {
+            None => Reason::SpawnFailed,
+            Some(c) => match supervise_by(&peek, v, &applied.token_sha256, &mut **c, deadline) {
+                Watch::Failed(reason) => reason,
+                Watch::Changed => {
+                    match decide_machine(ad, inst, &layout, v, &applied.token_sha256) {
+                        Ok(Decided::Confirmed) => break End::Confirmed,
+                        Ok(Decided::Superseded) => break End::Superseded,
+                        Ok(Decided::StillOurs) => continue,
+                        Err(kind) => break End::Failed(kind),
+                    }
+                }
+            },
+        };
+        match roll_back_machine(ad, service, inst, &layout, &applied, child.as_mut()) {
+            Ok(RolledBack::Done(previous)) => {
+                events.emit(&Event::Phase {
+                    phase: Phase::Rollback,
+                    version: Some(v.clone()),
+                    reason: Some(reason),
+                });
+                // The launcher starts whatever is current now: the previous version.
+                let started = stub_of(ad, &layout, previous.meta()).is_some_and(|program| {
+                    let relaunch = SpawnSpec {
+                        program,
+                        args: args.restart.clone(),
+                        env_set: Vec::new(),
+                        env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
+                        stdio: ChildStdio::Null,
+                    };
+                    start_unsupervised(ad, &relaunch, args.background).is_ok()
+                });
+                if !started {
+                    events.emit(&Event::warning(
+                        Warning::RelaunchFailed,
+                        Some(previous.tree_version()),
+                    ));
+                }
+                break End::RolledBack(previous.tree_version().clone());
+            }
+            Ok(RolledBack::NotOurs(Decided::Confirmed)) => break End::Confirmed,
+            Ok(RolledBack::NotOurs(_)) => break End::Superseded,
+            Ok(RolledBack::Unavailable) => {
+                events.emit(&Event::warning(Warning::RollbackUnavailable, Some(v)));
+                break End::Unavailable;
+            }
+            Err(kind) => break End::Failed(kind),
+        }
+    };
+    if matches!(end, End::Superseded) {
+        events.emit(&Event::warning(Warning::Superseded, Some(v)));
+    }
+    // No GC: the service collects after it confirms (M10 step 6), never this runtime.
     end
 }
 
@@ -1365,5 +1768,860 @@ mod tests {
             decide(&mac.ad, &inst, &layout, &v("1.1.0"), &applied.token_sha256),
             Ok(Decided::Confirmed)
         ));
+    }
+}
+
+/// The apply of a machine install (M10 step 18), against the core's real engine on the memory
+/// filesystem, reached through the testkit's in-memory duplex (one engine serves every connection,
+/// as the service's host loop does, so its in-memory supervision lease outlives a connection).
+#[cfg(test)]
+mod machine_tests {
+    use std::ffi::OsString;
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use lunepack::{
+        Channel, Fs, HEALTH_TOKEN_VAR, InstallMeta, Installation, Platform, RelPath, Sha256Digest,
+        Target, UpdateConfig, Version,
+    };
+    use lunepack_core::engine::{Engine, Ports, protected_dirs, serve};
+    use lunepack_core::service::{ClientSession, ClientTimeouts, ServerSession, Token};
+    use lunepack_core::state::{Floors, InstallState, MachineStore, RootParts, Scope, StagedRef};
+    use lunepack_core::{
+        AppId, ConnectError, ExitKind, LayoutScheme, MachineLayout, MachinePolicy, Process as _,
+        ProcessId, UPDATE_CONFIG_FILE,
+    };
+    use lunepack_testkit::{
+        ChainFixture, ChildScript, FakeClock, FakeCodec, FakeConnector, FakeHasher,
+        FakeIntegration, FakePolicy, FakeProcess, FakeProtect, FakePublisherCheck, FakeRegistrar,
+        FakeRng, FakeVerifier, MemFs, SUITE_APP_ID, SUITE_T0, abs_path, mem_duplex,
+    };
+
+    use super::{
+        Decided, End, Reason, RolledBack, ServiceEnd, Watch, apply_machine, commit_machine,
+        machine_store, roll_back_machine, supervise_by,
+    };
+    use crate::events::{Event, Events, Sink, SinkFailed, to_json_line};
+    use crate::modes::{Adapters, ApplyArgs, Kind, ServiceWhy};
+
+    const TARGET: Target = Target::WindowsX86_64;
+    const ENTRY: &str = "app.exe";
+
+    fn v(text: &str) -> Version {
+        Version::parse(text).expect("version")
+    }
+
+    fn app() -> AppId {
+        AppId::parse(SUITE_APP_ID).expect("app id")
+    }
+
+    /// Everything the engine runs on.
+    struct Host {
+        fs: MemFs,
+        protect: FakeProtect,
+        policy: FakePolicy,
+        integration: FakeIntegration,
+        publisher: FakePublisherCheck,
+        registrar: FakeRegistrar,
+        process: FakeProcess,
+        rng: FakeRng,
+        clock: FakeClock,
+        codec: FakeCodec,
+        root: PathBuf,
+        monotonic: AtomicU64,
+        connects: AtomicUsize,
+    }
+
+    impl Host {
+        fn ports(&self) -> Ports<'_> {
+            Ports {
+                fs: &self.fs,
+                codec: &self.codec,
+                hasher: &FakeHasher,
+                verifier: &FakeVerifier,
+                clock: &self.clock,
+                rng: &self.rng,
+                integration: &self.integration,
+                publisher: &self.publisher,
+                protect: &self.protect,
+                policy: &self.policy,
+                registrar: &self.registrar,
+                process: &self.process,
+                scheme: lunepack_core::MachineScheme::WINDOWS,
+            }
+        }
+
+        fn store(&self) -> MachineStore {
+            MachineStore {
+                dir: MachineLayout::new(&self.root).state_dir(),
+                app_id: app(),
+            }
+        }
+
+        fn record(&self) -> InstallState {
+            self.store()
+                .load(&self.fs, &FakeHasher)
+                .expect("load")
+                .record
+                .expect("record")
+        }
+    }
+
+    fn meta() -> InstallMeta {
+        InstallMeta {
+            entry: RelPath::parse(ENTRY).expect("entry"),
+            name: "Hello".into(),
+            comment: None,
+            icon: None,
+            categories: Vec::new(),
+            bin: None,
+            terminal: false,
+            publisher: None,
+            file_types: Vec::new(),
+            url_schemes: Vec::new(),
+            autostart: false,
+        }
+    }
+
+    fn config_for(version: &str) -> UpdateConfig {
+        let fx = ChainFixture::fake();
+        UpdateConfig::new(
+            &fx.trusted_root(1, 1, &[0]),
+            v(version),
+            TARGET,
+            "https://updates.example.org/hello/",
+            Channel::parse("stable").expect("channel"),
+            60,
+            meta(),
+        )
+        .expect("config")
+    }
+
+    /// One machine install of 1.0.0, with 1.1.0 staged, its engine, and the runtime's way in.
+    struct Rig {
+        host: Arc<Host>,
+        ad: Adapters,
+        process: FakeProcess,
+        tx: Mutex<mpsc::Sender<(lunepack_testkit::MemDuplex, AppId)>>,
+        home: PathBuf,
+    }
+
+    fn write_tree(fs: &MemFs, root: &Path, version: &str) {
+        let dir = root.join("app").join(version);
+        fs.create_dir_all(&dir).expect("dir");
+        for (name, bytes) in [
+            (ENTRY, format!("entry of {version}").into_bytes()),
+            (
+                UPDATE_CONFIG_FILE,
+                config_for(version).to_bytes().expect("config"),
+            ),
+        ] {
+            let mut w = fs.create_new(&dir.join(name)).expect("create");
+            w.write_all(&bytes).expect("write");
+            w.sync().expect("sync");
+        }
+    }
+
+    impl Rig {
+        fn new(staged: bool) -> Rig {
+            let fs = MemFs::new();
+            let home = abs_path("/pf");
+            let root = home.join("Hello");
+            let host = Arc::new(Host {
+                protect: FakeProtect::new(&fs),
+                policy: FakePolicy::new(),
+                integration: FakeIntegration::new(),
+                publisher: FakePublisherCheck::new([]),
+                registrar: FakeRegistrar::new(),
+                process: FakeProcess::new(root.join("app/1.0.0").join(ENTRY)),
+                rng: FakeRng::new(7),
+                clock: FakeClock::new(SUITE_T0 + 3600),
+                codec: FakeCodec::new(),
+                root: root.clone(),
+                monotonic: AtomicU64::new(1000),
+                connects: AtomicUsize::new(0),
+                fs: fs.clone(),
+            });
+            for (dir, class) in protected_dirs(&root) {
+                fs.create_dir_all(&dir).expect("dirs");
+                host.protect.mark(&dir, class);
+            }
+            write_tree(&fs, &root, "1.0.0");
+            let mut record = InstallState::new(1, app(), Scope::Machine, [9; 16], TARGET)
+                .install(v("1.0.0"), SUITE_T0, TARGET, [9; 16])
+                .raise_floors(&Floors {
+                    root: Some(RootParts::from_trusted(&ChainFixture::fake().trusted_root(
+                        1,
+                        1,
+                        &[0],
+                    ))),
+                    ..Floors::default()
+                });
+            if staged {
+                write_tree(&fs, &root, "1.1.0");
+                record = record.set_staged(Some((
+                    StagedRef::new(v("1.1.0"), TARGET, Sha256Digest::from_bytes([1; 32])),
+                    20,
+                )));
+            }
+            let store = host.store();
+            let loaded = store.load(&fs, &FakeHasher).expect("load");
+            store
+                .commit(&fs, &loaded, &record, &FakeHasher)
+                .expect("commit");
+            let (tx, rx) = mpsc::channel();
+            let engine_host = Arc::clone(&host);
+            thread::spawn(move || {
+                let mut engine: Option<Engine<'_>> = None;
+                for (io, app) in rx {
+                    let Ok(session) = ServerSession::accept(io, app) else {
+                        continue;
+                    };
+                    if engine.is_none() {
+                        engine = Engine::open(engine_host.ports(), &engine_host.root).ok();
+                    }
+                    let Some(engine) = engine.as_mut() else {
+                        continue;
+                    };
+                    let now = || Duration::from_secs(engine_host.monotonic.load(Ordering::SeqCst));
+                    let _ = serve(session, engine, &now);
+                }
+            });
+            // The runtime's own adapters: the same memory filesystem, its own process fake.
+            let process = FakeProcess::new(root.join("app/1.0.0").join(ENTRY));
+            let fs_arc: Arc<dyn Fs> = Arc::new(fs.clone());
+            let platform = Platform::native()
+                .with_fs(Arc::clone(&fs_arc))
+                .with_hasher(Arc::new(FakeHasher))
+                .with_verifier(Arc::new(FakeVerifier))
+                .with_process(Arc::new(process.clone()))
+                .with_integration(Arc::new(FakeIntegration::new()))
+                .with_rng(Arc::new(FakeRng::new(9)))
+                .with_health_token(None)
+                .with_layout_scheme(LayoutScheme::WINDOWS)
+                .with_machine_home(home.clone())
+                .with_local_data(abs_path("/local/alice"));
+            let ad = Adapters {
+                fs: fs_arc,
+                hasher: Arc::new(FakeHasher),
+                verifier: Arc::new(FakeVerifier),
+                codec: Arc::new(FakeCodec::new()),
+                process: Arc::new(process.clone()),
+                integration: Arc::new(FakeIntegration::new()),
+                rng: Arc::new(FakeRng::new(9)),
+                platform,
+            };
+            Rig {
+                host,
+                ad,
+                process,
+                tx: Mutex::new(tx),
+                home,
+            }
+        }
+
+        fn root(&self) -> PathBuf {
+            self.host.root.clone()
+        }
+
+        /// A connector to the engine; `before` runs at the start of every connection (with its
+        /// number, from 0).
+        fn connector_with(&self, before: impl Fn(usize) + Send + Sync + 'static) -> FakeConnector {
+            let tx = self.tx.lock().unwrap().clone();
+            let host = Arc::clone(&self.host);
+            FakeConnector::new(move |app| {
+                let n = host.connects.fetch_add(1, Ordering::SeqCst);
+                before(n);
+                let (client, server) = mem_duplex();
+                tx.send((server, app.clone())).expect("the service thread");
+                Ok(Box::new(client))
+            })
+        }
+
+        fn connector(&self) -> FakeConnector {
+            self.connector_with(|_| {})
+        }
+
+        fn open(&self) -> Installation {
+            Installation::from_exe_with(
+                &self.root().join("app/1.0.0").join(ENTRY),
+                self.ad.platform.clone(),
+            )
+            .expect("installation")
+        }
+
+        /// A session of another start of the app: confirms with `token`.
+        fn confirm(&self, version: &str, token: &Token) {
+            let io = lunepack_core::ServiceConnector::connect(&self.connector(), &app())
+                .expect("connect");
+            let mut session = ClientSession::connect(
+                io,
+                app(),
+                ClientTimeouts {
+                    hello: Some(Duration::from_secs(10)),
+                    answer: Some(Duration::from_secs(30)),
+                },
+            )
+            .expect("hello");
+            session.confirm(&v(version), token).expect("confirm");
+        }
+
+        /// The token the runtime put in the environment of the first child it started.
+        fn child_token(&self) -> Option<Token> {
+            let spawns = self.process.spawns();
+            let first = spawns.iter().find(|s| !s.detached)?;
+            let (_, value) = first.env_set.iter().find(|(k, _)| k == HEALTH_TOKEN_VAR)?;
+            Token::parse(value.to_str()?)
+        }
+
+        fn wait_for_child(&self) -> Token {
+            let until = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(token) = self.child_token() {
+                    return token;
+                }
+                assert!(Instant::now() < until, "the child was never started");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn args(version: &str) -> ApplyArgs {
+        ApplyArgs {
+            wait: ProcessId {
+                pid: 999,
+                start_ticks: 9,
+            },
+            version: v(version),
+            restart: vec![OsString::from("--after")],
+            no_ui: true,
+            background: false,
+        }
+    }
+
+    /// Events collected as the JSON lines the runtime would log.
+    fn collecting() -> (Events, Arc<Mutex<Vec<String>>>) {
+        struct Collect(Arc<Mutex<Vec<String>>>);
+        impl Sink for Collect {
+            fn name(&self) -> &'static str {
+                "collect"
+            }
+            fn deliver(&mut self, event: &Event) -> Result<(), SinkFailed> {
+                self.0.lock().unwrap().push(to_json_line(event));
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            Events::new(Some(Box::new(Collect(Arc::clone(&seen)))), None),
+            seen,
+        )
+    }
+
+    fn end_of(rig: &Rig, connector: &FakeConnector, version: &str, events: &Events) -> End {
+        let inst = rig.open();
+        let service = ServiceEnd {
+            connector,
+            policy: &rig.host.policy,
+        };
+        apply_machine(&rig.ad, &service, &inst, &args(version), events)
+    }
+
+    #[test]
+    fn an_apply_the_new_version_confirms_ends_confirmed_with_the_token_only_in_its_environment() {
+        let rig = Rig::new(true);
+        let connector = rig.connector();
+        let (events, seen) = collecting();
+        // The new version's start confirms through the service with the token it was given.
+        let confirmer = thread::scope(|scope| {
+            let helper = scope.spawn(|| {
+                let token = rig.wait_for_child();
+                rig.confirm("1.1.0", &token);
+                token
+            });
+            // The child runs until the record says it is confirmed.
+            rig.process.script_child(ChildScript::runs());
+            let end = end_of(&rig, &connector, "1.1.0", &events);
+            (end, helper.join().expect("confirmer"))
+        });
+        let (end, token) = confirmer;
+        assert!(matches!(end, End::Confirmed), "not confirmed");
+        let record = rig.host.record();
+        assert_eq!(record.current.expect("current").version, v("1.1.0"));
+        assert!(record.pending.is_none() && record.bad.is_empty());
+        // One child: the new tree's entry, the restart arguments, the token in its environment.
+        let spawns = rig.process.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].program, rig.root().join("app/1.1.0").join(ENTRY));
+        assert_eq!(spawns[0].args, vec![OsString::from("--after")]);
+        // The runtime did no removal of its own (the service collects after a confirm).
+        assert!(rig.process.in_use_calls().is_empty() && rig.process.strict_calls().is_empty());
+        // The token is in no argument, event, log or file the run left.
+        let hex = token.to_hex();
+        let mut lines = seen.lock().unwrap().clone();
+        events.finish(Duration::from_secs(1));
+        lines.extend(seen.lock().unwrap().iter().cloned());
+        assert!(lines.iter().all(|l| !l.contains(&hex)), "an event line");
+        for s in &spawns {
+            assert!(s.args.iter().all(|a| !a.to_string_lossy().contains(&hex)));
+        }
+        let mut stack = vec![PathBuf::from("/")];
+        let mut checked = 0;
+        while let Some(dir) = stack.pop() {
+            for e in rig.host.fs.list_dir(&dir).unwrap_or_default() {
+                let path = dir.join(&e.name);
+                match e.kind {
+                    lunepack::FileKind::Dir => stack.push(path),
+                    lunepack::FileKind::File => {
+                        let bytes = rig.host.fs.read_capped(&path, 1 << 20).unwrap_or_default();
+                        let text = String::from_utf8_lossy(&bytes);
+                        assert!(!text.contains(&hex), "{}", path.display());
+                        checked += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(checked > 4, "the scan reached {checked} files only");
+        // The raw token is not in any record, only its hash.
+        let raw = token.as_bytes();
+        let record_bytes = format!("{:?}", rig.host.record());
+        assert!(!record_bytes.contains(&format!("{raw:?}")));
+    }
+
+    #[test]
+    fn a_crash_rolls_the_version_back_through_the_service_and_starts_the_launcher_again() {
+        let rig = Rig::new(true);
+        let connector = rig.connector();
+        let (events, _) = collecting();
+        rig.process
+            .script_child(ChildScript::exits(0, ExitKind::Failure(1)));
+        let end = end_of(&rig, &connector, "1.1.0", &events);
+        assert!(
+            matches!(&end, End::RolledBack(p) if p == &v("1.0.0")),
+            "not rolled back"
+        );
+        let record = rig.host.record();
+        assert_eq!(record.current.expect("current").version, v("1.0.0"));
+        assert!(record.bad.contains(&v("1.1.0")) && record.pending.is_none());
+        // The new version, then the launcher `R\app.exe` detached, with no token.
+        let spawns = rig.process.spawns();
+        assert_eq!(spawns.len(), 2);
+        assert!(!spawns[0].detached && spawns[1].detached);
+        assert_eq!(spawns[1].program, rig.root().join(ENTRY));
+        assert!(spawns[1].env_set.is_empty());
+        assert!(spawns[1].env_remove.iter().any(|k| k == HEALTH_TOKEN_VAR));
+        assert_eq!(spawns[1].args, vec![OsString::from("--after")]);
+    }
+
+    #[test]
+    fn a_timeout_ends_the_wait_and_the_rollback_goes_through_the_service() {
+        let rig = Rig::new(true);
+        let connector = rig.connector();
+        let inst = rig.open();
+        let layout = inst.machine_layout().cloned().expect("layout");
+        let service = ServiceEnd {
+            connector: &connector,
+            policy: &rig.host.policy,
+        };
+        let (events, _) = collecting();
+        let applied = commit_machine(&rig.ad, &service, &inst, &layout, &v("1.1.0"), &events)
+            .map_err(|r| r.kind)
+            .expect("apply");
+        let record = rig.host.record();
+        assert!(record.pending.is_some(), "the service committed the apply");
+        rig.process.script_child(ChildScript::runs());
+        let mut child = rig
+            .process
+            .spawn_child(&lunepack::SpawnSpec::new(
+                rig.root().join("app/1.1.0").join(ENTRY),
+            ))
+            .expect("start");
+        let store = machine_store(&inst, &layout);
+        let peek = || {
+            store
+                .load(&*rig.ad.fs, &*rig.ad.hasher)
+                .ok()
+                .map(|l| l.record)
+        };
+        let started = Instant::now();
+        let watch = supervise_by(
+            &peek,
+            &v("1.1.0"),
+            &applied.token_sha256,
+            child.as_mut(),
+            started + Duration::from_millis(300),
+        );
+        assert!(matches!(watch, Watch::Failed(Reason::Timeout)));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let done = roll_back_machine(
+            &rig.ad,
+            &service,
+            &inst,
+            &layout,
+            &applied,
+            Some(&mut child),
+        )
+        .map_err(|k| k.code())
+        .expect("rollback");
+        let RolledBack::Done(previous) = done else {
+            panic!("not rolled back");
+        };
+        assert_eq!(previous.tree_version(), &v("1.0.0"));
+        assert!(rig.host.record().bad.contains(&v("1.1.0")));
+        // The own child, and only it, was ended.
+        assert_eq!(rig.process.terminated().len(), 1);
+    }
+
+    #[test]
+    fn a_rollback_answered_not_pending_after_a_bystander_confirmed_reports_what_the_record_says() {
+        let rig = Rig::new(true);
+        // The first connection applies; the second (the rollback's) finds the version confirmed by
+        // another start of the app that got in between: the record is read again and says so.
+        let confirm_first = {
+            let host = Arc::clone(&rig.host);
+            let process = rig.process.clone();
+            let tx = rig.tx.lock().unwrap().clone();
+            move |n: usize| {
+                if n != 1 {
+                    return;
+                }
+                let spawns = process.spawns();
+                let (_, value) = spawns[0]
+                    .env_set
+                    .iter()
+                    .find(|(k, _)| k == HEALTH_TOKEN_VAR)
+                    .expect("the token");
+                let token = Token::parse(value.to_str().unwrap()).expect("token");
+                let (client, server) = mem_duplex();
+                tx.send((server, app())).expect("service");
+                let mut session = ClientSession::connect(
+                    client,
+                    app(),
+                    ClientTimeouts {
+                        hello: Some(Duration::from_secs(10)),
+                        answer: Some(Duration::from_secs(30)),
+                    },
+                )
+                .expect("hello");
+                session.confirm(&v("1.1.0"), &token).expect("confirm");
+                drop(session);
+                let _ = &host;
+            }
+        };
+        let connector = rig.connector_with(confirm_first);
+        let (events, _) = collecting();
+        rig.process
+            .script_child(ChildScript::exits(0, ExitKind::Failure(1)));
+        let end = end_of(&rig, &connector, "1.1.0", &events);
+        // The record was ours when the failure was seen; by the time of the rollback request it was
+        // confirmed: the answer is `not_pending`, and the run reports what the record says.
+        assert!(matches!(end, End::Confirmed), "not confirmed");
+        // The apply, and the rollback the service answered `not_pending` (the bystander's confirm
+        // went in between, on a connection of its own).
+        assert_eq!(rig.host.connects.load(Ordering::SeqCst), 2);
+        assert!(rig.host.record().bad.is_empty());
+        assert_eq!(
+            rig.host.record().current.expect("current").version,
+            v("1.1.0")
+        );
+        // No relaunch of the previous version: nothing was rolled back.
+        assert!(rig.process.spawns().iter().all(|s| !s.detached));
+    }
+
+    #[test]
+    fn a_service_that_cannot_be_reached_is_the_apply_error_and_the_app_starts_again() {
+        for (error, kind) in [
+            (
+                ConnectError::NotInstalled,
+                Kind::ServiceUnavailable(ServiceWhy::NotInstalled),
+            ),
+            (
+                ConnectError::Disabled,
+                Kind::ServiceUnavailable(ServiceWhy::Disabled),
+            ),
+            (
+                ConnectError::WrongOwner,
+                Kind::ServiceUnavailable(ServiceWhy::Untrusted),
+            ),
+            (ConnectError::Busy, Kind::Busy),
+        ] {
+            let rig = Rig::new(true);
+            let connector = FakeConnector::failing(error);
+            let (events, _) = collecting();
+            let end = end_of(&rig, &connector, "1.1.0", &events);
+            assert!(matches!(end, End::Failed(k) if k == kind), "{error:?}");
+            // Nothing was committed; the launcher starts the version that exited.
+            assert!(rig.host.record().pending.is_none());
+            let spawns = rig.process.spawns();
+            assert_eq!(spawns.len(), 1, "{error:?}");
+            assert!(spawns[0].detached && spawns[0].program == rig.root().join(ENTRY));
+        }
+    }
+
+    #[test]
+    fn a_policy_that_disables_self_update_is_33_before_any_connection() {
+        let rig = Rig::new(true);
+        rig.host.policy.set(MachinePolicy {
+            self_update_disabled: true,
+            no_update_ui: false,
+        });
+        let connector = rig.connector();
+        let (events, _) = collecting();
+        let end = end_of(&rig, &connector, "1.1.0", &events);
+        assert!(matches!(end, End::Failed(Kind::DisabledByPolicy)));
+        assert_eq!(rig.host.connects.load(Ordering::SeqCst), 0);
+        assert!(rig.host.record().pending.is_none());
+        assert_eq!(rig.process.spawns().len(), 1, "the app starts again");
+    }
+
+    #[test]
+    fn nothing_staged_is_refused_from_the_record_with_no_connection() {
+        let rig = Rig::new(false);
+        let connector = rig.connector();
+        let (events, _) = collecting();
+        let end = end_of(&rig, &connector, "1.1.0", &events);
+        assert!(matches!(end, End::Failed(Kind::NothingStaged)));
+        assert_eq!(rig.host.connects.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_runtimes_own_collection_does_nothing_on_a_machine_install() {
+        let rig = Rig::new(true);
+        // Old trees the service would collect, and a version nothing keeps.
+        write_tree(&rig.host.fs, &rig.root(), "0.9.0");
+        let inst = rig.open();
+        let (events, _) = collecting();
+        rig.process.script_in_use(false);
+        let report = crate::gc::gc(&rig.ad, &inst, None, &events);
+        assert!(report.removed.is_empty() && report.kept.is_empty());
+        assert!(rig.process.in_use_calls().is_empty());
+        assert!(
+            rig.host
+                .fs
+                .symlink_metadata(&rig.root().join("app/0.9.0"))
+                .expect("lstat")
+                .is_some(),
+            "the tree is still there"
+        );
+        let _ = (&rig.home, Decided::Confirmed);
+    }
+
+    // ---- uninstall from the copy outside `R` ---------------------------------------------------
+
+    use lunepack_core::error::ElevationError;
+    use lunepack_core::service::Duplex;
+    use lunepack_core::{Elevated, ElevatedChild, Elevation, Standing};
+
+    /// An elevation whose child ends with `code`, after doing what the elevated side would have
+    /// done to the install: removing it, or not.
+    struct Child {
+        fs: MemFs,
+        root: PathBuf,
+        remove: bool,
+        code: i32,
+        calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
+    }
+
+    struct Ended(i32);
+
+    impl ElevatedChild for Ended {
+        fn wait(&mut self) -> Result<i32, ElevationError> {
+            Ok(self.0)
+        }
+    }
+
+    impl Elevation for Child {
+        fn standing(&self) -> Standing {
+            Standing::Standard
+        }
+
+        fn run_elevated(&self, exe: &Path, args: &[String]) -> Result<Elevated, ElevationError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((exe.to_path_buf(), args.to_vec()));
+            if self.remove {
+                self.fs.remove_dir_all_nofollow(&self.root).expect("remove");
+            }
+            Ok(Elevated::Started(Box::new(Ended(self.code))))
+        }
+    }
+
+    /// Operations the unelevated side must never use.
+    struct NoOps;
+
+    impl crate::machine::Ops for NoOps {
+        fn repair(&self, _: &Path, _: &str) -> Result<Version, Kind> {
+            panic!("the unelevated side runs no engine operation")
+        }
+        fn uninstall(&self, _: &Path, _: &str) -> Result<(), Kind> {
+            panic!("the unelevated side runs no engine operation")
+        }
+        fn enter(&self, _: &Path) -> bool {
+            panic!("the unelevated side changes no directory")
+        }
+        fn delete_at_restart(&self, _: &Path) -> bool {
+            panic!("the unelevated side registers no deletion")
+        }
+    }
+
+    struct NoService;
+
+    impl lunepack_core::ServiceConnector for NoService {
+        fn connect(&self, _: &AppId) -> Result<Box<dyn Duplex>, ConnectError> {
+            panic!("an uninstall never reaches the update service")
+        }
+    }
+
+    /// Hands the reader of a pipe over once.
+    struct Reader(Mutex<Option<lunepack_testkit::MemDuplex>>);
+
+    impl crate::relay::EventConnector for Reader {
+        fn connect(&self, _: &str, _: Duration) -> Result<Box<dyn Duplex>, crate::relay::Attempt> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .map(|d| Box::new(d) as Box<dyn Duplex>)
+                .ok_or(crate::relay::Attempt::Refused)
+        }
+    }
+
+    fn uninstall_with(rig: &Rig, remove: bool, code: i32, pipe: &str) -> (Kind, Arc<Child>) {
+        let child = Arc::new(Child {
+            fs: rig.host.fs.clone(),
+            root: rig.root(),
+            remove,
+            code,
+            calls: Mutex::new(Vec::new()),
+        });
+        // Another user's home, and this user's: only the second goes with the install.
+        for user in ["alice", "bob"] {
+            let dir = abs_path("/local")
+                .join(user)
+                .join("lunepack")
+                .join(app().as_str())
+                .join("state");
+            rig.host.fs.create_dir_all(&dir).unwrap();
+            let mut w = rig.host.fs.create_new(&dir.join("counters")).unwrap();
+            w.write_all(b"x").unwrap();
+            w.sync().unwrap();
+        }
+        let (mut writer, reader) = mem_duplex();
+        writer.write_all(pipe.as_bytes()).unwrap();
+        drop(writer);
+        let pipes = Reader(Mutex::new(Some(reader)));
+        let host = crate::machine::Host {
+            elevation: &*child,
+            ops: &NoOps,
+            pipes: &pipes,
+            service: &NoService,
+            policy: &rig.host.policy,
+            rng: &FakeRng::new(5),
+            sid: Some("S-1-5-21-1-2-3-1001"),
+            relay: crate::machine::Relay::Pipe,
+        };
+        let inst = rig.open();
+        let (events, _) = collecting();
+        let ui = crate::ui_host::UiHost::headless(lunepack_core::ui::Flow::Uninstall);
+        let (kind, _) = crate::uninstall::run_machine_uninstall(
+            &rig.ad,
+            Some(&host),
+            &inst,
+            false,
+            &events,
+            &ui,
+        );
+        events.finish(Duration::from_secs(1));
+        (kind, child)
+    }
+
+    fn home_of(user: &str) -> PathBuf {
+        abs_path("/local")
+            .join(user)
+            .join("lunepack")
+            .join(app().as_str())
+    }
+
+    #[test]
+    fn an_uninstall_that_removed_the_install_removes_this_users_home_and_no_other() {
+        let rig = Rig::new(false);
+        let (kind, child) = uninstall_with(&rig, true, 0, "phase uninstall\nend 0\n");
+        assert_eq!(kind, Kind::Ok);
+        let calls = child.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        // The elevated image is the runtime of the current version inside `R`.
+        assert_eq!(
+            calls[0].0,
+            rig.root().join("app/1.0.0").join("lunepack-runtime.exe")
+        );
+        assert_eq!(calls[0].1[0], "machine-uninstall");
+        let exists = |p: PathBuf| rig.host.fs.symlink_metadata(&p).unwrap().is_some();
+        assert!(!exists(home_of("alice")), "this user's home is removed");
+        assert!(exists(home_of("bob")), "another user's home stays");
+    }
+
+    #[test]
+    fn a_refused_uninstall_keeps_the_install_and_the_users_home_and_reports_why() {
+        let rig = Rig::new(false);
+        // The elevated side found a process running from the install: 25 through the pipe.
+        let (kind, _) = uninstall_with(&rig, false, 0, "phase uninstall\nend 25\n");
+        assert_eq!(kind, Kind::InUse);
+        let exists = |p: PathBuf| rig.host.fs.symlink_metadata(&p).unwrap().is_some();
+        assert!(exists(rig.root()), "the install stays");
+        assert!(exists(home_of("alice")) && exists(home_of("bob")));
+        // Phase 1 refusing (not protected): that code, no pipe needed.
+        let rig = Rig::new(false);
+        let (kind, _) = uninstall_with(&rig, false, 35, "");
+        assert_eq!(kind, Kind::NotProtected);
+        assert!(
+            rig.host
+                .fs
+                .symlink_metadata(&home_of("alice"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// What starts the install again after an apply or a rollback is by the scheme's projection
+    /// (M11-D6, D12): the launcher stub on Windows, the entry through `R/current` on Linux, the
+    /// entry of the live bundle `R/bundle` names on macOS; no bundle pointer, nothing to start.
+    #[test]
+    fn the_launcher_follows_the_projection_of_the_scheme() {
+        use lunepack_core::MachineScheme;
+
+        let rig = Rig::new(false);
+        let root = abs_path("/opt/org.example.hello");
+        let nested = InstallMeta {
+            entry: RelPath::parse("Contents/MacOS/app").expect("entry"),
+            ..meta()
+        };
+        let windows = MachineLayout::with_scheme(&rig.root(), MachineScheme::WINDOWS);
+        assert_eq!(
+            super::stub_of(&rig.ad, &windows, &meta()),
+            Some(rig.root().join(ENTRY))
+        );
+        let linux = MachineLayout::with_scheme(&root, MachineScheme::LINUX);
+        assert_eq!(
+            super::stub_of(&rig.ad, &linux, &nested),
+            Some(root.join("current/Contents/MacOS/app"))
+        );
+        // macOS: from the bundle pointer, never from where the old tree was.
+        let mac_root = abs_path("/Library/Application Support/lunepack/org.example.hello");
+        let mac = MachineLayout::with_scheme(&mac_root, MachineScheme::MACOS);
+        assert_eq!(super::stub_of(&rig.ad, &mac, &nested), None);
+        let bundle = abs_path("/Applications/Hello.app");
+        rig.host.fs.create_dir_all(&bundle).expect("bundle");
+        rig.host.fs.create_dir_all(&mac_root).expect("root");
+        lunepack_core::set_bundle_pointer(&rig.host.fs, &mac.view(), &bundle).expect("pointer");
+        assert_eq!(
+            super::stub_of(&rig.ad, &mac, &nested),
+            Some(bundle.join("Contents/MacOS/app"))
+        );
     }
 }

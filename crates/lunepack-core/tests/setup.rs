@@ -533,3 +533,293 @@ fn a_payload_file_must_be_aligned_start_at_zero_and_end_in_its_trailer() {
     let (setup, _) = setup_file(vec![0x7f; 4000]);
     assert!(parse_payload(&setup).is_err());
 }
+
+// ---- The setup anchor (M10-D4, M10 step 14) -------------------------------------------------
+
+mod anchor {
+    use lunepack_core::pe::{PeError, PeHeaders, RT_RCDATA, rcdata};
+    use lunepack_core::setup::{
+        ANCHOR_MAGIC, ANCHOR_SIZE, SetupAnchor, SetupPart, SetupTrailer, TRAILER_SIZE,
+        verify_setup_anchored,
+    };
+    use lunepack_core::{
+        Channel, ClockReading, CodecId, Error, InstallMeta, PayloadKind, RelPath, Target,
+        TrustedRoot, UPDATE_CONFIG_FILE, UpdateConfig, Version,
+    };
+    use lunepack_testkit::exe_headers::{PeSpec, pe_image};
+    use lunepack_testkit::{
+        ChainFixture, FakeClock, FakeCodec, FakeHasher, FakeVerifier, PackBuilder, SUITE_T0,
+    };
+
+    use super::Bytes as Mem;
+
+    const TARGET: Target = Target::WindowsX86_64;
+
+    fn meta() -> InstallMeta {
+        InstallMeta {
+            entry: RelPath::parse("app.exe").unwrap(),
+            name: "Hello".into(),
+            comment: None,
+            icon: None,
+            categories: Vec::new(),
+            bin: None,
+            terminal: false,
+            publisher: None,
+            file_types: Vec::new(),
+            url_schemes: Vec::new(),
+            autostart: false,
+        }
+    }
+
+    /// A complete setup file: filler runtime, key set, manifest, pack and trailer, every part
+    /// 8-aligned, signed under the root of `root_seed` (release key seed 5), of `version`.
+    struct Built {
+        file: Vec<u8>,
+        trailer: SetupTrailer,
+        keys: Vec<u8>,
+        manifest: Vec<u8>,
+    }
+
+    impl Built {
+        fn new(root_seed: u8, version: &str) -> Built {
+            let fx = ChainFixture::fake();
+            let root: TrustedRoot = fx.trusted_root(1, 1, &[root_seed]);
+            let config = UpdateConfig::new(
+                &root,
+                Version::parse(version).unwrap(),
+                TARGET,
+                "https://updates.example.org/hello/",
+                Channel::parse("stable").unwrap(),
+                60,
+                meta(),
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+            let mut pack = PackBuilder::new();
+            pack.file(fx.hasher, "app.exe", b"entry", CodecId::Lzma2);
+            pack.file(fx.hasher, UPDATE_CONFIG_FILE, &config, CodecId::Stored);
+            let keys = fx.envelope(
+                PayloadKind::Keys,
+                &fx.keyset_document(1, 1, None, 1, &[5]).to_payload(),
+                &[root_seed],
+            );
+            let manifest = fx.envelope(
+                PayloadKind::Manifest,
+                &fx.manifest_document(version, TARGET, &pack).to_payload(),
+                &[5],
+            );
+            let mut file = vec![0x4du8; 1000];
+            let place = |file: &mut Vec<u8>, bytes: &[u8]| {
+                while !file.len().is_multiple_of(8) {
+                    file.push(0);
+                }
+                let part = SetupPart {
+                    offset: file.len() as u64,
+                    length: bytes.len() as u64,
+                };
+                file.extend_from_slice(bytes);
+                part
+            };
+            let k = place(&mut file, &keys);
+            let m = place(&mut file, &manifest);
+            let p = place(&mut file, &pack.bytes);
+            while !file.len().is_multiple_of(8) {
+                file.push(0);
+            }
+            let trailer = SetupTrailer {
+                root,
+                version: Version::parse(version).unwrap(),
+                target: TARGET,
+                keys: k,
+                manifest: m,
+                pack: p,
+            };
+            file.extend_from_slice(&trailer.encode().unwrap());
+            Built {
+                file,
+                trailer,
+                keys,
+                manifest,
+            }
+        }
+
+        fn block(&self) -> &[u8] {
+            &self.file[self.file.len() - TRAILER_SIZE as usize..]
+        }
+
+        fn anchor(&self) -> SetupAnchor {
+            SetupAnchor::of(self.block(), &self.keys, &self.manifest, &FakeHasher)
+        }
+    }
+
+    fn check(
+        anchor: &SetupAnchor,
+        file: &[u8],
+    ) -> Result<lunepack_core::setup::AnchoredSetup, Error> {
+        let end = file.len() as u64;
+        verify_setup_anchored(
+            anchor,
+            &file[file.len() - TRAILER_SIZE as usize..],
+            &Mem(file.to_vec()),
+            end,
+            &ClockReading::read(&FakeClock::new(SUITE_T0), None),
+            &FakeCodec::new(),
+            &FakeHasher,
+            &FakeVerifier,
+        )
+    }
+
+    fn anchor_error(r: Result<lunepack_core::setup::AnchoredSetup, Error>) -> &'static str {
+        match r {
+            Err(Error::SetupAnchor(why)) => why,
+            Err(e) => panic!("not an anchor error: {e}"),
+            Ok(_) => panic!("verified"),
+        }
+    }
+
+    #[test]
+    fn a_matching_anchor_verifies_and_names_the_key_set_version() {
+        let b = Built::new(0, "1.2.0");
+        let a = b.anchor();
+        let ok = check(&a, &b.file).expect("verifies");
+        assert_eq!(ok.trailer, b.trailer);
+        assert_eq!(ok.keyset_version, 1);
+        assert_eq!(ok.setup.config.version.to_string(), "1.2.0");
+        // The encoding round-trips and is the magic and three digests.
+        let enc = a.encode();
+        assert_eq!(enc.len(), ANCHOR_SIZE);
+        assert_eq!(enc[..8], ANCHOR_MAGIC);
+        assert_eq!(SetupAnchor::parse(&enc).unwrap(), a);
+    }
+
+    #[test]
+    fn each_wrong_digest_fails() {
+        let b = Built::new(0, "1.2.0");
+        let good = b.anchor();
+        for (i, why) in [(0, "trailer"), (1, "key set"), (2, "manifest")] {
+            let mut enc = good.encode();
+            enc[8 + 32 * i] ^= 1;
+            let bad = SetupAnchor::parse(&enc).unwrap();
+            assert_eq!(anchor_error(check(&bad, &b.file)), why);
+        }
+        // The same through the file: a byte flipped in the trailer's body, the key set or the
+        // manifest.
+        let t = &b.trailer;
+        for (at, why) in [
+            (b.file.len() - TRAILER_SIZE as usize + 2, "trailer"),
+            ((t.keys.offset + t.keys.length / 2) as usize, "key set"),
+            (
+                (t.manifest.offset + t.manifest.length / 2) as usize,
+                "manifest",
+            ),
+        ] {
+            let mut f = b.file.clone();
+            f[at] ^= 1;
+            assert_eq!(anchor_error(check(&good, &f)), why);
+        }
+    }
+
+    #[test]
+    fn the_placeholder_and_malformed_encodings_are_refused() {
+        let b = Built::new(0, "1.2.0");
+        let placeholder = SetupAnchor::parse(&SetupAnchor::PLACEHOLDER).unwrap();
+        assert!(placeholder.is_placeholder());
+        assert_eq!(
+            anchor_error(check(&placeholder, &b.file)),
+            "the anchor was never written"
+        );
+        let enc = b.anchor().encode();
+        for bad in [
+            &enc[..ANCHOR_SIZE - 1],
+            &[&enc[..], &[0u8][..]].concat()[..],
+            &[][..],
+        ] {
+            assert!(matches!(
+                SetupAnchor::parse(bad),
+                Err(Error::SetupAnchor("malformed"))
+            ));
+        }
+        let mut wrong_magic = enc;
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            SetupAnchor::parse(&wrong_magic),
+            Err(Error::SetupAnchor("malformed"))
+        ));
+    }
+
+    /// A whole payload (and its trailer) swapped for another validly signed one fails: another
+    /// root, or the same root and another version.
+    #[test]
+    fn a_swapped_valid_payload_fails() {
+        let a = Built::new(0, "1.2.0");
+        let anchor = a.anchor();
+        for other in [Built::new(9, "1.2.0"), Built::new(0, "1.1.0")] {
+            check(&other.anchor(), &other.file).expect("the other setup is valid on its own");
+            assert_eq!(anchor_error(check(&anchor, &other.file)), "trailer");
+            // Even with the original trailer block kept over the other payload.
+            let mut f = other.file[..other.file.len() - TRAILER_SIZE as usize].to_vec();
+            f.extend_from_slice(a.block());
+            assert!(check(&anchor, &f).is_err());
+        }
+    }
+
+    /// The hardened test image with its `RT_MANIFEST` resource retyped as `RT_RCDATA` `id`.
+    fn rcdata_image(id: u32) -> (Vec<u8>, usize) {
+        let mut img = pe_image(0x8664, &PeSpec::hardened(2));
+        let h = PeHeaders::parse(&img, img.len() as u64).unwrap();
+        let rsrc = h.sections.last().unwrap().raw_ptr as usize;
+        // Type entry id at +16, name entry id at +40 (testkit's `.rsrc` layout).
+        img[rsrc + 16..rsrc + 20].copy_from_slice(&RT_RCDATA.to_le_bytes());
+        img[rsrc + 40..rsrc + 44].copy_from_slice(&id.to_le_bytes());
+        (img, rsrc)
+    }
+
+    #[test]
+    fn rcdata_finds_the_span_or_nothing() {
+        let (img, rsrc) = rcdata_image(1);
+        let span = rcdata(&img, 1).unwrap().expect("found");
+        assert_eq!(span.file_offset, (rsrc + 88) as u64);
+        let manifest = lunepack_testkit::exe_headers::HARDENED_MANIFEST.as_bytes();
+        assert_eq!(span.len as usize, manifest.len());
+        assert_eq!(
+            &img[span.file_offset as usize..span.file_offset as usize + manifest.len()],
+            manifest
+        );
+        // Another id, an image with only a manifest, an image with no resources.
+        assert_eq!(rcdata(&img, 2).unwrap(), None);
+        let plain = pe_image(0x8664, &PeSpec::hardened(2));
+        assert_eq!(rcdata(&plain, 1).unwrap(), None);
+        let bare = pe_image(
+            0x8664,
+            &PeSpec {
+                manifest: None,
+                ..PeSpec::hardened(2)
+            },
+        );
+        assert_eq!(rcdata(&bare, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn rcdata_refuses_a_truncated_or_ambiguous_directory() {
+        let (img, rsrc) = rcdata_image(1);
+        // The language directory claims more entries than its section holds.
+        let mut many = img.clone();
+        many[rsrc + 48 + 14..rsrc + 48 + 16].copy_from_slice(&0xffffu16.to_le_bytes());
+        assert!(matches!(rcdata(&many, 1), Err(PeError::Malformed(_))));
+        // Two language entries: which one the loader picks is not ours to guess.
+        let mut two = img.clone();
+        two[rsrc + 48 + 14..rsrc + 48 + 16].copy_from_slice(&2u16.to_le_bytes());
+        assert!(rcdata(&two, 1).is_err());
+        // The data entry's size runs past the section.
+        let mut long = img.clone();
+        long[rsrc + 76..rsrc + 80].copy_from_slice(&0x10_0000u32.to_le_bytes());
+        assert!(rcdata(&long, 1).is_err());
+        // The file cut inside the resource section.
+        assert!(rcdata(&img[..rsrc + 20], 1).is_err());
+        // Never a panic on any prefix.
+        for n in (0..img.len()).step_by(7) {
+            let _ = rcdata(&img[..n], 1);
+        }
+    }
+}

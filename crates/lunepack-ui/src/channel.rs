@@ -41,6 +41,8 @@ impl Exit {
 }
 
 /// What the reader and writer post to the event loop.
+// One frame at a time goes through the loop, so the size of the hello's variant costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum UserEvent {
     /// A frame from the engine.

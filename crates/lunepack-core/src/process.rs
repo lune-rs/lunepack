@@ -323,4 +323,19 @@ pub trait Process: Send + Sync {
     /// design (a non-dumpable process of the same user on Linux): that one is judged by its
     /// command line alone (M5-D9).
     fn tree_in_use(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool>;
+
+    /// The check every deletion the privileged engine makes under a machine install's root asks
+    /// first (M10-D20): whether the tree at `tree` is in use, by the same rule as
+    /// [`Process::tree_in_use`] and beyond it. It is at least as conservative: it answers `true`
+    /// whenever `tree_in_use` would. Where the platform can tell, it also answers for the tree's
+    /// files themselves (an image mapped by any process, a working directory, a file or directory
+    /// held open without delete sharing), so a process the scan cannot inspect does not weaken
+    /// it. `exclude` applies to the process scan only: a caller must hold nothing inside `tree`.
+    /// Only `Ok(false)` lets a caller delete; `Ok(true)` and `Err` keep the tree.
+    ///
+    /// The default is [`Process::tree_in_use`] (macOS and Linux keep their scans); the Windows
+    /// adapter adds a file-system probe.
+    fn tree_in_use_strict(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool> {
+        self.tree_in_use(tree, exclude)
+    }
 }

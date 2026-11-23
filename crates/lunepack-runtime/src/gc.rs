@@ -1,5 +1,5 @@
 //! Garbage collection of version trees (M5-D9), run after an apply's outcome is decided, never
-//! before the relaunch.
+//! before the relaunch. A machine install is not collected here: its service collects.
 //!
 //! Under the install's lock it keeps `gc_keep` of the record (current, previous, pending and
 //! staged) and removes only direct children of the layout's versions directory (`R/versions`,
@@ -34,6 +34,11 @@ pub struct GcReport {
 /// Collects `inst`'s install. `me` is excluded from the in-use check.
 pub fn gc(ad: &Adapters, inst: &Installation, me: Option<ProcessId>, events: &Events) -> GcReport {
     let mut report = GcReport::default();
+    // A machine install's trees are the service's to collect, after a confirm (M10 step 6): this
+    // runtime does nothing there, whatever the layout it could build (M10 step 18).
+    if inst.is_machine() {
+        return report;
+    }
     let Some(layout) = inst.layout() else {
         return report;
     };

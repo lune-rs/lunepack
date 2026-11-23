@@ -21,6 +21,9 @@ pub const UI_NAME: &str = "lunepack-ui";
 pub const RUNTIME_NAME: &str = "lunepack-runtime";
 /// The payload file's name in `Contents/Resources`.
 pub const PAYLOAD_NAME: &str = "lunepack-setup.payload";
+/// The all-users `.pkg`'s file name in `Contents/Resources` (M11-D8), present when the release holds
+/// the update service.
+pub const ALL_USERS_PKG_NAME: &str = "lunepack-all-users.pkg";
 /// The icon's file name in `Contents/Resources`, without the extension (`CFBundleIconFile`).
 pub const ICON_NAME: &str = "lunepack-installer";
 
@@ -53,6 +56,9 @@ pub struct InstallerApp<'a> {
     pub payload: &'a [u8],
     /// The `.icns` file, when the release has one.
     pub icon: Option<&'a [u8]>,
+    /// The finished all-users `.pkg` (M11-D8), when the release holds the update service: embedded
+    /// before the app is signed, so the app's seal covers it.
+    pub all_users_pkg: Option<&'a [u8]>,
 }
 
 fn make_dir(path: &Path) -> Result<()> {
@@ -103,6 +109,9 @@ pub fn write_app(parent: &Path, app: &InstallerApp<'_>) -> Result<PathBuf> {
     make_file(&resources.join(PAYLOAD_NAME), app.payload, false)?;
     if let Some(icon) = app.icon {
         make_file(&resources.join(format!("{ICON_NAME}.icns")), icon, false)?;
+    }
+    if let Some(pkg) = app.all_users_pkg {
+        make_file(&resources.join(ALL_USERS_PKG_NAME), pkg, false)?;
     }
     Ok(root)
 }
@@ -298,13 +307,20 @@ mod tests {
 
     /// A fake `hdiutil`: a script that appends a line to `calls`, then runs `body` (with `$n` the
     /// call number).
+    ///
+    /// Linux refuses to `exec` a file that any process still holds open for writing (ETXTBSY). The
+    /// tests run in parallel threads, and a thread that forks while this one has the script open for
+    /// writing leaves a copy of that descriptor in its child until the child's own `exec`, which
+    /// outlives this function's close. So the script is run once (`--probe`, answered before any
+    /// other case) until the kernel accepts it: from then on no process holds it open, and no
+    /// later fork can (the descriptor is closed here).
     fn fake(dir: &Path, body: &str) -> Hdiutil {
         let script = dir.join("hdiutil");
         let calls = dir.join("calls");
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\ncase \"$1\" in info|detach) echo \"$@\" >> '{released}'; [ \"$1\" = detach ] || cat '{info}' 2>/dev/null; exit 0 ;; esac\n\
+                "#!/bin/sh\ncase \"$1\" in --probe) exit 0 ;; info|detach) echo \"$@\" >> '{released}'; [ \"$1\" = detach ] || cat '{info}' 2>/dev/null; exit 0 ;; esac\n\
                  echo \"$@\" >> '{calls}'\nn=$(wc -l < '{calls}' | tr -d ' ')\n{body}\n",
                 calls = calls.display(),
                 released = dir.join("released").display(),
@@ -313,6 +329,22 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        loop {
+            match std::process::Command::new(&script).arg("--probe").status() {
+                Ok(status) => {
+                    assert!(status.success(), "the fake's probe failed: {status}");
+                    break;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && started.elapsed() < Duration::from_secs(20) =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => panic!("the fake hdiutil cannot be run: {e}"),
+            }
+        }
         Hdiutil {
             program: script,
             create_timeout: Duration::from_secs(30),
@@ -545,6 +577,7 @@ mod tests {
             plist: b"plist",
             payload: b"payload!",
             icon: Some(b"icns"),
+            all_users_pkg: Some(b"pkg"),
         };
         let root = write_app(tmp.path(), &app).unwrap();
         let mode = |p: &str| fs::metadata(root.join(p)).unwrap().permissions().mode() & 0o777;
@@ -557,6 +590,11 @@ mod tests {
         assert_eq!(mode("Contents/Info.plist"), 0o644);
         assert_eq!(mode("Contents/Resources/lunepack-setup.payload"), 0o644);
         assert_eq!(mode("Contents/Resources/lunepack-installer.icns"), 0o644);
+        assert_eq!(
+            fs::read(root.join("Contents/Resources/lunepack-all-users.pkg")).unwrap(),
+            b"pkg"
+        );
+        assert_eq!(mode("Contents/Resources/lunepack-all-users.pkg"), 0o644);
         assert_eq!(mode("Contents"), 0o755);
         assert!(write_app(tmp.path(), &app).is_err());
     }

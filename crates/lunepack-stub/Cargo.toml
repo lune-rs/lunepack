@@ -1,6 +1,6 @@
 [package]
 name = "lunepack-stub"
-description = "The Windows launcher stub: starts an installed app's current version (launch contract v1)."
+description = "The Windows launcher stub: starts an installed app's current version (launch contract v2)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -20,9 +20,9 @@ use lunepack_core::update_config::MACOS_ENTRY_DIR;
 use lunepack_core::{
     AppId, ArtifactRef, Channel, ClockReading, CodeSign, Hasher, InstallMeta, NameRule,
     PayloadKind, RelPath, ReleaseDoc, ReleaseLayout, RollbackFloor, Signer, Target, UpdateConfig,
-    VerifiedEntry, VerifiedKeySet, Version, check_pe_stub, check_runtime_image, check_ui_image,
-    decode_verified, macos_name_ok, next_feed, sign_envelope, verify_feed, verify_manifest,
-    windows_name_ok,
+    VerifiedEntry, VerifiedKeySet, Version, check_pe_stub, check_runtime_image,
+    check_service_image, check_ui_image, decode_verified, macos_name_ok, next_feed, sign_envelope,
+    verify_feed, verify_manifest, windows_name_ok,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
@@ -43,6 +43,8 @@ const MAX_RUNTIME_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_UI_BYTES: u64 = 64 * 1024 * 1024;
 /// Largest `--stub` file read, in bytes.
 const MAX_STUB_BYTES: u64 = 32 * 1024 * 1024;
+/// Largest `--service` file read, in bytes.
+const MAX_SERVICE_BYTES: u64 = 32 * 1024 * 1024;
 /// Default memory budget of the pack stage, in MiB.
 const DEFAULT_BUDGET_MIB: u64 = 2048;
 /// The channel of the throwaway feed the self-check signs; never written anywhere.
@@ -98,6 +100,11 @@ pub struct PackArgs {
     /// refused for any other target. The console stub for a terminal app, the GUI stub otherwise.
     #[arg(long)]
     stub: Option<PathBuf>,
+    /// The update service, placed beside the entry as `lunepack-service.exe` (Windows) or
+    /// `lunepack-service` (Linux and macOS; in `Contents/MacOS` for macOS). Optional: it enables
+    /// per-machine installs. Needs `--runtime` and `[update]`.
+    #[arg(long)]
+    service: Option<PathBuf>,
     /// For a `macos-*` target with `[update]` (M8-D8): write the tree `pack` would hash to this
     /// new directory and stop, so it can be code-signed and then packed. Takes no release
     /// directory and no signer, and writes nothing to a release.
@@ -269,6 +276,8 @@ struct Prepared {
     ui: Option<Vec<u8>>,
     /// The stamped Windows stub (M7-D14); `Some` exactly for a `windows-*` target.
     stub: Option<Vec<u8>>,
+    /// The update service's bytes (M10-D7, M11); `Some` exactly with `--service`, for any target.
+    service: Option<Vec<u8>>,
     /// The helper app's `Info.plist` (M8-D6); `Some` for a `macos-*` target with `--ui`.
     helper_plist: Option<Vec<u8>>,
     /// The helper app's checked `.icns` bytes, when `[macos] icon` is set and a helper is built.
@@ -314,6 +323,7 @@ struct UpdateInputs<'a> {
     runtime: Option<&'a Path>,
     ui: Option<&'a Path>,
     stub: Option<&'a Path>,
+    service: Option<&'a Path>,
     /// The `--input` directory, where a PNG `install.icon` is read from.
     input: &'a Path,
     /// The `--version` text, written into a stamped stub's version info.
@@ -452,6 +462,9 @@ fn prepare_update(
         if inputs.stub.is_some() {
             bail!("--stub needs [update] and [install] in the config");
         }
+        if inputs.service.is_some() {
+            bail!("--service needs [update] and [install] in the config");
+        }
         return Ok(None);
     };
     let Some(runtime) = inputs.runtime else {
@@ -460,6 +473,9 @@ fn prepare_update(
         }
         if inputs.stub.is_some() {
             bail!("--stub needs --runtime");
+        }
+        if inputs.service.is_some() {
+            bail!("--service needs --runtime");
         }
         bail!("--runtime is required when the config has [update]");
     };
@@ -507,6 +523,26 @@ fn prepare_update(
         .stub
         .map(|path| prepare_stub(config, &document.install, path, inputs, version, target))
         .transpose()?;
+    let service = inputs
+        .service
+        .map(|path| {
+            let bytes = read_capped(path, "--service", MAX_SERVICE_BYTES)?;
+            // A Windows service is a hardened console PE (M10-D7); a Linux or macOS one is checked
+            // as a runtime is (static, the target's format and architecture).
+            let checked = if target.is_windows() {
+                check_service_image(&bytes, target)
+            } else {
+                check_runtime_image(&bytes, target)
+            };
+            checked.map_err(|e| {
+                anyhow!(
+                    "--service is not a service image for {}: {e}",
+                    target.as_str()
+                )
+            })?;
+            Ok::<_, anyhow::Error>(bytes)
+        })
+        .transpose()?;
     // The helper app's files exist only with a UI, and `[macos] icon` is read only then.
     let (helper_plist, helper_icon) = if target.is_macos() && ui.is_some() {
         let icon = config
@@ -527,6 +563,7 @@ fn prepare_update(
         runtime: bytes,
         ui,
         stub,
+        service,
         helper_plist,
         helper_icon,
     }))
@@ -567,6 +604,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
             runtime: args.runtime.as_deref(),
             ui: args.ui.as_deref(),
             stub: args.stub.as_deref(),
+            service: args.service.as_deref(),
             input: &args.input,
             version_text: &args.version,
         },
@@ -579,6 +617,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
         runtime: &p.runtime,
         ui: p.ui.as_deref(),
         stub: p.stub.as_deref(),
+        service: p.service.as_deref(),
         config: &p.config,
         helper_plist: p.helper_plist.as_deref(),
         helper_icon: p.helper_icon.as_deref(),

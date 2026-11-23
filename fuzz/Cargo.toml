@@ -116,3 +116,17 @@ path = "fuzz_targets/setup.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "service"
+path = "fuzz_targets/service.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ui"
+path = "fuzz_targets/ui.rs"
+test = false
+doc = false
+bench = false

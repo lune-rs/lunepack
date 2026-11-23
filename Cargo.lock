@@ -2248,6 +2248,7 @@ version = "0.0.0"
 dependencies = [
  "lunepack-core",
  "lunepack-testkit",
+ "tracing",
  "windows",
  "windows-sys 0.61.2",
 ]
@@ -2267,6 +2268,21 @@ dependencies = [
  "lunepack-testkit",
  "tempfile",
  "url",
+]
+
+[[package]]
+name = "lunepack-service"
+version = "0.0.0"
+dependencies = [
+ "lunepack-codec-lzma",
+ "lunepack-core",
+ "lunepack-crypto",
+ "lunepack-fs",
+ "lunepack-os-linux",
+ "lunepack-os-macos",
+ "lunepack-os-windows",
+ "lunepack-testkit",
+ "tempfile",
 ]
 
 [[package]]

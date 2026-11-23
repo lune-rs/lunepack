@@ -43,6 +43,7 @@ pub const ROLES: &[(&str, Role)] = &[
     ("lunepack-cli", Role::Binary),
     ("lunepack-ui", Role::Binary),
     ("lunepack-stub", Role::Binary),
+    ("lunepack-service", Role::Binary),
     ("xtask", Role::Tool),
 ];
 
@@ -88,20 +89,41 @@ pub const ONLY_DEPENDED_ON_BY: &[(&str, &[&str])] = &[
     ("lunepack-ui", &[]),
 ];
 
-/// Closed dependency lists (M7-D7, M7-D20): `(package, the only crates it may depend on)`. Every
+/// Closed dependency lists (M7-D7, M7-D20, M10-D7): `(package, the only crates it may depend on)`. Every
 /// normal and build dependency of the package, workspace member or external, must be named here;
 /// dev-dependencies are not held. The launcher stub's contract is frozen across versions, so it
 /// links the core's read path, the filesystem, the record's hash and the Windows helpers, and no
 /// facade, network, codec or UI code.
-pub const DEPENDS_ONLY_ON: &[(&str, &[&str])] = &[(
-    "lunepack-stub",
-    &[
-        "lunepack-core",
-        "lunepack-fs",
-        "lunepack-crypto",
-        "lunepack-os-windows",
-    ],
-)];
+pub const DEPENDS_ONLY_ON: &[(&str, &[&str])] = &[
+    (
+        "lunepack-stub",
+        &[
+            "lunepack-core",
+            "lunepack-fs",
+            "lunepack-crypto",
+            "lunepack-os-windows",
+        ],
+    ),
+    // The update service (M10-D7, M11) runs as LocalSystem or root and is fed by any local user
+    // through one pipe or socket: the core's engine, the filesystem, the hash and signature
+    // adapters, the frame decoder and the Windows, Linux and macOS adapters, and no facade,
+    // network, UI or packager code. `tracing` and `anyhow` are the only outside crates it may
+    // name.
+    (
+        "lunepack-service",
+        &[
+            "lunepack-core",
+            "lunepack-fs",
+            "lunepack-crypto",
+            "lunepack-codec-lzma",
+            "lunepack-os-windows",
+            "lunepack-os-linux",
+            "lunepack-os-macos",
+            "tracing",
+            "anyhow",
+        ],
+    ),
+];
 
 /// Reach-only-through crates (M4-D16): `(crate, vias)`. In the lock graph of the workspace and of
 /// `fuzz/`, no workspace member may reach `crate` except through one of the members in `vias`.

@@ -73,6 +73,28 @@ pub fn install_scope() -> &'static str {
     "Installs for your account only. No administrator rights needed."
 }
 
+/// The welcome screen's line under the title once "Install for all users" is ticked: it names the
+/// next step of this OS (Windows asks for approval, Linux asks for an administrator's password or
+/// shows a command, macOS continues in Installer).
+pub fn install_scope_all_users(os: Os) -> &'static str {
+    match os {
+        Os::Windows => {
+            "Installs for everyone on this PC. Windows will ask for administrator approval."
+        }
+        Os::Macos => {
+            "Installs for everyone on this Mac. It continues in Installer, which asks for an administrator."
+        }
+        Os::Linux => {
+            "Installs for everyone on this computer. You will be asked for an administrator's password, or shown a command to run as an administrator."
+        }
+    }
+}
+
+/// The label of the welcome screen's all-users checkbox.
+pub fn install_all_users_label() -> &'static str {
+    "Install for all users"
+}
+
 /// The done screen's body.
 pub fn install_done(os: Os, name: &str, version: &str) -> String {
     format!(
@@ -89,6 +111,37 @@ pub fn install_failed_title() -> &'static str {
 /// The failed screen's line under the title.
 pub fn install_failed_note(os: Os) -> String {
     format!("Nothing was changed on this {}.", os.machine())
+}
+
+/// The title of the screen that shows the command to run as an administrator (M11-D9, D14).
+pub fn admin_command_title() -> &'static str {
+    "Finish in a terminal"
+}
+
+/// The line under that title: what the command does, by flow (`install` is true for an install).
+pub fn admin_command_note(install: bool, name: &str) -> String {
+    if install {
+        format!(
+            "Run this command in a terminal as an administrator to install {name} for all users."
+        )
+    } else {
+        format!("Run this command in a terminal as an administrator to uninstall {name}.")
+    }
+}
+
+/// The label of the button that copies the administrator command.
+pub fn admin_command_copy() -> &'static str {
+    "Copy command"
+}
+
+/// The title of the screen that says the install went on in the system's installer (M11-D8).
+pub fn handed_off_title() -> &'static str {
+    "Continue in Installer"
+}
+
+/// The line under that title.
+pub fn handed_off_note(name: &str) -> String {
+    format!("Installer has opened to install {name} for all users. You can close this window.")
 }
 
 /// What an exit code of the runtime (docs/RUNTIME.md, "Exit codes") means to a person.
@@ -326,5 +379,21 @@ mod tests {
             "Move My App to your Applications folder and open it from there."
         );
         assert_eq!(kind_name(28), "unsupported_location");
+    }
+
+    #[test]
+    fn the_all_users_line_names_the_next_step_of_its_own_os_only() {
+        let windows = install_scope_all_users(Os::Windows);
+        let mac = install_scope_all_users(Os::Macos);
+        let linux = install_scope_all_users(Os::Linux);
+        assert!(windows.contains("Windows will ask for administrator approval"));
+        assert!(mac.contains("Installer") && mac.contains("Mac"));
+        assert!(linux.contains("password") && linux.contains("command"));
+        // No other OS's words leak into a screen.
+        for text in [mac, linux] {
+            assert!(!text.contains("Windows") && !text.contains("PC"), "{text}");
+        }
+        assert!(!linux.contains("Installer") && !linux.contains("Mac"));
+        assert!(!mac.contains("password") && !mac.contains("computer"));
     }
 }

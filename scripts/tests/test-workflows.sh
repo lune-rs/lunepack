@@ -238,46 +238,43 @@ if [ -f "$ci" ]; then
   e2e_windows_jobs_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
   t_check "a file with no Windows e2e jobs fails" rc_nonzero
 fi
-# --- the macOS end-to-end job (M8 step 11) -----------------------------------------------------
-# Required (no continue-on-error), time-bounded, on a macOS runner, runs the suite with --ci, and
-# uploads the instrument records whatever the suite did.
-e2e_macos_job_ok() {
-  local block bad=0
-  block=$(job_block "$1" e2e-macos)
-  if [ -z "$block" ]; then echo "no e2e-macos job"; return 1; fi
-  if ! printf '%s\n' "$block" | grep -q 'timeout-minutes:'; then echo "e2e-macos has no timeout-minutes"; bad=1; fi
-  if printf '%s\n' "$block" | grep -q 'continue-on-error'; then echo "e2e-macos must not be continue-on-error"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'runs-on: macos-latest'; then echo "e2e-macos does not run on macos-latest"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'scripts/e2e-macos.sh --ci'; then echo "e2e-macos does not run e2e-macos.sh --ci"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'actions/upload-artifact@'; then echo "e2e-macos does not upload the instrument records"; bad=1; fi
-  if ! printf '%s\n' "$block" | grep -q 'if: always()'; then echo "e2e-macos's records are not kept after a failure"; bad=1; fi
-  return "$bad"
-}
-
-if [ -f "$ci" ]; then
-  RC=0
-  e2e_macos_job_ok "$ci" >"$OUT" 2>&1 || RC=$?
-  t_check "ci.yml has the e2e-macos job, required and time-bounded" rc_is 0
-  if [ "$RC" -ne 0 ]; then sed 's/^/    /' "$OUT" >&2; fi
-  sed 's|^  e2e-macos:|  e2e-macos:\n    continue-on-error: true|' "$ci" >"$T_TMP/macos-coe.yml"
-  RC=0
-  e2e_macos_job_ok "$T_TMP/macos-coe.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "seeded continue-on-error on e2e-macos fails" rc_nonzero
-  t_check "seeded continue-on-error on e2e-macos reports why" out_has "continue-on-error"
-  sed 's|scripts/e2e-macos.sh --ci|scripts/e2e-macos.sh|' "$ci" >"$T_TMP/macos-noci.yml"
-  RC=0
-  e2e_macos_job_ok "$T_TMP/macos-noci.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "seeded e2e-macos without --ci fails" rc_nonzero
-  RC=0
-  e2e_macos_job_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
-  t_check "a file with no e2e-macos job fails" rc_nonzero
-fi
 
 t_check "defender-on.ps1 refuses off GitHub Actions" grep -q "GITHUB_ACTIONS -ne 'true'" "$repo/scripts/ci/defender-on.ps1"
 if command -v pwsh >/dev/null 2>&1; then
   RC=0
   env -u CI -u GITHUB_ACTIONS pwsh -NoProfile -File "$repo/scripts/ci/defender-on.ps1" >"$OUT" 2>&1 || RC=$?
   t_check "defender-on.ps1 refuses off CI: exit 3" rc_is 3
+fi
+
+# windows-machine-adapter-test.ps1 refuses off CI without -Install (exit 3) before it touches
+# anything; its administrator check and its leftover check are in the text.
+# shellcheck disable=SC2016  # the script's own PowerShell text, searched literally
+t_check "windows-machine-adapter-test.ps1 asks for CI or -Install" grep -q 'if (-not $Install)' "$repo/scripts/ci/windows-machine-adapter-test.ps1"
+t_check "windows-machine-adapter-test.ps1 asks for an administrator" grep -q 'refused: not an administrator' "$repo/scripts/ci/windows-machine-adapter-test.ps1"
+if command -v pwsh >/dev/null 2>&1; then
+  RC=0
+  env -u CI -u GITHUB_ACTIONS pwsh -NoProfile -File "$repo/scripts/ci/windows-machine-adapter-test.ps1" >"$OUT" 2>&1 || RC=$?
+  t_check "windows-machine-adapter-test.ps1 refuses without CI or -Install: exit 3" rc_is 3
+  t_check "windows-machine-adapter-test.ps1 names why" out_has "refused"
+fi
+
+# The per-machine suite (M10 step 19) runs its install rows only on CI or with -Install, and only as
+# an administrator; it removes what it made and fails on a leftover. Its planted-DLL list is read
+# from plant-dll-test.ps1, which prints it with -Describe (the list is in one place).
+e2e_machine="$repo/scripts/e2e-windows-machine.ps1"
+# shellcheck disable=SC2016  # the script's own PowerShell text, searched literally
+t_check "e2e-windows-machine.ps1 gates its install rows on CI or -Install" grep -Fq "if (\$env:CI -eq 'true' -or \$env:LUNEPACK_E2E_INSTALL -eq '1') { \$Install = \$true }" "$e2e_machine"
+# shellcheck disable=SC2016
+t_check "e2e-windows-machine.ps1 runs the install rows as an administrator only" grep -Fq '$runInstall = $Install -and $isAdmin' "$e2e_machine"
+# shellcheck disable=SC2016
+t_check "e2e-windows-machine.ps1 fails on a leftover" grep -Fq "FAIL leftovers" "$e2e_machine"
+t_check "e2e-windows-machine.ps1 reads the planted list from plant-dll-test.ps1" grep -Fq "plant-dll-test.ps1') -Describe" "$e2e_machine"
+if command -v pwsh >/dev/null 2>&1; then
+  RC=0
+  # shellcheck disable=SC2016  # PowerShell text
+  PLANT_SCRIPT="$repo/scripts/ci/plant-dll-test.ps1" pwsh -NoProfile -Command '$d = & $env:PLANT_SCRIPT -Describe; "$($d.Planted.Count) $($d.LoaderFailures.Count) $($d.Content.Length)"' >"$OUT" 2>&1 || RC=$?
+  t_check "plant-dll-test.ps1 -Describe prints the list, the failure set and the content" rc_is 0
+  t_check "plant-dll-test.ps1 -Describe: twelve names, eight failure codes, eight bytes" out_has "12 8 8"
 fi
 
 # The scripts refuse off CI (exit 3) before touching anything: no scratch directory appears.
@@ -313,6 +310,44 @@ if [ "$(uname -s)" = Darwin ]; then
   CI=true bash "$repo/scripts/ci/macos-selfsigned.sh" delete "$T_TMP/guard-tmp" >"$OUT" 2>&1 || RC=$?
   t_check "macos-selfsigned.sh delete refuses a directory it did not make" rc_is 1
   t_check "macos-selfsigned.sh delete left that directory alone" test -d "$T_TMP/guard-tmp"
+fi
+
+# Nothing on a runner answers an authorization prompt, so every call of the identity script that
+# could wait for one (a trust change, codesign, find-identity) goes through its `bounded`, which
+# stops a command that outlives its limit and answers 124 (F13: CI waited 90 minutes in an
+# unbounded add-trusted-cert). Pure bash: runs on every OS.
+bounded_src=$T_TMP/bounded.sh
+sed -n '/^bounded() {/,/^}/p' "$repo/scripts/ci/macos-selfsigned.sh" >"$bounded_src"
+t_check "macos-selfsigned.sh defines bounded" grep -q '^bounded() {' "$bounded_src"
+RC=0
+bounded_start=$SECONDS
+bash -c '. "$1"; bounded 1 sleep 30' _ "$bounded_src" >"$OUT" 2>&1 || RC=$?
+t_check "bounded stops a command that outlives its limit: 124" rc_is 124
+t_check "bounded stopped it within a few seconds" test $((SECONDS - bounded_start)) -lt 10
+RC=0
+bash -c '. "$1"; bounded 5 sh -c "exit 7"' _ "$bounded_src" >"$OUT" 2>&1 || RC=$?
+t_check "bounded passes on the command's own exit status" rc_is 7
+# unbounded_prompt_calls prints the code lines of the identity script that change trust, sign or
+# list identities without going through bounded.
+unbounded_prompt_calls() {
+  grep -nE '(add|remove)-trusted-cert|find-identity -p|--sign ' "$repo/scripts/ci/macos-selfsigned.sh" |
+    grep -vE '^[0-9]+:[[:space:]]*#' | grep -v 'bounded ' || true
+}
+t_check "macos-selfsigned.sh: every trust change, codesign and find-identity call is bounded" test -z "$(unbounded_prompt_calls)"
+
+# Every tracked shell script that a workflow or another script runs by path must be executable
+# (git mode 100755): a 100644 one fails with "Permission denied" only in CI. Only the
+# scripts/tests/test-*.sh files are exempt, because run.sh runs them through bash.
+# modes_not_executable reads `git ls-files -s` lines on stdin and prints the paths that are not 100755.
+modes_not_executable() {
+  awk '$1 != "100755" { sub(/^[^\t]*\t/, ""); print }' | grep -E '^scripts/.*\.sh$' | grep -Ev '^scripts/tests/test-[^/]*\.sh$' || true
+}
+mode_fixture=$(printf '100644 0000000000000000000000000000000000000000 0\tscripts/ci/fixture.sh\n100755 0000000000000000000000000000000000000000 0\tscripts/ci/ok.sh\n100644 0000000000000000000000000000000000000000 0\tscripts/tests/test-fixture.sh\n')
+t_check "mode check flags a 100644 script and only that" test "$(printf '%s\n' "$mode_fixture" | modes_not_executable)" = "scripts/ci/fixture.sh"
+if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  not_exec=$(git -C "$repo" ls-files -s scripts | modes_not_executable)
+  [ -z "$not_exec" ] || echo "  not executable (git mode is not 100755): $not_exec" >&2
+  t_check "every tracked scripts/**/*.sh (except tests/test-*.sh) has git mode 100755" test -z "$not_exec"
 fi
 
 t_finish

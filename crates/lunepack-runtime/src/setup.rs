@@ -48,12 +48,13 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use lunepack::{
-    ChildStdio, DownloadOptions, Fs, HEALTH_TOKEN_VAR, Installation, Layout, OfflinePayload,
+    AppId, ChildStdio, DownloadOptions, Fs, HEALTH_TOKEN_VAR, Installation, Layout, OfflinePayload,
     PayloadPart, Phase, Progress, ReadAt, SpawnSpec, TrustedRoot, UpdaterBuilder, UserLayout,
     Version,
 };
 use lunepack_core::setup::{
-    Located, SetupPart, SetupTrailer, TRAILER_SIZE, VerifiedSetup, locate_file, verify_setup,
+    Located, SetupAnchor, SetupPart, SetupTrailer, TRAILER_SIZE, VerifiedSetup, locate_file,
+    verify_setup, verify_setup_anchored,
 };
 use lunepack_core::ui::{ChoiceValue, Outcome, PromptKind, StepItem};
 use lunepack_core::{ClockReading, Hasher, Verifier};
@@ -66,6 +67,10 @@ use crate::ui_host::{self, UiHost};
 pub const COMMAND: &str = "setup";
 /// The result's outcome.
 pub const OUTCOME: &str = "installed";
+/// The result's outcome of an all-users install handed to the operating system's installer
+/// (macOS, M11-D8): nothing is installed yet, the installer package goes on.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const OUTCOME_HANDED_OFF: &str = "handed_off";
 /// The prefix of the UI directories a setup makes under the app's cache.
 pub const UI_DIR_PREFIX: &str = "setup-ui-";
 /// The marker file inside such a directory.
@@ -79,9 +84,15 @@ pub struct Found {
     pub trailer: SetupTrailer,
     /// The executable, open for reading.
     pub file: Arc<dyn ReadAt>,
+    /// The [`TRAILER_SIZE`] bytes the trailer was parsed from (empty for a payload file): what a
+    /// Windows setup's anchor is checked against, before the trailer is trusted (M10-D4).
+    pub block: Vec<u8>,
+    /// The end of the setup data in the file (the trailer's end; empty for a payload file).
+    pub end: u64,
 }
 
 /// What the end of the executable holds.
+#[allow(clippy::large_enum_variant)]
 pub enum Detect {
     /// No setup trailer: an ordinary runtime.
     None,
@@ -150,17 +161,33 @@ pub fn detect_installer(
     let payload = lunepack_core::update_config::MACOS_INSTALLER_PAYLOAD
         .split('/')
         .fold(installer.to_path_buf(), |dir, name| dir.join(name));
-    match fs.symlink_metadata(&payload) {
+    detect_payload_file(fs, &payload, hasher, verifier)
+}
+
+/// A payload file (FORMAT.md 14.4, no runtime part) at `payload`: [`Detect::None`] when it is not
+/// a regular file (a link included), [`Detect::Malformed`] when it cannot be read or parsed, else
+/// the setup it holds. The installer app's own file ([`detect_installer`]) and the one the
+/// installer package places beside the runtime (`machine-install --pkg`, M11-D8) are read here.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn detect_payload_file(
+    fs: &dyn Fs,
+    payload: &Path,
+    hasher: &dyn Hasher,
+    verifier: &dyn Verifier,
+) -> Detect {
+    match fs.symlink_metadata(payload) {
         Ok(Some(meta)) if meta.kind == lunepack::FileKind::File => {}
         _ => return Detect::None,
     }
-    let Ok(file) = fs.open_read(&payload) else {
+    let Ok(file) = fs.open_read(payload) else {
         return Detect::Malformed;
     };
     match lunepack_core::setup::parse_payload_file(file.as_ref(), hasher, verifier) {
         Ok(trailer) => Detect::Setup(Found {
             trailer,
             file: Arc::from(file),
+            block: Vec::new(),
+            end: 0,
         }),
         Err(_) => Detect::Malformed,
     }
@@ -188,6 +215,8 @@ pub fn detect(fs: &dyn Fs, exe: &Path, hasher: &dyn Hasher, verifier: &dyn Verif
         Ok(trailer) => Detect::Setup(Found {
             trailer,
             file: Arc::from(file),
+            block: tail,
+            end,
         }),
         Err(_) => Detect::Malformed,
     }
@@ -215,6 +244,123 @@ pub fn cache_home(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     }
     let home = PathBuf::from(env("HOME")?);
     home.is_absolute().then(|| home.join(".cache"))
+}
+
+/// What a setup's payload is bound to before it is trusted.
+#[derive(Clone, Copy)]
+pub enum Binding<'a> {
+    /// Linux and macOS: the trailer's own root (FORMAT.md 14).
+    TrailerRoot,
+    /// Windows (M10-D4): the digests the started image carries of its own payload; `None` when the
+    /// image has no usable anchor, which no payload can then satisfy. The trailer's root alone is
+    /// never accepted.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Anchor(Option<&'a SetupAnchor>),
+}
+
+/// A setup whose payload verified, before anything was shown or written and before the choice of
+/// where it installs.
+pub struct Verified {
+    found: Found,
+    setup: VerifiedSetup,
+    /// The version of the key set the verification accepted (a floor of a first machine record).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    keyset_version: u64,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl Verified {
+    /// The version the setup installs.
+    pub fn version(&self) -> &Version {
+        &self.found.trailer.version
+    }
+
+    /// The app's display name, from the verified config.
+    pub fn name(&self) -> &str {
+        &self.setup.config.install.name
+    }
+
+    /// The payload's verification result.
+    pub fn setup(&self) -> &VerifiedSetup {
+        &self.setup
+    }
+
+    /// The verified key set's version.
+    pub fn keyset_version(&self) -> u64 {
+        self.keyset_version
+    }
+
+    /// The verified setup file.
+    pub fn found(&self) -> &Found {
+        &self.found
+    }
+
+    /// The app's id.
+    pub fn app_id(&self) -> &lunepack::AppId {
+        self.found.trailer.root.app_id()
+    }
+
+    /// Whether the release carries the update service beside its entry (M10-D7), so it can be
+    /// installed for all users.
+    pub fn has_service(&self) -> bool {
+        self.has_service_for(lunepack_core::MachineOs::Windows)
+    }
+
+    /// [`Verified::has_service`] for the service file name of `os` (`lunepack-service` on unix).
+    pub fn has_service_for(&self, os: lunepack_core::MachineOs) -> bool {
+        let Some(service) =
+            lunepack_core::layout::service_path_in_tree_for(&self.setup.config.install.entry, os)
+        else {
+            return false;
+        };
+        self.setup.manifest.entries().iter().any(|e| {
+            matches!(
+                e,
+                lunepack_core::VerifiedEntry::File { path, size, .. }
+                    if *path == service && *size > 0
+            )
+        })
+    }
+
+    /// Finds the per-user `R` under `data_home` ([`lunepack_core::resolve_root`]) and, when
+    /// `want_ui`, extracts the UI under `ui_home`; see [`prepare`].
+    pub fn into_prepared(
+        self,
+        ad: &Adapters,
+        data_home: &Path,
+        ui_home: Option<&Path>,
+        want_ui: bool,
+        own: Option<lunepack::ProcessId>,
+        alive: Alive<'_>,
+    ) -> Result<Prepared, Refused> {
+        // M7-D16: `R` is found by record (or named) under the platform's layout scheme;
+        // `<data home>/<app id>` under XDG.
+        let install_root = lunepack_core::resolve_root(
+            &*ad.fs,
+            &*ad.hasher,
+            data_home,
+            self.found.trailer.root.app_id(),
+            &self.setup.config.install.name,
+            ad.platform.layout_scheme(),
+        )
+        .map_err(|e| Refused {
+            kind: Kind::of(&lunepack::Error::from(lunepack_core::Error::Layout(e))),
+            name: Some(self.setup.config.install.name.clone()),
+        })?
+        .into_path();
+        let mut prepared = Prepared {
+            found: self.found,
+            verified: self.setup,
+            install_root,
+            data_home: data_home.to_path_buf(),
+            ui_dir: None,
+            apps_dir: None,
+        };
+        if want_ui && let (Some(home), Some(own)) = (ui_home, own) {
+            prepared.ui_dir = extract_ui(ad, &prepared, home, own, alive);
+        }
+        Ok(prepared)
+    }
 }
 
 /// A verified setup, ready for its prompts.
@@ -246,6 +392,17 @@ impl Prepared {
         self.ui_dir.as_deref()
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
+    /// The verified payload.
+    pub fn setup(&self) -> &VerifiedSetup {
+        &self.verified
+    }
+
+    /// The app's id.
+    pub fn app_id(&self) -> &lunepack::AppId {
+        self.found.trailer.root.app_id()
+    }
+
     /// macOS: the install is a bundle install into `apps_dir` (the canonical `~/Applications`,
     /// M8-D2), which the welcome screen shows as the location.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -273,59 +430,80 @@ pub struct Refused {
     pub name: Option<String>,
 }
 
-/// Verifies the setup, finds `R`, and, when `want_ui`, extracts the UI under `ui_home` ([`ui_home`];
-/// M6-D7, M7-D13) with a marker naming `own` (this process). A verification failure or a refused
-/// root is its exit kind ([`Refused`]), with nothing written; a UI that cannot be extracted means a
-/// headless run.
+/// Verifies the payload against its binding and nothing else: nothing is shown or written, and no
+/// location is looked at. A failure is [`Kind::Verify`] (or what [`Kind::of`] makes of the core's
+/// error) with no name.
+pub fn verify(ad: &Adapters, found: Found, binding: Binding<'_>) -> Result<Verified, Refused> {
+    let clock = ClockReading::read(&lunepack::SystemClock, None);
+    let refuse = |e: lunepack_core::Error| Refused {
+        kind: Kind::of(&lunepack::Error::from(e)),
+        name: None,
+    };
+    match binding {
+        Binding::TrailerRoot => {
+            let setup = verify_setup(
+                &found.trailer,
+                &*found.file,
+                &clock,
+                &*ad.codec,
+                &*ad.hasher,
+                &*ad.verifier,
+            )
+            .map_err(refuse)?;
+            Ok(Verified {
+                found,
+                setup,
+                keyset_version: 0,
+            })
+        }
+        Binding::Anchor(anchor) => {
+            let Some(anchor) = anchor else {
+                return Err(Refused {
+                    kind: Kind::Verify,
+                    name: None,
+                });
+            };
+            let anchored = verify_setup_anchored(
+                anchor,
+                &found.block,
+                &*found.file,
+                found.end,
+                &clock,
+                &*ad.codec,
+                &*ad.hasher,
+                &*ad.verifier,
+            )
+            .map_err(refuse)?;
+            // The trailer the anchor named is the one every later step reads.
+            let mut found = found;
+            found.trailer = anchored.trailer;
+            Ok(Verified {
+                found,
+                setup: anchored.setup,
+                keyset_version: anchored.keyset_version,
+            })
+        }
+    }
+}
+
+/// Verifies the setup ([`verify`]), finds the per-user `R`, and, when `want_ui`, extracts the UI
+/// under `ui_home` ([`ui_home`]; M6-D7, M7-D13) with a marker naming `own` (this process). A
+/// verification failure or a refused root is its exit kind ([`Refused`]), with nothing written; a
+/// UI that cannot be extracted means a headless run. (macOS only: the other systems verify first,
+/// look at the choice of where to install and then prepare, [`Verified::into_prepared`].)
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn prepare(
     ad: &Adapters,
     found: Found,
+    binding: Binding<'_>,
     data_home: &Path,
     ui_home: Option<&Path>,
     want_ui: bool,
     own: Option<lunepack::ProcessId>,
     alive: Alive<'_>,
 ) -> Result<Prepared, Refused> {
-    let clock = ClockReading::read(&lunepack::SystemClock, None);
-    let verified = verify_setup(
-        &found.trailer,
-        &*found.file,
-        &clock,
-        &*ad.codec,
-        &*ad.hasher,
-        &*ad.verifier,
-    )
-    .map_err(|e| Refused {
-        kind: Kind::of(&lunepack::Error::from(e)),
-        name: None,
-    })?;
-    // M7-D16: `R` is found by record (or named) under the platform's layout scheme;
-    // `<data home>/<app id>` under XDG.
-    let install_root = lunepack_core::resolve_root(
-        &*ad.fs,
-        &*ad.hasher,
-        data_home,
-        found.trailer.root.app_id(),
-        &verified.config.install.name,
-        ad.platform.layout_scheme(),
-    )
-    .map_err(|e| Refused {
-        kind: Kind::of(&lunepack::Error::from(lunepack_core::Error::Layout(e))),
-        name: Some(verified.config.install.name.clone()),
-    })?
-    .into_path();
-    let mut prepared = Prepared {
-        found,
-        verified,
-        install_root,
-        data_home: data_home.to_path_buf(),
-        ui_dir: None,
-        apps_dir: None,
-    };
-    if want_ui && let (Some(home), Some(own)) = (ui_home, own) {
-        prepared.ui_dir = extract_ui(ad, &prepared, home, own, alive);
-    }
-    Ok(prepared)
+    verify(ad, found, binding)?.into_prepared(ad, data_home, ui_home, want_ui, own, alive)
 }
 
 /// The marker text of a UI directory made by process `me` for `app`.
@@ -496,7 +674,12 @@ fn extract_ui(
 }
 
 /// The UI card and details of the welcome screen, from the verified manifest and config.
-pub fn welcome(prepared: &Prepared) -> (lunepack_core::ui::AppCard, lunepack_core::ui::Details) {
+/// `all_users`: where an install for all users would go, when the screen offers the choice
+/// (M10-D38; only an install welcome may).
+pub fn welcome(
+    prepared: &Prepared,
+    all_users: Option<String>,
+) -> (lunepack_core::ui::AppCard, lunepack_core::ui::Details) {
     let install = &prepared.verified.config.install;
     let mut card = ui_host::card(&install.name, &prepared.version().to_string(), None);
     card.publisher = install
@@ -512,24 +695,98 @@ pub fn welcome(prepared: &Prepared) -> (lunepack_core::ui::AppCard, lunepack_cor
             .map(str::to_owned)
             .and_then(|t| ui_host::within(t, lunepack_core::ui::MAX_LOCATION)),
         size_bytes: Some(prepared.verified.installed_bytes()),
+        all_users_location: all_users
+            .and_then(|t| ui_host::within(t, lunepack_core::ui::MAX_LOCATION)),
     };
     (card, details)
 }
 
+/// How the unelevated setup hands the all-users install off, and reads its progress.
+pub enum Transfer<'a> {
+    /// Windows: an elevated copy that writes its progress into a pipe the setup reads.
+    #[cfg(windows)]
+    Pipe(crate::machine::HandOff<'a>),
+    /// Linux (M11-D9): an elevated copy through pkexec, its progress on its standard output.
+    #[cfg(unix)]
+    Stdout(crate::machine::StdoutHandOff<'a>),
+    /// macOS (M11-D8): the installer package the app carries, opened in Installer; the rest of
+    /// the install is Installer's and the package's postinstall.
+    #[cfg(target_os = "macos")]
+    Package(crate::machine::PackageHandOff<'a>),
+}
+
+/// The all-users install a setup can hand off to (M10 step 16, M11): what it needs besides the
+/// per-user flow's own state.
+pub struct Machine<'a> {
+    /// The machine home (the Program Files known folder, `/opt`; canonical).
+    pub home: &'a Path,
+    /// The OS's machine scheme: the names under the home.
+    pub scheme: lunepack_core::MachineScheme,
+    /// Starts the elevated copy and reads its progress.
+    pub transfer: Transfer<'a>,
+    /// The welcome screen offers the choice.
+    pub offered: bool,
+    /// The choice is taken without being asked (`--all-users` as a standard user, with a window).
+    pub forced: bool,
+}
+
+/// Whether an install of the app by the installing user is there: under `data_home` by the
+/// per-user lookup the first install uses ([`lunepack_core::resolve_root`]). A taken folder, or
+/// any answer but an existing install, is not one.
+pub fn user_install_exists(ad: &Adapters, data_home: &Path, app_id: &AppId, name: &str) -> bool {
+    matches!(
+        lunepack_core::resolve_root(
+            &*ad.fs,
+            &*ad.hasher,
+            data_home,
+            app_id,
+            name,
+            ad.platform.layout_scheme(),
+        ),
+        Ok(lunepack_core::RootChoice::Existing(_))
+    )
+}
+
 /// Runs the install flow of a prepared setup with its prompts in `ui`. Returns the exit kind and
-/// the final event.
+/// the final event. With `machine` (Windows), the welcome screen may offer the all-users install,
+/// and a per-user install is refused while an all-users one exists (M10-D14).
 pub fn run_setup(
     ad: &Adapters,
     prepared: &Prepared,
     events: &Events,
     ui: &UiHost,
+    machine: Option<&Machine<'_>>,
 ) -> (Kind, Event) {
-    if ui.prompt(PromptKind::Welcome, events, &mut |_| {}) != ChoiceValue::Proceed {
-        ui.outcome(Outcome::Cancelled);
-        return report(prepared, Err(Kind::Cancelled));
-    }
+    let all_users = match ui.prompt(PromptKind::Welcome, events, &mut |_| {}) {
+        ChoiceValue::Proceed => machine.is_some_and(|m| m.forced),
+        ChoiceValue::ProceedAllUsers if machine.is_some_and(|m| m.offered) => true,
+        _ => {
+            ui.outcome(Outcome::Cancelled);
+            return report(prepared, Err(Kind::Cancelled));
+        }
+    };
     loop {
-        let result = install(ad, prepared, events);
+        let result = match machine {
+            Some(m) if all_users => match install_all_users(ad, prepared, events, m) {
+                Ok(version) => Ok(version),
+                Err(AllUsersEnd::Kind(kind)) => Err(kind),
+                // No prompt can ask for an administrator: the window shows the command to run
+                // as one, and the run is over (M11-D9). Nothing was changed.
+                Err(AllUsersEnd::NeedsAdministrator(command)) => {
+                    show_admin_command(ui, events, command);
+                    return report(prepared, Err(Kind::ElevationRequired));
+                }
+                // Installer has the package: the window says to go on there, this run is over.
+                Err(AllUsersEnd::HandedOff) => {
+                    if ui.hand_off_to_installer() {
+                        let _ = ui.prompt(PromptKind::HandedOff, events, &mut |_| {});
+                    }
+                    return report_handed_off(prepared);
+                }
+            },
+            Some(m) => install_user_unless_machine(ad, prepared, events, m),
+            None => install(ad, prepared, events),
+        };
         match &result {
             Ok(_) => {
                 ui.steps(&[
@@ -552,12 +809,189 @@ pub fn run_setup(
             ChoiceValue::Retry => continue,
             ChoiceValue::Finish { launch: true } => {
                 if let Ok(version) = &result {
-                    launch(ad, prepared, version, events);
+                    if all_users {
+                        launch_machine(ad, prepared, machine, version, events);
+                    } else {
+                        launch(ad, prepared, version, events);
+                    }
                 }
             }
             _ => {}
         }
         return report(prepared, result);
+    }
+}
+
+/// The per-user install, unless the all-users one is there (`already_installed`).
+fn install_user_unless_machine(
+    ad: &Adapters,
+    prepared: &Prepared,
+    events: &Events,
+    machine: &Machine<'_>,
+) -> Result<Version, Kind> {
+    let found = crate::machine::find_in(
+        &*ad.fs,
+        &*ad.hasher,
+        machine.home,
+        prepared.app_id(),
+        prepared.name(),
+        machine.scheme,
+    );
+    if crate::machine::blocks_user_install(&found) {
+        return Err(Kind::AlreadyInstalled);
+    }
+    install(ad, prepared, events)
+}
+
+/// Why an all-users install did not happen: an exit kind, or no way to ask for an administrator.
+enum AllUsersEnd {
+    Kind(Kind),
+    /// The command to run as an administrator instead, when one can be shown (M11-D9).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    NeedsAdministrator(Option<String>),
+    /// The installer package was opened in Installer, which goes on (macOS, M11-D8): the window
+    /// says to continue there, and this run ends with nothing installed yet.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    HandedOff,
+}
+
+impl From<Kind> for AllUsersEnd {
+    fn from(kind: Kind) -> AllUsersEnd {
+        AllUsersEnd::Kind(kind)
+    }
+}
+
+/// The all-users install by hand-off: refused (`already_installed`) while the installing user has
+/// an install of their own (M10-D14: the unelevated side's check), then the elevated copy runs
+/// ([`crate::machine::hand_off`], on Linux [`crate::machine::hand_off_stdout`]) and its result is
+/// checked against the machine record.
+fn install_all_users(
+    ad: &Adapters,
+    prepared: &Prepared,
+    events: &Events,
+    machine: &Machine<'_>,
+) -> Result<Version, AllUsersEnd> {
+    let version = prepared.version().clone();
+    let user_install_there =
+        || user_install_exists(ad, &prepared.data_home, prepared.app_id(), prepared.name());
+    let installed = || {
+        matches!(
+            crate::machine::find_in(
+                &*ad.fs,
+                &*ad.hasher,
+                machine.home,
+                prepared.app_id(),
+                prepared.name(),
+                machine.scheme,
+            ),
+            crate::machine::Machine::Present(_, Some(found)) if found.to_string() == version.to_string()
+        )
+    };
+    match &machine.transfer {
+        #[cfg(windows)]
+        Transfer::Pipe(hand_off) => {
+            crate::machine::hand_off_unless(hand_off, events, &user_install_there, &installed)?;
+        }
+        #[cfg(target_os = "macos")]
+        Transfer::Package(hand_off) => {
+            // The refusals of the unelevated side come first, as on Windows (M10-D14): an install
+            // of the installing user, then of anyone (the machine record).
+            if user_install_there() {
+                return Err(Kind::AlreadyInstalled.into());
+            }
+            if crate::machine::blocks_user_install(&crate::machine::find_in(
+                &*ad.fs,
+                &*ad.hasher,
+                machine.home,
+                prepared.app_id(),
+                prepared.name(),
+                machine.scheme,
+            )) {
+                return Err(Kind::AlreadyInstalled.into());
+            }
+            events.emit(&Event::phase(Phase::Install, Some(&version)));
+            // `open` is started only for a package this app carries, by its absolute path.
+            if !crate::machine::open_package(hand_off) {
+                return Err(Kind::Process.into());
+            }
+            return Err(AllUsersEnd::HandedOff);
+        }
+        #[cfg(unix)]
+        Transfer::Stdout(hand_off) => {
+            if user_install_there() {
+                return Err(Kind::AlreadyInstalled.into());
+            }
+            // The window moves to its running screen, the one that takes the command to run as an
+            // administrator when no prompt can ask (and shows the copy's own progress when one does).
+            events.emit(&Event::phase(Phase::Install, Some(&version)));
+            match crate::machine::hand_off_stdout(hand_off, events, &installed) {
+                Ok(()) => {}
+                Err(crate::machine::HandOffEnd::Failed(kind)) => return Err(kind.into()),
+                Err(crate::machine::HandOffEnd::NeedsAdministrator) => {
+                    return Err(AllUsersEnd::NeedsAdministrator(
+                        crate::machine::admin_command(hand_off.setup),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(version)
+}
+
+/// Shows the screen of the command to run as an administrator and waits for it to be closed. A
+/// command the UI would refuse (too long, not printable), or no UI, shows nothing.
+fn show_admin_command(ui: &UiHost, events: &Events, command: Option<String>) {
+    if let Some(command) = command
+        && ui.admin_command(command)
+    {
+        let _ = ui.prompt(PromptKind::AdminCommand, events, &mut |_| {});
+    }
+}
+
+/// Starts the all-users install's launcher, detached, with no arguments and without a health
+/// token: `R\<entry name>` on Windows, the entry through `R/current` on Linux (M11-D12); a failure
+/// is a warning.
+fn launch_machine(
+    ad: &Adapters,
+    prepared: &Prepared,
+    machine: Option<&Machine<'_>>,
+    version: &Version,
+    events: &Events,
+) {
+    let started = machine
+        .and_then(|m| {
+            match crate::machine::find_in(
+                &*ad.fs,
+                &*ad.hasher,
+                m.home,
+                prepared.app_id(),
+                prepared.name(),
+                m.scheme,
+            ) {
+                crate::machine::Machine::Present(root, _) => Some((root, m.scheme)),
+                _ => None,
+            }
+        })
+        .and_then(|(root, scheme)| {
+            let entry = &prepared.verified.config.install.entry;
+            let program = match scheme.projection() {
+                lunepack_core::Projection::CurrentLink => entry.components().fold(
+                    root.join(lunepack_core::layout::CURRENT_LINK),
+                    |dir, part| dir.join(part),
+                ),
+                _ => root.join(entry.as_str().rsplit('/').next()?),
+            };
+            let spec = SpawnSpec {
+                program,
+                args: Vec::new(),
+                env_set: Vec::new(),
+                env_remove: vec![OsString::from(HEALTH_TOKEN_VAR)],
+                stdio: ChildStdio::Null,
+            };
+            ad.process.spawn_detached(&spec).ok()
+        });
+    if started.is_none() {
+        events.emit(&Event::warning(Warning::RelaunchFailed, Some(version)));
     }
 }
 
@@ -570,6 +1004,21 @@ pub fn failed(kind: Kind, version: Option<Version>) -> Event {
         exit_code: kind.code(),
         reason: kind.reason(),
     }
+}
+
+/// The end of a run that opened the installer package (macOS): exit 0, nothing installed by this
+/// process; the result says so.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn report_handed_off(prepared: &Prepared) -> (Kind, Event) {
+    (
+        Kind::Ok,
+        Event::Result {
+            command: COMMAND,
+            tree_version: Some(prepared.version().clone()),
+            outcome: OUTCOME_HANDED_OFF,
+            version: None,
+        },
+    )
 }
 
 fn report(prepared: &Prepared, result: Result<Version, Kind>) -> (Kind, Event) {

@@ -23,6 +23,8 @@ undocumented_unsafe_blocks = "deny"
 lunepack-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# The policy reader logs a value it could not read (without the value).
+tracing.workspace = true
 # SystemParametersInfoW for the client-area animation setting (M6-D8); the DLL search hardening, the
 # known folders, the message box and the app user model id (M7).
 windows-sys = { workspace = true }
@@ -40,4 +42,11 @@ windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_Co
 # first argument names the helper mode), and the cases run one after another.
 [[test]]
 name = "process"
+harness = false
+
+# Own main: the test binary is also the program the self-test starts (its first argument is
+# `--self-test`, its behaviour comes from the file name it was copied to), and the cases run one
+# after another.
+[[test]]
+name = "scm"
 harness = false

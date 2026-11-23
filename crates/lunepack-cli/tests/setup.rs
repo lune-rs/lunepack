@@ -107,6 +107,9 @@ struct Mac {
     ui: bool,
     icon: bool,
     signed: bool,
+    /// Whether the release holds the update service (`--service`, M11): it also gets an
+    /// all-users `.pkg`. Only with an unsigned bundle.
+    service: bool,
 }
 
 /// What a Windows world differs by: the runtime image, extra config, extra input files.
@@ -263,6 +266,12 @@ impl World {
         let (runtime, ui) = (self.dir.path().join("runtime"), self.dir.path().join("ui"));
         fs::write(&runtime, mac_binary(mac.signed)).unwrap();
         fs::write(&ui, mac_binary(mac.signed)).unwrap();
+        assert!(
+            !(mac.signed && mac.service),
+            "a service is packed unsigned here"
+        );
+        let service = self.dir.path().join("service");
+        fs::write(&service, mac_binary(false)).unwrap();
         if mac.icon {
             fs::write(self.dir.path().join("app.icns"), icns(b"pixels")).unwrap();
         }
@@ -291,6 +300,9 @@ impl World {
             ];
             if mac.ui {
                 args.extend_from_slice(&["--ui", s(ui)]);
+            }
+            if mac.service {
+                args.extend_from_slice(&["--service", s(&service)]);
             }
             args.extend_from_slice(extra);
             self.run(&args, &env)
@@ -1246,6 +1258,7 @@ const PLAIN_MAC: Mac = Mac {
     ui: true,
     icon: true,
     signed: false,
+    service: false,
 };
 
 #[test]
@@ -1316,6 +1329,7 @@ fn macos_zip_needs_no_ui_and_no_icon_and_never_replaces_a_file() {
         ui: false,
         icon: false,
         signed: false,
+        service: false,
     };
     let w = World::mac(mac);
     let a = w.dir.path().join("a.zip");
@@ -1391,6 +1405,7 @@ fn a_signed_bundle_zipped_and_extracted_still_verifies() {
         ui: true,
         icon: true,
         signed: true,
+        service: false,
     };
     let w = World::mac(mac);
     let a = w.dir.path().join("signed.zip");
@@ -1617,6 +1632,7 @@ fn macos_dmg_refusals_leave_nothing_behind() {
         ui: false,
         icon: false,
         signed: false,
+        service: false,
     });
     let out_dir = tempfile::tempdir().unwrap();
     let dmg = out_dir.path().join("hello.dmg");
@@ -2085,6 +2101,7 @@ fn the_installer_app_in_the_dmg_verifies_when_signed_and_not_otherwise() {
         ui: true,
         icon: true,
         signed: true,
+        service: false,
     });
     let verify = |dmg: &Path, mnt: &str| {
         let mount = attach(dmg, &w.dir.path().join(mnt));
@@ -2124,4 +2141,520 @@ fn the_installer_app_in_the_dmg_verifies_when_signed_and_not_otherwise() {
         .output()
         .unwrap();
     assert!(image.status.success(), "the image is not signed");
+}
+
+// ---- The setup anchor (M10-D4, M10 step 14) -------------------------------------------------
+
+/// The anchor of a built Windows setup file, read through its image's `RT_RCDATA` resource, and
+/// that resource's byte span.
+fn anchor_of(bytes: &[u8]) -> (lunepack_core::setup::SetupAnchor, std::ops::Range<usize>) {
+    use lunepack_core::setup::{ANCHOR_RESOURCE_ID, SetupAnchor};
+    let span = lunepack_core::pe::rcdata(bytes, ANCHOR_RESOURCE_ID)
+        .unwrap()
+        .expect("an anchor resource");
+    let range = span.file_offset as usize..span.file_offset as usize + span.len as usize;
+    (SetupAnchor::parse(&bytes[range.clone()]).unwrap(), range)
+}
+
+/// Verifies `bytes` against the anchor in its own image, as a started Setup.exe does.
+fn check_anchored(bytes: &[u8]) -> Result<u64, String> {
+    let (anchor, _) = anchor_of(bytes);
+    let end = bytes.len();
+    lunepack_core::setup::verify_setup_anchored(
+        &anchor,
+        &bytes[end - TRAILER_SIZE as usize..],
+        &Bytes(bytes.to_vec()),
+        end as u64,
+        &ClockReading::read(&At(AT), None),
+        &LzmaCodec,
+        &Sha256Hasher,
+        &Ed25519Verifier,
+    )
+    .map(|a| a.keyset_version)
+    .map_err(|e| e.to_string())
+}
+
+#[test]
+fn windows_setup_carries_its_own_anchor_and_only_the_anchor_was_patched() {
+    use lunepack_core::Hasher as _;
+    use lunepack_core::setup::{ANCHOR_SIZE, SetupAnchor};
+    let w = World::windows(plain_windows());
+    let a = w.dir.path().join("a.exe");
+    assert_ok(&w.setup(&a, &[]), "windows setup");
+    let bytes = fs::read(&a).unwrap();
+    // Deterministic: a second run to the same file name gives the same bytes.
+    let again = w.dir.path().join("again").join("a.exe");
+    fs::create_dir_all(again.parent().unwrap()).unwrap();
+    assert_ok(&w.setup(&again, &[]), "windows setup again");
+    assert_eq!(fs::read(&again).unwrap(), bytes, "two runs differ");
+
+    // The anchor equals the digests of the file's own trailer block, key set and manifest.
+    let t = trailer_of(&bytes);
+    let part = |p: lunepack_core::setup::SetupPart| {
+        bytes[p.offset as usize..(p.offset + p.length) as usize].to_vec()
+    };
+    let (anchor, span) = anchor_of(&bytes);
+    assert_eq!(span.len(), ANCHOR_SIZE);
+    assert!(
+        span.end <= t.keys.offset as usize,
+        "inside the runtime image"
+    );
+    let h = Sha256Hasher;
+    assert_eq!(
+        anchor.trailer,
+        h.sha256(&bytes[bytes.len() - TRAILER_SIZE as usize..])
+    );
+    assert_eq!(anchor.keys, h.sha256(&part(t.keys)));
+    assert_eq!(anchor.manifest, h.sha256(&part(t.manifest)));
+    assert!(!anchor.is_placeholder());
+    assert_eq!(check_anchored(&bytes), Ok(1));
+
+    // With the placeholder put back, the runtime image is the stamped one: its RT_RCDATA 1 is the
+    // placeholder, it still passes the runtime check, and nothing else differs.
+    let mut placeholder = bytes.clone();
+    placeholder[span.clone()].copy_from_slice(&SetupAnchor::PLACEHOLDER);
+    let differing: Vec<usize> = (0..bytes.len())
+        .filter(|&i| bytes[i] != placeholder[i])
+        .collect();
+    assert!(!differing.is_empty());
+    assert!(differing.iter().all(|i| span.contains(i)));
+    let runtime = &placeholder[..t.keys.offset as usize];
+    lunepack_core::check_runtime_image(runtime, lunepack_core::Target::WindowsX86_64)
+        .expect("a hardened Windows runtime");
+    let image = editpe::Image::parse(runtime.to_vec()).unwrap();
+    let rcdata = image
+        .resource_directory()
+        .unwrap()
+        .root()
+        .get(editpe::ResourceEntryName::ID(10))
+        .and_then(|e| e.as_table())
+        .and_then(|t| t.get(editpe::ResourceEntryName::ID(1)))
+        .and_then(|e| e.as_table())
+        .expect("RT_RCDATA 1");
+    let langs = rcdata.entries();
+    assert_eq!(langs.len(), 1);
+    let data = rcdata.get(langs[0]).and_then(|e| e.as_data()).unwrap();
+    assert_eq!(data.data(), &SetupAnchor::PLACEHOLDER[..]);
+    // The placeholder file is refused.
+    assert!(check_anchored(&placeholder).is_err());
+}
+
+#[test]
+fn a_flipped_byte_in_the_trailer_keys_or_manifest_fails_the_anchored_read_back() {
+    let w = World::windows(plain_windows());
+    let a = w.dir.path().join("a.exe");
+    assert_ok(&w.setup(&a, &[]), "windows setup");
+    let bytes = fs::read(&a).unwrap();
+    let t = trailer_of(&bytes);
+    for (name, at) in [
+        ("trailer", bytes.len() - TRAILER_SIZE as usize + 3),
+        ("key set", (t.keys.offset + t.keys.length / 2) as usize),
+        (
+            "manifest",
+            (t.manifest.offset + t.manifest.length / 2) as usize,
+        ),
+    ] {
+        let mut b = bytes.clone();
+        b[at] ^= 0x01;
+        let err = check_anchored(&b).unwrap_err();
+        assert!(err.contains(name), "{name}: {err}");
+    }
+    // A flipped anchor byte fails too.
+    let (_, span) = anchor_of(&bytes);
+    let mut b = bytes.clone();
+    b[span.start + 20] ^= 0x01;
+    assert!(check_anchored(&b).is_err());
+}
+
+#[test]
+fn a_linux_setup_file_has_no_anchor() {
+    let w = World::new();
+    let a = w.dir.path().join("a-setup");
+    assert_ok(&w.setup(&a, &[]), "setup");
+    let bytes = fs::read(&a).unwrap();
+    let t = trailer_of(&bytes);
+    assert_eq!(&bytes[..w.runtime.len()], &w.runtime[..]);
+    assert!(
+        bytes[w.runtime.len()..t.keys.offset as usize]
+            .iter()
+            .all(|&b| b == 0)
+    );
+}
+
+// ---- the all-users `.pkg` of a macOS release with the service (M11 step 7) -----------------------
+
+const SERVICE_MAC: Mac = Mac {
+    ui: true,
+    icon: true,
+    signed: false,
+    service: true,
+};
+
+/// The payload folder of the package below `/` (M11-D8).
+const PKG_LEAF: &str = "Library/Application Support/lunepack/.installer/org.example.hello";
+
+/// Runs a system tool and returns its output; the tool must exist (macOS).
+fn system(program: &str, args: &[&std::ffi::OsStr]) -> Output {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("{program}: {e}"))
+}
+
+/// The mode, owner, group and path of each entry of the BOM at `bom`, from `lsbom -p MUGf`.
+fn bom_entries(bom: &Path) -> Vec<(String, String, String, String)> {
+    let out = system(
+        "/usr/bin/lsbom",
+        &["-p".as_ref(), "MUGf".as_ref(), bom.as_os_str()],
+    );
+    assert!(out.status.success(), "lsbom: {}", stderr(&out));
+    stdout(&out)
+        .lines()
+        .map(|line| {
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 4, "an lsbom line: {line:?}");
+            (
+                f[0].trim().to_owned(),
+                f[1].to_owned(),
+                f[2].to_owned(),
+                f[3].to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// A release with the service builds `<name>.pkg` beside the image and embeds the same bytes in the
+/// installer app. The package holds exactly the runtime and the payload file under the root-only
+/// `.installer/<app id>` folder, every folder above `.installer` is root 0755, nothing is group- or
+/// world-writable, the postinstall is the fixed line, and the distribution allows the local system
+/// domain only (M11-D8, P4).
+#[test]
+fn macos_pkg_holds_exactly_the_runtime_and_the_payload_in_root_only_folders() {
+    let w = World::mac(SERVICE_MAC);
+    let dir = w.dir.path().join("out");
+    fs::create_dir(&dir).unwrap();
+    let dmg = dir.join("hello.dmg");
+    if !macos_host("the all-users .pkg") {
+        let err = assert_fails(&mac_dmg(&w, &dmg), 1, "dmg off macOS");
+        assert!(err.contains("--zip"), "{err}");
+        assert!(names_in(&dir).is_empty(), "{:?}", names_in(&dir));
+        return;
+    }
+    let out = mac_dmg(&w, &dmg);
+    assert_ok(&out, "setup of a release with the service");
+    let said: Vec<String> = stdout(&out).lines().map(str::to_owned).collect();
+    assert!(said[0].starts_with("setup: hello.dmg ("), "{said:?}");
+    assert!(said[1].starts_with("setup: hello.pkg ("), "{said:?}");
+    assert_eq!(names_in(&dir), ["hello.dmg", "hello.pkg"]);
+    let pkg = dir.join("hello.pkg");
+
+    // Unsigned: pkgutil says so, and setup still succeeded (no [codesign.macos]).
+    let sig = system(
+        "/usr/sbin/pkgutil",
+        &["--check-signature".as_ref(), pkg.as_os_str()],
+    );
+    assert!(!sig.status.success());
+    assert!(stdout(&sig).contains("no signature"), "{}", stdout(&sig));
+
+    // The payload files, exactly.
+    let listed = system(
+        "/usr/sbin/pkgutil",
+        &["--payload-files".as_ref(), pkg.as_os_str()],
+    );
+    assert_ok(&listed, "pkgutil --payload-files");
+    let mut files: Vec<String> = stdout(&listed).lines().map(str::to_owned).collect();
+    files.sort();
+    let mut want: Vec<String> = [
+        ".",
+        "./Library",
+        "./Library/Application Support",
+        "./Library/Application Support/lunepack",
+        "./Library/Application Support/lunepack/.installer",
+        &format!("./{PKG_LEAF}"),
+        &format!("./{PKG_LEAF}/lunepack-runtime"),
+        &format!("./{PKG_LEAF}/lunepack-setup.payload"),
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    want.sort();
+    assert_eq!(files, want);
+
+    // Expanded: the distribution, the component's identifier, the scripts, the modes in the BOM.
+    let expanded = w.dir.path().join("expanded");
+    let ex = system(
+        "/usr/sbin/pkgutil",
+        &[
+            "--expand-full".as_ref(),
+            pkg.as_os_str(),
+            expanded.as_os_str(),
+        ],
+    );
+    assert_ok(&ex, "pkgutil --expand-full");
+    let distribution = fs::read_to_string(expanded.join("Distribution")).unwrap();
+    assert!(
+        distribution.contains(
+            "<domains enable_localSystem=\"true\" enable_currentUserHome=\"false\" enable_anywhere=\"false\"/>"
+        ),
+        "{distribution}"
+    );
+    assert!(
+        distribution.contains("<title>Hello</title>"),
+        "{distribution}"
+    );
+    assert!(
+        distribution.contains("<os-version min=\"10.15\"/>"),
+        "{distribution}"
+    );
+    let component = expanded.join("component.pkg");
+    let info = fs::read_to_string(component.join("PackageInfo")).unwrap();
+    for needle in [
+        "identifier=\"org.example.hello.lunepack-machine\"",
+        "version=\"1.2.3\"",
+        "install-location=\"/\"",
+    ] {
+        assert!(info.contains(needle), "{needle}\n{info}");
+    }
+    assert_eq!(
+        fs::read(component.join("Scripts/postinstall")).unwrap(),
+        b"#!/bin/sh\nexec \"/Library/Application Support/lunepack/.installer/org.example.hello/lunepack-runtime\" machine-install --pkg\n"
+    );
+    assert_eq!(names_in(&component.join("Scripts")), ["postinstall"]);
+    assert_eq!(
+        fs::metadata(component.join("Scripts/postinstall"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+
+    let entries = bom_entries(&component.join("Bom"));
+    let group = entries[0].2.clone();
+    let mut seen = Vec::new();
+    for (mode, user, grp, path) in &entries {
+        assert_eq!(user, "root", "{path}");
+        assert_eq!(grp, &group, "one recorded group: {path}");
+        let bits = &mode[1..];
+        assert_eq!(&bits[4..5], "-", "group-writable: {path} {mode}");
+        assert_eq!(&bits[7..8], "-", "world-writable: {path} {mode}");
+        let expect = match path.as_str() {
+            "."
+            | "./Library"
+            | "./Library/Application Support"
+            | "./Library/Application Support/lunepack" => "drwxr-xr-x",
+            "./Library/Application Support/lunepack/.installer" => "drwx------",
+            p if p == format!("./{PKG_LEAF}") => "drwx------",
+            p if p.ends_with("/lunepack-runtime") => "-rwx------",
+            p if p.ends_with("/lunepack-setup.payload") => "-rw-------",
+            other => panic!("an entry the package must not hold: {other}"),
+        };
+        assert_eq!(mode, expect, "{path}");
+        seen.push(path.clone());
+    }
+    assert_eq!(seen.len(), 8, "{seen:?}");
+
+    // The files are the release's own runtime and payload (read through its signed frames), and the
+    // installer app embeds the same package and the same payload.
+    let leaf = component.join("Payload").join(PKG_LEAF);
+    assert_eq!(
+        fs::read(leaf.join("lunepack-runtime")).unwrap(),
+        mac_binary(false)
+    );
+    let mount = attach(&dmg, &w.dir.path().join("mnt"));
+    let app = mount.0.join("Install Hello.app");
+    assert_eq!(
+        fs::read(leaf.join("lunepack-setup.payload")).unwrap(),
+        fs::read(app.join("Contents/Resources/lunepack-setup.payload")).unwrap()
+    );
+    assert_eq!(
+        fs::read(app.join("Contents/Resources/lunepack-all-users.pkg")).unwrap(),
+        fs::read(&pkg).unwrap()
+    );
+}
+
+/// A release without the service gets no `.pkg`: nothing beside the image, nothing in the app.
+#[test]
+fn a_release_without_the_service_builds_no_pkg() {
+    if !macos_host("the installer .dmg") {
+        return;
+    }
+    let w = World::mac(PLAIN_MAC);
+    let dir = w.dir.path().join("out");
+    fs::create_dir(&dir).unwrap();
+    let dmg = dir.join("hello.dmg");
+    let out = mac_dmg(&w, &dmg);
+    assert_ok(&out, "setup");
+    assert_eq!(stdout(&out).lines().count(), 1, "{}", stdout(&out));
+    assert_eq!(names_in(&dir), ["hello.dmg"]);
+    let mount = attach(&dmg, &w.dir.path().join("mnt"));
+    assert!(
+        !mount
+            .0
+            .join("Install Hello.app/Contents/Resources/lunepack-all-users.pkg")
+            .exists()
+    );
+}
+
+/// The `.zip` is the bundle as released: a release with the service gets no package with it.
+#[test]
+fn the_zip_of_a_release_with_the_service_has_no_pkg() {
+    let w = World::mac(SERVICE_MAC);
+    let dir = w.dir.path().join("out");
+    fs::create_dir(&dir).unwrap();
+    assert_ok(&mac_zip(&w, &dir.join("a.zip")), "setup --zip");
+    assert_eq!(names_in(&dir), ["a.zip"]);
+}
+
+/// A package beside the image that is already there is never replaced, and nothing is written.
+#[test]
+fn an_existing_pkg_is_never_replaced_and_leaves_no_image() {
+    if !macos_host("the all-users .pkg") {
+        return;
+    }
+    let w = World::mac(SERVICE_MAC);
+    let dir = w.dir.path().join("out");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("hello.pkg"), b"keep").unwrap();
+    let err = assert_fails(&mac_dmg(&w, &dir.join("hello.dmg")), 1, "an existing pkg");
+    assert!(
+        err.contains("hello.pkg") && err.contains("already exists"),
+        "{err}"
+    );
+    assert_eq!(names_in(&dir), ["hello.pkg"]);
+    assert_eq!(fs::read(dir.join("hello.pkg")).unwrap(), b"keep");
+}
+
+/// A `xar` file whose table of contents carries a signature element: what the fake signing tool
+/// leaves behind for the signed-form check.
+fn signed_xar() -> Vec<u8> {
+    use std::io::Write as _;
+    let xml = "<xar><toc><signature style=\"RSA\"><size>256</size></signature></toc></xar>";
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(xml.as_bytes()).unwrap();
+    let toc = z.finish().unwrap();
+    let mut out = b"xar!".to_vec();
+    out.extend_from_slice(&28u16.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&(toc.len() as u64).to_be_bytes());
+    out.extend_from_slice(&(xml.len() as u64).to_be_bytes());
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(&toc);
+    out.extend_from_slice(&[0u8; 32]);
+    out
+}
+
+/// The fake signing tools of a package test: the installer template signs a `.pkg` by copying
+/// `signed.xar` over it, a `.dmg` with the real `codesign` (ad hoc), an app as the default does;
+/// `staple` leaves a package and an image alone.
+fn pkg_section(tools: &Tools, sign_pkg: &str) -> String {
+    fs::write(tools.dir.join("signed.xar"), signed_xar()).unwrap();
+    tools.macos_section(&[
+        (
+            "sign_installer",
+            &format!(
+                "echo \"sign_installer|$(basename \"$1\")\" >> \"$LOG\"\n\
+                 case \"$1\" in\n\
+                 *.pkg) {sign_pkg} ;;\n\
+                 *.dmg) /usr/bin/codesign --force --sign - \"$1\" ;;\n\
+                 *.app) mkdir -p \"$1/Contents/_CodeSignature\"; echo seal > \"$1/Contents/_CodeSignature/CodeResources\" ;;\n\
+                 *) cp \"$TOOLS/signed.macho\" \"$1\" ;;\n\
+                 esac"
+            ),
+        ),
+        (
+            "staple",
+            "echo \"staple|$(basename \"$1\")\" >> \"$LOG\"\n\
+             case \"$1\" in\n\
+             *.dmg|*.pkg) ;;\n\
+             *) echo ticket > \"$1/Contents/CodeResources\" ;;\n\
+             esac",
+        ),
+    ])
+}
+
+/// M11 step 7's stage order: the package is built, signed, notarized and stapled, then embedded in
+/// the installer app before the app's items are signed (the zip the notary gets holds it), then the
+/// app, then the image. The package beside the image is the embedded one.
+#[test]
+fn the_pkg_is_signed_notarized_and_stapled_before_it_is_embedded() {
+    if !macos_host("the all-users .pkg") {
+        return;
+    }
+    let w = World::mac(SERVICE_MAC);
+    let tools = Tools::new(&w);
+    append_config(&w, &pkg_section(&tools, "cp \"$TOOLS/signed.xar\" \"$1\""));
+    let dir = w.dir.path().join("out");
+    fs::create_dir(&dir).unwrap();
+    let dmg = dir.join("hello.dmg");
+    assert_ok(&mac_dmg(&w, &dmg), "setup with signing");
+    assert_eq!(
+        tools.log(),
+        [
+            "sign_installer|installer.pkg",
+            "notarize|installer.pkg|installer.pkg",
+            "staple|installer.pkg",
+            "sign_installer|lunepack-runtime",
+            "sign_installer|Install Hello.app",
+            "verify|Install Hello.app",
+            "notarize|Install Hello.app|lunepack-notarize.zip",
+            "staple|Install Hello.app",
+            "sign_installer|installer.dmg",
+            "notarize|installer.dmg|installer.dmg",
+            "staple|installer.dmg",
+        ]
+    );
+    assert_eq!(names_in(&dir), ["hello.dmg", "hello.pkg"]);
+    assert_eq!(fs::read(dir.join("hello.pkg")).unwrap(), signed_xar());
+    let zip = fs::read(tools.dir.join("notarized-app.zip")).unwrap();
+    let name = "Install Hello.app/Contents/Resources/lunepack-all-users.pkg";
+    assert!(
+        zip.windows(name.len()).any(|w| w == name.as_bytes()),
+        "the notarized app holds the package"
+    );
+    let mount = attach(&dmg, &w.dir.path().join("mnt"));
+    assert_eq!(
+        fs::read(
+            mount
+                .0
+                .join("Install Hello.app/Contents/Resources/lunepack-all-users.pkg")
+        )
+        .unwrap(),
+        signed_xar()
+    );
+}
+
+/// A package the signing tool leaves unsigned, or a tool that fails, stops `setup`: no image, no
+/// package, nothing beside them.
+#[test]
+fn a_failing_pkg_signing_step_leaves_nothing() {
+    if !macos_host("the all-users .pkg") {
+        return;
+    }
+    for (what, body, expect) in [
+        ("unsigned", "true", "is not signed after sign_installer"),
+        (
+            "failing",
+            "echo 'the identity is gone' >&2; exit 7",
+            "sign_installer failed",
+        ),
+        (
+            "not a package",
+            "cp \"$TOOLS/signed.macho\" \"$1\"",
+            "is not signed after sign_installer",
+        ),
+    ] {
+        let w = World::mac(SERVICE_MAC);
+        let tools = Tools::new(&w);
+        append_config(&w, &pkg_section(&tools, body));
+        let dir = w.dir.path().join("out");
+        fs::create_dir(&dir).unwrap();
+        let err = assert_fails(&mac_dmg(&w, &dir.join("hello.dmg")), 1, what);
+        assert!(err.contains(expect), "{what}: {err}");
+        assert!(
+            err.contains("installer.pkg") || err.contains("hello.pkg"),
+            "{what}: {err}"
+        );
+        assert!(names_in(&dir).is_empty(), "{what}: {:?}", names_in(&dir));
+    }
 }

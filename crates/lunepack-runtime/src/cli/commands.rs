@@ -12,7 +12,8 @@ use super::WaitTarget;
 use super::args::{Command, Parsed};
 use super::json::{Body, UpdateSummary};
 use super::progress::Output;
-use crate::modes::Kind;
+use crate::machine::{self, Host};
+use crate::modes::{Adapters, Kind};
 
 /// The platform the commands run on: the runtime's adapters, with the health token of this
 /// process's environment (an app's child inherits the one the supervisor gave it; the runtime
@@ -23,8 +24,12 @@ pub fn platform(base: &Platform) -> Platform {
 }
 
 /// Runs `parsed` for the tree `inst`. Progress goes to `output`; `cancel` ends a long operation;
-/// `wait` is the process `apply-and-restart` waits for (`None` for the other commands).
+/// `wait` is the process `apply-and-restart` waits for (`None` for the other commands). `host` is
+/// what a machine install's `repair` hands its work to; no other command receives it, so none of
+/// them can reach the elevation port (C4).
 pub fn run(
+    ad: &Adapters,
+    host: Option<&Host<'_>>,
     inst: &Installation,
     parsed: &Parsed,
     output: &Output,
@@ -45,7 +50,23 @@ pub fn run(
         Command::Startup => startup(inst, parsed),
         Command::Confirm => confirm(inst),
         Command::ApplyAndRestart => apply_and_restart(inst, parsed, wait),
+        Command::Repair => repair(ad, host, inst, parsed),
     }
+}
+
+/// `repair` (M10-D13): a machine install's update service registration and descriptor, re-made
+/// from the confirmed current version after one administrator approval (none when this process is
+/// an administrator's already). Anything that is not a machine install is a usage error.
+fn repair(
+    ad: &Adapters,
+    host: Option<&Host<'_>>,
+    inst: &Installation,
+    parsed: &Parsed,
+) -> Result<Body, Kind> {
+    let target = machine::target_of(&*ad.fs, &*ad.hasher, inst).ok_or(Kind::Usage)?;
+    let host = host.ok_or(Kind::Unsupported)?;
+    machine::repair(host, &target, parsed.silent)?;
+    Ok(Body::Repair)
 }
 
 /// Follows `inst`'s bundle to where the user moved it ([`lunepack::follow_move`]); a copy that is

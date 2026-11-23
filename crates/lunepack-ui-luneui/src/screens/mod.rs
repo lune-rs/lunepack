@@ -1,6 +1,7 @@
 //! The screens of the three flows. Each draws the main area (right of the rail) for one screen of
 //! a [`View`] and reports what the user did.
 
+pub(crate) mod admin;
 pub(crate) mod install;
 pub(crate) mod uninstall;
 pub(crate) mod update;
@@ -43,6 +44,8 @@ pub(crate) struct Out {
     pub focused: bool,
     /// The "open now" checkbox changed.
     pub launch: Option<bool>,
+    /// The welcome screen's "Install for all users" checkbox changed.
+    pub all_users: Option<bool>,
 }
 
 impl Draw<'_> {

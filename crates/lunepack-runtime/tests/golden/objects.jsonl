@@ -37,6 +37,12 @@
 {"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"no_release","exit_code":27}
 {"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"unsupported_location","exit_code":28,"reason":"translocated"}
 {"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"publisher_mismatch","exit_code":29,"reason":"different"}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"elevation_required","exit_code":30}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"elevation_declined","exit_code":31}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"service_unavailable","exit_code":32,"reason":"not_installed"}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"disabled_by_policy","exit_code":33}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"per_machine_unavailable","exit_code":34}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"not_protected","exit_code":35}
 {"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"internal","exit_code":70}
 {"schema":1,"type":"result","command":"apply-and-restart","tree_version":"1.0.0","version":"1.1.0","scheduled":true}
 {"schema":1,"type":"error","command":"apply-and-restart","tree_version":"1.0.0","kind":"nothing_staged","exit_code":12}
@@ -52,3 +58,11 @@
 {"schema":1,"type":"error","command":"download","tree_version":"1.0.0","kind":"publisher_mismatch","exit_code":29,"reason":"candidate_invalid"}
 {"schema":1,"type":"error","command":"download","tree_version":"1.0.0","kind":"publisher_mismatch","exit_code":29,"reason":"os"}
 {"schema":1,"type":"result","command":"download","tree_version":"1.0.0","version":"1.1.0","staged":true,"publisher":"installed_unsigned"}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"service_unavailable","exit_code":32,"reason":"disabled"}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"service_unavailable","exit_code":32,"reason":"start_failed"}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"service_unavailable","exit_code":32,"reason":"untrusted"}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"service_unavailable","exit_code":32,"reason":"timeout"}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"service_unavailable","exit_code":32,"reason":"protocol"}
+{"schema":1,"type":"error","command":"check","tree_version":"1.0.0","kind":"service_unavailable","exit_code":32,"reason":"unsupported"}
+{"schema":1,"type":"result","command":"repair","tree_version":"1.0.0","repaired":true}
+{"schema":1,"type":"error","command":"repair","tree_version":"1.0.0","kind":"elevation_required","exit_code":30}

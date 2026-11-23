@@ -12,6 +12,7 @@ pub mod exe_headers;
 mod hasher;
 mod http_server;
 mod integration;
+mod machine;
 mod memfs;
 mod process;
 mod publisher;
@@ -36,6 +37,10 @@ pub use integration::{
     FakeIntegration, IntegrationCall, IntegrationOp, SuiteHooks, run_integration_suite,
     run_integration_suite_with,
 };
+pub use machine::{
+    ElevationScript, FakeConnector, FakeElevation, FakeMachineIntegration, FakePolicy, FakeProtect,
+    FakeRegistrar, FaultFs, MachineIntegrationCall, MemDuplex, mem_duplex,
+};
 pub use memfs::{MemFs, MemPlace, RecoverMode};
 pub use process::{
     ChildScript, FakeChildPipes, FakePipeReader, FakePipeWriter, FakeProcess, SpawnRecord,
@@ -50,8 +55,8 @@ pub use signer::FakeSigner;
 pub use suites::{
     HashKat, SHA256_KATS, SignFixture, TransportCaps, VerifyKat, run_blocking_transport_suite,
     run_blocking_transport_suite_with, run_clock_suite, run_codec_suite, run_fs_suite,
-    run_fs_suite_with, run_hasher_suite, run_rng_suite, run_signer_suite, run_transport_suite,
-    run_verifier_suite,
+    run_fs_suite_with, run_hasher_suite, run_protect_suite, run_rng_suite,
+    run_service_channel_suite, run_signer_suite, run_transport_suite, run_verifier_suite,
 };
 pub use transport::{
     FAKE_BASE_URL, FakeBlockingTransport, FakeOrigin, FakeTransport, SeenRequest, TransportFault,

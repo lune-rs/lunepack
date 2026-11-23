@@ -14,14 +14,20 @@
 //! A reader that finds the magic parses the rest fail-closed ([`SetupTrailer::parse`]); nothing in
 //! the trailer is trusted beyond its shape: the root is the trust anchor the setup was built with,
 //! and every part is verified against it before use (M6-D4).
+//!
+//! A Windows setup file also carries a [`SetupAnchor`] in an `RT_RCDATA` resource of its runtime
+//! image (M10-D4): the SHA-256 digests of its trailer block, key set and manifest. Read from the
+//! process's own mapped image, it binds the payload to the image that was started (and, after a
+//! UAC prompt, to the image the administrator consented to); [`verify_setup_anchored`] checks it.
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::digest::Sha256Digest;
 use crate::error::{Error, Result};
 use crate::fs::{FsError, FsErrorKind, ReadAt};
 use crate::ident::AppId;
-use crate::keyset::verify_key_set;
+use crate::keyset::{VerifiedKeySet, verify_key_set};
 use crate::limits::Limits;
 use crate::manifest::{VerifiedManifest, read_entry, verify_payload_manifest};
 use crate::path::RelPath;
@@ -526,24 +532,50 @@ pub fn verify_setup(
     verifier: &dyn Verifier,
 ) -> Result<VerifiedSetup> {
     let keys_bytes = read_part(file, trailer.keys, "keys", Limits::V1.keys_doc_bytes)?;
-    let keys = verify_key_set(
-        &trailer.root,
-        &keys_bytes,
-        &RollbackFloor::default(),
-        clock,
-        hasher,
-        verifier,
-    )?;
     let manifest_bytes = read_part(
         file,
         trailer.manifest,
         "manifest",
         Limits::V1.manifest_doc_bytes,
     )?;
+    let (setup, _) = verify_parts(
+        trailer,
+        &keys_bytes,
+        &manifest_bytes,
+        file,
+        clock,
+        codec,
+        hasher,
+        verifier,
+    )?;
+    Ok(setup)
+}
+
+/// [`verify_setup`]'s checks over the key set and manifest bytes already read from `file`, so a
+/// caller that hashed those bytes verifies exactly them. Also returns the verified key set.
+#[allow(clippy::too_many_arguments)]
+fn verify_parts(
+    trailer: &SetupTrailer,
+    keys_bytes: &[u8],
+    manifest_bytes: &[u8],
+    file: &dyn ReadAt,
+    clock: &ClockReading,
+    codec: &dyn Codec,
+    hasher: &dyn Hasher,
+    verifier: &dyn Verifier,
+) -> Result<(VerifiedSetup, VerifiedKeySet)> {
+    let keys = verify_key_set(
+        &trailer.root,
+        keys_bytes,
+        &RollbackFloor::default(),
+        clock,
+        hasher,
+        verifier,
+    )?;
     let manifest = verify_payload_manifest(
         &keys,
         (&trailer.version, trailer.target),
-        &manifest_bytes,
+        manifest_bytes,
         clock.now(),
         hasher,
         verifier,
@@ -592,7 +624,168 @@ pub fn verify_setup(
     {
         return Err(Error::VersionMismatch);
     }
-    Ok(VerifiedSetup { manifest, config })
+    Ok((VerifiedSetup { manifest, config }, keys))
+}
+
+/// The id of the `RT_RCDATA` resource of a Windows setup file's runtime image that holds its
+/// [`SetupAnchor`] (M10-D4).
+pub const ANCHOR_RESOURCE_ID: u16 = 1;
+/// The first bytes of an encoded [`SetupAnchor`].
+pub const ANCHOR_MAGIC: [u8; 8] = *b"\x89LPANC\r\n";
+/// The size of an encoded [`SetupAnchor`]: the magic and three SHA-256 digests.
+pub const ANCHOR_SIZE: usize = 8 + 3 * 32;
+
+/// The SHA-256 digests a Windows setup file carries of its own payload in an `RT_RCDATA` resource
+/// of its runtime image (M10-D4): of the [`TRAILER_SIZE`]-byte trailer block as written, of the
+/// key-set part and of the manifest part (the manifest binds the pack). A process reading the
+/// anchor from its own mapped image verifies against what was started, whatever happens to the
+/// file afterwards ([`verify_setup_anchored`]).
+///
+/// Encoding ([`ANCHOR_SIZE`] bytes): [`ANCHOR_MAGIC`], then the trailer, key-set and manifest
+/// digests. Setup.exe is read only by the runtime inside it, so this is not a cross-version format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetupAnchor {
+    /// SHA-256 of the trailer block.
+    pub trailer: Sha256Digest,
+    /// SHA-256 of the key-set part.
+    pub keys: Sha256Digest,
+    /// SHA-256 of the manifest part.
+    pub manifest: Sha256Digest,
+}
+
+impl SetupAnchor {
+    /// What the packager stamps before the payload exists: the magic and 96 zero bytes. It is
+    /// patched in place with the real anchor once the trailer is written; never accepted.
+    pub const PLACEHOLDER: [u8; ANCHOR_SIZE] = {
+        let mut b = [0u8; ANCHOR_SIZE];
+        let mut i = 0;
+        while i < ANCHOR_MAGIC.len() {
+            b[i] = ANCHOR_MAGIC[i];
+            i += 1;
+        }
+        b
+    };
+
+    /// The anchor of a trailer block and the key-set and manifest parts' bytes.
+    pub fn of(
+        trailer_block: &[u8],
+        keys: &[u8],
+        manifest: &[u8],
+        hasher: &dyn Hasher,
+    ) -> SetupAnchor {
+        SetupAnchor {
+            trailer: hasher.sha256(trailer_block),
+            keys: hasher.sha256(keys),
+            manifest: hasher.sha256(manifest),
+        }
+    }
+
+    /// The [`ANCHOR_SIZE`]-byte encoding.
+    pub fn encode(&self) -> [u8; ANCHOR_SIZE] {
+        let mut out = [0u8; ANCHOR_SIZE];
+        out[..8].copy_from_slice(&ANCHOR_MAGIC);
+        out[8..40].copy_from_slice(self.trailer.as_bytes());
+        out[40..72].copy_from_slice(self.keys.as_bytes());
+        out[72..].copy_from_slice(self.manifest.as_bytes());
+        out
+    }
+
+    /// Parses an encoding: exactly [`ANCHOR_SIZE`] bytes starting with [`ANCHOR_MAGIC`], else
+    /// [`Error::SetupAnchor`]. The placeholder parses (to all-zero digests); it is refused by
+    /// [`verify_setup_anchored`].
+    pub fn parse(bytes: &[u8]) -> Result<SetupAnchor> {
+        if bytes.len() != ANCHOR_SIZE || bytes[..8] != ANCHOR_MAGIC {
+            return Err(Error::SetupAnchor("malformed"));
+        }
+        let digest = |at: usize| {
+            let mut d = [0u8; 32];
+            d.copy_from_slice(&bytes[at..at + 32]);
+            Sha256Digest::from_bytes(d)
+        };
+        Ok(SetupAnchor {
+            trailer: digest(8),
+            keys: digest(40),
+            manifest: digest(72),
+        })
+    }
+
+    /// Whether this is the placeholder (every digest zero).
+    pub fn is_placeholder(&self) -> bool {
+        self.encode() == Self::PLACEHOLDER
+    }
+}
+
+/// A setup file's payload verified against its anchor.
+#[derive(Debug, Clone)]
+pub struct AnchoredSetup {
+    /// The parsed trailer (where the parts lie in the file).
+    pub trailer: SetupTrailer,
+    /// The verified payload.
+    pub setup: VerifiedSetup,
+    /// The version of the key set the verification accepted (a floor of a first record).
+    pub keyset_version: u64,
+}
+
+/// Verifies a setup file against `anchor` (M10-D4), the one check a Windows setup makes before it
+/// trusts its payload. `trailer_block` is the [`TRAILER_SIZE`] bytes before `end` (the end of the
+/// setup data, [`locate_file`]); `file` the setup file. Fail-closed, in this order:
+///
+/// 1. the anchor is not the placeholder (before any hashing);
+/// 2. the trailer block's SHA-256 is the anchor's, before the trailer is parsed;
+/// 3. the trailer parses ([`SetupTrailer::parse`] with `end` as the file size);
+/// 4. the key-set part and then the manifest part, each read once within its cap, hash to the
+///    anchor's digests;
+/// 5. [`verify_setup`]'s checks over exactly those bytes (the pack is bound by the manifest).
+///
+/// Steps 1, 2 and 4 fail with [`Error::SetupAnchor`]; the rest with what [`verify_setup`] returns.
+/// The trailer's root is never trusted on its own: it is trusted because the trailer block is the
+/// one the anchor names.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_setup_anchored(
+    anchor: &SetupAnchor,
+    trailer_block: &[u8],
+    file: &dyn ReadAt,
+    end: u64,
+    clock: &ClockReading,
+    codec: &dyn Codec,
+    hasher: &dyn Hasher,
+    verifier: &dyn Verifier,
+) -> Result<AnchoredSetup> {
+    if anchor.is_placeholder() {
+        return Err(Error::SetupAnchor("the anchor was never written"));
+    }
+    if hasher.sha256(trailer_block) != anchor.trailer {
+        return Err(Error::SetupAnchor("trailer"));
+    }
+    let trailer = SetupTrailer::parse(trailer_block, end, hasher, verifier)?;
+    let keys_bytes = read_part(file, trailer.keys, "keys", Limits::V1.keys_doc_bytes)?;
+    if hasher.sha256(&keys_bytes) != anchor.keys {
+        return Err(Error::SetupAnchor("key set"));
+    }
+    let manifest_bytes = read_part(
+        file,
+        trailer.manifest,
+        "manifest",
+        Limits::V1.manifest_doc_bytes,
+    )?;
+    if hasher.sha256(&manifest_bytes) != anchor.manifest {
+        return Err(Error::SetupAnchor("manifest"));
+    }
+    let (setup, keys) = verify_parts(
+        &trailer,
+        &keys_bytes,
+        &manifest_bytes,
+        file,
+        clock,
+        codec,
+        hasher,
+        verifier,
+    )?;
+    Ok(AnchoredSetup {
+        trailer,
+        setup,
+        keyset_version: keys.version(),
+    })
 }
 
 #[cfg(test)]
@@ -603,5 +796,8 @@ mod tests {
     fn the_footer_and_the_magic_have_their_sizes() {
         assert_eq!(FOOTER_SIZE, 4 + 4 + 8 + 3 * 16 + TRAILER_MAGIC.len());
         assert!(!has_magic(&[0u8; 8]));
+        assert_eq!(ANCHOR_SIZE, 104);
+        assert_eq!(&SetupAnchor::PLACEHOLDER[..8], &ANCHOR_MAGIC);
+        assert!(SetupAnchor::PLACEHOLDER[8..].iter().all(|&b| b == 0));
     }
 }

@@ -155,6 +155,20 @@ fn scenes() -> Vec<Scene> {
         scenario::install_welcome(OS, LONG_NAME, false),
         600,
     );
+    // The all-users choice offered: unchecked, then ticked by a click (the pointer away, the
+    // selection animation long done).
+    still(
+        "install-welcome-scope",
+        Flow::Install,
+        scenario::install_welcome_offering_all_users(OS, scenario::APP_NAME, true),
+        600,
+    );
+    still(
+        "install-welcome-scope-all",
+        Flow::Install,
+        scenario::install_welcome_all_users_ticked(OS, 700),
+        1400,
+    );
     still(
         "install-installing",
         Flow::Install,
@@ -171,6 +185,38 @@ fn scenes() -> Vec<Scene> {
         "install-failed",
         Flow::Install,
         scenario::install_failed(OS, 1000, 4000, 9),
+        5500,
+    );
+    // The two screens that end an operation elsewhere (M11 step 8): the administrator command
+    // (short, long, and exactly the cap; an uninstall's) and the hand-off to Installer.
+    still(
+        "install-admin-command",
+        Flow::Install,
+        scenario::install_admin_command(OS, 1000, 4000, scenario::ADMIN_COMMAND),
+        5500,
+    );
+    still(
+        "install-admin-command-long",
+        Flow::Install,
+        scenario::install_admin_command(OS, 1000, 4000, scenario::ADMIN_COMMAND_LONG),
+        5500,
+    );
+    still(
+        "install-admin-command-max",
+        Flow::Install,
+        scenario::install_admin_command(OS, 1000, 4000, &scenario::admin_command_max()),
+        5500,
+    );
+    still(
+        "uninstall-admin-command",
+        Flow::Uninstall,
+        scenario::uninstall_admin_command(OS, 1000, 4000, scenario::ADMIN_COMMAND_UNINSTALL),
+        5500,
+    );
+    still(
+        "install-handed-off",
+        Flow::Install,
+        scenario::install_handed_off(OS, 1000, 4000),
         5500,
     );
     still(
@@ -423,12 +469,14 @@ fn reachable(screen: Screen) -> bool {
         | Screen::UninstallConfirm
         | Screen::Uninstalling
         | Screen::UninstallDone
-        | Screen::UninstallFailed => true,
+        | Screen::UninstallFailed
+        | Screen::AdminCommand
+        | Screen::HandedOff => true,
     }
 }
 
 /// Every screen the reducer can reach, listed once.
-const ALL_SCREENS: [Screen; 15] = [
+const ALL_SCREENS: [Screen; 17] = [
     Screen::Idle,
     Screen::InstallWelcome,
     Screen::Installing,
@@ -443,6 +491,8 @@ const ALL_SCREENS: [Screen; 15] = [
     Screen::Uninstalling,
     Screen::UninstallDone,
     Screen::UninstallFailed,
+    Screen::AdminCommand,
+    Screen::HandedOff,
     Screen::Closed,
 ];
 

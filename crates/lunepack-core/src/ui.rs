@@ -40,6 +40,8 @@ pub const MAX_LEFTOVERS: usize = 64;
 pub const MAX_LEFTOVER: usize = 4096;
 /// Longest build id in bytes.
 pub const MAX_BUILD_ID: usize = 256;
+/// Longest administrator command in bytes (M11-D9, D14: `sudo '<path>' ...`).
+pub const MAX_ADMIN_COMMAND: usize = 1024;
 
 /// The build id of this build: [`BUILD_ID`], plus `.<id>` when the release build sets
 /// `LUNEPACK_BUILD_ID` while compiling the core (M13).
@@ -103,6 +105,10 @@ pub enum ProtocolError {
     /// A name is not in the closed set for this field.
     #[error("field `{0}` has an unknown value")]
     UnknownValue(&'static str),
+    /// A text holds a control character, an invisible or direction-changing character, or a space
+    /// other than U+0020, or is empty (a field that is shown to a person to copy and run).
+    #[error("field `{0}` is empty or holds a character that is not printable")]
+    BadText(&'static str),
     /// A string or list is over its cap.
     #[error("{what} is over its cap of {cap}")]
     TooLong {
@@ -158,6 +164,10 @@ pub struct Details {
     pub location: Option<String>,
     /// How much space the install takes, in bytes.
     pub size_bytes: Option<u64>,
+    /// Where the app would be installed for all users (at most [`MAX_LOCATION`] bytes). The
+    /// install welcome screen offers the choice exactly when this is present; only an install
+    /// hello may carry it.
+    pub all_users_location: Option<String>,
 }
 
 /// One item of work the engine reports as done. Which items belong to which flow is fixed by
@@ -220,6 +230,12 @@ pub enum PromptKind {
     Failed,
     /// Update: acknowledge that the previous version was restored.
     RolledBack,
+    /// Install and uninstall: close the screen that shows the administrator command
+    /// ([`EngineMsg::AdminCommand`]).
+    AdminCommand,
+    /// Install: close the screen that says to continue in Installer
+    /// ([`EngineMsg::HandedOffToInstaller`]).
+    HandedOff,
 }
 
 /// An answer to a prompt.
@@ -227,6 +243,9 @@ pub enum PromptKind {
 pub enum ChoiceValue {
     /// Go ahead.
     Proceed,
+    /// Go ahead and install for all users; valid only on the install welcome prompt, and only
+    /// when the hello offered it ([`Details::all_users_location`]).
+    ProceedAllUsers,
     /// Do not.
     Cancel,
     /// Leave the done screen; `launch` starts the app.
@@ -317,6 +336,18 @@ pub enum EngineMsg {
     },
     /// Whether the user may cancel the running operation now.
     Cancellable(bool),
+    /// The operation needs an administrator and no prompt of ours can ask for one: show this
+    /// command to run in a terminal as one (M11-D9, D14). Valid while an install or an uninstall
+    /// runs; the screen then asks [`PromptKind::AdminCommand`] and the operation is over for the UI.
+    /// The command is shown as it is, selectable and copyable, and never run by the UI.
+    AdminCommand {
+        /// The text the engine built: at most [`MAX_ADMIN_COMMAND`] bytes, not empty, printable.
+        command: String,
+    },
+    /// The operation was handed to the operating system's installer (the macOS `.pkg`, M11-D8):
+    /// the window says to continue there. Valid while an install runs; the screen then asks
+    /// [`PromptKind::HandedOff`].
+    HandedOffToInstaller,
     /// The operation ended.
     Outcome(Outcome),
     /// A liveness probe; the UI answers with `Pong` of the same `n`.
@@ -371,6 +402,29 @@ fn check_bytes(text: &str, what: &'static str, cap: usize) -> Result<(), Protoco
     }
 }
 
+/// Whether `c` may not appear in a text a person copies into a terminal as an administrator: a
+/// control character (newline and tab included), a space other than U+0020, or a character that
+/// is invisible or reorders the text it sits in (zero-width and direction marks and overrides,
+/// the BOM, the soft hyphen), any of which could make the screen show something else than what
+/// would run.
+fn hides_text(c: char) -> bool {
+    c.is_control()
+        || (c.is_whitespace() && c != ' ')
+        || matches!(c,
+            '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}')
+}
+
+/// `text` is not empty and holds no character that [`hides_text`] names.
+fn check_printable(text: &str, what: &'static str) -> Result<(), ProtocolError> {
+    if text.is_empty() || text.chars().any(hides_text) {
+        Err(ProtocolError::BadText(what))
+    } else {
+        Ok(())
+    }
+}
+
 fn check_int(n: u64, what: &'static str) -> Result<(), ProtocolError> {
     if n <= MAX_JSON_INT {
         Ok(())
@@ -383,9 +437,9 @@ fn validate_engine(msg: &EngineMsg) -> Result<(), ProtocolError> {
     match msg {
         EngineMsg::Hello {
             build_id,
+            flow,
             app,
             details,
-            ..
         } => {
             check_bytes(build_id, "build_id", MAX_BUILD_ID)?;
             check_scalars(&app.name, "app name", MAX_NAME)?;
@@ -405,6 +459,12 @@ fn validate_engine(msg: &EngineMsg) -> Result<(), ProtocolError> {
             }
             if let Some(l) = &details.location {
                 check_bytes(l, "location", MAX_LOCATION)?;
+            }
+            if let Some(l) = &details.all_users_location {
+                check_bytes(l, "all_users_location", MAX_LOCATION)?;
+                if *flow != Flow::Install {
+                    return out_of_order("an all-users location outside the install flow");
+                }
             }
             if let Some(n) = details.size_bytes {
                 check_int(n, "size_bytes")?;
@@ -429,9 +489,14 @@ fn validate_engine(msg: &EngineMsg) -> Result<(), ProtocolError> {
                 check_bytes(path, "leftover", MAX_LEFTOVER)?;
             }
         }
+        EngineMsg::AdminCommand { command } => {
+            check_bytes(command, "administrator command", MAX_ADMIN_COMMAND)?;
+            check_printable(command, "command")?;
+        }
         EngineMsg::Step { .. }
         | EngineMsg::Prompt { .. }
         | EngineMsg::Cancellable(_)
+        | EngineMsg::HandedOffToInstaller
         | EngineMsg::Outcome(_)
         | EngineMsg::Ping { .. }
         | EngineMsg::Close => {}
@@ -473,6 +538,8 @@ const PROMPTS: &[(&str, PromptKind)] = &[
     ("done", PromptKind::Done),
     ("failed", PromptKind::Failed),
     ("rolled_back", PromptKind::RolledBack),
+    ("admin_command", PromptKind::AdminCommand),
+    ("handed_off", PromptKind::HandedOff),
 ];
 
 /// Phase names, as the runtime's JSON writes them (`events.rs`); `Phase` carries no serde.
@@ -720,6 +787,11 @@ impl Message for EngineMsg {
                 m.insert("app".into(), Value::Object(a));
                 let mut d = Map::new();
                 insert_opt(&mut d, "location", details.location.as_ref());
+                insert_opt(
+                    &mut d,
+                    "all_users_location",
+                    details.all_users_location.as_ref(),
+                );
                 if let Some(n) = details.size_bytes {
                     d.insert("size_bytes".into(), Value::from(n));
                 }
@@ -759,6 +831,11 @@ impl Message for EngineMsg {
                 m = base("outcome");
                 outcome_json(&mut m, outcome);
             }
+            EngineMsg::AdminCommand { command } => {
+                m = base("admin_command");
+                m.insert("command".into(), Value::from(command.as_str()));
+            }
+            EngineMsg::HandedOffToInstaller => m = base("handed_off_to_installer"),
             EngineMsg::Ping { n } => {
                 m = base("ping");
                 m.insert("n".into(), Value::from(*n));
@@ -791,6 +868,7 @@ impl Message for EngineMsg {
                 a.done()?;
                 let mut d = Fields::of(f.take("details")?, "details")?;
                 let location = d.opt_string("location")?;
+                let all_users_location = d.opt_string("all_users_location")?;
                 let size_bytes = match d.0.remove("size_bytes") {
                     None => None,
                     Some(v) => Some(Fields::uint_of(v, "size_bytes", MAX_JSON_INT)?),
@@ -803,6 +881,7 @@ impl Message for EngineMsg {
                     details: Details {
                         location,
                         size_bytes,
+                        all_users_location,
                     },
                 }
             }
@@ -820,6 +899,10 @@ impl Message for EngineMsg {
             },
             "cancellable" => EngineMsg::Cancellable(f.boolean("value")?),
             "outcome" => EngineMsg::Outcome(read_outcome(&mut f)?),
+            "admin_command" => EngineMsg::AdminCommand {
+                command: f.string("command")?,
+            },
+            "handed_off_to_installer" => EngineMsg::HandedOffToInstaller,
             "ping" => EngineMsg::Ping { n: f.u32("n")? },
             "close" => EngineMsg::Close,
             _ => return Err(ProtocolError::UnknownType),
@@ -844,6 +927,7 @@ impl Message for UiMsg {
                 m.insert("id".into(), Value::from(*id));
                 let (name, extra): (&str, Option<(&str, Value)>) = match value {
                     ChoiceValue::Proceed => ("proceed", None),
+                    ChoiceValue::ProceedAllUsers => ("proceed_all_users", None),
                     ChoiceValue::Cancel => ("cancel", None),
                     ChoiceValue::Finish { launch } => {
                         ("finish", Some(("launch", Value::Bool(*launch))))
@@ -879,6 +963,7 @@ impl Message for UiMsg {
                 let id = f.u32("id")?;
                 let value = match f.string("value")?.as_str() {
                     "proceed" => ChoiceValue::Proceed,
+                    "proceed_all_users" => ChoiceValue::ProceedAllUsers,
                     "cancel" => ChoiceValue::Cancel,
                     "finish" => ChoiceValue::Finish {
                         launch: f.boolean("launch")?,
@@ -983,6 +1068,10 @@ pub enum Screen {
     UninstallDone,
     /// Uninstall: failed.
     UninstallFailed,
+    /// Install and uninstall: the command to run as an administrator ([`EngineMsg::AdminCommand`]).
+    AdminCommand,
+    /// Install: continue in the operating system's installer ([`EngineMsg::HandedOffToInstaller`]).
+    HandedOff,
     /// The window is closed.
     Closed,
 }
@@ -1010,13 +1099,19 @@ struct OpenPrompt {
 /// it receives. One reducer per flow, selected by the hello. The engine asks
 /// [`FlowState::accepts`] about every message from the UI and refuses what it does not accept.
 ///
-/// - Install: welcome prompt, then `proceed` or `cancel`; installing (progress and steps); then
+/// - Install: welcome prompt, then `proceed` or `cancel` (or `proceed_all_users`, when the hello
+///   offered it); installing (progress and steps); then
 ///   `Installed` and the done prompt (`finish`), or `Failed` and the failed prompt (`retry`, which
 ///   goes back to installing, or `close`).
 /// - Update: waiting, applying, starting; then `Updated` (the window closes), or `RolledBack` and
 ///   the acknowledge prompt, or `Failed` and the failed prompt (`close`).
 /// - Uninstall: the confirm prompt; removing; `Uninstalled` and the done prompt (`close`, or
 ///   `reveal` of a leftover the outcome listed) or `UninstallFailed` and the failed prompt.
+///
+/// - Install and uninstall, while running: `AdminCommand` (the screen of the command to run as an
+///   administrator; an uninstall too) and, install only, `HandedOffToInstaller`. Each ends the
+///   operation for the UI: the matching prompt (`close`) is the only thing that follows, then
+///   `Close`; no progress, step, outcome or `Cancellable` is accepted after it.
 ///
 /// `Ping` is valid in every state after the hello and changes no screen. A cancel before an
 /// outcome (the `cancel` choice of a prompt, or `Cancel` while cancellable) is the only way
@@ -1034,6 +1129,10 @@ pub struct FlowState {
     ping: Option<u32>,
     outcome: Option<Outcome>,
     leftovers: usize,
+    all_users_offered: bool,
+    /// An [`EngineMsg::AdminCommand`] or [`EngineMsg::HandedOffToInstaller`] was applied: the
+    /// operation is over for the UI, which only waits for the close.
+    handed_off: bool,
 }
 
 impl Default for FlowState {
@@ -1061,6 +1160,8 @@ impl FlowState {
             ping: None,
             outcome: None,
             leftovers: 0,
+            all_users_offered: false,
+            handed_off: false,
         }
     }
 
@@ -1089,7 +1190,13 @@ impl FlowState {
 
     /// Whether a `Cancel` is accepted now.
     pub fn cancellable(&self) -> bool {
-        self.cancellable && self.outcome.is_none() && self.flow.is_some()
+        self.cancellable && self.outcome.is_none() && !self.handed_off && self.flow.is_some()
+    }
+
+    /// Whether the hello offered the all-users install (an install flow with a
+    /// [`Details::all_users_location`]).
+    pub fn all_users_offered(&self) -> bool {
+        self.all_users_offered
     }
 
     /// How the operation ended, once it did.
@@ -1114,6 +1221,10 @@ impl FlowState {
             }
             (Flow::Install, Screen::InstallDone) => Some(PromptKind::Done),
             (Flow::Install, Screen::InstallFailed) => Some(PromptKind::Failed),
+            (Flow::Install | Flow::Uninstall, Screen::AdminCommand) => {
+                Some(PromptKind::AdminCommand)
+            }
+            (Flow::Install, Screen::HandedOff) => Some(PromptKind::HandedOff),
             (Flow::Update, Screen::UpdateRolledBack) => Some(PromptKind::RolledBack),
             (Flow::Update, Screen::UpdateFailed) => Some(PromptKind::Failed),
             (Flow::Uninstall, Screen::UninstallConfirm) if self.outcome.is_none() => {
@@ -1127,7 +1238,7 @@ impl FlowState {
 
     /// Applies a message the engine sends (or the UI receives).
     pub fn apply(&mut self, msg: &EngineMsg) -> Result<(), ProtocolError> {
-        if let EngineMsg::Hello { flow, .. } = msg {
+        if let EngineMsg::Hello { flow, details, .. } = msg {
             if self.flow.is_some() {
                 return out_of_order("a second hello");
             }
@@ -1135,6 +1246,7 @@ impl FlowState {
                 return out_of_order("the hello names another flow");
             }
             self.flow = Some(*flow);
+            self.all_users_offered = *flow == Flow::Install && details.all_users_location.is_some();
             self.screen = match flow {
                 Flow::Install => Screen::InstallWelcome,
                 Flow::Update => Screen::UpdateWaiting,
@@ -1161,7 +1273,7 @@ impl FlowState {
                 Ok(())
             }
             EngineMsg::Cancellable(on) => {
-                if self.outcome.is_some() {
+                if self.outcome.is_some() || self.handed_off {
                     return out_of_order("cancellable after the outcome");
                 }
                 self.cancellable = *on;
@@ -1199,8 +1311,32 @@ impl FlowState {
                 });
                 Ok(())
             }
+            EngineMsg::AdminCommand { .. } => {
+                if flow == Flow::Update {
+                    return out_of_order("an administrator command in the update flow");
+                }
+                self.hand_off(Screen::AdminCommand)
+            }
+            EngineMsg::HandedOffToInstaller => {
+                if flow != Flow::Install {
+                    return out_of_order("a hand-off to the installer outside the install flow");
+                }
+                self.hand_off(Screen::HandedOff)
+            }
             EngineMsg::Outcome(outcome) => self.finish_with(flow, outcome),
         }
+    }
+
+    /// The operation goes on elsewhere: only while it runs with no prompt open, and then only
+    /// the prompt of `screen` and the close follow.
+    fn hand_off(&mut self, screen: Screen) -> Result<(), ProtocolError> {
+        if !self.is_running() {
+            return out_of_order("a hand-off while not running");
+        }
+        self.handed_off = true;
+        self.cancellable = false;
+        self.set_screen(screen);
+        Ok(())
     }
 
     fn progress(&mut self, flow: Flow, phase: Phase) -> Result<(), ProtocolError> {
@@ -1239,7 +1375,7 @@ impl FlowState {
     }
 
     fn finish_with(&mut self, flow: Flow, outcome: &Outcome) -> Result<(), ProtocolError> {
-        if self.outcome.is_some() || self.prompt.is_some() {
+        if self.outcome.is_some() || self.prompt.is_some() || self.handed_off {
             return out_of_order("an outcome after one, or with a prompt open");
         }
         let screen = match (flow, outcome) {
@@ -1305,6 +1441,7 @@ impl FlowState {
         use ChoiceValue as C;
         match (flow, kind, value) {
             (Flow::Install, PromptKind::Welcome, C::Proceed | C::Cancel) => true,
+            (Flow::Install, PromptKind::Welcome, C::ProceedAllUsers) => self.all_users_offered,
             (Flow::Uninstall, PromptKind::Confirm, C::Proceed | C::Cancel) => true,
             (Flow::Install, PromptKind::Done, C::Finish { .. }) => true,
             (Flow::Install, PromptKind::Failed, C::Retry | C::Close) => true,
@@ -1314,6 +1451,8 @@ impl FlowState {
             }
             (Flow::Uninstall | Flow::Update, PromptKind::Failed, C::Close) => true,
             (Flow::Update, PromptKind::RolledBack, C::Acknowledge) => true,
+            (Flow::Install | Flow::Uninstall, PromptKind::AdminCommand, C::Close) => true,
+            (Flow::Install, PromptKind::HandedOff, C::Close) => true,
             _ => false,
         }
     }
@@ -1337,7 +1476,7 @@ impl FlowState {
                     self.answered = true;
                     self.cancel_requested = true;
                 }
-                ChoiceValue::Proceed => {
+                ChoiceValue::Proceed | ChoiceValue::ProceedAllUsers => {
                     self.prompt = None;
                     let next = if self.flow == Some(Flow::Install) {
                         Screen::Installing
@@ -1359,6 +1498,76 @@ impl FlowState {
             },
         }
         Ok(())
+    }
+}
+
+/// The fuzz harness over the UI frames (`fuzz::ui`): the first byte selects the direction (even: the
+/// engine's frames, read by a UI and applied to a reducer that answers its prompts; odd: the UI's frames, read by the engine
+/// and checked against a reducer that is at its welcome prompt), the rest is the byte stream.
+/// Accepted: every frame decoded (and applied) and the stream ended on a frame boundary.
+pub(crate) fn fuzz_run(data: &[u8]) -> bool {
+    let Some((side, rest)) = data.split_first() else {
+        return false;
+    };
+    let mut input = std::io::Cursor::new(rest);
+    if side % 2 == 0 {
+        let mut state = FlowState::new();
+        loop {
+            match read_frame::<_, EngineMsg>(&mut input) {
+                Ok(msg) => {
+                    if state.apply(&msg).is_err() {
+                        return false;
+                    }
+                    // A UI that answers every prompt with its first fitting choice, so the
+                    // frames after a prompt reach the states behind it.
+                    if let Some((id, _)) = state.open_prompt() {
+                        for value in [
+                            ChoiceValue::Proceed,
+                            ChoiceValue::Close,
+                            ChoiceValue::Acknowledge,
+                            ChoiceValue::Finish { launch: false },
+                        ] {
+                            if state.answer(&UiMsg::Choice { id, value }).is_ok() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(ProtocolError::Closed) => return true,
+                Err(_) => return false,
+            }
+        }
+    }
+    let mut state = FlowState::new();
+    let hello = EngineMsg::Hello {
+        build_id: build_id(),
+        flow: Flow::Install,
+        app: AppCard {
+            name: "A".into(),
+            version: "1".into(),
+            from_version: None,
+            publisher: None,
+            icon_png: None,
+        },
+        details: Details {
+            location: None,
+            size_bytes: None,
+            all_users_location: Some("/opt/A".into()),
+        },
+    };
+    let _ = state.apply(&hello);
+    let _ = state.apply(&EngineMsg::Prompt {
+        id: 1,
+        kind: PromptKind::Welcome,
+    });
+    loop {
+        match read_frame::<_, UiMsg>(&mut input) {
+            Ok(msg) => {
+                let _ = state.accepts(&msg);
+            }
+            Err(ProtocolError::Closed) => return true,
+            Err(_) => return false,
+        }
     }
 }
 

@@ -1,0 +1,2360 @@
+//! The privileged engine of a per-machine install (M10, C8): the only writer of the machine tree
+//! `R` (`<Program Files>\<display name>` on Windows). It runs as LocalSystem inside the update
+//! service, or once as an administrator after consent, and serves the requests of the service
+//! protocol ([`crate::service`]) through [`serve`].
+//!
+//! Trust (M4-SEC-obs1, M10-D2, M10-D17): the engine takes the install root from its host and
+//! nothing else about location. The trust root and the floors come from the machine record alone;
+//! the channel from the installed tree's own update configuration; the candidate from its own
+//! [`select_candidate`] over the feed it verified. Every byte a client sends is first written into
+//! a folder only administrators can reach (`R\.lunepack\machine\incoming\<random>\`), hashed while
+//! written, and kept only when it is an object of the verified manifest. It reads no clock,
+//! randomness, environment or filesystem except through its ports; the supervision lease's
+//! monotonic time is passed in by the host.
+//!
+//! Every operation goes: take the engine's lock (`R\.lunepack\machine\lock`), check the tree's
+//! protection, load the machine record, make one pure transition, commit it, then the side
+//! effects (the projection of [`Ports::scheme`], then the integration), then answer. A refusal
+//! changes nothing.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+// `Duration` is a plain value (no clock is read); the purity test forbids `std::time` as a whole.
+use core::time::Duration;
+
+use crate::cancel::CancelToken;
+use crate::chain::{RootWalk, raised_floors};
+use crate::codesign::{Decision, decide};
+use crate::digest::Sha256Digest;
+use crate::encoding::hex_encode;
+use crate::error::{Error, LayoutError, LifecycleError, ProtectError, ServiceError, StageError};
+use crate::fs::{FileKind, FileWrite, Fs, FsErrorKind, LockGuard};
+use crate::ident::{AppId, Channel};
+use crate::integration::{IntegrationError, IntegrationRequest, OsIntegration};
+use crate::layout::{
+    GC_PREFIX, MachineLayout, MachineScheme, OUT_SLOT, Projection, RootChoice, SWAP_SLOT,
+    TOMBSTONE_RANDOM_BYTES, is_tombstone_of, resolve_machine_bundle_target, resolve_root_scoped,
+    service_path_in_tree_for, set_bundle_pointer, tombstone_name, tree_identity,
+};
+use crate::lifecycle::{AttemptOutcome, ConfirmOutcome, gc_keep, machine};
+use crate::manifest::{VerifiedEntry, VerifiedManifest, verify_manifest};
+use crate::policy::select_candidate;
+use crate::process::Process;
+use crate::progress::Progress;
+use crate::root::TrustedRoot;
+use crate::service::{
+    AttemptAnswer, CommitOutcome, ConfirmAnswer, Duplex, ErrorCode, MAX_COMMITS, MAX_NEED_FETCH,
+    ObjectKind, PendingStatus, Request, Response, ServerSession, StatusReport, Token, VerifyClass,
+};
+use crate::setup::VerifiedSetup;
+use crate::stage::{PARTIAL_SUFFIX, SourceFor, StageEnv, StageInput, scan, stage};
+use crate::state::{
+    Floors, InstallState, Loaded, MAX_BAD_VERSIONS, MachineStore, Scope, StagedRef, load_any,
+};
+use crate::traits::{
+    Clock, Codec, DirClass, HashState, Hasher, PolicySource, Protect, PublisherCheck, Rng,
+    ServiceRegistrar, SignedTree, Verifier,
+};
+use crate::trust::ClockReading;
+use crate::update_config::{MAX_UPDATE_CONFIG_BYTES, PublisherPolicy, UpdateConfig};
+use crate::version::Version;
+
+/// The version trees' directory under `R`.
+pub const APP_DIR: &str = "app";
+/// The machine tree's private directory under `R`.
+pub const LUNEPACK_DIR: &str = ".lunepack";
+/// The machine record's directory under `R\.lunepack`.
+pub const STATE_DIR: &str = "state";
+/// The admin-only directory under `R\.lunepack`.
+pub const MACHINE_DIR: &str = "machine";
+/// The upload staging directory under `R\.lunepack\machine`.
+pub const INCOMING_DIR: &str = "incoming";
+/// The engine's lock file under `R\.lunepack\machine`.
+pub const LOCK_FILE: &str = "lock";
+/// Added to the health timeout for a supervision lease.
+pub const LEASE_GRACE: Duration = Duration::from_secs(15);
+/// The health timeout a lease uses is clamped to this range (seconds).
+pub const HEALTH_TIMEOUT_RANGE: (u64, u64) = (5, 3600);
+/// Bytes of the random name of a session's upload folder.
+pub const SESSION_NAME_BYTES: usize = 16;
+/// The stage budget the engine runs with (one worker).
+pub const STAGE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+/// Suffix of an upload being written.
+pub const PART_SUFFIX: &str = ".part";
+
+/// Why an engine operation was refused: one protocol code (and a class for `verify_failed`).
+/// Nothing else crosses the boundary; the engine changed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineError {
+    /// The code.
+    pub code: ErrorCode,
+    /// The verification class, for [`ErrorCode::VerifyFailed`].
+    pub class: Option<VerifyClass>,
+}
+
+impl EngineError {
+    fn of(code: ErrorCode) -> EngineError {
+        EngineError { code, class: None }
+    }
+
+    fn verify(e: &Error) -> EngineError {
+        EngineError {
+            code: ErrorCode::VerifyFailed,
+            class: Some(verify_class(e)),
+        }
+    }
+
+    /// The `error` answer.
+    pub fn to_response(self) -> Response {
+        Response::Error {
+            code: self.code,
+            class: self.class,
+        }
+    }
+}
+
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.class {
+            Some(c) => write!(f, "{} ({c})", self.code),
+            None => write!(f, "{}", self.code),
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
+
+/// The closed verification class of a core verification error; the detail stays local.
+fn verify_class(e: &Error) -> VerifyClass {
+    match e {
+        Error::Signature(_)
+        | Error::SignatureCount { .. }
+        | Error::SignatureLength { .. }
+        | Error::KeyIdSyntax(_)
+        | Error::Threshold { .. }
+        | Error::KeyIdMismatch
+        | Error::DuplicatePublicKey
+        | Error::KeyThreshold { .. }
+        | Error::KeyWindow
+        | Error::RootVersion { .. } => VerifyClass::Signature,
+        Error::Expired { .. } => VerifyClass::Expired,
+        Error::Rollback { .. } | Error::KeySetRootVersion { .. } => VerifyClass::Rollback,
+        Error::ArtifactSize { .. } | Error::ArtifactHash => VerifyClass::Hash,
+        Error::AppIdMismatch => VerifyClass::AppMismatch,
+        _ => VerifyClass::Format,
+    }
+}
+
+fn lifecycle_code(e: LifecycleError) -> EngineError {
+    EngineError::of(match e {
+        LifecycleError::NothingStaged | LifecycleError::StagedIssuedUnbound => {
+            ErrorCode::NothingStaged
+        }
+        LifecycleError::StagedVersionMismatch => ErrorCode::VersionMismatch,
+        LifecycleError::PendingExists => ErrorCode::PendingExists,
+        LifecycleError::NotPending => ErrorCode::NotPending,
+        LifecycleError::TokenMismatch => ErrorCode::TokenMismatch,
+        LifecycleError::BadFull => ErrorCode::BadFull,
+        // A record of the wrong scope cannot reach here (the store refuses it), nor can the
+        // other refusals of the first-install transitions.
+        _ => ErrorCode::Internal,
+    })
+}
+
+fn internal<E>(_: E) -> EngineError {
+    EngineError::of(ErrorCode::Internal)
+}
+
+/// The capabilities the engine runs with; nothing else reaches it.
+#[derive(Clone, Copy)]
+pub struct Ports<'a> {
+    /// The filesystem.
+    pub fs: &'a dyn Fs,
+    /// The frame decoder.
+    pub codec: &'a dyn Codec,
+    /// SHA-256.
+    pub hasher: &'a dyn Hasher,
+    /// Signature verification.
+    pub verifier: &'a dyn Verifier,
+    /// Wall time, for document expiry only (never for the lease).
+    pub clock: &'a dyn Clock,
+    /// Randomness (tokens, session folder names).
+    pub rng: &'a dyn Rng,
+    /// The machine-scope desktop integration.
+    pub integration: &'a dyn OsIntegration,
+    /// The publisher-continuity check (M9).
+    pub publisher: &'a dyn PublisherCheck,
+    /// Protected directories.
+    pub protect: &'a dyn Protect,
+    /// The administrator's policy.
+    pub policy: &'a dyn PolicySource,
+    /// The operating system's service registration.
+    pub registrar: &'a dyn ServiceRegistrar,
+    /// The in-use probe (GC and uninstall).
+    pub process: &'a dyn Process,
+    /// The names of the machine install on this OS (M11-D6): the service file and the projection
+    /// the engine runs after every commit that changes the current version.
+    pub scheme: MachineScheme,
+}
+
+/// A running supervision lease (M10-D3): only in memory, lost on restart.
+#[derive(Debug, Clone)]
+struct Lease {
+    version: Version,
+    until: Duration,
+}
+
+/// Text equality of versions (two versions of equal precedence but different build metadata are
+/// different trees).
+fn same(a: &Version, b: &Version) -> bool {
+    a == b && a.to_string() == b.to_string()
+}
+
+/// The engine of one machine install.
+pub struct Engine<'a> {
+    p: Ports<'a>,
+    root: PathBuf,
+    app_id: AppId,
+    store: MachineStore,
+    lease: Option<Lease>,
+    service_version: Option<Version>,
+}
+
+impl std::fmt::Debug for Engine<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("app_id", &self.app_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The admin-only folder of one stage session and what was uploaded into it. Dropping it removes
+/// the folder and, when the session started a stage that did not finish, the partial tree.
+pub struct StageSession<'a> {
+    fs: &'a dyn Fs,
+    dir: PathBuf,
+    lock: PathBuf,
+    versions_dir: PathBuf,
+    manifest: VerifiedManifest,
+    manifest_sha256: Sha256Digest,
+    current: Version,
+    objects: BTreeMap<[u8; 32], PathBuf>,
+    commits: u32,
+    staged: bool,
+}
+
+impl std::fmt::Debug for StageSession<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StageSession")
+            .field("version", self.manifest.version())
+            .field("commits", &self.commits)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StageSession<'_> {
+    /// The version this session stages.
+    pub fn version(&self) -> &Version {
+        self.manifest.version()
+    }
+
+    /// `stage_commit` requests made so far.
+    pub fn commits(&self) -> u32 {
+        self.commits
+    }
+}
+
+impl Drop for StageSession<'_> {
+    fn drop(&mut self) {
+        let _ = self.fs.remove_dir_all_nofollow(&self.dir);
+        if self.commits > 0 && !self.staged {
+            // Only under the engine's lock: a partial tree is the engine's state.
+            if let Ok(Some(_guard)) = self.fs.try_lock(&self.lock) {
+                let partial = self
+                    .versions_dir
+                    .join(format!("{}{PARTIAL_SUFFIX}", self.manifest.version()));
+                let _ = self.fs.remove_dir_all_nofollow(&partial);
+            }
+        }
+    }
+}
+
+/// An upload being written: hashed while written, capped at its declared size.
+pub struct PartWriter {
+    file: Box<dyn FileWrite>,
+    hash: Box<dyn HashState>,
+    path: PathBuf,
+    written: u64,
+    size: u64,
+}
+
+impl std::fmt::Debug for PartWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartWriter")
+            .field("written", &self.written)
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Write for PartWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.written.saturating_add(buf.len() as u64) > self.size {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        self.file.write_all(buf)?;
+        self.hash.update(buf);
+        self.written += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl PartWriter {
+    /// Removes the part file (an upload that did not finish).
+    pub fn discard(self, fs: &dyn Fs) {
+        let path = self.path.clone();
+        drop(self);
+        let _ = fs.remove_file(&path);
+    }
+}
+
+impl<'a> Engine<'a> {
+    /// Opens the engine of the machine install at `root`: checks the tree's protection, takes the
+    /// lock, reads the machine record (which must be a machine record with a trust root) and
+    /// removes upload folders a previous run left.
+    pub fn open(ports: Ports<'a>, root: &Path) -> Result<Engine<'a>, EngineError> {
+        let root = root.to_path_buf();
+        check_protection(&ports, &root)?;
+        let _guard = take_lock(ports.fs, &lock_path(&root))?;
+        let record = read_machine_record(&ports, &root)?;
+        let app_id = record.app_id.clone();
+        let engine = Engine {
+            p: ports,
+            store: MachineStore {
+                dir: state_dir(&root),
+                app_id: app_id.clone(),
+            },
+            root,
+            app_id,
+            lease: None,
+            service_version: None,
+        };
+        engine.remove_leftover_uploads();
+        engine.reconcile(&record);
+        Ok(engine)
+    }
+
+    /// What [`Engine::open`] verifies before it would change anything, without taking the lock and
+    /// without changing anything: the tree's protection, and a readable machine record with a
+    /// trust root. It answers with the errors `open` would (never `busy`: it does not try the
+    /// lock), so a new service binary can prove, while the engine that is switching to it holds
+    /// the lock, that it finds its root and its tree (`--self-test`).
+    pub fn check(ports: &Ports<'_>, root: &Path) -> Result<(), EngineError> {
+        check_protection(ports, root)?;
+        read_machine_record(ports, root).map(drop)
+    }
+
+    /// The same engine reporting `version` as the running service's own version in `status`
+    /// (the host knows it from its own path); without it `status` reports the current version.
+    pub fn with_service_version(mut self, version: Version) -> Engine<'a> {
+        self.service_version = Some(version);
+        self
+    }
+
+    /// Whether a supervision lease is running at `now` (the host's monotonic time): an applying
+    /// runtime or a counted start is still inside its health window. The host does not exit as
+    /// idle while this is true (M10-D11).
+    pub fn lease_running(&self, now: Duration) -> bool {
+        self.lease.as_ref().is_some_and(|l| now < l.until)
+    }
+
+    /// The app this engine serves.
+    pub fn app_id(&self) -> &AppId {
+        &self.app_id
+    }
+
+    /// Removes the session folders a host that ended mid-session left in `incoming\`. Exempt from
+    /// the removal guard (M10-D20): the folders are admin-only and their paths are never handed to
+    /// anyone, so no process can run from one.
+    fn remove_leftover_uploads(&self) {
+        let incoming = incoming_dir(&self.root);
+        if let Ok(entries) = self.p.fs.list_dir(&incoming) {
+            for e in entries {
+                let _ = self.p.fs.remove_dir_all_nofollow(&incoming.join(&e.name));
+            }
+        }
+    }
+
+    /// The lock and the protection check every operation starts with.
+    fn guard(&self) -> Result<Box<dyn LockGuard>, EngineError> {
+        let guard = take_lock(self.p.fs, &lock_path(&self.root))?;
+        check_protection(&self.p, &self.root)?;
+        Ok(guard)
+    }
+
+    fn load(&self) -> Result<(Loaded<InstallState>, InstallState), EngineError> {
+        let loaded = self
+            .store
+            .load(self.p.fs, self.p.hasher)
+            .map_err(|_| EngineError::of(ErrorCode::NotProtected))?;
+        let record = loaded
+            .record
+            .clone()
+            .ok_or(EngineError::of(ErrorCode::NotProtected))?;
+        if record.current.is_none() || record.floors.root.is_none() {
+            return Err(EngineError::of(ErrorCode::NotProtected));
+        }
+        Ok((loaded, record))
+    }
+
+    fn commit(
+        &self,
+        loaded: &Loaded<InstallState>,
+        next: &InstallState,
+    ) -> Result<InstallState, EngineError> {
+        self.store
+            .commit(self.p.fs, loaded, next, self.p.hasher)
+            .map_err(internal)
+    }
+
+    /// The trust root of the machine record, and nothing else (M4-SEC-obs1).
+    fn trusted_root(&self, record: &InstallState) -> Result<TrustedRoot, EngineError> {
+        record
+            .floors
+            .root
+            .as_ref()
+            .ok_or(EngineError::of(ErrorCode::NotProtected))?
+            .to_trusted(self.app_id.clone(), self.p.hasher, self.p.verifier)
+            .map_err(|_| EngineError::of(ErrorCode::NotProtected))
+    }
+
+    fn versions_dir(&self) -> PathBuf {
+        self.root.join(APP_DIR)
+    }
+
+    /// The tree of `version`: `R/app/<version>`, or under the bundle projection the live bundle
+    /// when that is where the version is ([`locate_tree`]).
+    fn tree(&self, version: &Version) -> PathBuf {
+        locate_tree(self.p.fs, &self.layout(), version)
+    }
+
+    /// The update configuration of the installed tree of `version` (admin-only, so trusted): a
+    /// real directory holding a regular config file (at the scheme's config path, every directory
+    /// on the way a real one) for this app and that version.
+    fn tree_config(&self, version: &Version) -> Result<UpdateConfig, EngineError> {
+        let tree = self.tree(version);
+        let fs = self.p.fs;
+        match fs.symlink_metadata(&tree) {
+            Ok(Some(m)) if m.kind == FileKind::Dir => {}
+            _ => return Err(EngineError::of(ErrorCode::Internal)),
+        }
+        let config = read_tree_config(fs, self.p.scheme, &tree)?;
+        if config.app_id != self.app_id || !same(&config.version, version) {
+            return Err(EngineError::of(ErrorCode::Internal));
+        }
+        Ok(config)
+    }
+
+    fn lease_length(&self, version: &Version) -> Duration {
+        let (lo, hi) = HEALTH_TIMEOUT_RANGE;
+        // An unreadable config errs towards supervision: the longest lease.
+        let secs = self
+            .tree_config(version)
+            .map_or(hi, |c| c.health_timeout_secs.clamp(lo, hi));
+        Duration::from_secs(secs) + LEASE_GRACE
+    }
+
+    /// Projects the committed `record` (M11-D6, [`project_record`]). An error is `internal`: the
+    /// record stays committed and the next `open` finishes the projection.
+    fn project(&self, record: &InstallState) -> Result<(), EngineError> {
+        project_record(self.p.fs, &self.layout(), record).map_err(internal)
+    }
+
+    /// Refreshes the machine integration after a committed change from `from` to `to` (the
+    /// runtime's order for a user install: commit, then the integration). Its result is not the
+    /// operation's: the record is committed either way.
+    fn refresh_integration(&self, from: Option<&UpdateConfig>, to: &UpdateConfig) {
+        let stale_bins = match from.and_then(|f| f.install.bin.clone()) {
+            Some(bin) if to.install.bin.as_ref() != Some(&bin) => vec![bin],
+            _ => Vec::new(),
+        };
+        let request = IntegrationRequest {
+            app_id: self.app_id.clone(),
+            install_root: self.root.clone(),
+            version: to.version.clone(),
+            meta: to.install.clone(),
+            previous: from.map(|f| f.install.clone()),
+            stale_bins,
+        };
+        let _ = self.p.integration.apply(Scope::Machine, &request);
+    }
+
+    // ---- operations ------------------------------------------------------------------------------
+
+    /// `status`: the record's versions, the service's version and the policy; no token digest,
+    /// install id or path.
+    pub fn status(&self) -> Result<StatusReport, EngineError> {
+        let _guard = self.guard()?;
+        let (_, record) = self.load()?;
+        let current = record
+            .current
+            .as_ref()
+            .ok_or(EngineError::of(ErrorCode::NotProtected))?
+            .version
+            .clone();
+        Ok(StatusReport {
+            service: self
+                .registered_service_version()
+                .or_else(|| self.service_version.clone())
+                .unwrap_or(current.clone()),
+            current,
+            previous: record.previous.map(|p| p.version),
+            pending: record.pending.map(|p| PendingStatus {
+                version: p.version,
+                attempts: p.attempts,
+            }),
+            staged: record.staged.map(|s| s.version),
+            self_update_disabled: self.p.policy.read(&self.app_id).self_update_disabled,
+        })
+    }
+
+    /// `stage_begin`: verifies `roots`, `keys`, `feed` against the machine record's root and
+    /// floors for the installed tree's channel, commits raised floors, selects the candidate and
+    /// verifies `manifest` against it. `None`: no update. `Some`: a session whose admin-only
+    /// upload folder exists.
+    pub fn stage_begin(
+        &mut self,
+        channel: &Channel,
+        roots: &[&[u8]],
+        keys: &[u8],
+        feed: &[u8],
+        manifest: &[u8],
+    ) -> Result<Option<StageSession<'a>>, EngineError> {
+        let _guard = self.guard()?;
+        if self.p.policy.read(&self.app_id).self_update_disabled {
+            return Err(EngineError::of(ErrorCode::DisabledByPolicy));
+        }
+        let (loaded, mut record) = self.load()?;
+        if record.pending.is_some() {
+            return Err(EngineError::of(ErrorCode::PendingExists));
+        }
+        let current = record
+            .current
+            .clone()
+            .ok_or(EngineError::of(ErrorCode::NotProtected))?;
+        let config = self.tree_config(&current.version)?;
+        if &config.channel != channel {
+            return Err(EngineError::of(ErrorCode::ChannelNotAllowed));
+        }
+        let mut walk = RootWalk::new(self.trusted_root(&record)?);
+        for bytes in roots {
+            walk.advance(bytes, self.p.hasher, self.p.verifier)
+                .map_err(|e| EngineError::verify(&e))?;
+        }
+        let clock = ClockReading::read(self.p.clock, Some(current.issued));
+        let docs = walk
+            .finish(
+                &self.app_id,
+                channel,
+                &record.floors,
+                keys,
+                feed,
+                &clock,
+                self.p.hasher,
+                self.p.verifier,
+            )
+            .map_err(|e| EngineError::verify(&e))?;
+        let raised = raised_floors(&docs.root, &docs.keys, &docs.feed, channel);
+        if !record.floors.is_at_least(&raised) {
+            record = self.commit(&loaded, &record.raise_floors(&raised))?;
+        }
+        let Some(candidate) = select_candidate(
+            &docs.feed,
+            Some(&current.version),
+            record.target,
+            &record.bad,
+            &record.install_id,
+            self.p.hasher,
+        ) else {
+            return Ok(None);
+        };
+        let verified = verify_manifest(
+            &docs.keys,
+            &candidate.entry,
+            manifest,
+            self.p.hasher,
+            self.p.verifier,
+        )
+        .map_err(|e| EngineError::verify(&e))?;
+        let dir = self.new_upload_dir()?;
+        Ok(Some(StageSession {
+            fs: self.p.fs,
+            dir,
+            lock: lock_path(&self.root),
+            versions_dir: self.versions_dir(),
+            manifest_sha256: self.p.hasher.sha256(manifest),
+            manifest: verified,
+            current: current.version,
+            objects: BTreeMap::new(),
+            commits: 0,
+            staged: false,
+        }))
+    }
+
+    /// `R\.lunepack\machine\incoming\<32 hex from Rng>`, created admin-only.
+    fn new_upload_dir(&self) -> Result<PathBuf, EngineError> {
+        let incoming = incoming_dir(&self.root);
+        match self.p.fs.symlink_metadata(&incoming) {
+            Ok(None) => self
+                .p
+                .protect
+                .create_dir(&incoming, DirClass::AdminOnly)
+                .map_err(|_| EngineError::of(ErrorCode::NotProtected))?,
+            Ok(Some(_)) => self
+                .p
+                .protect
+                .check(&incoming, DirClass::AdminOnly)
+                .map_err(|_| EngineError::of(ErrorCode::NotProtected))?,
+            Err(_) => return Err(EngineError::of(ErrorCode::Internal)),
+        }
+        let mut name = [0u8; SESSION_NAME_BYTES];
+        self.p.rng.fill(&mut name).map_err(internal)?;
+        let dir = incoming.join(hex_encode(&name));
+        self.p
+            .protect
+            .create_dir(&dir, DirClass::AdminOnly)
+            .map_err(|_| EngineError::of(ErrorCode::Internal))?;
+        Ok(dir)
+    }
+
+    /// `put`, before any byte: the object must be the manifest's pack or one of its frames, of
+    /// that size, and not uploaded before in this session (a repeat is `malformed`).
+    pub fn put_check(
+        &self,
+        session: &StageSession<'_>,
+        kind: ObjectKind,
+        sha256: &Sha256Digest,
+        size: u64,
+    ) -> Result<(), EngineError> {
+        let _guard = self.guard()?;
+        let want = match kind {
+            ObjectKind::Pack => {
+                let pack = session.manifest.pack();
+                (pack.sha256() == *sha256).then(|| pack.size())
+            }
+            ObjectKind::Frame => session.manifest.entries().iter().find_map(|e| match e {
+                VerifiedEntry::File { frame: Some(f), .. } if f.sha256() == *sha256 => {
+                    Some(f.length())
+                }
+                _ => None,
+            }),
+        };
+        let want = want.ok_or(EngineError::of(ErrorCode::NotInManifest))?;
+        if want != size {
+            return Err(EngineError::of(ErrorCode::SizeMismatch));
+        }
+        if session.objects.contains_key(sha256.as_bytes()) {
+            return Err(EngineError::of(ErrorCode::Malformed));
+        }
+        Ok(())
+    }
+
+    /// Creates the part file the object's bytes are written to.
+    pub fn put_open(
+        &self,
+        session: &StageSession<'_>,
+        sha256: &Sha256Digest,
+        size: u64,
+    ) -> Result<PartWriter, EngineError> {
+        let path = session
+            .dir
+            .join(format!("{}{PART_SUFFIX}", sha256.to_hex()));
+        let file = self.p.fs.create_new(&path).map_err(internal)?;
+        Ok(PartWriter {
+            file,
+            hash: self.p.hasher.sha256_start(),
+            path,
+            written: 0,
+            size,
+        })
+    }
+
+    /// Ends an upload: the bytes written must be the declared size and hash to `sha256`; then the
+    /// part file is renamed to its SHA-256 name. Otherwise it is removed.
+    pub fn put_finish(
+        &self,
+        session: &mut StageSession<'_>,
+        sha256: &Sha256Digest,
+        writer: PartWriter,
+    ) -> Result<(), EngineError> {
+        let PartWriter {
+            mut file,
+            hash,
+            path,
+            written,
+            size,
+        } = writer;
+        let synced = file.flush().is_ok() && file.sync().is_ok();
+        drop(file);
+        let digest = hash.finalize();
+        let fail = |code| {
+            let _ = self.p.fs.remove_file(&path);
+            Err(EngineError::of(code))
+        };
+        if !synced {
+            return fail(ErrorCode::Internal);
+        }
+        if written != size {
+            return fail(ErrorCode::SizeMismatch);
+        }
+        if digest != *sha256 {
+            return fail(ErrorCode::HashMismatch);
+        }
+        let _guard = match self.guard() {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = self.p.fs.remove_file(&path);
+                return Err(e);
+            }
+        };
+        let kept = session.dir.join(sha256.to_hex());
+        if self.p.fs.rename(&path, &kept).is_err() {
+            return fail(ErrorCode::Internal);
+        }
+        session.objects.insert(*sha256.as_bytes(), kept);
+        Ok(())
+    }
+
+    /// `stage_commit`: builds the session's version under `R\app` from the current tree and the
+    /// uploaded objects, runs the publisher check under the installed tree's policy and records
+    /// the tree as staged. Paths no source covers are answered as `need_fetch`.
+    pub fn stage_commit(
+        &mut self,
+        session: &mut StageSession<'_>,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<CommitOutcome, EngineError> {
+        if session.commits >= MAX_COMMITS {
+            return Err(EngineError::of(ErrorCode::Malformed));
+        }
+        session.commits += 1;
+        let _guard = self.guard()?;
+        let (loaded, record) = self.load()?;
+        if record.pending.is_some() {
+            return Err(EngineError::of(ErrorCode::PendingExists));
+        }
+        let current = record
+            .current
+            .clone()
+            .ok_or(EngineError::of(ErrorCode::NotProtected))?;
+        if !same(&current.version, &session.current) {
+            return Err(EngineError::of(ErrorCode::VersionMismatch));
+        }
+        let version = session.manifest.version().clone();
+        self.refuse_case_collision(&record, &version)?;
+        let cancel = CancelToken::new();
+        let current_tree = self.tree(&current.version);
+        let unchanged = scan(
+            &session.manifest,
+            Some(&current_tree),
+            self.p.fs,
+            self.p.hasher,
+            1,
+            &cancel,
+            &|_| {},
+        )
+        .map_err(internal)?;
+        let pack = session
+            .objects
+            .get(session.manifest.pack().sha256().as_bytes())
+            .cloned();
+        let mut sources = Vec::with_capacity(unchanged.len());
+        let mut missing = Vec::new();
+        for (entry, same_file) in session.manifest.entries().iter().zip(unchanged) {
+            let source = match entry {
+                VerifiedEntry::File { frame: Some(f), .. } => {
+                    if let Some(p) = same_file {
+                        SourceFor::Unchanged(p)
+                    } else if let Some(p) = session.objects.get(f.sha256().as_bytes()) {
+                        SourceFor::Frame(p.clone())
+                    } else if let Some(p) = &pack {
+                        SourceFor::Pack(p.clone())
+                    } else {
+                        missing.push(entry.path().clone());
+                        SourceFor::Patch
+                    }
+                }
+                // Directories, symlinks and empty files take no bytes; the source is ignored.
+                _ => SourceFor::Unchanged(PathBuf::new()),
+            };
+            sources.push(source);
+        }
+        if !missing.is_empty() {
+            return Ok(need_fetch(missing));
+        }
+        let progress = RefCell::new(progress);
+        let on_progress = |p: Progress| (progress.borrow_mut())(p.done, p.total);
+        let input = StageInput {
+            manifest: &session.manifest,
+            versions_dir: self.versions_dir(),
+            sources,
+        };
+        let env = StageEnv {
+            fs: self.p.fs,
+            codec: self.p.codec,
+            hasher: self.p.hasher,
+            workers: 1,
+            budget_bytes: STAGE_BUDGET_BYTES,
+            cancel: &cancel,
+            progress: &on_progress,
+        };
+        let staged = match stage(&input, &env) {
+            Ok(staged) => staged,
+            Err(StageError::NeedFetch(paths)) => return Ok(need_fetch(paths)),
+            Err(_) => return Err(EngineError::of(ErrorCode::Internal)),
+        };
+        // M9-D9, the facade's decision for the same inputs: the installed tree's policy, then
+        // the check, through the shared `decide`.
+        match self.publisher_decision(&current.version, &staged.tree)? {
+            Decision::Proceed(_) => {}
+            Decision::Refuse { mark_bad, .. } => {
+                if mark_bad && !record.bad.contains(&version) && record.bad.len() < MAX_BAD_VERSIONS
+                {
+                    self.commit(&loaded, &record.mark_bad(version))?;
+                }
+                return Err(EngineError::of(ErrorCode::PublisherMismatch));
+            }
+        }
+        let staged_ref = StagedRef::new(version.clone(), staged.target, session.manifest_sha256);
+        let next = record.set_staged(Some((staged_ref, session.manifest.issued())));
+        self.commit(&loaded, &next)?;
+        session.staged = true;
+        Ok(CommitOutcome::Staged(version))
+    }
+
+    /// The facade's publisher decision (M9-D9) over the installed tree of `current` and the
+    /// candidate tree: no installed config or policy `off` proceeds; a candidate without a
+    /// readable config fails closed.
+    fn publisher_decision(
+        &self,
+        current: &Version,
+        candidate: &Path,
+    ) -> Result<Decision, EngineError> {
+        let installed = self.tree_config(current)?;
+        if installed.publisher_check == PublisherPolicy::Off {
+            return Ok(Decision::Proceed(None));
+        }
+        let candidate_config = read_tree_config(self.p.fs, self.p.scheme, candidate)?;
+        if candidate_config.app_id != self.app_id {
+            return Err(EngineError::of(ErrorCode::Internal));
+        }
+        let result = self.p.publisher.same_publisher(
+            &SignedTree {
+                root: self.tree(current),
+                entry: installed.install.entry,
+            },
+            &SignedTree {
+                root: candidate.to_path_buf(),
+                entry: candidate_config.install.entry,
+            },
+        );
+        Ok(decide(installed.publisher_check, result))
+    }
+
+    /// Refuses a version whose directory name differs only in ASCII case from a kept version's
+    /// or from an entry of `R\app` (one directory on a case-insensitive file system, F11).
+    fn refuse_case_collision(
+        &self,
+        record: &InstallState,
+        version: &Version,
+    ) -> Result<(), EngineError> {
+        let mut names: Vec<String> = record
+            .current
+            .iter()
+            .map(|c| c.version.to_string())
+            .chain(record.previous.iter().map(|p| p.version.to_string()))
+            .chain(record.pending.iter().map(|p| p.version.to_string()))
+            .chain(record.staged.iter().map(|s| s.tree.clone()))
+            .collect();
+        match self.p.fs.list_dir(&self.versions_dir()) {
+            Ok(entries) => names.extend(
+                entries
+                    .into_iter()
+                    .map(|e| e.name.to_string_lossy().into_owned()),
+            ),
+            Err(e) if e.kind == FsErrorKind::NotFound => {}
+            Err(_) => return Err(EngineError::of(ErrorCode::Internal)),
+        }
+        let candidate = version.to_string();
+        let partial = format!("{candidate}{PARTIAL_SUFFIX}");
+        let collides = names.iter().any(|n| {
+            (n != &candidate && n.eq_ignore_ascii_case(&candidate))
+                || (n != &partial && n.eq_ignore_ascii_case(&partial))
+        });
+        if collides {
+            return Err(EngineError::of(ErrorCode::VersionMismatch));
+        }
+        Ok(())
+    }
+
+    /// `apply{version}`: makes the staged `version` current and pending with a fresh token (only
+    /// its SHA-256 is recorded), refreshes the integration and starts the supervision lease at
+    /// `now` (monotonic).
+    pub fn apply(&mut self, version: &Version, now: Duration) -> Result<Token, EngineError> {
+        let _guard = self.guard()?;
+        if self.p.policy.read(&self.app_id).self_update_disabled {
+            return Err(EngineError::of(ErrorCode::DisabledByPolicy));
+        }
+        let (loaded, record) = self.load()?;
+        if record.pending.is_some() {
+            return Err(EngineError::of(ErrorCode::PendingExists));
+        }
+        let staged_is_v = record
+            .staged
+            .as_ref()
+            .is_some_and(|s| same(&s.version, version));
+        if !staged_is_v {
+            return Err(EngineError::of(if record.staged.is_some() {
+                ErrorCode::VersionMismatch
+            } else {
+                ErrorCode::NothingStaged
+            }));
+        }
+        // The new version's own config decides its timeout and integration; without a usable
+        // one nothing is committed.
+        let incoming = self
+            .tree_config(version)
+            .map_err(|_| EngineError::of(ErrorCode::NothingStaged))?;
+        let outgoing = record
+            .current
+            .as_ref()
+            .and_then(|c| self.tree_config(&c.version).ok());
+        let mut raw = [0u8; 32];
+        self.p.rng.fill(&mut raw).map_err(internal)?;
+        let token = Token::from_bytes(raw);
+        let next =
+            machine::apply(&record, version, self.p.hasher.sha256(&raw)).map_err(lifecycle_code)?;
+        let committed = self.commit(&loaded, &next)?;
+        // The disk follows the record as committed, before the integration that points into it.
+        let projected = self.project(&committed);
+        self.refresh_integration(outgoing.as_ref(), &incoming);
+        projected?;
+        self.lease = Some(Lease {
+            version: version.clone(),
+            until: now + self.lease_length(version),
+        });
+        Ok(token)
+    }
+
+    /// `attempt{version}`: a start of the pending `version` without a token (M10-D3). Under a
+    /// running lease: `supervised`, nothing committed. Otherwise one attempt is counted with a
+    /// fresh token and a new lease, or, past the limit, the version is rolled back and marked bad.
+    pub fn attempt(
+        &mut self,
+        version: &Version,
+        now: Duration,
+    ) -> Result<AttemptAnswer, EngineError> {
+        let _guard = self.guard()?;
+        let (loaded, record) = self.load()?;
+        let pending = record
+            .pending
+            .as_ref()
+            .is_some_and(|p| same(&p.version, version));
+        if !pending {
+            return Ok(AttemptAnswer::NotPending);
+        }
+        if self
+            .lease
+            .as_ref()
+            .is_some_and(|l| same(&l.version, version) && now < l.until)
+        {
+            return Ok(AttemptAnswer::Supervised);
+        }
+        let mut raw = [0u8; 32];
+        self.p.rng.fill(&mut raw).map_err(internal)?;
+        let (next, outcome) = machine::attempt(&record, version, self.p.hasher.sha256(&raw))
+            .map_err(lifecycle_code)?;
+        match outcome {
+            AttemptOutcome::Counted(attempts) => {
+                self.commit(&loaded, &next)?;
+                self.lease = Some(Lease {
+                    version: version.clone(),
+                    until: now + self.lease_length(version),
+                });
+                Ok(AttemptAnswer::Counted {
+                    attempts,
+                    token: Token::from_bytes(raw),
+                })
+            }
+            AttemptOutcome::RollBack => {
+                let (from, to) = self.rollback_configs(&record, version)?;
+                let next = machine::rollback_at_limit(&record, version).map_err(lifecycle_code)?;
+                let committed = self.commit(&loaded, &next)?;
+                let projected = self.project(&committed);
+                self.refresh_integration(from.as_ref(), &to);
+                self.lease = None;
+                projected?;
+                Ok(AttemptAnswer::RolledBack {
+                    current: committed
+                        .current
+                        .map(|c| c.version)
+                        .ok_or(EngineError::of(ErrorCode::Internal))?,
+                })
+            }
+        }
+    }
+
+    /// The configs a rollback of `version` refreshes the integration with: the outgoing pending
+    /// version's (if readable) and the previous version's, which must be readable (otherwise
+    /// nothing is rolled back, as the runtime does).
+    fn rollback_configs(
+        &self,
+        record: &InstallState,
+        version: &Version,
+    ) -> Result<(Option<UpdateConfig>, UpdateConfig), EngineError> {
+        let previous = record
+            .previous
+            .as_ref()
+            .ok_or(EngineError::of(ErrorCode::Internal))?;
+        let to = self.tree_config(&previous.version)?;
+        Ok((self.tree_config(version).ok(), to))
+    }
+
+    /// `confirm{version, token}`: the pending `version` presenting its token is healthy.
+    pub fn confirm(
+        &mut self,
+        version: &Version,
+        token: &Token,
+    ) -> Result<ConfirmAnswer, EngineError> {
+        let _guard = self.guard()?;
+        let (loaded, record) = self.load()?;
+        let presented = self.p.hasher.sha256(token.as_bytes());
+        let (next, outcome) =
+            machine::confirm(&record, version, presented).map_err(lifecycle_code)?;
+        match outcome {
+            ConfirmOutcome::Confirmed => {
+                let committed = self.commit(&loaded, &next)?;
+                self.lease = None;
+                // Housekeeping after the confirm: neither is an error of `confirm`; a crash before
+                // them is repaired by the next `reconcile`.
+                let _ = self.switch_service(&committed);
+                self.gc(&committed);
+                Ok(ConfirmAnswer::Confirmed)
+            }
+            ConfirmOutcome::NothingPending => Ok(ConfirmAnswer::NothingPending),
+        }
+    }
+
+    /// `rollback{version, token}`: the pending `version` failed; the previous version becomes
+    /// current, `version` is marked bad and the integration is refreshed from the previous
+    /// version's config.
+    pub fn rollback(&mut self, version: &Version, token: &Token) -> Result<Version, EngineError> {
+        let _guard = self.guard()?;
+        let (loaded, record) = self.load()?;
+        let presented = self.p.hasher.sha256(token.as_bytes());
+        // The token first, so a bystander learns nothing from the config checks.
+        let next = machine::rollback(&record, version, presented).map_err(lifecycle_code)?;
+        let (from, to) = self.rollback_configs(&record, version)?;
+        let committed = self.commit(&loaded, &next)?;
+        let projected = self.project(&committed);
+        self.refresh_integration(from.as_ref(), &to);
+        self.lease = None;
+        projected?;
+        committed
+            .current
+            .map(|c| c.version)
+            .ok_or(EngineError::of(ErrorCode::Internal))
+    }
+}
+
+/// A `need_fetch` answer with as many of `paths` as fit in one message (at most
+/// [`MAX_NEED_FETCH`] and within the message cap); `more` when some were left out.
+fn need_fetch(paths: Vec<crate::path::RelPath>) -> CommitOutcome {
+    let total = paths.len();
+    let mut kept = Vec::new();
+    for p in paths {
+        kept.push(p);
+        let fits = kept.len() <= MAX_NEED_FETCH
+            && Response::NeedFetch {
+                paths: kept.clone(),
+                more: true,
+            }
+            .encode()
+            .is_ok();
+        if !fits {
+            kept.pop();
+            break;
+        }
+    }
+    let more = kept.len() < total;
+    CommitOutcome::NeedFetch { paths: kept, more }
+}
+
+/// The update config of `tree` under `scheme`: every directory on the way to the scheme's config
+/// path a real directory and the config a regular file (nothing followed).
+fn read_tree_config(
+    fs: &dyn Fs,
+    scheme: MachineScheme,
+    tree: &Path,
+) -> Result<UpdateConfig, EngineError> {
+    let mut at = tree.to_path_buf();
+    let mut names = scheme.config().split('/').peekable();
+    while let Some(name) = names.next() {
+        at.push(name);
+        if names.peek().is_some() {
+            match fs.symlink_metadata(&at) {
+                Ok(Some(m)) if m.kind == FileKind::Dir => {}
+                _ => return Err(EngineError::of(ErrorCode::Internal)),
+            }
+        }
+    }
+    read_config_at(fs, &at)
+}
+
+/// Where the tree of `version` is under `layout`: `R/app/<version>`, except under the bundle
+/// projection (macOS) when nothing is there and `R/bundle` names a bundle: then that bundle
+/// (the current version lives in it, M8-D1). The caller checks the tree's own config before it
+/// trusts it ([`Engine::tree_config`]); nothing here follows a link.
+fn locate_tree(fs: &dyn Fs, layout: &MachineLayout, version: &Version) -> PathBuf {
+    let parked = layout.version_dir(version);
+    if layout.scheme().projection() != Projection::Bundle
+        || !matches!(fs.symlink_metadata(&parked), Ok(None))
+    {
+        return parked;
+    }
+    match layout.view().bundle_path(fs) {
+        Ok(Some(bundle)) => bundle,
+        _ => parked,
+    }
+}
+
+/// Projects `record` onto the disk as `layout`'s scheme says (M11-D6): nothing on Windows,
+/// `R/current` → `app/<current>` on Linux, the bundle reconcile of FORMAT 17 on macOS. Run under
+/// the engine's lock with the record as committed, after every commit that changes the current
+/// version and at every `open`; idempotent, so a crash at any point is finished by the next run.
+fn project_record(
+    fs: &dyn Fs,
+    layout: &MachineLayout,
+    record: &InstallState,
+) -> Result<(), LayoutError> {
+    match layout.scheme().projection() {
+        Projection::None => Ok(()),
+        Projection::CurrentLink | Projection::Bundle => layout.view().reconcile(fs, record),
+    }
+}
+
+fn read_config_at(fs: &dyn Fs, path: &Path) -> Result<UpdateConfig, EngineError> {
+    match fs.symlink_metadata(path) {
+        Ok(Some(m)) if m.kind == FileKind::File => {}
+        _ => return Err(EngineError::of(ErrorCode::Internal)),
+    }
+    let bytes = fs
+        .read_capped(path, MAX_UPDATE_CONFIG_BYTES)
+        .map_err(internal)?;
+    UpdateConfig::parse(&bytes).map_err(internal)
+}
+
+fn state_dir(root: &Path) -> PathBuf {
+    root.join(LUNEPACK_DIR).join(STATE_DIR)
+}
+
+fn machine_dir(root: &Path) -> PathBuf {
+    root.join(LUNEPACK_DIR).join(MACHINE_DIR)
+}
+
+fn incoming_dir(root: &Path) -> PathBuf {
+    machine_dir(root).join(INCOMING_DIR)
+}
+
+fn lock_path(root: &Path) -> PathBuf {
+    machine_dir(root).join(LOCK_FILE)
+}
+
+/// The machine record of the install at `root`: it must load, be of scope `machine` and hold a
+/// trust root. Any other state is `not_protected` (the tree is not an install this engine may
+/// serve).
+fn read_machine_record(ports: &Ports<'_>, root: &Path) -> Result<InstallState, EngineError> {
+    let record = load_any::<InstallState>(ports.fs, &state_dir(root), ports.hasher)
+        .map_err(|_| EngineError::of(ErrorCode::NotProtected))?
+        .ok_or(EngineError::of(ErrorCode::NotProtected))?;
+    if record.scope != Scope::Machine || record.floors.root.is_none() {
+        return Err(EngineError::of(ErrorCode::NotProtected));
+    }
+    Ok(record)
+}
+
+fn take_lock(fs: &dyn Fs, path: &Path) -> Result<Box<dyn LockGuard>, EngineError> {
+    match fs.try_lock(path) {
+        Ok(Some(guard)) => Ok(guard),
+        Ok(None) => Err(EngineError::of(ErrorCode::Busy)),
+        Err(_) => Err(EngineError::of(ErrorCode::Internal)),
+    }
+}
+
+/// The directories the engine checks at every start and operation (M10-D9).
+pub fn protected_dirs(root: &Path) -> [(PathBuf, DirClass); 5] {
+    [
+        (root.to_path_buf(), DirClass::MachineTree),
+        (root.join(APP_DIR), DirClass::MachineTree),
+        (root.join(LUNEPACK_DIR), DirClass::MachineTree),
+        (state_dir(root), DirClass::MachineTree),
+        (machine_dir(root), DirClass::AdminOnly),
+    ]
+}
+
+fn check_protection(ports: &Ports<'_>, root: &Path) -> Result<(), EngineError> {
+    for (dir, class) in protected_dirs(root) {
+        ports
+            .protect
+            .check(&dir, class)
+            .map_err(|_| EngineError::of(ErrorCode::NotProtected))?;
+    }
+    Ok(())
+}
+
+// ---- first install, service switch, reconcile, GC, repair, uninstall (M10 step 6) --------------
+
+/// Why a one-shot machine operation (first install, repair, uninstall) was refused. Carries no
+/// path, name or OS text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MachineOpError {
+    /// An install of the app is already in the machine home.
+    AlreadyInstalled,
+    /// Both candidate folders for the root are taken by something else.
+    FolderTaken,
+    /// The display name is not a usable folder name.
+    NameNotAllowed,
+    /// The release's tree holds no service binary: it installs per user only.
+    PerMachineUnavailable,
+    /// A process runs from the install.
+    InUse,
+    /// The tree, or a directory the operation needs, is not protected as it must be.
+    NotProtected,
+    /// Another host holds the engine's lock.
+    Busy,
+    /// The setup payload or the staged tree does not verify.
+    Verify,
+    /// The desktop integration refused or failed.
+    Integration,
+    /// The service binary's self-test failed.
+    SelfTest,
+    /// Anything else (a fixed description).
+    Failed(&'static str),
+}
+
+impl std::fmt::Display for MachineOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MachineOpError::Failed(what) => write!(f, "machine operation failed: {what}"),
+            other => write!(f, "{other:?}"),
+        }
+    }
+}
+
+impl std::error::Error for MachineOpError {}
+
+impl From<EngineError> for MachineOpError {
+    fn from(e: EngineError) -> MachineOpError {
+        match e.code {
+            ErrorCode::NotProtected => MachineOpError::NotProtected,
+            ErrorCode::Busy => MachineOpError::Busy,
+            ErrorCode::VerifyFailed => MachineOpError::Verify,
+            _ => MachineOpError::Failed("engine"),
+        }
+    }
+}
+
+/// What the first install needs (M10 step 6). The host (step 14) copied the setup payload's pack
+/// into the admin-only folder `payload_dir` directly under the machine home and verified the
+/// payload against the anchor in its own image (`setup`); `keyset_version` is the version of the
+/// key set that verification accepted. The trust root is the setup's own (its update config's,
+/// which `verify_setup` checked to be the trailer's).
+#[derive(Debug, Clone, Copy)]
+pub struct InstallRequest<'r> {
+    /// The machine home (the Program Files known folder), canonical.
+    pub machine_home: &'r Path,
+    /// The release's display name (`install.name`): `R`'s folder name.
+    pub display_name: &'r str,
+    /// The verified payload.
+    pub setup: &'r VerifiedSetup,
+    /// The verified key set's version (a floor of the first record).
+    pub keyset_version: u64,
+    /// The admin-only folder holding the copied payload.
+    pub payload_dir: &'r Path,
+    /// The copied pack in `payload_dir`.
+    pub pack: &'r Path,
+    /// The apps folder the live bundle goes in (`/Applications`), under the bundle projection
+    /// (macOS) only: it must exist and is never created or changed. `None` elsewhere.
+    pub apps_dir: Option<&'r Path>,
+}
+
+/// What a successful first install made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    /// The install root `R`.
+    pub root: PathBuf,
+    /// The installed version.
+    pub version: Version,
+}
+
+/// What a first install has made so far, undone in reverse on a failure.
+#[derive(Default)]
+struct Made {
+    root_created: Option<PathBuf>,
+    children: Vec<PathBuf>,
+    integration: Option<IntegrationRequest>,
+    registered: bool,
+    /// `root_created` is this app's own first install that an earlier run left cut off (F1).
+    resumed: bool,
+    /// The live bundle this run placed (macOS), holding this app's tree.
+    bundle: Option<PathBuf>,
+    /// The install was committed and only its projection failed: nothing is undone, the next
+    /// `open` finishes the projection.
+    keep: bool,
+}
+
+/// The first install of a per-machine release (M10 step 6), in the per-user install's order:
+/// the service binary is required; (2) the root is resolved over the machine home (an install of
+/// this app there is [`MachineOpError::AlreadyInstalled`], two taken folders
+/// [`MachineOpError::FolderTaken`]); (3) `R`, `R\app`, `R\.lunepack`, `R\.lunepack\state` are
+/// created `MachineTree` and `R\.lunepack\machine` `AdminOnly`; (4) the first record, scope
+/// `machine`, a fresh install id, the setup's floors; (5) the tree staged from the copied pack;
+/// (6) integration check, `install_first`, integration apply, commit; (7) the service binary
+/// copied to `service\<ver>\`, self-tested and registered; (8) the payload copy removed. A failure
+/// removes everything this run made (the registration, the integration, `R` when this run created
+/// it, the payload copy) and leaves a folder that was there before untouched.
+///
+/// A first install cut off by a crash, a power loss or a reboot (F1) is this app's own: under `R`'s
+/// lock, a machine record of this app with no current version, or (before the record) a root
+/// holding only the directories of (3) with nothing in them but the lock, is resumed: the record
+/// is written again (its floors kept when the trust root is the same), the stage reuses what the
+/// earlier run built, and the integration is applied again. A run that fails after resuming
+/// removes the root only when the removal guard (M10-D20) says no process runs from it, else it
+/// leaves it for the next run.
+///
+/// Under the projection of [`Ports::scheme`] (M11-D6) the root is named by the app id on unix;
+/// on macOS the live bundle is chosen in `req.apps_dir` before anything is created
+/// ([`MachineOpError::FolderTaken`] when both names are taken), `R/bundle` is written with the
+/// first record, and after the install record's commit the record is projected (`R/current` on
+/// Linux, the tree moved into the bundle on macOS) before the service binary is placed from
+/// wherever the tree then is. A failure of that projection keeps the committed install (nothing
+/// is undone): the service is still registered, the result is `Failed`, and the next `open`
+/// finishes the projection. A later failure that undoes the install removes the bundle too.
+///
+/// The engine looks only at the machine home: it never looks for, or names, a per-user install
+/// (M10-D14; that check is the unelevated bootstrap's).
+pub fn install(ports: Ports<'_>, req: &InstallRequest<'_>) -> Result<Installed, MachineOpError> {
+    let mut made = Made::default();
+    let result = install_steps(ports, req, &mut made);
+    if result.is_err() && !made.keep {
+        undo_install(ports, req, &made);
+    }
+    let _ = ports.fs.remove_dir_all_nofollow(req.payload_dir);
+    result
+}
+
+fn install_steps(
+    ports: Ports<'_>,
+    req: &InstallRequest<'_>,
+    made: &mut Made,
+) -> Result<Installed, MachineOpError> {
+    let setup = req.setup;
+    let config = &setup.config;
+    let app_id = config.app_id.clone();
+    let version = setup.manifest.version().clone();
+    // A release without the service binary installs per user only (M10-D7), before anything.
+    let service_rel = service_path_in_tree_for(&config.install.entry, ports.scheme.os)
+        .ok_or(MachineOpError::PerMachineUnavailable)?;
+    let has_service = setup.manifest.entries().iter().any(|e| {
+        matches!(e, VerifiedEntry::File { path, size, .. } if *path == service_rel && *size > 0)
+    });
+    if !has_service {
+        return Err(MachineOpError::PerMachineUnavailable);
+    }
+    remove_free_tombstones(ports, req.machine_home, &app_id);
+    if ports.scheme.projection() == Projection::Bundle
+        && let Some(apps) = req.apps_dir
+    {
+        // A bundle tombstone an uninstall cut off before its end left beside the live bundles.
+        remove_free_tombstones(ports, apps, &app_id);
+    }
+
+    // (2) The root, over the machine home only. An install of this app there is refused under its
+    // lock below unless it never got a current version.
+    let root = match resolve_root_scoped(
+        ports.fs,
+        ports.hasher,
+        req.machine_home,
+        &app_id,
+        req.display_name,
+        ports.scheme.view,
+        Scope::Machine,
+    ) {
+        Ok(RootChoice::New(root)) => root,
+        // Read before anything is touched: an install with a current version is refused at once.
+        Ok(RootChoice::Existing(root)) => {
+            let finished = MachineStore {
+                dir: MachineLayout::with_scheme(&root, ports.scheme).state_dir(),
+                app_id: app_id.clone(),
+            }
+            .load(ports.fs, ports.hasher)
+            .map(|l| l.record.is_none_or(|r| r.current.is_some()))
+            .unwrap_or(true);
+            if finished {
+                return Err(MachineOpError::AlreadyInstalled);
+            }
+            root
+        }
+        Err(LayoutError::InstallUnreadable) => return Err(MachineOpError::AlreadyInstalled),
+        Err(LayoutError::FolderTaken) | Err(LayoutError::InstallAmbiguous) => {
+            return Err(MachineOpError::FolderTaken);
+        }
+        Err(LayoutError::NameNotAllowed(_)) => return Err(MachineOpError::NameNotAllowed),
+        Err(_) => return Err(MachineOpError::Failed("resolve the install root")),
+    };
+    let layout = MachineLayout::with_scheme(&root, ports.scheme);
+    // The live bundle's path (macOS), chosen before anything is created.
+    let bundle = match ports.scheme.projection() {
+        Projection::Bundle => Some(machine_bundle_target(ports, req, &layout, &app_id)?),
+        Projection::None | Projection::CurrentLink => None,
+    };
+
+    // (3) The protected directories. A folder that was there before (empty, or this app's install)
+    // is used only when it is protected already, and so is each directory in it.
+    let held_something = match ports.fs.symlink_metadata(&root) {
+        Ok(None) => {
+            ports
+                .protect
+                .create_dir(&root, DirClass::MachineTree)
+                .map_err(|_| MachineOpError::NotProtected)?;
+            made.root_created = Some(root.clone());
+            false
+        }
+        Ok(Some(_)) => {
+            ports
+                .protect
+                .check(&root, DirClass::MachineTree)
+                .map_err(|_| MachineOpError::NotProtected)?;
+            !ports
+                .fs
+                .list_dir(&root)
+                .map_err(|_| MachineOpError::Failed("read the install root"))?
+                .is_empty()
+        }
+        Err(_) => return Err(MachineOpError::Failed("read the install root")),
+    };
+    for (dir, class) in [
+        (layout.app_dir(), DirClass::MachineTree),
+        (layout.lunepack_dir(), DirClass::MachineTree),
+        (layout.state_dir(), DirClass::MachineTree),
+        (layout.machine_dir(), DirClass::AdminOnly),
+    ] {
+        let created = match ports.protect.create_dir(&dir, class) {
+            Ok(()) => true,
+            Err(ProtectError::Exists) => {
+                ports
+                    .protect
+                    .check(&dir, class)
+                    .map_err(|_| MachineOpError::NotProtected)?;
+                false
+            }
+            Err(_) => return Err(MachineOpError::NotProtected),
+        };
+        if created && made.root_created.is_none() {
+            made.children.push(dir);
+        }
+    }
+    let guard = match take_lock(ports.fs, &layout.lock_path()) {
+        Ok(guard) => guard,
+        Err(e) => {
+            // Another run holds this root: it is that run's, and so is what this one made in it.
+            if e.code == ErrorCode::Busy {
+                *made = Made::default();
+            }
+            return Err(e.into());
+        }
+    };
+
+    // (4) The first record. A record of this app with a current version is an install; one
+    // without, or a root that held only what (3) makes, is this app's install cut off (F1).
+    let store = MachineStore {
+        dir: layout.state_dir(),
+        app_id: app_id.clone(),
+    };
+    let loaded = store
+        .load(ports.fs, ports.hasher)
+        .map_err(|_| MachineOpError::Failed("read the machine record"))?;
+    let resumed = match &loaded.record {
+        Some(r) if r.current.is_some() || r.scope != Scope::Machine || r.app_id != app_id => {
+            return Err(MachineOpError::AlreadyInstalled);
+        }
+        Some(_) => true,
+        None => held_something,
+    };
+    let floors = Floors {
+        root: Some(config.root.clone()),
+        keyset_version: req.keyset_version,
+        feed_seq: BTreeMap::new(),
+    };
+    if resumed {
+        made.root_created = Some(root.clone());
+        made.children.clear();
+        made.resumed = true;
+        // The earlier run may have applied the integration: a failure of this one removes it with
+        // the root.
+        made.integration = Some(IntegrationRequest {
+            app_id: app_id.clone(),
+            install_root: root.clone(),
+            version: version.clone(),
+            meta: config.install.clone(),
+            previous: None,
+            stale_bins: Vec::new(),
+        });
+    }
+    let mut install_id = [0u8; crate::policy::INSTALL_ID_BYTES];
+    ports
+        .rng
+        .fill(&mut install_id)
+        .map_err(|_| MachineOpError::Failed("randomness"))?;
+    let mut first = InstallState::new(
+        loaded.next_seq,
+        app_id.clone(),
+        Scope::Machine,
+        install_id,
+        setup.manifest.target(),
+    )
+    .raise_floors(&floors);
+    // A resumed record's floors stay when they are of the same trust root: never lowered.
+    if let Some(earlier) = &loaded.record
+        && earlier.floors.root == first.floors.root
+    {
+        first = first.raise_floors(&earlier.floors);
+    }
+    store
+        .commit(ports.fs, &loaded, &first, ports.hasher)
+        .map_err(|_| MachineOpError::Failed("write the first record"))?;
+    if let Some(bundle) = &bundle {
+        // Before the install record: the projection after its commit reads the pointer.
+        set_bundle_pointer(ports.fs, &layout.view(), bundle)
+            .map_err(|_| MachineOpError::Failed("write the bundle pointer"))?;
+    }
+
+    // (5) The tree, from the copied pack.
+    let sources = setup
+        .manifest
+        .entries()
+        .iter()
+        .map(|_| SourceFor::Pack(req.pack.to_path_buf()))
+        .collect();
+    let cancel = CancelToken::new();
+    let input = StageInput {
+        manifest: &setup.manifest,
+        versions_dir: layout.app_dir(),
+        sources,
+    };
+    let env = StageEnv {
+        fs: ports.fs,
+        codec: ports.codec,
+        hasher: ports.hasher,
+        workers: 1,
+        budget_bytes: STAGE_BUDGET_BYTES,
+        cancel: &cancel,
+        progress: &|_| {},
+    };
+    let staged = stage(&input, &env).map_err(|e| match e {
+        StageError::NeedFetch(_) => MachineOpError::Verify,
+        _ => MachineOpError::Failed("stage"),
+    })?;
+    // The staged tree's own config: this app, this version, exactly the payload's root.
+    let tree_config = read_tree_config(ports.fs, ports.scheme, &staged.tree)
+        .map_err(|_| MachineOpError::Verify)?;
+    if tree_config.app_id != app_id
+        || !same(&tree_config.version, &version)
+        || tree_config.root != config.root
+    {
+        return Err(MachineOpError::Verify);
+    }
+
+    // (6) Integration check, the transition, integration apply, commit.
+    let request = IntegrationRequest {
+        app_id: app_id.clone(),
+        install_root: root.clone(),
+        version: version.clone(),
+        meta: tree_config.install.clone(),
+        previous: None,
+        stale_bins: Vec::new(),
+    };
+    ports
+        .integration
+        .check(Scope::Machine, &request)
+        .map_err(|_| MachineOpError::Integration)?;
+    let loaded = store
+        .load(ports.fs, ports.hasher)
+        .map_err(|_| MachineOpError::Failed("read the machine record"))?;
+    let record = loaded
+        .record
+        .clone()
+        .ok_or(MachineOpError::Failed("read the machine record"))?;
+    let next = machine::install_first(
+        &record,
+        version.clone(),
+        setup.manifest.issued(),
+        install_id,
+    )
+    .map_err(|_| MachineOpError::AlreadyInstalled)?;
+    made.integration = Some(request.clone());
+    ports
+        .integration
+        .apply(Scope::Machine, &request)
+        .map_err(|_| MachineOpError::Integration)?;
+    let committed = store
+        .commit(ports.fs, &loaded, &next, ports.hasher)
+        .map_err(|_| MachineOpError::Failed("write the install record"))?;
+
+    // (6b) The projection of the committed record (`R/current`, or the tree moved into the live
+    // bundle). A failure keeps the install: the record is committed and the next `open` finishes
+    // the projection; the service is still placed and registered so that `open` comes.
+    let projected = project_record(ports.fs, &layout, &committed);
+    if let Some(bundle) = &bundle
+        && matches!(
+            tree_identity(ports.fs, layout.scheme().view, bundle),
+            Ok(Some((id, v))) if id == app_id && same(&v, &version)
+        )
+    {
+        made.bundle = Some(bundle.clone());
+    }
+
+    // (7) The service binary: copied (from wherever the projection left the tree), self-tested,
+    // registered.
+    let tree = locate_tree(ports.fs, &layout, &version);
+    let image = place_service_binary(ports, &layout, &version, &tree, &service_rel)?;
+    ports
+        .registrar
+        .self_test(&image)
+        .map_err(|_| MachineOpError::SelfTest)?;
+    made.registered = true;
+    ports
+        .registrar
+        .register(&app_id, &image)
+        .map_err(|_| MachineOpError::Failed("register the service"))?;
+    drop(guard);
+    if projected.is_err() {
+        made.keep = true;
+        return Err(MachineOpError::Failed("project the install"));
+    }
+    Ok(Installed { root, version })
+}
+
+/// The live bundle a macOS first install places (FORMAT 17.1): `R/bundle`'s target when a cut-off
+/// run of this install wrote it in `req.apps_dir` and nothing is there yet, else
+/// `<apps>/<display name>.app` (the app id when the name is not a bundle name), else
+/// `<apps>/<name> (<app id>).app`; both taken is [`MachineOpError::FolderTaken`]. The apps
+/// folder must exist and is never created or changed.
+fn machine_bundle_target(
+    ports: Ports<'_>,
+    req: &InstallRequest<'_>,
+    layout: &MachineLayout,
+    app_id: &AppId,
+) -> Result<PathBuf, MachineOpError> {
+    let apps = req
+        .apps_dir
+        .ok_or(MachineOpError::Failed("no apps folder"))?;
+    if let Ok(Some(earlier)) = layout.view().bundle_path(ports.fs)
+        && earlier.parent() == Some(apps)
+        && matches!(ports.fs.symlink_metadata(&earlier), Ok(None))
+    {
+        return Ok(earlier);
+    }
+    resolve_machine_bundle_target(ports.fs, apps, req.display_name, app_id).map_err(|e| match e {
+        LayoutError::BundleNameTaken => MachineOpError::FolderTaken,
+        _ => MachineOpError::Failed("resolve the bundle"),
+    })
+}
+
+/// Whether the removal guard (M10-D20) lets the engine delete `path`: only an answer of `Ok(false)`
+/// from [`Process::tree_in_use_strict`] does; `Ok(true)` and `Err` keep it.
+fn free_to_remove(ports: Ports<'_>, path: &Path) -> bool {
+    matches!(ports.process.tree_in_use_strict(path, &[]), Ok(false))
+}
+
+/// Removes this app's tombstones in the machine home (uninstalls cut off before the end), each a
+/// real directory checked right before its removal, without following links, and only when the
+/// removal guard says no process runs from it (F6): a tombstone keeps `R`'s descriptor, so a user
+/// may still run a program from one. One in use, or whose removal fails, stays for a later run.
+fn remove_free_tombstones(ports: Ports<'_>, home: &Path, app_id: &AppId) {
+    let Ok(entries) = ports.fs.list_dir(home) else {
+        return;
+    };
+    for entry in entries {
+        if entry.kind != FileKind::Dir || !is_tombstone_of(app_id, &entry.name) {
+            continue;
+        }
+        let path = home.join(&entry.name);
+        let real_dir =
+            matches!(ports.fs.symlink_metadata(&path), Ok(Some(m)) if m.kind == FileKind::Dir);
+        if real_dir && free_to_remove(ports, &path) {
+            let _ = ports.fs.remove_dir_all_nofollow(&path);
+        }
+    }
+}
+
+/// Copies the tree's service binary to `service\<version>\` (created admin-only) unless it is
+/// there; returns the image path.
+fn place_service_binary(
+    ports: Ports<'_>,
+    layout: &MachineLayout,
+    version: &Version,
+    tree: &Path,
+    service_rel: &crate::path::RelPath,
+) -> Result<PathBuf, MachineOpError> {
+    let image = layout.service_image(version);
+    if matches!(ports.fs.symlink_metadata(&image), Ok(Some(m)) if m.kind == FileKind::File) {
+        return Ok(image);
+    }
+    let mut source = tree.to_path_buf();
+    for c in service_rel.components() {
+        source.push(c);
+    }
+    match ports.fs.symlink_metadata(&source) {
+        Ok(Some(m)) if m.kind == FileKind::File => {}
+        _ => return Err(MachineOpError::PerMachineUnavailable),
+    }
+    for dir in [layout.service_dir(), layout.service_version_dir(version)] {
+        match ports.fs.symlink_metadata(&dir) {
+            Ok(None) => ports
+                .protect
+                .create_dir(&dir, DirClass::AdminOnly)
+                .map_err(|_| MachineOpError::NotProtected)?,
+            Ok(Some(_)) => ports
+                .protect
+                .check(&dir, DirClass::AdminOnly)
+                .map_err(|_| MachineOpError::NotProtected)?,
+            Err(_) => return Err(MachineOpError::Failed("read the service folder")),
+        }
+    }
+    ports
+        .fs
+        .copy_file(&source, &image)
+        .map_err(|_| MachineOpError::Failed("copy the service binary"))?;
+    Ok(image)
+}
+
+/// Removes only what this run of the first install created. Exempt from the removal guard
+/// (M10-D20): nothing has been given a path into it yet. A resumed root (F1) is not: the earlier
+/// run may have applied the integration, so a user may run a program from it. It goes, with the
+/// integration, only when the guard says nothing runs from it; else both stay for the next run to
+/// resume.
+fn undo_install(ports: Ports<'_>, req: &InstallRequest<'_>, made: &Made) {
+    let app_id = &req.setup.config.app_id;
+    if made.registered {
+        let _ = ports.registrar.remove(app_id);
+    }
+    if made.resumed {
+        let Some(root) = &made.root_created else {
+            return;
+        };
+        if !free_to_remove(ports, root)
+            || made
+                .bundle
+                .as_ref()
+                .is_some_and(|b| !free_to_remove(ports, b))
+        {
+            return;
+        }
+        if let Some(request) = &made.integration {
+            let _ = ports.integration.remove(Scope::Machine, request);
+        }
+        if let Some(bundle) = &made.bundle {
+            let _ = ports.fs.remove_dir_all_nofollow(bundle);
+        }
+        let _ = ports.fs.remove_dir_all_nofollow(root);
+        return;
+    }
+    if let Some(request) = &made.integration {
+        let _ = ports.integration.remove(Scope::Machine, request);
+    }
+    // The tree this run moved out of `R` into the live bundle (macOS).
+    if let Some(bundle) = &made.bundle {
+        let _ = ports.fs.remove_dir_all_nofollow(bundle);
+    }
+    if let Some(root) = &made.root_created {
+        let _ = ports.fs.remove_dir_all_nofollow(root);
+        return;
+    }
+    for dir in made.children.iter().rev() {
+        let _ = ports.fs.remove_dir_all_nofollow(dir);
+    }
+}
+
+impl<'a> Engine<'a> {
+    fn layout(&self) -> MachineLayout {
+        MachineLayout::with_scheme(&self.root, self.p.scheme)
+    }
+
+    /// The version of the registered service binary, when it is one of this root's.
+    fn registered_service_version(&self) -> Option<Version> {
+        let image = self.p.registrar.image(&self.app_id).ok()??;
+        let (layout, version) = MachineLayout::of_service_image_as(&image, self.p.scheme)?;
+        (layout.root() == self.root).then_some(version)
+    }
+
+    /// Run at every `open`, under the lock: `.partial` trees and `.gc-` leftovers go, the record
+    /// is projected (M11-D6: `R/current` on Linux, the live bundle on macOS), the service is
+    /// switched to the current version when nothing is pending, and versions nobody keeps are
+    /// collected. Nothing here is an error of `open`.
+    fn reconcile(&self, record: &InstallState) {
+        // `.partial` trees are exempt from the removal guard (M10-D20): half-written staging
+        // that nobody is given a path to, so nothing can run from it.
+        if let Ok(entries) = self.p.fs.list_dir(&self.versions_dir()) {
+            for e in entries {
+                let partial = e.name.to_str().is_some_and(|n| n.ends_with(PARTIAL_SUFFIX));
+                if partial && e.kind == FileKind::Dir {
+                    let _ = self
+                        .p
+                        .fs
+                        .remove_dir_all_nofollow(&self.versions_dir().join(&e.name));
+                }
+            }
+        }
+        // The disk follows the record before anything reads a tree from it (a crash after a
+        // commit, or a projection that failed, is finished here).
+        let _ = self.project(record);
+        if record.pending.is_none() {
+            let _ = self.switch_service(record);
+        }
+        self.gc(record);
+    }
+
+    /// The service switch (M10-D1 "the service updating itself"): to the current version, or the
+    /// previous one while a version is pending. Its binary is copied to `service\<ver>\` when
+    /// absent, self-tested, and only then made the registration's image; service folders other
+    /// than the new image's and the one it replaced are removed. A failed self-test or a tree
+    /// without a service binary leaves the registration as it was (`Err`). An unregistered
+    /// service is left to `repair`.
+    fn switch_service(&self, record: &InstallState) -> Result<(), MachineOpError> {
+        let Some(registered) = self
+            .p
+            .registrar
+            .image(&self.app_id)
+            .map_err(|_| MachineOpError::Failed("read the registration"))?
+        else {
+            return Ok(());
+        };
+        let target = self.service_target(record)?;
+        let layout = self.layout();
+        let want = layout.service_image(&target);
+        if registered == want {
+            return Ok(());
+        }
+        let image = self.ready_service_image(&target)?;
+        self.p
+            .registrar
+            .set_image(&self.app_id, &image)
+            .map_err(|_| MachineOpError::Failed("switch the service"))?;
+        self.prune_service_dirs(&[image, registered]);
+        Ok(())
+    }
+
+    /// The version whose service binary the registration should name.
+    fn service_target(&self, record: &InstallState) -> Result<Version, MachineOpError> {
+        match (&record.pending, &record.previous, &record.current) {
+            (Some(_), Some(previous), _) => Ok(previous.version.clone()),
+            (None, _, Some(current)) => Ok(current.version.clone()),
+            _ => Err(MachineOpError::Failed("no confirmed version")),
+        }
+    }
+
+    /// The service image of `version`, placed from its tree when absent and self-tested.
+    fn ready_service_image(&self, version: &Version) -> Result<PathBuf, MachineOpError> {
+        let config = self
+            .tree_config(version)
+            .map_err(|_| MachineOpError::PerMachineUnavailable)?;
+        let rel = service_path_in_tree_for(&config.install.entry, self.p.scheme.os)
+            .ok_or(MachineOpError::PerMachineUnavailable)?;
+        let image =
+            place_service_binary(self.p, &self.layout(), version, &self.tree(version), &rel)?;
+        self.p
+            .registrar
+            .self_test(&image)
+            .map_err(|_| MachineOpError::SelfTest)?;
+        Ok(image)
+    }
+
+    /// [`free_to_remove`] with this engine's ports.
+    fn free_to_remove(&self, path: &Path) -> bool {
+        free_to_remove(self.p, path)
+    }
+
+    /// Removes the service folders other than those of `keep`, each only when the removal guard
+    /// says no process uses it (a service still running from it keeps it for a later prune).
+    fn prune_service_dirs(&self, keep: &[PathBuf]) {
+        let dir = self.layout().service_dir();
+        let Ok(entries) = self.p.fs.list_dir(&dir) else {
+            return;
+        };
+        for e in entries {
+            let path = dir.join(&e.name);
+            if !keep.iter().any(|k| k.parent() == Some(path.as_path()))
+                && self.free_to_remove(&path)
+            {
+                let _ = self.p.fs.remove_dir_all_nofollow(&path);
+            }
+        }
+    }
+
+    /// The machine GC (M5-D9 over the machine tree, M10-D20): every version tree `gc_keep` does
+    /// not keep is checked by the removal guard, renamed to `R\app\.gc-<16 hex>` (which takes the
+    /// path away from new launches), checked again under its new name and only then removed. A
+    /// tree the first check keeps, or whose rename fails, stays as it is; a `.gc-` folder the
+    /// second check keeps stays for a later GC. The rename is not an in-use check: on Windows a
+    /// folder can be renamed while a program runs from it (Revision 2). Leftover `.gc-` folders
+    /// are removed only when the guard says nobody uses them. A failed removal leaves the folder
+    /// and is recorded nowhere.
+    fn gc(&self, record: &InstallState) {
+        let keep = gc_keep(record);
+        let versions = self.versions_dir();
+        let Ok(entries) = self.p.fs.list_dir(&versions) else {
+            return;
+        };
+        for entry in entries {
+            if entry.kind != FileKind::Dir {
+                continue;
+            }
+            let Some(name) = entry.name.to_str() else {
+                continue;
+            };
+            // The bundle projection's slots are never versions: the reconcile owns them.
+            if name == SWAP_SLOT || name == OUT_SLOT {
+                continue;
+            }
+            let path = versions.join(name);
+            if name.starts_with(GC_PREFIX) {
+                if self.free_to_remove(&path) {
+                    let _ = self.p.fs.remove_dir_all_nofollow(&path);
+                }
+                continue;
+            }
+            let Ok(version) = Version::parse(name) else {
+                continue;
+            };
+            if version.to_string() != name || keep.contains(&version) {
+                continue;
+            }
+            if !self.free_to_remove(&path) {
+                continue;
+            }
+            let mut random = [0u8; 8];
+            if self.p.rng.fill(&mut random).is_err() {
+                return;
+            }
+            let renamed = versions.join(format!("{GC_PREFIX}{}", hex_encode(&random)));
+            if self.p.fs.rename(&path, &renamed).is_ok() && self.free_to_remove(&renamed) {
+                let _ = self.p.fs.remove_dir_all_nofollow(&renamed);
+            }
+        }
+        let _ = self.p.fs.sync_dir(&versions);
+    }
+
+    /// `repair` (M10-D13): with an installed, protected tree, re-creates the service registration
+    /// (its descriptor and demand start) for the confirmed current version (the previous one while
+    /// a version is pending), from that version's own binary when it passes its self-test, else
+    /// from the image registered now. Changes no record. Returns the registered version.
+    pub fn repair(&self) -> Result<Version, MachineOpError> {
+        let _guard = self.guard()?;
+        let (_, record) = self.load()?;
+        let target = self.service_target(&record)?;
+        let registered = self.p.registrar.image(&self.app_id).ok().flatten();
+        let (image, version) = match self.ready_service_image(&target) {
+            Ok(image) => (image, target),
+            Err(e) => {
+                let fallback = registered
+                    .clone()
+                    .and_then(|r| {
+                        MachineLayout::of_service_image_as(&r, self.p.scheme)
+                            .map(|(l, v)| (r, l, v))
+                    })
+                    .filter(|(r, l, _)| {
+                        l.root() == self.root
+                            && matches!(
+                                self.p.fs.symlink_metadata(r),
+                                Ok(Some(m)) if m.kind == FileKind::File
+                            )
+                    });
+                match fallback {
+                    Some((r, _, v)) => (r, v),
+                    None => return Err(e),
+                }
+            }
+        };
+        self.p
+            .registrar
+            .register(&self.app_id, &image)
+            .map_err(|_| MachineOpError::Failed("register the service"))?;
+        let mut keep = vec![image];
+        keep.extend(registered);
+        self.prune_service_dirs(&keep);
+        Ok(version)
+    }
+
+    /// `uninstall` (M10-D19 as restated, M10-D20). `R` is the engine's own, given by the host
+    /// from its own image path. In order: (1) under the lock, load the record (nothing installed
+    /// is `Failed`), build the integration request from the current tree and read the registered
+    /// service image; (2) remove the service (it stops: its image lives under `R`); (3) release
+    /// the lock (its file is under `R`); (4) the removal guard over `R`; (5) remove the machine
+    /// integration (it deletes the stub under `R`, so `R` must still be at its path); (6) rename
+    /// `R` to its tombstone in the machine home; (7) the removal guard over the tombstone; (8)
+    /// remove the tombstone without following links.
+    ///
+    /// Under the bundle projection (macOS) the live bundle `B` goes with `R` when it holds this
+    /// app's tree (nothing at `B` is followed; another app's tree there is left alone): (4) the
+    /// removal guard covers `B` too; after (5) `B` is renamed to its tombstone in its own folder
+    /// (before `R`'s rename); (7) the guard runs on both tombstones; (8) `B`'s tombstone is
+    /// removed after `R`'s.
+    ///
+    /// A refusal at (4), (6) or (7), or an integration error at (5), undoes what came before it
+    /// (the tombstones renamed back, the integration re-applied, the service image read at (1)
+    /// registered again when it lies under this `R`) and returns `InUse` (or `Integration`), so a
+    /// refused uninstall leaves the install as it was. When the undo itself fails the result is
+    /// `Failed("restore ...")` naming what was not restored (an administrator then runs
+    /// `repair`). An error at (8) leaves the tombstone (admin-only, referenced by nothing) and
+    /// returns `Failed("remove the install")`.
+    pub fn uninstall(self) -> Result<(), MachineOpError> {
+        // (1) Everything the undo needs is read before anything changes.
+        let guard = self.guard()?;
+        let (_, record) = self.load()?;
+        let current = record
+            .current
+            .as_ref()
+            .ok_or(MachineOpError::Failed("nothing installed"))?;
+        let request = self
+            .tree_config(&current.version)
+            .ok()
+            .map(|config| IntegrationRequest {
+                app_id: self.app_id.clone(),
+                install_root: self.root.clone(),
+                version: current.version.clone(),
+                meta: config.install,
+                previous: None,
+                stale_bins: Vec::new(),
+            });
+        let registered = self
+            .p
+            .registrar
+            .image(&self.app_id)
+            .map_err(|_| MachineOpError::Failed("read the registration"))?
+            .filter(|image| image.starts_with(&self.root));
+        let home = self
+            .root
+            .parent()
+            .ok_or(MachineOpError::Failed("the root has no parent"))?
+            .to_path_buf();
+        let mut random = [0u8; TOMBSTONE_RANDOM_BYTES];
+        self.p
+            .rng
+            .fill(&mut random)
+            .map_err(|_| MachineOpError::Failed("randomness"))?;
+        let tomb = home.join(tombstone_name(&self.app_id, &random));
+        let bundle = self.own_bundle();
+        let bundle_tomb = match &bundle {
+            Some(b) => {
+                let mut random = [0u8; TOMBSTONE_RANDOM_BYTES];
+                self.p
+                    .rng
+                    .fill(&mut random)
+                    .map_err(|_| MachineOpError::Failed("randomness"))?;
+                let folder = b
+                    .parent()
+                    .ok_or(MachineOpError::Failed("the bundle has no folder"))?;
+                Some(folder.join(tombstone_name(&self.app_id, &random)))
+            }
+            None => None,
+        };
+        let bundle_pair = bundle.as_deref().zip(bundle_tomb.as_deref());
+        let undo = Undo {
+            engine: &self,
+            request: request.as_ref(),
+            image: registered.as_deref(),
+            tomb: &tomb,
+            bundle: bundle_pair,
+        };
+
+        // (2) The service: stopped and deleted.
+        self.p
+            .registrar
+            .remove(&self.app_id)
+            .map_err(|_| MachineOpError::Failed("remove the service"))?;
+        // (3) The lock file lives inside `R`: release it before anything under `R` goes.
+        drop(guard);
+        // (4) The removal guard over `R`, with the service gone.
+        if !self.free_to_remove(&self.root)
+            || bundle.as_ref().is_some_and(|b| !self.free_to_remove(b))
+        {
+            return undo.run(UndoFrom::Service, MachineOpError::InUse);
+        }
+        // (5) The machine integration, while `R` (and the stub in it) is at its path. An error
+        // may have removed part of it: the undo applies it again.
+        if let Some(request) = &request {
+            match self.p.integration.remove(Scope::Machine, request) {
+                Ok(_) | Err(IntegrationError::Conflict(_)) => {}
+                Err(_) => {
+                    return undo.run(UndoFrom::Integration, MachineOpError::Integration);
+                }
+            }
+        }
+        // (5b) The live bundle to its tombstone in its own folder (macOS), before `R`'s rename.
+        if let Some((b, t)) = bundle_pair
+            && self.p.fs.rename(b, t).is_err()
+        {
+            return undo.run(UndoFrom::Integration, MachineOpError::InUse);
+        }
+        // (6) The rename takes `R` away from new launches; it is not an in-use check.
+        if self.p.fs.rename(&self.root, &tomb).is_err() {
+            return undo.run(UndoFrom::Bundle, MachineOpError::InUse);
+        }
+        // (7) The removal guard again, on the tombstones, right before deleting.
+        if !self.free_to_remove(&tomb)
+            || bundle_tomb
+                .as_ref()
+                .is_some_and(|t| !self.free_to_remove(t))
+        {
+            return undo.run(UndoFrom::Rename, MachineOpError::InUse);
+        }
+        // (8) The tombstones, without following links.
+        self.p
+            .fs
+            .remove_dir_all_nofollow(&tomb)
+            .map_err(|_| MachineOpError::Failed("remove the install"))?;
+        if let Some(t) = &bundle_tomb {
+            self.p
+                .fs
+                .remove_dir_all_nofollow(t)
+                .map_err(|_| MachineOpError::Failed("remove the bundle"))?;
+        }
+        Ok(())
+    }
+
+    /// The live bundle uninstall removes (macOS): `R/bundle`'s target when it is a real directory
+    /// holding this app's tree by its own config. Nothing there, a pointer that is missing or not
+    /// canonical, a link, or another app's or an unreadable tree: `None` (left alone).
+    fn own_bundle(&self) -> Option<PathBuf> {
+        let layout = self.layout();
+        if layout.scheme().projection() != Projection::Bundle {
+            return None;
+        }
+        let Ok(Some(bundle)) = layout.view().bundle_path(self.p.fs) else {
+            return None;
+        };
+        let ours = matches!(
+            tree_identity(self.p.fs, layout.scheme().view, &bundle),
+            Ok(Some((id, _))) if id == self.app_id
+        );
+        ours.then_some(bundle)
+    }
+}
+
+/// How far a refused `uninstall` got: its undo reverses that and everything before it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum UndoFrom {
+    /// The service was removed.
+    Service,
+    /// The integration was removed (or its removal failed part-way).
+    Integration,
+    /// The live bundle was renamed to its tombstone (macOS).
+    Bundle,
+    /// `R` was renamed to its tombstone.
+    Rename,
+}
+
+/// What a refused `uninstall` restores, read at its step (1).
+struct Undo<'e, 'a> {
+    engine: &'e Engine<'a>,
+    request: Option<&'e IntegrationRequest>,
+    /// The registered service image, only when it lies under this `R`.
+    image: Option<&'e Path>,
+    tomb: &'e Path,
+    /// The live bundle and its tombstone (macOS), when uninstall removes it.
+    bundle: Option<(&'e Path, &'e Path)>,
+}
+
+impl Undo<'_, '_> {
+    /// Renames the tombstone back, re-applies the integration and registers the service image
+    /// again, as far as `from` says; returns `refusal`, or `Failed("restore ...")` naming what
+    /// could not be restored.
+    fn run(&self, from: UndoFrom, refusal: MachineOpError) -> Result<(), MachineOpError> {
+        let e = self.engine;
+        if from >= UndoFrom::Rename && e.p.fs.rename(self.tomb, &e.root).is_err() {
+            // Without `R` at its path neither the integration nor the service can point into it.
+            return Err(MachineOpError::Failed("restore the install folder"));
+        }
+        if from >= UndoFrom::Bundle
+            && let Some((bundle, tomb)) = self.bundle
+            && e.p.fs.rename(tomb, bundle).is_err()
+        {
+            return Err(MachineOpError::Failed("restore the bundle"));
+        }
+        let integration = from < UndoFrom::Integration
+            || self
+                .request
+                .is_none_or(|r| e.p.integration.apply(Scope::Machine, r).is_ok());
+        let service = self
+            .image
+            .is_none_or(|image| e.p.registrar.register(&e.app_id, image).is_ok());
+        match (integration, service) {
+            (true, true) => Err(refusal),
+            (false, true) => Err(MachineOpError::Failed("restore the integration")),
+            (true, false) => Err(MachineOpError::Failed("restore the service")),
+            (false, false) => Err(MachineOpError::Failed(
+                "restore the integration and the service",
+            )),
+        }
+    }
+}
+
+// ---- the dispatcher ------------------------------------------------------------------------------
+
+fn end_malformed<D: Duplex>(
+    session: &mut ServerSession<D>,
+    why: &'static str,
+) -> Result<(), ServiceError> {
+    let _ = session.reply(&Response::error(ErrorCode::Malformed));
+    Err(ServiceError::Malformed(why))
+}
+
+/// Serves one connection: maps each request to the engine and answers it. A request out of order
+/// (`put` or `stage_commit` without a stage session, a second `stage_begin`, a repeated object, a
+/// fourth commit) answers `malformed` and ends the connection without touching the engine. The
+/// stage session lives here; when the connection ends for any reason it is dropped, which removes
+/// its upload folder and an unfinished partial tree. `monotonic` is the host's monotonic time for
+/// the supervision lease.
+pub fn serve<D: Duplex>(
+    mut session: ServerSession<D>,
+    engine: &mut Engine<'_>,
+    monotonic: &dyn Fn() -> Duration,
+) -> Result<(), ServiceError> {
+    let mut stage: Option<StageSession<'_>> = None;
+    while let Some(request) = session.next_request()? {
+        let answer = match request {
+            Request::Status => engine.status().map(Response::Status),
+            Request::StageBegin { channel, documents } => {
+                if stage.is_some() {
+                    return end_malformed(&mut session, "a second stage_begin");
+                }
+                let mut data = Vec::new();
+                session.read_data(documents.iter().map(|d| d.bytes).sum(), &mut data)?;
+                let mut at = 0usize;
+                let mut roots: Vec<&[u8]> = Vec::new();
+                let (mut keys, mut feed, mut manifest): (&[u8], &[u8], &[u8]) = (&[], &[], &[]);
+                for d in &documents {
+                    // The sizes were checked against FORMAT 4's caps and read in full.
+                    let len = usize::try_from(d.bytes).unwrap_or(usize::MAX);
+                    let bytes = &data[at..at + len];
+                    at += len;
+                    match d.kind {
+                        crate::service::DocumentKind::Root => roots.push(bytes),
+                        crate::service::DocumentKind::Keys => keys = bytes,
+                        crate::service::DocumentKind::Feed => feed = bytes,
+                        crate::service::DocumentKind::Manifest => manifest = bytes,
+                    }
+                }
+                match engine.stage_begin(&channel, &roots, keys, feed, manifest) {
+                    Ok(Some(s)) => {
+                        let version = s.version().clone();
+                        stage = Some(s);
+                        Ok(Response::StageReady { version })
+                    }
+                    Ok(None) => Ok(Response::NoUpdate),
+                    Err(e) => Err(e),
+                }
+            }
+            Request::Put { sha256, size, kind } => {
+                let Some(s) = stage.as_mut() else {
+                    return end_malformed(&mut session, "put without a stage session");
+                };
+                match engine.put_check(s, kind, &sha256, size) {
+                    Err(e) if e.code == ErrorCode::Malformed => {
+                        return end_malformed(&mut session, "an object uploaded twice");
+                    }
+                    Err(e) => {
+                        // Refused before any byte: the declared bytes are read and dropped so
+                        // the connection stays in step.
+                        session.read_data(size, &mut io::sink())?;
+                        Err(e)
+                    }
+                    Ok(()) => match engine.put_open(s, &sha256, size) {
+                        Err(e) => {
+                            session.read_data(size, &mut io::sink())?;
+                            Err(e)
+                        }
+                        Ok(mut writer) => match session.read_data(size, &mut writer) {
+                            Ok(()) => engine
+                                .put_finish(s, &sha256, writer)
+                                .map(|()| Response::PutOk),
+                            Err(ServiceError::Sink(_)) => {
+                                writer.discard(engine.p.fs);
+                                let _ = session.reply(&Response::error(ErrorCode::Internal));
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                writer.discard(engine.p.fs);
+                                return Err(e);
+                            }
+                        },
+                    },
+                }
+            }
+            Request::StageCommit => {
+                let Some(s) = stage.as_mut() else {
+                    return end_malformed(&mut session, "stage_commit without a stage session");
+                };
+                if s.commits() >= MAX_COMMITS {
+                    return end_malformed(&mut session, "a fourth stage_commit");
+                }
+                let mut failed = None;
+                let outcome = engine.stage_commit(s, &mut |done, total| {
+                    if failed.is_none()
+                        && let Err(e) = session.reply(&Response::Progress { done, total })
+                    {
+                        failed = Some(e);
+                    }
+                });
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+                match outcome {
+                    Ok(CommitOutcome::Staged(version)) => {
+                        stage = None;
+                        Ok(Response::Staged { version })
+                    }
+                    Ok(CommitOutcome::NeedFetch { paths, more }) => {
+                        Ok(Response::NeedFetch { paths, more })
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Request::Apply { version } => engine
+                .apply(&version, monotonic())
+                .map(|token| Response::Applied { version, token }),
+            Request::Attempt { version } => {
+                engine.attempt(&version, monotonic()).map(Response::Attempt)
+            }
+            Request::Confirm { version, token } => {
+                engine.confirm(&version, &token).map(|a| match a {
+                    ConfirmAnswer::Confirmed => Response::Confirmed,
+                    ConfirmAnswer::NothingPending => Response::NothingPending,
+                })
+            }
+            Request::Rollback { version, token } => engine
+                .rollback(&version, &token)
+                .map(|current| Response::RolledBack { current }),
+        };
+        session.reply(&answer.unwrap_or_else(EngineError::to_response))?;
+    }
+    Ok(())
+}

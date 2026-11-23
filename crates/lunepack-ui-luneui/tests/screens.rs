@@ -861,3 +861,372 @@ fn a_hello_from_another_build_is_refused_and_a_message_out_of_order_is_a_protoco
         Err(ProtocolError::OutOfOrder(_))
     ));
 }
+
+// ---- the all-users choice on the welcome screen ----
+
+fn offering() -> Vec<Timed> {
+    scenario::install_welcome_offering_all_users(Os::Windows, scenario::APP_NAME, true)
+}
+
+fn only_value(answers: &[UiMsg], want: ChoiceValue) -> bool {
+    matches!(answers, [UiMsg::Choice { value, .. }] if *value == want)
+}
+
+#[test]
+fn the_all_users_checkbox_exists_only_when_offered_and_is_unchecked() {
+    let (_, _, tree, _) = run(&welcome(), 600, MotionTier::Full);
+    assert!(
+        find(&tree, Role::Checkbox, "Install for all users").is_none(),
+        "not offered: no checkbox"
+    );
+    let (_, _, tree, _) = run(&offering(), 600, MotionTier::Full);
+    let node = find(&tree, Role::Checkbox, "Install for all users").expect("offered: a checkbox");
+    assert!(!node.states.contains(lune_ui::access::State::Checked));
+    assert!(node.states.contains(lune_ui::access::State::Focusable));
+}
+
+#[test]
+fn ticking_the_checkbox_checks_it_and_install_then_answers_all_users() {
+    // The click at 700 ticks the box; the Install button then answers ProceedAllUsers.
+    let mut s = scenario::install_welcome_all_users_ticked(Os::Windows, 700);
+    let (player, _, tree, answers) = run(&s, 1400, MotionTier::Full);
+    assert!(answers.is_empty(), "ticking answers nothing: {answers:?}");
+    assert_eq!(player.model.screen(), Screen::InstallWelcome);
+    let node = find(&tree, Role::Checkbox, "Install for all users").expect("a checkbox");
+    assert!(node.states.contains(lune_ui::access::State::Checked));
+
+    s.push(at(1500, Step::Click(520.0, 324.0)));
+    let (player, _, _, answers) = run(&s, 1600, MotionTier::Full);
+    assert!(
+        only_value(&answers, ChoiceValue::ProceedAllUsers),
+        "{answers:?}"
+    );
+    assert_eq!(player.model.screen(), Screen::Installing);
+}
+
+#[test]
+fn an_unticked_install_answers_proceed_even_when_offered() {
+    let mut s = offering();
+    s.push(at(700, Step::Click(520.0, 324.0)));
+    let (_, _, _, answers) = run(&s, 800, MotionTier::Full);
+    assert!(only_value(&answers, ChoiceValue::Proceed), "{answers:?}");
+
+    let mut s = offering();
+    s.push(at(700, Step::Key(NamedKey::Enter)));
+    let (_, _, _, answers) = run(&s, 800, MotionTier::Full);
+    assert!(only_value(&answers, ChoiceValue::Proceed), "{answers:?}");
+}
+
+#[test]
+fn enter_while_the_ticked_box_has_the_focus_answers_nothing_like_the_done_screens() {
+    // Ticking needs the focus, and Enter on a focused checkbox is the widget's, not the primary
+    // button's (as on the done screen); Install answers by click, Space or Enter on the button.
+    let mut s = scenario::install_welcome_all_users_ticked(Os::Windows, 700);
+    s.push(at(1000, Step::Key(NamedKey::Enter)));
+    let (_, _, _, answers) = run(&s, 1100, MotionTier::Full);
+    assert!(answers.is_empty(), "{answers:?}");
+}
+
+#[test]
+fn the_checkbox_ticks_by_keyboard_and_install_follows() {
+    // Tab to the box, Space ticks it, Tab to Cancel, Tab to Install, Space presses it.
+    let mut s = offering();
+    for (i, key) in [
+        NamedKey::Tab,
+        NamedKey::Space,
+        NamedKey::Tab,
+        NamedKey::Tab,
+        NamedKey::Space,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        s.push(at(700 + 100 * i as u64, Step::Key(key)));
+    }
+    let (_, _, _, answers) = run(&s, 1300, MotionTier::Full);
+    assert!(
+        only_value(&answers, ChoiceValue::ProceedAllUsers),
+        "{answers:?}"
+    );
+}
+
+#[test]
+fn ticked_the_note_and_the_location_describe_an_install_for_everyone() {
+    let ticked = scenario::install_welcome_all_users_ticked(Os::Windows, 700);
+    let (_, scene, _, _) = run(&ticked, 1400, MotionTier::Full);
+    let (_, plain, _, _) = run(&offering(), 1400, MotionTier::Full);
+    assert_ne!(
+        format!("{scene:?}"),
+        format!("{plain:?}"),
+        "the ticked frame differs from the unticked one"
+    );
+}
+
+// ---- the administrator command and the hand-off to Installer (M11 step 8) ----
+
+/// `run_flow`, with every clipboard write of every frame collected.
+fn run_collecting(
+    flow: Flow,
+    script: &[Timed],
+    until_ms: u64,
+) -> (
+    Player,
+    lune_ui::access::SemanticTree,
+    Vec<UiMsg>,
+    Vec<String>,
+) {
+    let mut player = Player::new(flow_opts(flow, MotionTier::Full));
+    let mut text = FakeText;
+    let mut next = 0;
+    let mut tree = Default::default();
+    let mut writes = Vec::new();
+    for ms in (0..=until_ms).step_by(10) {
+        let now = Duration::from_millis(ms);
+        while let Some(item) = script.get(next).filter(|s| s.at <= now) {
+            next += 1;
+            player.play(item).expect("the script is valid");
+        }
+        let (_, out, _) = player.frame(&mut text, now);
+        for request in out.clipboard {
+            if let lune_ui::input::ClipboardRequest::Write(text) = request {
+                writes.push(text);
+            }
+        }
+        tree = out.tree;
+    }
+    let answers = player.take_answers();
+    (player, tree, answers, writes)
+}
+
+/// Where the Copy command button is: the failed screen's Copy details place.
+const COPY_CLICK: (f32, f32) = (230.0, 324.0);
+
+#[test]
+fn the_maximum_command_is_exactly_the_cap_and_the_long_one_is_199_bytes() {
+    assert_eq!(
+        scenario::admin_command_max().len(),
+        lunepack_core::ui::MAX_ADMIN_COMMAND
+    );
+    assert_eq!(scenario::ADMIN_COMMAND_LONG.len(), 199);
+    // Every scene's command is one the protocol accepts.
+    for c in [
+        scenario::ADMIN_COMMAND,
+        scenario::ADMIN_COMMAND_LONG,
+        scenario::ADMIN_COMMAND_UNINSTALL,
+        &scenario::admin_command_max(),
+    ] {
+        let mut wire = Vec::new();
+        lunepack_core::ui::write_frame(
+            &mut wire,
+            &EngineMsg::AdminCommand {
+                command: c.to_owned(),
+            },
+        )
+        .expect("an accepted command");
+    }
+}
+
+#[test]
+fn the_command_screen_names_its_controls_and_carries_the_whole_command() {
+    for (command, flow, script) in [
+        (
+            scenario::ADMIN_COMMAND.to_owned(),
+            Flow::Install,
+            scenario::install_admin_command(Os::Windows, 1000, 4000, scenario::ADMIN_COMMAND),
+        ),
+        (
+            scenario::ADMIN_COMMAND_LONG.to_owned(),
+            Flow::Install,
+            scenario::install_admin_command(Os::Windows, 1000, 4000, scenario::ADMIN_COMMAND_LONG),
+        ),
+        (
+            scenario::admin_command_max(),
+            Flow::Install,
+            scenario::install_admin_command(
+                Os::Windows,
+                1000,
+                4000,
+                &scenario::admin_command_max(),
+            ),
+        ),
+        (
+            scenario::ADMIN_COMMAND_UNINSTALL.to_owned(),
+            Flow::Uninstall,
+            scenario::uninstall_admin_command(
+                Os::Windows,
+                1000,
+                4000,
+                scenario::ADMIN_COMMAND_UNINSTALL,
+            ),
+        ),
+    ] {
+        let (player, tree, answers, writes) = run_collecting(flow, &script, 5500);
+        assert_eq!(player.model.screen(), Screen::AdminCommand);
+        assert!(answers.len() <= 1, "only the scripted proceed");
+        assert!(writes.is_empty(), "nothing is copied before a click");
+        for name in ["Copy command", "Close"] {
+            assert!(find(&tree, Role::Button, name).is_some(), "{name}");
+        }
+        assert!(find(&tree, Role::StaticText, "Finish in a terminal").is_some());
+        // The command's node: named and valued by the full text, byte for byte, however long.
+        let node = find(&tree, Role::StaticText, &command)
+            .unwrap_or_else(|| panic!("no node carries the command {command:?}"));
+        assert!(
+            matches!(&node.value, Some(Value::Text(t)) if *t == command),
+            "the node's value is the command verbatim"
+        );
+    }
+}
+
+#[test]
+fn copy_command_writes_exactly_the_command_and_nothing_else_does() {
+    for (flow, command, script) in [
+        (
+            Flow::Install,
+            scenario::ADMIN_COMMAND_LONG.to_owned(),
+            scenario::install_admin_command(Os::Windows, 1000, 4000, scenario::ADMIN_COMMAND_LONG),
+        ),
+        (
+            Flow::Install,
+            scenario::admin_command_max(),
+            scenario::install_admin_command(
+                Os::Windows,
+                1000,
+                4000,
+                &scenario::admin_command_max(),
+            ),
+        ),
+        (
+            Flow::Uninstall,
+            scenario::ADMIN_COMMAND_UNINSTALL.to_owned(),
+            scenario::uninstall_admin_command(
+                Os::Windows,
+                1000,
+                4000,
+                scenario::ADMIN_COMMAND_UNINSTALL,
+            ),
+        ),
+    ] {
+        let mut clicked = script.clone();
+        clicked.push(at(5600, Step::Click(COPY_CLICK.0, COPY_CLICK.1)));
+        clicked.push(at(5650, Step::PointerAway));
+        let (player, _, answers, writes) = run_collecting(flow, &clicked, 5800);
+        assert_eq!(writes, vec![command], "one write, the whole text");
+        assert_eq!(player.model.screen(), Screen::AdminCommand, "still shown");
+        assert!(
+            answers.iter().all(|a| !matches!(
+                a,
+                UiMsg::Choice {
+                    value: ChoiceValue::Close,
+                    ..
+                }
+            )),
+            "copying answers nothing"
+        );
+    }
+}
+
+#[test]
+fn the_command_screen_closes_on_enter_escape_and_the_close_button() {
+    let base = scenario::install_admin_command(Os::Windows, 1000, 4000, scenario::ADMIN_COMMAND);
+    for step in [
+        Step::Key(NamedKey::Enter),
+        Step::Key(NamedKey::Escape),
+        // The Close button: bottom right.
+        Step::Click(500.0, 324.0),
+    ] {
+        let mut s = base.clone();
+        s.push(at(5600, step.clone()));
+        let (_, _, answers, writes) = run_collecting(Flow::Install, &s, 5700);
+        assert!(
+            matches!(
+                answers.last(),
+                Some(UiMsg::Choice {
+                    id: 2,
+                    value: ChoiceValue::Close
+                })
+            ),
+            "{step:?}: {answers:?}"
+        );
+        assert!(writes.is_empty());
+    }
+    // Nothing else answers: before the prompt, and no Cancel.
+    let (_, _, answers, _) = run_collecting(Flow::Install, &base, 5500);
+    assert!(answers.iter().all(|a| !matches!(
+        a,
+        UiMsg::Cancel
+            | UiMsg::Choice {
+                value: ChoiceValue::Cancel,
+                ..
+            }
+    )));
+}
+
+#[test]
+fn tab_goes_from_copy_command_to_close_and_the_text_is_no_tab_stop() {
+    let mut s = scenario::install_admin_command(Os::Windows, 1000, 4000, scenario::ADMIN_COMMAND);
+    s.push(at(5600, Step::Key(NamedKey::Tab)));
+    let (_, tree, _, _) = run_collecting(Flow::Install, &s, 5700);
+    let focused = |name: &str| {
+        find(&tree, Role::Button, name)
+            .is_some_and(|n| n.states.contains(lune_ui::access::State::Focused))
+    };
+    assert!(
+        focused("Copy command"),
+        "the first Tab lands on Copy command"
+    );
+    let mut s2 = s.clone();
+    s2.push(at(5650, Step::Key(NamedKey::Tab)));
+    let (_, tree2, _, _) = run_collecting(Flow::Install, &s2, 5800);
+    assert!(
+        find(&tree2, Role::Button, "Close")
+            .is_some_and(|n| n.states.contains(lune_ui::access::State::Focused)),
+        "the second lands on Close"
+    );
+}
+
+#[test]
+fn the_hand_off_screen_has_a_close_button_only() {
+    let s = scenario::install_handed_off(Os::Windows, 1000, 4000);
+    let (player, tree, _, _) = run_collecting(Flow::Install, &s, 5500);
+    assert_eq!(player.model.screen(), Screen::HandedOff);
+    assert!(find(&tree, Role::Button, "Close").is_some());
+    assert!(find(&tree, Role::Button, "Copy command").is_none());
+    assert!(find(&tree, Role::StaticText, "Continue in Installer").is_some());
+    let mut enter = s.clone();
+    enter.push(at(5600, Step::Key(NamedKey::Enter)));
+    let (_, _, answers, _) = run_collecting(Flow::Install, &enter, 5700);
+    assert!(matches!(
+        answers.last(),
+        Some(UiMsg::Choice {
+            id: 2,
+            value: ChoiceValue::Close
+        })
+    ));
+}
+
+#[test]
+fn the_ui_crate_starts_no_process() {
+    // The command is text to show: nothing in this crate may spawn what it displays.
+    fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("src dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, hits);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("source");
+                for needle in ["std::process", "Command::new", "tokio::process"] {
+                    if text.contains(needle) {
+                        hits.push(format!("{} uses {needle}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut hits,
+    );
+    assert!(hits.is_empty(), "{hits:?}");
+}

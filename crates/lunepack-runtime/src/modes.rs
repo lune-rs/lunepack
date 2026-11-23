@@ -82,6 +82,66 @@ pub const PUBLISHER_REASONS: [PublisherOutcome; 5] = [
     PublisherOutcome::Os,
 ];
 
+/// Why the update service of a machine install cannot be used (M10-D13): the closed set of
+/// `reason` of the `service_unavailable` outcome (exit 32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ServiceWhy {
+    /// No service is registered (an administrator runs `repair`).
+    NotInstalled,
+    /// An administrator disabled the service (until `repair` or re-enabling).
+    Disabled,
+    /// The service could not be started.
+    StartFailed,
+    /// The service's channel is not owned by the account that must own it.
+    Untrusted,
+    /// The service did not answer in time.
+    Timeout,
+    /// The service broke the protocol, or the channel failed in the middle of an exchange.
+    Protocol,
+    /// The service speaks no protocol version this runtime does.
+    Unsupported,
+}
+
+impl ServiceWhy {
+    /// Every reason, in the order the docs list them.
+    #[allow(dead_code)]
+    pub const ALL: [ServiceWhy; 7] = [
+        ServiceWhy::NotInstalled,
+        ServiceWhy::Disabled,
+        ServiceWhy::StartFailed,
+        ServiceWhy::Untrusted,
+        ServiceWhy::Timeout,
+        ServiceWhy::Protocol,
+        ServiceWhy::Unsupported,
+    ];
+
+    /// The `reason` text.
+    pub const fn name(self) -> &'static str {
+        match self {
+            ServiceWhy::NotInstalled => "not_installed",
+            ServiceWhy::Disabled => "disabled",
+            ServiceWhy::StartFailed => "start_failed",
+            ServiceWhy::Untrusted => "untrusted",
+            ServiceWhy::Timeout => "timeout",
+            ServiceWhy::Protocol => "protocol",
+            ServiceWhy::Unsupported => "unsupported",
+        }
+    }
+
+    /// The reason the facade reports; a reason a later facade adds is `protocol`.
+    pub fn of(reason: lunepack::ServiceReason) -> ServiceWhy {
+        use lunepack::ServiceReason as R;
+        match reason {
+            R::NotInstalled => ServiceWhy::NotInstalled,
+            R::Disabled => ServiceWhy::Disabled,
+            R::StartFailed => ServiceWhy::StartFailed,
+            R::Untrusted => ServiceWhy::Untrusted,
+            R::Timeout => ServiceWhy::Timeout,
+            _ => ServiceWhy::Protocol,
+        }
+    }
+}
+
 /// The outcome classes of the runtime, each with a stable exit code and a stable `kind` name
 /// (C4: one per error class of the facade's error enum, plus the runtime's own outcomes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -151,6 +211,21 @@ pub enum Kind {
     /// reason, a closed code (`different`, `installed_invalid`, `candidate_unsigned`,
     /// `candidate_invalid`, `os`). Nothing was staged.
     PublisherMismatch(PublisherOutcome),
+    /// The install is for all users and needs administrator rights, and the run cannot ask for them
+    /// (`--all-users --silent` as a standard user; M10-D15).
+    ElevationRequired,
+    /// The user declined the administrator prompt (M10-D15).
+    ElevationDeclined,
+    /// The update service of a machine install cannot be used (M10-D13); the output names the
+    /// reason, a closed code. The app keeps running its current version.
+    ServiceUnavailable(ServiceWhy),
+    /// An administrator's policy switched self-update off for this machine install (M10-D12);
+    /// nothing was requested or changed.
+    DisabledByPolicy,
+    /// The release carries no update service, so it installs per user only (M10-D7).
+    PerMachineUnavailable,
+    /// A directory of the machine install is not protected as it must be (M10-D9).
+    NotProtected,
     /// Anything else (a worker panic, a facade error this build does not know).
     Internal,
 }
@@ -158,7 +233,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind, in code order (for the golden of step 12).
     #[allow(dead_code)]
-    pub const ALL: [Kind; 30] = [
+    pub const ALL: [Kind; 36] = [
         Kind::Ok,
         Kind::Usage,
         Kind::NotInstalled,
@@ -190,6 +265,13 @@ impl Kind {
         Kind::UnsupportedLocation(Place::Translocated),
         // One representative: every reason shares the code and the name (`PUBLISHER_REASONS`).
         Kind::PublisherMismatch(PublisherOutcome::Different),
+        Kind::ElevationRequired,
+        Kind::ElevationDeclined,
+        // One representative: every reason shares the code and the name (`ServiceWhy::ALL`).
+        Kind::ServiceUnavailable(ServiceWhy::NotInstalled),
+        Kind::DisabledByPolicy,
+        Kind::PerMachineUnavailable,
+        Kind::NotProtected,
         Kind::Internal,
     ];
 
@@ -225,6 +307,12 @@ impl Kind {
             Kind::NoRelease => 27,
             Kind::UnsupportedLocation(_) => 28,
             Kind::PublisherMismatch(_) => 29,
+            Kind::ElevationRequired => 30,
+            Kind::ElevationDeclined => 31,
+            Kind::ServiceUnavailable(_) => 32,
+            Kind::DisabledByPolicy => 33,
+            Kind::PerMachineUnavailable => 34,
+            Kind::NotProtected => 35,
             Kind::Internal => 70,
         }
     }
@@ -261,6 +349,12 @@ impl Kind {
             Kind::NoRelease => "no_release",
             Kind::UnsupportedLocation(_) => "unsupported_location",
             Kind::PublisherMismatch(_) => "publisher_mismatch",
+            Kind::ElevationRequired => "elevation_required",
+            Kind::ElevationDeclined => "elevation_declined",
+            Kind::ServiceUnavailable(_) => "service_unavailable",
+            Kind::DisabledByPolicy => "disabled_by_policy",
+            Kind::PerMachineUnavailable => "per_machine_unavailable",
+            Kind::NotProtected => "not_protected",
             Kind::Internal => "internal",
         }
     }
@@ -270,8 +364,30 @@ impl Kind {
         match self {
             Kind::UnsupportedLocation(place) => Some(place.name()),
             Kind::PublisherMismatch(reason) => Some(reason.code()),
+            Kind::ServiceUnavailable(why) => Some(why.name()),
             _ => None,
         }
+    }
+
+    /// The kind a child's exit code names: success, one of this table's codes (the kinds that
+    /// carry a reason are never a child's answer here), else `process`.
+    pub fn from_exit_code(code: i32) -> Kind {
+        let Ok(code) = u8::try_from(code) else {
+            return Kind::Process;
+        };
+        Kind::ALL
+            .iter()
+            .copied()
+            .find(|k| k.code() == code)
+            .filter(|k| {
+                !matches!(
+                    k,
+                    Kind::UnsupportedLocation(_)
+                        | Kind::PublisherMismatch(_)
+                        | Kind::ServiceUnavailable(_)
+                )
+            })
+            .unwrap_or(Kind::Process)
     }
 
     /// The class of a facade error. The facade's `Display` text is never used.
@@ -308,6 +424,23 @@ impl Kind {
                 Place::of(*reason).map_or(Kind::Internal, Kind::UnsupportedLocation)
             }
             E::PublisherMismatch { reason } => Kind::PublisherMismatch(*reason),
+            E::DisabledByPolicy => Kind::DisabledByPolicy,
+            E::ServiceUnavailable { reason } => Kind::ServiceUnavailable(ServiceWhy::of(*reason)),
+            E::ServiceUnsupported => Kind::ServiceUnavailable(ServiceWhy::Unsupported),
+            // The service's own refusals: a refused document is `verify`, a tree that is not
+            // protected as it must be is `not_protected`; the rest carries no class of its own.
+            E::ServiceRefused { code, .. } => {
+                use lunepack_core::service::ErrorCode as C;
+                match code {
+                    C::VerifyFailed | C::NotInManifest | C::SizeMismatch | C::HashMismatch => {
+                        Kind::Verify
+                    }
+                    C::NotProtected => Kind::NotProtected,
+                    // As a user install reports the core's refusals of the same transitions.
+                    C::PendingExists | C::BadFull => Kind::Verify,
+                    _ => Kind::Internal,
+                }
+            }
             // WorkerPanicked, and any variant a later facade adds (the enum is non-exhaustive).
             _ => Kind::Internal,
         }
@@ -386,8 +519,61 @@ pub enum Mode {
     /// [--silent | /S]`, phase 2 of the hand-off, accepted only from the uninstaller's own temp
     /// copy (checked before any action, M7-D5).
     UninstallHandOff(HandOffArgs),
-    /// An app-facing command (`check`, `download`, `startup`, `confirm`).
+    /// An app-facing command (`check`, `download`, `startup`, `confirm`, `apply-and-restart`,
+    /// `repair`).
     Command(crate::cli::args::Parsed),
+    /// Windows only, hidden: `machine-repair --events <id> --for-sid <SID>`, the engine's `repair`
+    /// in an elevated runtime started by the unelevated `repair` command (M10 step 18).
+    MachineRepair(MachineArgs),
+    /// Windows only, hidden: the two phases of the elevated machine uninstall (M10 step 18).
+    MachineUninstall(MachineUninstall),
+    /// Linux and macOS, hidden: the elevated modes of a machine install, with their events on the
+    /// standard output (M11-D14); the Windows modes above take a pipe id and a SID instead.
+    MachineUnix(MachineUnix),
+    /// Linux and macOS, hidden: `uninstall --user-copy [--silent]`, the unelevated uninstall run
+    /// from the copy of the runtime its first run made in the user's own home for the install
+    /// (outside `R`, so the removal guard sees no process of ours in it; M11-D14).
+    UninstallCopy {
+        /// `--silent`: no UI and no prompt (D41).
+        silent: bool,
+    },
+    /// macOS only, hidden: `machine-install --pkg`, the first all-users install from the payload
+    /// the installer package placed beside this runtime (M11-D8). It takes nothing from its
+    /// caller: no other argument, no environment variable.
+    MachinePkg,
+}
+
+/// The hidden elevated modes of a machine install on a unix system (M11-D14). Every value any of
+/// them needs comes from the process's own image and the machine record; none takes a path, an
+/// id or an account from its command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineUnix {
+    /// `machine-repair --events stdout`: the engine's `repair` for the install the image stands in.
+    Repair,
+    /// `machine-uninstall --events stdout`: phase 1, from the runtime inside `R`: copies itself
+    /// into an admin-only folder of the machine home and becomes the copy (it never deletes).
+    UninstallStart,
+    /// `machine-uninstall --second [--events stdout]`: phase 2, in the copy: the engine's
+    /// `uninstall`, then the copy's own folder. `relay`: progress as relay lines on the standard
+    /// output (the unelevated parent reads them), else the events and the result line of a run
+    /// started by an administrator.
+    UninstallSecond {
+        /// The events go to the standard output as relay lines.
+        relay: bool,
+    },
+}
+
+/// The phases of the hidden `machine-uninstall` mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MachineUninstall {
+    /// Phase 1, from the runtime inside `R`: `--events <id> --for-sid <SID>`.
+    Start(MachineArgs),
+    /// Phase 2, from the copy in its own admin-only folder: `--wait-pid <u32> --wait-start <u64>`
+    /// and nothing else; everything else it needs is in its folder's marker.
+    Second {
+        /// Phase 1, waited for before anything changes.
+        wait: ProcessId,
+    },
 }
 
 /// The arguments of phase 2 of the Windows uninstall hand-off.
@@ -425,7 +611,49 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
         Some("uninstall") if HAND_OFF && rest.iter().any(|a| a == "--install-root") => {
             parse_hand_off(rest).map(Mode::UninstallHandOff)
         }
+        Some("uninstall") if UNIX_MACHINE && rest.first().is_some_and(|a| a == USER_COPY_FLAG) => {
+            match &rest[1..] {
+                [] => Ok(Mode::UninstallCopy { silent: false }),
+                [flag] if flag == "--silent" => Ok(Mode::UninstallCopy { silent: true }),
+                _ => Err(UsageError),
+            }
+        }
         Some("uninstall") => silent_or_s(rest).map(|silent| Mode::Uninstall { silent }),
+        Some(MACHINE_REPAIR) if UNIX_MACHINE => match rest {
+            [name, value] if name == "--events" && value == EVENTS_STDOUT => {
+                Ok(Mode::MachineUnix(MachineUnix::Repair))
+            }
+            _ => Err(UsageError),
+        },
+        Some(MACHINE_UNINSTALL) if UNIX_MACHINE => match rest {
+            [name, value] if name == "--events" && value == EVENTS_STDOUT => {
+                Ok(Mode::MachineUnix(MachineUnix::UninstallStart))
+            }
+            [second] if second == "--second" => {
+                Ok(Mode::MachineUnix(MachineUnix::UninstallSecond {
+                    relay: false,
+                }))
+            }
+            [second, name, value]
+                if second == "--second" && name == "--events" && value == EVENTS_STDOUT =>
+            {
+                Ok(Mode::MachineUnix(MachineUnix::UninstallSecond {
+                    relay: true,
+                }))
+            }
+            _ => Err(UsageError),
+        },
+        // The elevated modes of a machine install take a pipe and a SID on Windows only;
+        // elsewhere that shape is not a word of the grammar.
+        Some(MACHINE_REPAIR) if MACHINE_MODES => {
+            parse_machine_install(rest).map(Mode::MachineRepair)
+        }
+        Some(MACHINE_UNINSTALL) if MACHINE_MODES => parse_machine_uninstall(rest),
+        // The installer package's postinstall runs exactly this and nothing else (M11-D8).
+        Some(MACHINE_INSTALL) if PKG_MODE => match rest {
+            [flag] if flag == PKG_FLAG => Ok(Mode::MachinePkg),
+            _ => Err(UsageError),
+        },
         Some(word) => match crate::cli::args::Command::named(word) {
             Some(command) => crate::cli::args::parse(command, rest).map(Mode::Command),
             None => Err(UsageError),
@@ -438,6 +666,213 @@ pub fn parse(args: &[OsString]) -> Result<Mode, UsageError> {
 /// once; anything else is a usage error.
 pub fn parse_setup(args: &[OsString]) -> Result<bool, UsageError> {
     silent_or_s(args)
+}
+
+/// The option that asks a Windows setup to install for all users (M10-D15).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const ALL_USERS_FLAG: &str = "--all-users";
+/// The hidden mode of a Windows setup file's elevated copy (M10 step 16).
+pub const MACHINE_INSTALL: &str = "machine-install";
+/// The hidden mode of the elevated `repair` (M10 step 18).
+pub const MACHINE_REPAIR: &str = "machine-repair";
+/// The hidden mode of the elevated machine uninstall, both phases (M10 step 18).
+pub const MACHINE_UNINSTALL: &str = "machine-uninstall";
+
+/// The options of a setup file's run on a system with per-machine installs (Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetupArgs {
+    /// `--silent` or `/S`: no UI and no prompt (D41).
+    pub silent: bool,
+    /// `--all-users`: install for all users.
+    pub all_users: bool,
+}
+
+/// The arguments of the hidden `machine-install` mode. Both values are checked for their form
+/// only; the system parses the SID when the pipe is made.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MachineArgs {
+    /// `--events <32 lowercase hex>`: the id of the elevation pipe's name.
+    pub events: String,
+    /// `--for-sid <SID>`: the one account that may read the pipe (`S-1-…`).
+    pub for_sid: String,
+}
+
+impl std::fmt::Debug for MachineArgs {
+    /// Shows no value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MachineArgs").finish_non_exhaustive()
+    }
+}
+
+/// What a setup file's command line asks for on Windows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum SetupCommand {
+    /// An install run: nothing, or `--silent` / `/S` and `--all-users`, each at most once, in
+    /// any order.
+    Run(SetupArgs),
+    /// `machine-install --events <id> --for-sid <SID>`: the elevated copy's mode.
+    MachineInstall(MachineArgs),
+    /// `machine-install --events stdout` (Linux, M11-D9): the elevated copy's mode, its events on
+    /// its standard output, which the unelevated setup reads through pkexec.
+    #[cfg(unix)]
+    MachineInstallStdout,
+}
+
+/// The value of `--events` that names the elevated copy's standard output (M11-D9).
+pub const EVENTS_STDOUT: &str = "stdout";
+
+/// Parses the command line of a setup file on a unix system with per-machine installs (Linux):
+/// the run's options ([`parse_setup_command_with`], `--silent` and `--all-users`, each once, in
+/// any order) or exactly `machine-install --events stdout`. The Windows form of the mode (a pipe
+/// id and a SID) is no word of this grammar.
+#[cfg(unix)]
+pub fn parse_setup_command_unix(args: &[OsString]) -> Result<SetupCommand, UsageError> {
+    if args.first().is_some_and(|a| a == MACHINE_INSTALL) {
+        return match &args[1..] {
+            [name, value] if name == "--events" && value == EVENTS_STDOUT => {
+                Ok(SetupCommand::MachineInstallStdout)
+            }
+            _ => Err(UsageError),
+        };
+    }
+    parse_setup_command_with(args, true)
+}
+
+/// [`parse_setup_command_with`] for this system: per-machine options exist on Windows only.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_setup_command(args: &[OsString]) -> Result<SetupCommand, UsageError> {
+    parse_setup_command_with(args, cfg!(windows))
+}
+
+/// Parses a setup file's command line. With `machine` false it is [`parse_setup`]; with it, the
+/// `--all-users` option and the `machine-install` mode are accepted too. An unknown, repeated or
+/// malformed option is a usage error that names nothing.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_setup_command_with(
+    args: &[OsString],
+    machine: bool,
+) -> Result<SetupCommand, UsageError> {
+    if !machine {
+        return silent_or_s(args).map(|silent| {
+            SetupCommand::Run(SetupArgs {
+                silent,
+                all_users: false,
+            })
+        });
+    }
+    if args.first().is_some_and(|a| a == MACHINE_INSTALL) {
+        return parse_machine_install(&args[1..]).map(SetupCommand::MachineInstall);
+    }
+    let mut run = SetupArgs {
+        silent: false,
+        all_users: false,
+    };
+    for arg in args {
+        if is_silent_flag(arg) && !run.silent {
+            run.silent = true;
+        } else if arg == ALL_USERS_FLAG && !run.all_users {
+            run.all_users = true;
+        } else {
+            return Err(UsageError);
+        }
+    }
+    Ok(SetupCommand::Run(run))
+}
+
+/// `--events <id> --for-sid <SID>`, in either order, each once.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn parse_machine_install(args: &[OsString]) -> Result<MachineArgs, UsageError> {
+    let mut events: Option<String> = None;
+    let mut sid: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let name = args[i].to_str().ok_or(UsageError)?;
+        let value = args.get(i + 1).and_then(|v| v.to_str()).ok_or(UsageError)?;
+        match name {
+            "--events" if events.is_none() && is_events_id(value) => {
+                events = Some(value.to_owned());
+            }
+            "--for-sid" if sid.is_none() && is_sid_text(value) => sid = Some(value.to_owned()),
+            _ => return Err(UsageError),
+        }
+        i += 2;
+    }
+    match (events, sid) {
+        (Some(events), Some(for_sid)) => Ok(MachineArgs { events, for_sid }),
+        _ => Err(UsageError),
+    }
+}
+
+/// Whether the hidden elevated modes of a machine install exist: Windows only (M10).
+const MACHINE_MODES: bool = cfg!(windows);
+
+/// Whether the hidden elevated modes of a unix machine install exist: Linux and macOS (M11-D14).
+const UNIX_MACHINE: bool = cfg!(unix);
+
+/// The only argument of the unelevated uninstall's copy.
+pub const USER_COPY_FLAG: &str = "--user-copy";
+
+/// Whether the hidden `machine-install --pkg` mode exists: macOS only (M11-D8).
+const PKG_MODE: bool = cfg!(target_os = "macos");
+
+/// The only argument of the `--pkg` mode.
+pub const PKG_FLAG: &str = "--pkg";
+
+/// `machine-uninstall`: phase 1's `--events <id> --for-sid <SID>`, or phase 2's `--wait-pid <u32>
+/// --wait-start <u64>` and nothing else, each once.
+fn parse_machine_uninstall(args: &[OsString]) -> Result<Mode, UsageError> {
+    if args.first().is_some_and(|a| a == "--wait-pid") {
+        let mut pid: Option<u32> = None;
+        let mut start: Option<u64> = None;
+        let mut i = 0;
+        while i < args.len() {
+            let name = args[i].to_str().ok_or(UsageError)?;
+            let value = args.get(i + 1).ok_or(UsageError)?;
+            match name {
+                "--wait-pid" if pid.is_none() => {
+                    let p: u32 = decimal(value)?;
+                    if p == 0 {
+                        return Err(UsageError);
+                    }
+                    pid = Some(p);
+                }
+                "--wait-start" if start.is_none() => start = Some(decimal(value)?),
+                _ => return Err(UsageError),
+            }
+            i += 2;
+        }
+        return match (pid, start) {
+            (Some(pid), Some(start_ticks)) => {
+                Ok(Mode::MachineUninstall(MachineUninstall::Second {
+                    wait: ProcessId { pid, start_ticks },
+                }))
+            }
+            _ => Err(UsageError),
+        };
+    }
+    parse_machine_install(args).map(|a| Mode::MachineUninstall(MachineUninstall::Start(a)))
+}
+
+/// Exactly 32 lowercase hexadecimal characters.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_events_id(text: &str) -> bool {
+    text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The form of a SID's text: `S-1-<authority>` and one to fifteen sub-authorities, all decimal,
+/// at most 184 characters. The system parses it when it is used.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_sid_text(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("S-1-") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    text.len() <= 184
+        && (2..=16).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Whether `uninstall` has a phase 2 (`--install-root`): Windows only (M7-D5).
@@ -779,6 +1214,325 @@ mod tests {
         }
     }
 
+    /// M10-D15: a Windows setup takes `--silent`/`/S` and `--all-users`, each once, in any order.
+    #[test]
+    fn a_machine_setup_run_takes_silent_and_all_users_once_each() {
+        let run = |a: &[&str]| parse_setup_command_with(&os(a), true);
+        let want = |silent, all_users| Ok(SetupCommand::Run(SetupArgs { silent, all_users }));
+        assert_eq!(run(&[]), want(false, false));
+        assert_eq!(run(&["--silent"]), want(true, false));
+        assert_eq!(run(&["--all-users"]), want(false, true));
+        assert_eq!(run(&["--all-users", "--silent"]), want(true, true));
+        assert_eq!(run(&["--silent", "--all-users"]), want(true, true));
+        // `/S` is silent on Windows only (is_silent_flag).
+        if cfg!(windows) {
+            assert_eq!(run(&["/S"]), want(true, false));
+            assert_eq!(run(&["/S", "--all-users"]), want(true, true));
+        }
+        for bad in [
+            &["--all-users", "--all-users"][..],
+            &["--silent", "--silent"],
+            &["--silent", "--silent"],
+            &["--all-users=1"],
+            &["--ALL-USERS"],
+            &["--all-user"],
+            &["--for-all-users"],
+            &["all-users"],
+            &["--no-ui"],
+        ] {
+            assert_eq!(run(bad), Err(UsageError), "{bad:?}");
+        }
+        // Without per-machine installs (Linux, macOS) the option does not exist.
+        let plain = |a: &[&str]| parse_setup_command_with(&os(a), false);
+        assert_eq!(plain(&["--all-users"]), Err(UsageError));
+        assert_eq!(plain(&["machine-install"]), Err(UsageError));
+        assert_eq!(
+            plain(&["--silent"]),
+            Ok(SetupCommand::Run(SetupArgs {
+                silent: true,
+                all_users: false
+            }))
+        );
+    }
+
+    #[test]
+    fn the_machine_install_mode_takes_a_32_hex_id_and_a_sid_once_each() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let sid = "S-1-5-21-1004336348-1177238915-682003330-1001";
+        let ok = |a: &[&str]| parse_setup_command_with(&os(a), true);
+        let want = Ok(SetupCommand::MachineInstall(MachineArgs {
+            events: id.to_owned(),
+            for_sid: sid.to_owned(),
+        }));
+        assert_eq!(
+            ok(&["machine-install", "--events", id, "--for-sid", sid]),
+            want
+        );
+        assert_eq!(
+            ok(&["machine-install", "--for-sid", sid, "--events", id]),
+            want
+        );
+        let long_id = format!("{id}0");
+        let upper = id.to_uppercase();
+        let short = &id[..31];
+        let non_hex = format!("{}g", &id[..31]);
+        for bad in [
+            vec!["machine-install"],
+            vec!["machine-install", "--events", id],
+            vec!["machine-install", "--for-sid", sid],
+            vec![
+                "machine-install",
+                "--events",
+                id,
+                "--events",
+                id,
+                "--for-sid",
+                sid,
+            ],
+            vec![
+                "machine-install",
+                "--events",
+                id,
+                "--for-sid",
+                sid,
+                "--silent",
+            ],
+            vec!["machine-install", "--events", short, "--for-sid", sid],
+            vec!["machine-install", "--events", &long_id, "--for-sid", sid],
+            vec!["machine-install", "--events", &upper, "--for-sid", sid],
+            vec!["machine-install", "--events", &non_hex, "--for-sid", sid],
+            vec!["machine-install", "--events", id, "--for-sid", "S-1-5"],
+            vec!["machine-install", "--events", id, "--for-sid", "S-1-5-x"],
+            vec!["machine-install", "--events", id, "--for-sid", "s-1-5-21-1"],
+            vec!["machine-install", "--events", id, "--for-sid", "S-2-5-21-1"],
+            vec![
+                "machine-install",
+                "--events",
+                id,
+                "--for-sid",
+                "S-1-5-21--1",
+            ],
+            vec!["machine-install", "--events", id, "--for-sid", ""],
+            vec![
+                "machine-install",
+                "--events",
+                id,
+                "--for-sid",
+                &format!("S-1-5-{}", "1-".repeat(100)),
+            ],
+            vec![
+                "machine-install",
+                &format!("--events={id}"),
+                "--for-sid",
+                sid,
+            ],
+            vec![
+                "--all-users",
+                "machine-install",
+                "--events",
+                id,
+                "--for-sid",
+                sid,
+            ],
+        ] {
+            assert_eq!(ok(&bad), Err(UsageError), "{bad:?}");
+        }
+        // The ordinary runtime has no such mode.
+        assert_eq!(
+            parse(&os(&["machine-install", "--events", id, "--for-sid", sid])),
+            Err(UsageError)
+        );
+    }
+
+    /// M11-D9: a setup on Linux takes `--silent` and `--all-users` once each, or exactly
+    /// `machine-install --events stdout`; the Windows form of the mode is no word of its grammar.
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_setup_grammar_has_the_stdout_form_of_the_mode_and_not_the_pipe_form() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let sid = "S-1-5-21-1004336348-1177238915-682003330-1001";
+        let ok = |a: &[&str]| parse_setup_command_unix(&os(a));
+        assert_eq!(
+            ok(&["machine-install", "--events", "stdout"]),
+            Ok(SetupCommand::MachineInstallStdout)
+        );
+        assert_eq!(
+            ok(&["--all-users", "--silent"]),
+            Ok(SetupCommand::Run(SetupArgs {
+                silent: true,
+                all_users: true
+            }))
+        );
+        assert_eq!(
+            ok(&[]),
+            Ok(SetupCommand::Run(SetupArgs {
+                silent: false,
+                all_users: false
+            }))
+        );
+        for bad in [
+            vec!["machine-install"],
+            vec!["machine-install", "--events"],
+            vec!["machine-install", "--events", "Stdout"],
+            vec!["machine-install", "--events", "stdout", "--silent"],
+            vec![
+                "machine-install",
+                "--events",
+                "stdout",
+                "--events",
+                "stdout",
+            ],
+            vec!["machine-install", "--events=stdout"],
+            vec!["machine-install", "--events", id, "--for-sid", sid],
+            vec!["machine-install", "--for-sid", sid, "--events", "stdout"],
+            vec!["--all-users", "machine-install", "--events", "stdout"],
+            vec!["--silent", "machine-install", "--events", "stdout"],
+            vec!["/S"],
+        ] {
+            assert_eq!(ok(&bad), Err(UsageError), "{bad:?}");
+        }
+        // The ordinary runtime has no such mode either.
+        assert_eq!(
+            parse(&os(&["machine-install", "--events", "stdout"])),
+            Err(UsageError)
+        );
+    }
+
+    /// M11-D14: the elevated modes of a unix machine install take `--events stdout` and nothing
+    /// else (phase 2 of the uninstall also `--second`); the unelevated uninstall's copy takes
+    /// `--user-copy` and at most `--silent`. Windows has none of these words.
+    #[test]
+    fn the_unix_machine_modes_are_closed_and_exist_on_unix_only() {
+        let events = ["--events", "stdout"];
+        let cases: [(Vec<&str>, Mode); 7] = [
+            (
+                [&["machine-repair"][..], &events].concat(),
+                Mode::MachineUnix(MachineUnix::Repair),
+            ),
+            (
+                [&["machine-uninstall"][..], &events].concat(),
+                Mode::MachineUnix(MachineUnix::UninstallStart),
+            ),
+            (
+                vec!["machine-uninstall", "--second"],
+                Mode::MachineUnix(MachineUnix::UninstallSecond { relay: false }),
+            ),
+            (
+                [&["machine-uninstall", "--second"][..], &events].concat(),
+                Mode::MachineUnix(MachineUnix::UninstallSecond { relay: true }),
+            ),
+            (
+                vec!["uninstall", "--user-copy"],
+                Mode::UninstallCopy { silent: false },
+            ),
+            (
+                vec!["uninstall", "--user-copy", "--silent"],
+                Mode::UninstallCopy { silent: true },
+            ),
+            (vec!["uninstall"], Mode::Uninstall { silent: false }),
+        ];
+        for (args, want) in cases {
+            let got = parse(&os(&args));
+            let is_unix_word = !matches!(want, Mode::Uninstall { .. });
+            if is_unix_word && !cfg!(unix) {
+                assert_eq!(got, Err(UsageError), "{args:?}");
+            } else {
+                assert_eq!(got, Ok(want), "{args:?}");
+            }
+        }
+        if !cfg!(unix) {
+            return;
+        }
+        for bad in [
+            vec!["machine-repair"],
+            vec!["machine-repair", "--events"],
+            vec!["machine-repair", "--events", "Stdout"],
+            vec!["machine-repair", "--events", "stdout", "--silent"],
+            vec![
+                "machine-repair",
+                "--events",
+                "0123456789abcdef0123456789abcdef",
+                "--for-sid",
+                "S-1-5-21-1",
+            ],
+            vec!["machine-repair", "--second"],
+            vec!["machine-uninstall"],
+            vec!["machine-uninstall", "--second", "--second"],
+            vec!["machine-uninstall", "--second", "--events"],
+            vec!["machine-uninstall", "--second", "stdout"],
+            vec!["machine-uninstall", "--events", "stdout", "--second"],
+            vec!["machine-uninstall", "--wait-pid", "42", "--wait-start", "7"],
+            vec!["uninstall", "--user-copy", "--user-copy"],
+            vec!["uninstall", "--user-copy", "/tmp/x"],
+            vec!["uninstall", "--user-copy=1"],
+            vec!["uninstall", "--silent", "--user-copy"],
+            vec!["uninstall", "--user-copy", "--silent", "--silent"],
+        ] {
+            assert_eq!(parse(&os(&bad)), Err(UsageError), "{bad:?}");
+        }
+    }
+
+    /// M11-D8: `machine-install --pkg` is a word of the macOS grammar, with nothing beside it.
+    #[test]
+    fn the_pkg_mode_is_the_flag_alone_on_macos_and_no_word_elsewhere() {
+        let ok = os(&["machine-install", "--pkg"]);
+        if cfg!(target_os = "macos") {
+            assert_eq!(parse(&ok), Ok(Mode::MachinePkg));
+        } else {
+            assert_eq!(parse(&ok), Err(UsageError));
+        }
+        for bad in [
+            os(&["machine-install"]),
+            os(&["machine-install", "--pkg", "/"]),
+            os(&["machine-install", "--pkg", "--pkg"]),
+            os(&["machine-install", "--pkg=1"]),
+            os(&["machine-install", "--PKG"]),
+            os(&["machine-install", "/tmp/x", "--pkg"]),
+            os(&["--pkg"]),
+            os(&["pkg"]),
+            os(&["machine-install", "--events", "stdout"]),
+        ] {
+            assert_eq!(parse(&bad), Err(UsageError), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_child_exit_code_names_its_kind_and_an_unknown_one_is_a_process_error() {
+        assert_eq!(Kind::from_exit_code(0), Kind::Ok);
+        assert_eq!(Kind::from_exit_code(23), Kind::AlreadyInstalled);
+        assert_eq!(Kind::from_exit_code(30), Kind::ElevationRequired);
+        assert_eq!(Kind::from_exit_code(31), Kind::ElevationDeclined);
+        assert_eq!(Kind::from_exit_code(33), Kind::DisabledByPolicy);
+        assert_eq!(Kind::from_exit_code(34), Kind::PerMachineUnavailable);
+        assert_eq!(Kind::from_exit_code(35), Kind::NotProtected);
+        assert_eq!(Kind::from_exit_code(70), Kind::Internal);
+        // Not a code of the table, a reason-carrying kind, a negative or a wide code.
+        for code in [
+            1,
+            28,
+            29,
+            32,
+            36,
+            255,
+            -1,
+            256,
+            i32::MIN,
+            0xC000_0005_u32 as i32,
+        ] {
+            assert_eq!(Kind::from_exit_code(code), Kind::Process, "{code}");
+        }
+        for kind in Kind::ALL {
+            if !matches!(
+                kind,
+                Kind::UnsupportedLocation(_)
+                    | Kind::PublisherMismatch(_)
+                    | Kind::ServiceUnavailable(_)
+            ) {
+                assert_eq!(Kind::from_exit_code(i32::from(kind.code())), kind);
+            }
+        }
+    }
+
     #[test]
     fn install_and_uninstall_take_only_silent() {
         assert_eq!(
@@ -949,6 +1703,12 @@ mod tests {
         assert_eq!(Kind::InUse.code(), 25);
         assert_eq!(Kind::InstallMismatch.code(), 26);
         assert_eq!(Kind::NoRelease.code(), 27);
+        assert_eq!(Kind::ElevationRequired.code(), 30);
+        assert_eq!(Kind::ElevationDeclined.code(), 31);
+        assert_eq!(Kind::ServiceUnavailable(ServiceWhy::Disabled).code(), 32);
+        assert_eq!(Kind::DisabledByPolicy.code(), 33);
+        assert_eq!(Kind::PerMachineUnavailable.code(), 34);
+        assert_eq!(Kind::NotProtected.code(), 35);
         assert_eq!(Kind::of(&lunepack::Error::NoRelease), Kind::NoRelease);
         for place in Place::ALL {
             let kind = Kind::UnsupportedLocation(place);
@@ -1090,6 +1850,122 @@ mod tests {
         assert_eq!(refused, listed);
     }
 
+    /// Every reason of exit 32 is a closed code of its own and has a golden object; the facade's
+    /// reasons and errors map onto the kinds M10 step 18 names.
+    #[test]
+    fn every_service_reason_has_a_closed_code_and_a_golden_object() {
+        use lunepack::{Error as E, ServiceReason as R};
+        let golden = include_str!("../tests/golden/objects.jsonl");
+        for why in ServiceWhy::ALL {
+            let want = format!(
+                "\"kind\":\"service_unavailable\",\"exit_code\":32,\"reason\":\"{}\"}}",
+                why.name()
+            );
+            assert!(golden.lines().any(|l| l.ends_with(&want)), "{}", why.name());
+        }
+        for (reason, why) in [
+            (R::NotInstalled, ServiceWhy::NotInstalled),
+            (R::Disabled, ServiceWhy::Disabled),
+            (R::StartFailed, ServiceWhy::StartFailed),
+            (R::Untrusted, ServiceWhy::Untrusted),
+            (R::Timeout, ServiceWhy::Timeout),
+            (R::Protocol, ServiceWhy::Protocol),
+        ] {
+            assert_eq!(
+                Kind::of(&E::ServiceUnavailable { reason }),
+                Kind::ServiceUnavailable(why)
+            );
+        }
+        assert_eq!(
+            Kind::of(&E::ServiceUnsupported),
+            Kind::ServiceUnavailable(ServiceWhy::Unsupported)
+        );
+        assert_eq!(Kind::of(&E::DisabledByPolicy), Kind::DisabledByPolicy);
+        let refused = |code| Kind::of(&E::ServiceRefused { code, class: None });
+        use lunepack_core::service::ErrorCode as C;
+        assert_eq!(refused(C::VerifyFailed), Kind::Verify);
+        assert_eq!(refused(C::HashMismatch), Kind::Verify);
+        assert_eq!(refused(C::NotProtected), Kind::NotProtected);
+        assert_eq!(refused(C::PendingExists), Kind::Verify);
+        assert_eq!(refused(C::Internal), Kind::Internal);
+    }
+
+    /// The hidden machine modes: `machine-repair` takes `machine-install`'s shape, `machine-uninstall`
+    /// takes it for phase 1 and the wait pair only for phase 2; Windows only.
+    #[test]
+    fn the_hidden_machine_modes_take_their_shapes_on_windows_only() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let sid = "S-1-5-21-1-2-3-1001";
+        let shape = |mode: &str| os(&[mode, "--events", id, "--for-sid", sid]);
+        let wait = os(&["machine-uninstall", "--wait-pid", "42", "--wait-start", "7"]);
+        if !cfg!(windows) {
+            for args in [shape("machine-repair"), shape("machine-uninstall"), wait] {
+                assert_eq!(parse(&args), Err(UsageError), "{args:?}");
+            }
+            return;
+        }
+        let args = MachineArgs {
+            events: id.to_owned(),
+            for_sid: sid.to_owned(),
+        };
+        assert_eq!(
+            parse(&shape("machine-repair")),
+            Ok(Mode::MachineRepair(args.clone()))
+        );
+        assert_eq!(
+            parse(&shape("machine-uninstall")),
+            Ok(Mode::MachineUninstall(MachineUninstall::Start(args)))
+        );
+        assert_eq!(
+            parse(&wait),
+            Ok(Mode::MachineUninstall(MachineUninstall::Second {
+                wait: ProcessId {
+                    pid: 42,
+                    start_ticks: 7
+                }
+            }))
+        );
+        // Closed: no path, no other option, no repeat, no mixing of the two shapes.
+        for bad in [
+            os(&["machine-repair"]),
+            os(&["machine-repair", "--install-root", "C:\\x"]),
+            os(&["machine-repair", "--wait-pid", "1", "--wait-start", "1"]),
+            os(&["machine-uninstall"]),
+            os(&["machine-uninstall", "--wait-pid", "42"]),
+            os(&["machine-uninstall", "--wait-pid", "0", "--wait-start", "1"]),
+            os(&[
+                "machine-uninstall",
+                "--wait-pid",
+                "4",
+                "--wait-pid",
+                "5",
+                "--wait-start",
+                "1",
+            ]),
+            os(&[
+                "machine-uninstall",
+                "--wait-pid",
+                "4",
+                "--wait-start",
+                "1",
+                "--events",
+                id,
+            ]),
+            os(&[
+                "machine-uninstall",
+                "--events",
+                id,
+                "--for-sid",
+                sid,
+                "--wait-pid",
+                "4",
+            ]),
+            os(&["machine-uninstall", "--silent"]),
+        ] {
+            assert_eq!(parse(&bad), Err(UsageError), "{bad:?}");
+        }
+    }
+
     #[test]
     fn the_documented_commands_are_the_parsed_ones() {
         let doc = include_str!("../../../docs/RUNTIME.md");
@@ -1106,7 +1982,7 @@ mod tests {
                 "{name} is not in the command table of docs/RUNTIME.md"
             );
         }
-        for name in ["apply", "install", "uninstall"] {
+        for name in ["apply", "install", "uninstall", "repair"] {
             assert!(
                 doc.contains(&format!("`{name}")),
                 "{name} is not in docs/RUNTIME.md"

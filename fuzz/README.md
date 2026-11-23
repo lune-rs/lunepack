@@ -2,7 +2,7 @@
 
 libFuzzer targets over the untrusted-input harnesses of `lunepack_core::fuzz` (envelopes, root,
 key set, feed, manifest, paths, trees, version/target/id rules, strict JSON, frames, HTTP response
-headers, the setup-file locator and trailer). Each target
+headers, the setup-file locator and trailer, the service protocol, the UI frames). Each target
 calls one harness; a harness must return for any input without panicking.
 
 This directory is outside the Cargo workspace (root `exclude`) and has its own committed
@@ -18,7 +18,7 @@ the committed seeds and random and mutated inputs on stable:
     cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
 
 Targets: `envelope`, `root`, `keys`, `feed`, `manifest`, `path`, `tree`, `rules`, `json`, `frame`, `http`,
-`state`, `update_config`, `setup`.
+`state`, `update_config`, `setup`, `service`, `ui`.
 If AddressSanitizer does not work on your host, add `-s none`. `corpus/` and `artifacts/` are
 local and gitignored; a crash lands in `artifacts/<target>/`.
 
@@ -55,3 +55,12 @@ regression case and fix the parser.
 - `setup`: the bytes are a whole executable. The harness runs the PE reader, the setup locator (the
   trailer at the end of the file or before a signed PE's certificate table) and parses the trailer
   it finds with the fake scheme.
+- `service`: the first byte selects the side of a service-protocol connection (M10-D1): even, a
+  server for app `org.example.hello` reading the client's hello, requests and their data frames;
+  odd, a client reading the server's hello and answers. The rest is the peer's byte stream. Accepted:
+  every frame was valid and the stream ended on a frame boundary.
+- `ui`: the first byte selects the direction of the UI protocol (M6-D2): even, the engine's frames, decoded
+  and applied to a reducer that answers every prompt with its first fitting choice; odd, the UI's frames,
+  decoded and checked against a reducer at the install welcome prompt. The rest is the byte stream.
+  Accepted: every frame was valid (and, from the engine, in order) and the stream ended on a frame
+  boundary. The seeds include the administrator command at its cap and the refusals around it.

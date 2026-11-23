@@ -5,11 +5,15 @@
 //! `Send + Sync`; implementations live in adapter crates, fakes in `lunepack-testkit`.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::digest::Sha256Digest;
-use crate::error::{Error, PublisherError, Result};
+use crate::error::{
+    ConnectError, ElevationError, Error, ProtectError, PublisherError, Result, ServiceRegError,
+};
+use crate::ident::AppId;
 use crate::path::RelPath;
+use crate::service::Duplex;
 
 /// A streaming SHA-256 computation, created by [`Hasher::sha256_start`].
 pub trait HashState: Send {
@@ -265,4 +269,168 @@ pub trait PublisherCheck: Send + Sync {
         installed: &SignedTree,
         candidate: &SignedTree,
     ) -> std::result::Result<bool, PublisherError>;
+}
+
+// ---- the machine-install ports (M10) -------------------------------------------------------------
+
+/// The protection class of a directory the privileged engine creates or checks (M10-D9,
+/// M11-D7): who may change it and who may read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DirClass {
+    /// A directory of the machine tree (`R`, `R/app`, `R/.lunepack`, `R/.lunepack/state`):
+    /// only the administrators may change it, every local user may read it.
+    ///
+    /// Windows (M10-D9): owner Administrators, full control for LocalSystem and Administrators,
+    /// read and execute for Users and app packages, nothing else. Unix (M11-D7): owner uid 0, no
+    /// write for other, group write only for gid 0 (or 80 `admin` on macOS), no ACL
+    /// ([`crate::unix_protect`]).
+    MachineTree,
+    /// An admin-only directory (`R/.lunepack/machine` and below): only the administrators may
+    /// read or change it.
+    ///
+    /// Windows (M10-D9): owner Administrators, full control for LocalSystem and Administrators,
+    /// nothing for anyone else. Unix (M11-D7): owner uid 0, no bits for group or other, no ACL.
+    AdminOnly,
+}
+
+/// Protected directories (M10-D9, M11-D7): creates a directory protected as its class says, and
+/// checks that an existing one is. Object-safe and `Send + Sync`.
+pub trait Protect: Send + Sync {
+    /// Creates the directory `path` (its parent must exist) protected as `class` says (Windows:
+    /// an explicit protected descriptor; unix: owner 0:0 and the exact mode, then checked). An
+    /// existing entry at `path` is [`ProtectError::Exists`] and is left unchanged.
+    fn create_dir(&self, path: &Path, class: DirClass) -> std::result::Result<(), ProtectError>;
+
+    /// `Ok(())` when `path` is a real directory (not a link) protected as `class` says: nobody
+    /// outside the class's writers may change it and the owner is an administrator (Windows:
+    /// Administrators, LocalSystem or TrustedInstaller; unix: uid 0, and every ancestor of the
+    /// install root passes [`DirClass::MachineTree`]'s rule). A missing directory is
+    /// [`ProtectError::NotFound`]; any other shape is [`ProtectError::NotProtected`].
+    fn check(&self, path: &Path, class: DirClass) -> std::result::Result<(), ProtectError>;
+}
+
+/// The operating system's registration of an app's update service (M10-D10). Object-safe and
+/// `Send + Sync`.
+pub trait ServiceRegistrar: Send + Sync {
+    /// Registers the service of `app_id` with the binary `image`, replacing a registration that
+    /// exists, with its descriptor and demand start.
+    fn register(&self, app_id: &AppId, image: &Path) -> std::result::Result<(), ServiceRegError>;
+
+    /// The binary the registration names; `None` when the service is not registered.
+    fn image(&self, app_id: &AppId) -> std::result::Result<Option<PathBuf>, ServiceRegError>;
+
+    /// Points the registration at `image`; the running service is not restarted.
+    fn set_image(&self, app_id: &AppId, image: &Path) -> std::result::Result<(), ServiceRegError>;
+
+    /// Runs `image --self-test` once; `Ok(())` only when it exits 0 within its time limit.
+    fn self_test(&self, image: &Path) -> std::result::Result<(), ServiceRegError>;
+
+    /// Stops and deletes the registration; a missing one is not an error.
+    fn remove(&self, app_id: &AppId) -> std::result::Result<(), ServiceRegError>;
+}
+
+/// An administrator's policy for one app (M10-D12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MachinePolicy {
+    /// Self-update is switched off: the engine refuses `stage_begin` and `apply`.
+    pub self_update_disabled: bool,
+    /// The runtime shows no update window.
+    pub no_update_ui: bool,
+}
+
+impl MachinePolicy {
+    /// Both switches on: what an unreadable or invalid policy means (M10-D12, M11-D11).
+    pub const FAIL_CLOSED: MachinePolicy = MachinePolicy {
+        self_update_disabled: true,
+        no_update_ui: true,
+    };
+
+    /// The policy a policy file's bytes hold (M11-D11): strict JSON, one object whose only
+    /// members are `disable_self_update` and `no_update_ui`, each optional and a boolean. Anything
+    /// else (not strict JSON, a repeated key, an unknown member, a value that is not a boolean,
+    /// `null` included) is `None`, which the caller reads as [`MachinePolicy::FAIL_CLOSED`].
+    pub fn from_json(bytes: &[u8]) -> Option<MachinePolicy> {
+        let members: std::collections::BTreeMap<String, serde_json::Value> =
+            crate::json::parse_strict(bytes).ok()?;
+        let mut policy = MachinePolicy::default();
+        for (key, value) in members {
+            let serde_json::Value::Bool(on) = value else {
+                return None;
+            };
+            match key.as_str() {
+                "disable_self_update" => policy.self_update_disabled = on,
+                "no_update_ui" => policy.no_update_ui = on,
+                _ => return None,
+            }
+        }
+        Some(policy)
+    }
+}
+
+/// Reads the machine policy (M10-D12). An unreadable policy counts as on: the implementation
+/// returns `true` for each value it cannot read, so the answer is infallible.
+pub trait PolicySource: Send + Sync {
+    /// The policy for `app_id`.
+    fn read(&self, app_id: &AppId) -> MachinePolicy;
+}
+
+/// Connects a client to the update service of an app (the named pipe on Windows). Object-safe and
+/// `Send + Sync`.
+pub trait ServiceConnector: Send + Sync {
+    /// A channel to the service of `app_id`, its owner checked; the caller then runs the hello.
+    fn connect(&self, app_id: &AppId) -> std::result::Result<Box<dyn Duplex>, ConnectError>;
+}
+
+/// What the current process may do (M10-D15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// A standard user's process.
+    Standard,
+    /// An administrator's process without a split token (UAC off, or the built-in account).
+    Admin,
+    /// An administrator's process holding the full token of a UAC elevation.
+    UacElevated,
+}
+
+/// An elevated child process started by [`Elevation::run_elevated`].
+pub trait ElevatedChild: Send {
+    /// Waits for the child and returns its exit code.
+    fn wait(&mut self) -> std::result::Result<i32, ElevationError>;
+
+    /// The child's standard output, when the hand-off pipes it (Linux's pkexec, M11-D9); taken
+    /// once. The default has none.
+    fn take_output(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+        None
+    }
+}
+
+/// What [`Elevation::run_elevated`] did.
+pub enum Elevated {
+    /// The child runs elevated.
+    Started(Box<dyn ElevatedChild>),
+    /// The user declined the elevation prompt; nothing runs.
+    Declined,
+}
+
+impl std::fmt::Debug for Elevated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Elevated::Started(_) => "Started(..)",
+            Elevated::Declined => "Declined",
+        })
+    }
+}
+
+/// The current process's standing and the hand-off to an elevated child (M10-D15). Object-safe
+/// and `Send + Sync`.
+pub trait Elevation: Send + Sync {
+    /// The current process's standing.
+    fn standing(&self) -> Standing;
+
+    /// Starts `exe` with `args` elevated, asking the user when the system needs to.
+    fn run_elevated(
+        &self,
+        exe: &Path,
+        args: &[String],
+    ) -> std::result::Result<Elevated, ElevationError>;
 }

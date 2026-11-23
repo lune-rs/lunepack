@@ -18,13 +18,18 @@
 //! its Authenticode certificate table (when the pack's runtime carries one) is stripped, it is
 //! stamped with the app's icon and version info (M7-D14), the stamped bytes are checked again as a
 //! Windows runtime, and nothing follows the trailer. The self-check reads the file back through the
-//! trailer locator the runtime uses.
+//! trailer locator the runtime uses. The stamp also writes an anchor placeholder resource (M10-D4);
+//! once the payload and trailer are placed, the placeholder is overwritten in place with the
+//! digests of the trailer block, the key set and the manifest (no length or offset changes), and
+//! the read-back verifies the signed file against the anchor read from its own image.
 //!
 //! A macOS target has no setup file (M8-D7). `setup` builds `Install <name>.app` from the release's
 //! own frames: its UI and its runtime (each read through its signed frame), a generated
 //! `Info.plist`, the optional icon, and `lunepack-setup.payload` (the payload and trailer of a
 //! setup file without the runtime part); `hdiutil` then writes it into an LZMA `.dmg` (macOS host
-//! only). `--zip` instead writes the bundle exactly as released into a `.zip` (any host, M8-D9):
+//! only). A release that holds the update service also gets the all-users `.pkg` (M11-D8,
+//! [`crate::pkg`]): built, signed, notarized and stapled first, embedded in the app before the
+//! app is signed, and written beside the image. `--zip` instead writes the bundle exactly as released into a `.zip` (any host, M8-D9):
 //! every file is read through its signed frame, so nothing comes from an unverified byte.
 
 use std::collections::BTreeMap;
@@ -35,9 +40,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use lunepack_codec_lzma::LzmaCodec;
+use lunepack_core::layout::{MachineOs, service_path_in_tree_for};
+use lunepack_core::pe;
 use lunepack_core::setup::{
-    Located, MAX_SETUP_RUNTIME_BYTES, PART_ALIGN, SetupPart, SetupTrailer, TRAILER_SIZE,
-    locate_file, verify_setup,
+    ANCHOR_RESOURCE_ID, ANCHOR_SIZE, Located, MAX_SETUP_RUNTIME_BYTES, PART_ALIGN, SetupAnchor,
+    SetupPart, SetupTrailer, TRAILER_SIZE, locate_file, verify_setup, verify_setup_anchored,
 };
 use lunepack_core::update_config::{MACOS_HELPER_ICON, MACOS_HELPER_UI};
 use lunepack_core::{
@@ -50,6 +57,7 @@ use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 use crate::codesign::{InstallerFile, OsCodeSign, installer_app_plan};
 use crate::config::{CodeSignSection, Config, FixedClock};
 use crate::dmg::{self, Hdiutil, InstallerApp};
+use crate::pkg::{PkgSpec, PkgTools};
 use crate::place;
 use crate::plist;
 use crate::release_dir::{self, read_capped};
@@ -72,7 +80,9 @@ pub struct SetupArgs {
     target: String,
     /// Where to write the output (default: `<app_id>-<version>-<target>-setup`, with `.exe` for a
     /// Windows target, or `<app_id>-<version>-<target>.dmg` or `.zip` for a macOS target, in the
-    /// current directory). An existing file is not replaced.
+    /// current directory). An existing file is not replaced. A macOS `.dmg` of a release with the
+    /// update service is accompanied by its all-users `.pkg`, written beside it with the same name
+    /// and the extension `.pkg`.
     #[arg(long)]
     out: Option<PathBuf>,
     /// For a `macos-*` target: write the bundle as a `.zip` (any host) instead of the installer
@@ -146,8 +156,10 @@ fn default_name(app_id: &str, version: &str, target: &str, zip: bool) -> String 
 }
 
 /// The Windows runtime copy of a setup file (M7-D1, M7-D14): the certificate table stripped,
-/// stamped as the setup variant (`<name> Setup`, the file's own name as `OriginalFilename`), and
-/// checked again as a Windows runtime so the stamped bytes are what the packager would accept.
+/// stamped as the setup variant (`<name> Setup`, the file's own name as `OriginalFilename`) with
+/// [`SetupAnchor::PLACEHOLDER`] as its anchor resource (M10-D4) in the same rewrite, and checked
+/// again as a Windows runtime so the stamped bytes are what the packager would accept. After this
+/// the image's length and layout are final: the anchor is later patched in place, never restamped.
 fn windows_runtime(
     runtime: &[u8],
     update: &lunepack_core::UpdateConfig,
@@ -171,8 +183,13 @@ fn windows_runtime(
         original_filename: file_name,
         icon,
     };
-    let stamped =
-        stamp::stamp(&unsigned, &fields).context("the setup runtime cannot be stamped")?;
+    let stamped = stamp::stamp_with_rcdata(
+        &unsigned,
+        &fields,
+        ANCHOR_RESOURCE_ID,
+        &SetupAnchor::PLACEHOLDER,
+    )
+    .context("the setup runtime cannot be stamped")?;
     check_runtime_image(&stamped, target).map_err(|e| {
         anyhow::anyhow!(
             "the stamped setup runtime is not a runtime for {}: {e}",
@@ -361,9 +378,33 @@ pub fn build(
         runtime
     };
 
+    let runtime_len = runtime.len();
     let mut out = runtime;
     let trailer = loaded.place_payload(&mut out);
-    out.extend_from_slice(&trailer.encode()?);
+    let trailer_block = trailer.encode()?;
+    out.extend_from_slice(&trailer_block);
+
+    // A Windows setup's anchor (M10-D4): the digests of the trailer block as written and of the
+    // key-set and manifest parts, patched over the placeholder the stamp wrote. The patch changes
+    // no length and no byte outside the anchor's span, so every offset in the trailer stays right.
+    let anchor = if target.is_windows() {
+        let anchor = SetupAnchor::of(
+            &trailer_block,
+            &loaded.keys_bytes,
+            &loaded.manifest_bytes,
+            &hasher,
+        );
+        patch_anchor(&mut out, runtime_len, &anchor)?;
+        let tail = &out[out.len() - TRAILER_SIZE as usize..];
+        let reread = SetupTrailer::parse(tail, out.len() as u64, &hasher, &verifier)
+            .context("internal error: the trailer does not parse after the anchor patch")?;
+        if reread != trailer {
+            bail!("internal error: the trailer reads back differently after the anchor patch");
+        }
+        Some(anchor)
+    } else {
+        None
+    };
 
     // Signed after the file is complete, and read back below as signed: the setup data ends where
     // the unsigned file ended, and the certificate table follows (M7-D11).
@@ -404,7 +445,69 @@ pub fn build(
         "the setup does not verify as the runtime checks it (is keys.json signed under the root \
          the release's update config names?)",
     )?;
+    if let Some(expected) = anchor {
+        // The anchor as a started Setup.exe reads it: from its image's resource, of the signed file.
+        let read = read_anchor(&out)?;
+        if read != expected {
+            bail!("internal error: the setup file's anchor reads back differently");
+        }
+        verify_setup_anchored(
+            &read,
+            tail,
+            &Bytes(&out),
+            end,
+            &loaded.reading,
+            &codec,
+            &hasher,
+            &verifier,
+        )
+        .context("the finished setup file does not verify against its own anchor")?;
+    }
     Ok(out)
+}
+
+/// Overwrites the anchor placeholder in the runtime image (the first `runtime_len` bytes of
+/// `out`) with `anchor`. The resource must be exactly [`ANCHOR_SIZE`] bytes holding the
+/// placeholder, and afterwards `out` has the same length and differs only inside that span; any
+/// other outcome fails the build.
+fn patch_anchor(out: &mut [u8], runtime_len: usize, anchor: &SetupAnchor) -> Result<()> {
+    let image = out
+        .get(..runtime_len)
+        .context("internal error: the runtime image is longer than the file")?;
+    let span = pe::rcdata(image, ANCHOR_RESOURCE_ID)
+        .map_err(|e| anyhow::anyhow!("internal error: the setup runtime's resources: {e}"))?
+        .context("internal error: the setup runtime has no anchor resource")?;
+    let start = usize::try_from(span.file_offset).unwrap_or(usize::MAX);
+    if span.len as usize != ANCHOR_SIZE
+        || start
+            .checked_add(ANCHOR_SIZE)
+            .is_none_or(|e| e > runtime_len)
+        || out[start..start + ANCHOR_SIZE] != SetupAnchor::PLACEHOLDER
+    {
+        bail!("internal error: the setup runtime's anchor resource is not the placeholder");
+    }
+    let before = out.to_vec();
+    out[start..start + ANCHOR_SIZE].copy_from_slice(&anchor.encode());
+    if out.len() != before.len()
+        || out[..start] != before[..start]
+        || out[start + ANCHOR_SIZE..] != before[start + ANCHOR_SIZE..]
+    {
+        bail!("internal error: the anchor patch changed bytes outside the anchor");
+    }
+    Ok(())
+}
+
+/// The anchor of a Windows setup file `bytes`, read through its image's `RT_RCDATA` resource.
+fn read_anchor(bytes: &[u8]) -> Result<SetupAnchor> {
+    let span = pe::rcdata(bytes, ANCHOR_RESOURCE_ID)
+        .map_err(|e| anyhow::anyhow!("the finished setup file's resources: {e}"))?
+        .context("the finished setup file has no anchor resource")?;
+    let start = usize::try_from(span.file_offset).unwrap_or(usize::MAX);
+    let raw = start
+        .checked_add(span.len as usize)
+        .and_then(|e| bytes.get(start..e))
+        .context("the finished setup file's anchor lies outside it")?;
+    SetupAnchor::parse(raw).context("the finished setup file's anchor")
 }
 
 /// Signs the finished Windows setup file `bytes` with `sign_installer` (M9-D5) in a scratch
@@ -518,12 +621,73 @@ fn installer_parts(loaded: &Loaded) -> Result<InstallerParts> {
     })
 }
 
+/// Whether the release holds the update service (M11-D6): a non-empty file of the target's service
+/// name beside the entry, as the engine looks for it at an all-users install.
+fn has_service(loaded: &Loaded) -> bool {
+    let Some(at) = service_path_in_tree_for(
+        &loaded.update.install.entry,
+        MachineOs::of_target(loaded.target),
+    ) else {
+        return false;
+    };
+    loaded
+        .manifest
+        .entries()
+        .iter()
+        .any(|e| matches!(e, VerifiedEntry::File { path, size, .. } if *path == at && *size > 0))
+}
+
+/// What `setup` wrote for a macOS installer: the image, and the all-users package beside it.
+struct Written {
+    image_size: u64,
+    pkg: Option<(PathBuf, u64)>,
+}
+
+/// Builds the all-users `.pkg` (M11-D8) in `scratch` and returns its bytes. In the order M11
+/// step 7 fixes: built, then signed, notarized and stapled (when configured), all before the
+/// caller embeds it. `shown` names the finished file in signing lines and errors.
+fn build_pkg(
+    loaded: &Loaded,
+    parts: &InstallerParts,
+    payload: &[u8],
+    scratch: &Path,
+    signer: Option<&OsCodeSign>,
+    shown: &str,
+) -> Result<(PathBuf, Vec<u8>)> {
+    let version = loaded.version.to_string();
+    let spec = PkgSpec {
+        app_id: &loaded.update.app_id,
+        version: &version,
+        title: &loaded.update.install.name,
+        min_os: plist::MIN_SYSTEM_VERSION,
+        runtime: &parts.runtime,
+        payload,
+    };
+    let work = scratch.join("pkg-work");
+    fs::create_dir(&work).with_context(|| format!("cannot create {}", work.display()))?;
+    let at = scratch.join("installer.pkg");
+    PkgTools::system().build(&spec, &work, &at)?;
+    if let Some(signer) = signer {
+        signer.sign_installer_file(&at, InstallerFile::Pkg, shown)?;
+    }
+    let bytes = fs::read(&at).with_context(|| format!("cannot read {}", at.display()))?;
+    Ok((at, bytes))
+}
+
 /// Writes the installer `.dmg` of the release to `out` (M8-D7, M8-D9): the installer app built in a
 /// scratch directory next to `out`, `hdiutil create` and `hdiutil verify`, then the image moved to
-/// `out` without replacing anything. Returns the image's size.
-fn write_dmg(loaded: &Loaded, out: &Path, section: Option<&CodeSignSection>) -> Result<u64> {
+/// `out` without replacing anything. A release that holds the update service also gets its
+/// all-users `.pkg` (M11-D8), embedded in the app and written beside `out`. Returns what was
+/// written.
+fn write_dmg(loaded: &Loaded, out: &Path, section: Option<&CodeSignSection>) -> Result<Written> {
     if fs::symlink_metadata(out).is_ok() {
         bail!("{} already exists", out.display());
+    }
+    let pkg_out = has_service(loaded).then(|| out.with_extension("pkg"));
+    if let Some(at) = &pkg_out
+        && fs::symlink_metadata(at).is_ok()
+    {
+        bail!("{} already exists", at.display());
     }
     let payload = macos_payload(loaded)?;
     let parts = installer_parts(loaded)?;
@@ -538,6 +702,33 @@ fn write_dmg(loaded: &Loaded, out: &Path, section: Option<&CodeSignSection>) -> 
         .with_context(|| format!("cannot create a scratch directory in {}", parent.display()))?;
     let src = scratch.path().join("src");
     fs::create_dir(&src).with_context(|| format!("cannot create {}", src.display()))?;
+    let signer = section.map(|section| {
+        OsCodeSign::for_installer(
+            section.clone(),
+            parts.dir_name.clone(),
+            scratch.path().to_owned(),
+        )
+    });
+    // M11 step 7, in this order: the package built, signed, notarized and stapled; embedded in the
+    // app; then M9-D5's order: the app's items, the app, then (when configured) its notarization
+    // and staple; only then is the image built, signed, notarized and stapled.
+    let pkg = match &pkg_out {
+        Some(at) => {
+            let shown = at.file_name().map_or_else(
+                || "installer.pkg".to_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            Some(build_pkg(
+                loaded,
+                &parts,
+                &payload,
+                scratch.path(),
+                signer.as_ref(),
+                &shown,
+            )?)
+        }
+        None => None,
+    };
     dmg::write_app(
         &src,
         &InstallerApp {
@@ -547,17 +738,9 @@ fn write_dmg(loaded: &Loaded, out: &Path, section: Option<&CodeSignSection>) -> 
             plist: &parts.plist,
             payload: &payload,
             icon: parts.icon.as_deref(),
+            all_users_pkg: pkg.as_ref().map(|(_, bytes)| bytes.as_slice()),
         },
     )?;
-    // M9-D5, in this order: the app's items, the app, then (when configured) its notarization and
-    // staple; only then is the image built, signed, notarized and stapled.
-    let signer = section.map(|section| {
-        OsCodeSign::for_installer(
-            section.clone(),
-            parts.dir_name.clone(),
-            scratch.path().to_owned(),
-        )
-    });
     if let Some(signer) = &signer {
         signer.run(&src.join(&parts.dir_name), &installer_app_plan())?;
     }
@@ -573,11 +756,23 @@ fn write_dmg(loaded: &Loaded, out: &Path, section: Option<&CodeSignSection>) -> 
         );
         signer.sign_installer_file(&image, InstallerFile::Dmg, &shown)?;
     }
-    let size = fs::metadata(&image)
+    let image_size = fs::metadata(&image)
         .with_context(|| format!("cannot read {}", image.display()))?
         .len();
     place::move_new(&image, out)?;
-    Ok(size)
+    // The standalone package is the file that was embedded. If it cannot be placed, the image just
+    // placed (this run's own file) is removed so that a failed run leaves nothing.
+    let pkg = match (pkg, pkg_out) {
+        (Some((built, bytes)), Some(at)) => {
+            if let Err(e) = place::move_new(&built, &at) {
+                let _ = fs::remove_file(out);
+                return Err(e);
+            }
+            Some((at, bytes.len() as u64))
+        }
+        _ => None,
+    };
+    Ok(Written { image_size, pkg })
 }
 
 /// Writes the bundle of the release to `out` as a `.zip` (M8-D9) and returns its size. Every
@@ -703,12 +898,19 @@ pub fn setup(config_path: &Path, args: &SetupArgs) -> Result<()> {
             }
         }
         let loaded = load(&args.dir, &config, &args.version, &args.target, &*clock)?;
-        let size = if args.zip {
-            write_zip(&loaded, &out)?
+        if args.zip {
+            let size = write_zip(&loaded, &out)?;
+            println!("setup: {file_name} ({size} bytes)");
         } else {
-            write_dmg(&loaded, &out, config.codesign_for(loaded.target))?
-        };
-        println!("setup: {file_name} ({size} bytes)");
+            let written = write_dmg(&loaded, &out, config.codesign_for(loaded.target))?;
+            println!("setup: {file_name} ({} bytes)", written.image_size);
+            if let Some((at, size)) = written.pkg {
+                let name = at
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                println!("setup: {name} ({size} bytes)");
+            }
+        }
         return Ok(());
     }
     let bytes = build(

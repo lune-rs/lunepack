@@ -625,6 +625,45 @@ mod fake {
         );
     }
 
+    /// M11 step 6 (C7): the service is nested code beside the runtime, signed with the other loose
+    /// Mach-O files before the outer bundle, and the hash stage sees its signed bytes.
+    #[test]
+    fn macos_service_is_signed_as_nested_code_before_the_bundle() {
+        let (w, tools, dir, input) = mac_world(false);
+        let bins = mac_bins(&w);
+        let service = w.dir.path().join("service");
+        fs::write(&service, unsigned_macho(4_096)).unwrap();
+        let out = w.pack(
+            input.path(),
+            &dir,
+            "macos-aarch64",
+            &[
+                "--runtime",
+                s(&bins.0),
+                "--ui",
+                s(&bins.1),
+                "--service",
+                s(&service),
+            ],
+            &[],
+        );
+        assert_ok(&out, "macos pack with --service and fake signers");
+        let log = tools.log();
+        let position = |kind: &str, path: &str| {
+            log.iter()
+                .position(|(k, p)| k.as_str() == kind && p.as_str() == path)
+        };
+        let signed = position("sign", "Contents/MacOS/lunepack-service")
+            .expect("the service is signed as a Mach-O file");
+        let outer = position("sign_outer", "").expect("the outer bundle is signed");
+        assert!(
+            signed < outer,
+            "the service is signed before the bundle: {log:?}"
+        );
+        let (_, files) = w.verify(&dir, Target::MacosAarch64);
+        assert_eq!(files["Contents/MacOS/lunepack-service"], signed_macho());
+    }
+
     /// M9-D6 / M9-R1-D1: the policy a pack writes into the update configuration.
     #[test]
     fn the_publisher_policy_is_written_by_the_default_rule() {
@@ -915,6 +954,64 @@ mod fake {
         );
         assert_ok(&out, "linux pack");
         assert_eq!(tools.log().len(), 4, "no tool ran for linux");
+    }
+
+    /// M10-D7: the placed update service is an unsigned PE of the tree, so the OS sign stage signs
+    /// it and verifies it like the runtime, the stub and the entry; the sign stage runs after the
+    /// placement and before the hash.
+    #[test]
+    fn windows_service_is_signed_like_the_other_pes() {
+        let w = World::new();
+        let tools = Tools::new(&w);
+        let sign = tools.template(
+            "sign",
+            "echo \"sign|$1\" >> \"$LOG\"; cp \"$TOOLS/signed.pe\" \"$1\"",
+            &["{path}"],
+        );
+        let verify = tools.template("verify", "echo \"verify|$1\" >> \"$LOG\"", &["{path}"]);
+        w.set_config(&format!(
+            "\n[update]\nfeed = \"https://updates.example.com/hello\"\n\n\
+             [install]\nentry = \"bin/app.exe\"\nname = \"Hello\"\n\n\
+             [codesign.windows]\nsign = {sign}\nverify = {verify}\n"
+        ));
+        let input = tempfile::tempdir().unwrap();
+        write(input.path(), "bin/app.exe", &unsigned_pe());
+        let runtime = w.dir.path().join("runtime.exe");
+        fs::write(&runtime, unsigned_pe()).unwrap();
+        let stub = w.dir.path().join("stub.exe");
+        fs::write(&stub, unsigned_pe()).unwrap();
+        let service = w.dir.path().join("service.exe");
+        fs::write(
+            &service,
+            exe_headers::pe_image(0x8664, &PeSpec::hardened(3)),
+        )
+        .unwrap();
+        let dir = w.release_dir("rel");
+        let out = w.pack(
+            input.path(),
+            &dir,
+            "windows-x86_64",
+            &[
+                "--runtime",
+                s(&runtime),
+                "--stub",
+                s(&stub),
+                "--service",
+                s(&service),
+            ],
+            &[],
+        );
+        assert_ok(&out, "windows pack with --service and fake signers");
+        let got = tools.log();
+        for key in ["sign", "verify"] {
+            assert!(
+                got.iter()
+                    .any(|(k, p)| k == key && p == "bin/lunepack-service.exe"),
+                "{key} of the service: {got:?}"
+            );
+        }
+        let (_, files) = w.verify(&dir, Target::WindowsX86_64);
+        assert_eq!(files["bin/lunepack-service.exe"], signed_pe());
     }
 }
 

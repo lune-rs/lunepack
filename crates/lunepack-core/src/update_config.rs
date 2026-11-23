@@ -175,6 +175,11 @@ pub fn runtime_file(target: Target) -> &'static str {
     }
 }
 
+/// The update service's file name on `target` (M10-D7); only Windows has one today.
+pub fn service_file(target: Target) -> Option<&'static str> {
+    target.is_windows().then_some(crate::layout::SERVICE_FILE)
+}
+
 /// The UI binary's file name on `target`.
 pub fn ui_file(target: Target) -> &'static str {
     if target.is_windows() {

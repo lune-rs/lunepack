@@ -1816,3 +1816,135 @@ fn fs_link_cases(fs: &dyn Fs, base: &Path) {
     assert_eq!(names(fs), before);
     fs.remove_dir_all_nofollow(&dir).unwrap();
 }
+
+// ---- machine-install ports (M10) ------------------------------------------------------------------
+
+/// [`lunepack_core::Protect`] contract. `root` must be an existing directory the implementation
+/// may create protected directories in; the suite works in `root/lunepack-protect-suite` (which
+/// must not exist) and removes it through `fs` at the end, best effort.
+pub fn run_protect_suite(protect: &dyn lunepack_core::Protect, fs: &dyn Fs, root: &Path) {
+    use lunepack_core::{DirClass, ProtectError};
+    let base = root.join("lunepack-protect-suite");
+    protect
+        .create_dir(&base, DirClass::MachineTree)
+        .expect("create a machine-tree directory");
+    protect
+        .check(&base, DirClass::MachineTree)
+        .expect("a created machine-tree directory checks as one");
+    let admin = base.join("machine");
+    protect
+        .create_dir(&admin, DirClass::AdminOnly)
+        .expect("create an admin-only directory");
+    protect
+        .check(&admin, DirClass::AdminOnly)
+        .expect("a created admin-only directory checks as one");
+    assert!(
+        matches!(
+            protect.create_dir(&admin, DirClass::AdminOnly),
+            Err(ProtectError::Exists)
+        ),
+        "creating an existing directory is Exists"
+    );
+    assert!(
+        matches!(
+            protect.check(&base.join("missing"), DirClass::MachineTree),
+            Err(ProtectError::NotFound)
+        ),
+        "a missing directory is NotFound"
+    );
+    assert!(
+        protect
+            .create_dir(&base.join("no-parent").join("child"), DirClass::AdminOnly)
+            .is_err(),
+        "a directory whose parent is missing is not created"
+    );
+    let file = admin.join("file");
+    let mut w = fs.create_new(&file).expect("create a file");
+    w.write_all(b"x").expect("write");
+    w.sync().expect("sync");
+    drop(w);
+    assert!(
+        matches!(
+            protect.check(&file, DirClass::AdminOnly),
+            Err(ProtectError::NotProtected)
+        ),
+        "a file is not a protected directory"
+    );
+    let _ = fs.remove_dir_all_nofollow(&base);
+}
+
+/// The transport contract of a [`lunepack_core::service::Duplex`] pair (the named pipe's server
+/// and client ends, or the testkit's in-memory pair): message frames both ways, a 1 MiB stream of
+/// data frames, a read deadline that expires as [`lunepack_core::ServiceError::Timeout`], and the
+/// peer's close read as the end of the channel. `make` returns a fresh connected pair per case.
+#[allow(clippy::type_complexity)]
+pub fn run_service_channel_suite(
+    make: &dyn Fn() -> (
+        Box<dyn lunepack_core::service::Duplex>,
+        Box<dyn lunepack_core::service::Duplex>,
+    ),
+) {
+    use lunepack_core::ServiceError;
+    use lunepack_core::service::{
+        ClientHello, Frame, KIND_DATA, KIND_MESSAGE, MAX_DATA, ServerHello, read_frame, write_frame,
+    };
+    use std::time::{Duration, Instant};
+
+    // Frames both ways.
+    let (mut a, mut b) = make();
+    let hello = ClientHello { min: 1, max: 1 }.encode().expect("hello");
+    write_frame(&mut a, KIND_MESSAGE, &hello).expect("a writes");
+    b.set_read_deadline(Some(Duration::from_secs(10)))
+        .expect("deadline");
+    assert_eq!(
+        read_frame(&mut b).expect("b reads"),
+        Some(Frame::Message(hello))
+    );
+    let answer = ServerHello::Version(1).encode().expect("answer");
+    write_frame(&mut b, KIND_MESSAGE, &answer).expect("b writes");
+    a.set_read_deadline(Some(Duration::from_secs(10)))
+        .expect("deadline");
+    assert_eq!(
+        read_frame(&mut a).expect("a reads"),
+        Some(Frame::Message(answer))
+    );
+
+    // A 1 MiB data stream, written while the other end reads.
+    let (a, mut b) = make();
+    let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let sent = data.clone();
+    let writer = std::thread::spawn(move || {
+        let mut a = a;
+        for chunk in sent.chunks(MAX_DATA) {
+            write_frame(&mut a, KIND_DATA, chunk).expect("write data");
+        }
+        a
+    });
+    b.set_read_deadline(Some(Duration::from_secs(30)))
+        .expect("deadline");
+    let mut got = Vec::new();
+    while got.len() < data.len() {
+        match read_frame(&mut b).expect("read data") {
+            Some(Frame::Data(chunk)) => got.extend_from_slice(&chunk),
+            other => panic!("expected data, got {other:?}"),
+        }
+    }
+    assert_eq!(got, data, "the stream arrives whole and in order");
+    let a = writer.join().expect("writer");
+
+    // A read deadline expires as a timeout.
+    b.set_read_deadline(Some(Duration::from_millis(100)))
+        .expect("deadline");
+    let started = Instant::now();
+    assert_eq!(read_frame(&mut b), Err(ServiceError::Timeout));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the deadline bounds the read"
+    );
+
+    // The peer's close is the end of the channel.
+    drop(a);
+    b.set_read_deadline(Some(Duration::from_secs(10)))
+        .expect("deadline");
+    assert_eq!(read_frame(&mut b), Ok(None));
+}

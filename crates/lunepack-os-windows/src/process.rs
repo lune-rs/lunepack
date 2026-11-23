@@ -15,12 +15,16 @@
 //! - [`Child::terminate`] first asks (`WM_CLOSE` to the child's top-level windows; a child without
 //!   a window cannot be asked), waits up to the grace period, then ends the process.
 //! - `tree_in_use` compares the image path of every other process with the tree after
-//!   canonicalising both, never by string prefix.
+//!   canonicalising both, never by string prefix. It skips a process it cannot open, so it is not a
+//!   removal guard; `tree_in_use_strict` is (M10-D20): the same scan, then a file-system probe that
+//!   opens every file and directory of the tree the way a deletion would and treats any refusal as
+//!   "in use".
 
 use core::time::Duration;
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStringExt as _;
+use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle, RawHandle};
 use std::os::windows::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -35,7 +39,10 @@ use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, FILETIME, HWND,
     INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, SYNCHRONIZE,
+};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -124,6 +131,82 @@ fn command(spec: &SpawnSpec, flags: u32) -> Result<Command, Error> {
     cmd.stdin(piped()).stdout(piped()).stderr(Stdio::null());
     cmd.creation_flags(flags);
     Ok(cmd)
+}
+
+/// The sharing every probe open asks for: it conflicts with nothing a process holds except what
+/// a deletion would conflict with.
+const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+/// Opens `path` as `OPEN_EXISTING` with `access`, full sharing and `flags`, and closes it at
+/// once. Nothing is read, written, truncated or changed.
+fn probe_open(path: &Path, access: u32, flags: u32) -> io::Result<()> {
+    std::fs::OpenOptions::new()
+        .access_mode(access)
+        .share_mode(SHARE_ALL)
+        .custom_flags(flags)
+        .open(path)
+        .map(drop)
+}
+
+/// Opens a directory or a reparse point (never followed) the way a deletion of it would.
+fn probe_directory(path: &Path) -> io::Result<()> {
+    probe_open(
+        path,
+        DELETE,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    )
+}
+
+/// Whether anything holds a file or directory of `tree` in a way that keeps it from being
+/// deleted (M10-D20): an image mapped by any process, a working directory, a file or directory
+/// held open without delete sharing, a read-only file. Every regular file is opened for
+/// write-data and delete, every directory and reparse point (never followed or descended into)
+/// for delete, all with full sharing and each closed before the next; the first open that fails,
+/// for any reason, answers `true`. A failure to list or to read metadata is an error.
+fn tree_files_held(tree: &Path) -> Result<bool, Error> {
+    let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
+    let held = |path: &Path, err: &io::Error| {
+        tracing::debug!(
+            code = ?err.raw_os_error(),
+            leaf = ?path.file_name(),
+            "a file of the tree cannot be opened for deletion: in use"
+        );
+        Ok(true)
+    };
+    if let Err(e) = probe_directory(&tree) {
+        return held(&tree, &e);
+    }
+    let mut pending = vec![tree];
+    while let Some(dir) = pending.pop() {
+        // The listing is read in full first, so no listing handle is open while children are.
+        let entries = std::fs::read_dir(&dir)
+            .and_then(|it| {
+                it.map(|e| e.map(|e| e.path()))
+                    .collect::<io::Result<Vec<_>>>()
+            })
+            .map_err(|e| ProcessError::from_io("in use", e))?;
+        for path in entries {
+            let meta =
+                std::fs::symlink_metadata(&path).map_err(|e| ProcessError::from_io("in use", e))?;
+            let reparse = meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+            let opened = if reparse || meta.is_dir() {
+                probe_directory(&path)
+            } else {
+                probe_open(
+                    &path,
+                    FILE_WRITE_DATA | DELETE,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                )
+            };
+            if let Err(e) = opened {
+                return held(&path, &e);
+            }
+            if !reparse && meta.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(false)
 }
 
 // ---- the Win32 calls (every unsafe block of this module) --------------------------------------
@@ -446,6 +529,9 @@ impl Process for WindowsProcess {
         wait_handle(&handle, timeout).map_err(|e| unreadable("wait", e))
     }
 
+    /// Compares every other process's image with the tree. A process this one cannot open is
+    /// skipped, and only a process's image is looked at (not its working directory or the DLLs it
+    /// loaded), so this is no guard for a removal: that is [`Process::tree_in_use_strict`].
     fn tree_in_use(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
         let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
         let me = std::process::id();
@@ -482,6 +568,18 @@ impl Process for WindowsProcess {
             }
         }
         Ok(false)
+    }
+
+    /// The scan of `tree_in_use`, then the file-system probe: `true` when the scan says so, its
+    /// error when it fails, otherwise whether any file or directory of the tree refuses to be
+    /// opened for deletion. The probe sees what a rename does not (a running image, a DLL loaded
+    /// by any process, inspectable or not) and what the scan does not (a working directory, a
+    /// held file).
+    fn tree_in_use_strict(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
+        if self.tree_in_use(tree, exclude)? {
+            return Ok(true);
+        }
+        tree_files_held(tree)
     }
 }
 

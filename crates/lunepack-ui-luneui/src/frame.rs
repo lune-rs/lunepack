@@ -99,6 +99,9 @@ pub fn frame(ui: &mut Ui<'_>, model: &mut UiModel, t: Duration, tier: MotionTier
     if let Some(on) = out.launch {
         model.set_launch(on);
     }
+    if let Some(on) = out.all_users {
+        model.set_all_users(on);
+    }
     match close_clicked {
         Some(true) => msg = msg.or_else(|| model.close_action()),
         Some(false) => model.request_minimize(),

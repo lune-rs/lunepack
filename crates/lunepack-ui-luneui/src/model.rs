@@ -91,6 +91,7 @@ pub(crate) struct View {
     pub outcome: Option<Outcome>,
     pub known: bool,
     pub launch: bool,
+    pub all_users: bool,
     pub prompt: Option<(u32, lunepack_core::ui::PromptKind)>,
     pub cancellable: bool,
 }
@@ -119,10 +120,16 @@ pub(crate) fn step_bit(item: StepItem) -> u16 {
 fn rail_index(flow: Option<Flow>, screen: Screen) -> usize {
     match (flow, screen) {
         (Some(Flow::Install), Screen::InstallWelcome) => 0,
-        (Some(Flow::Install), Screen::Installing | Screen::InstallFailed) => 1,
+        (
+            Some(Flow::Install),
+            Screen::Installing | Screen::InstallFailed | Screen::AdminCommand | Screen::HandedOff,
+        ) => 1,
         (Some(Flow::Install), Screen::InstallDone) => 2,
         (Some(Flow::Uninstall), Screen::UninstallConfirm) => 0,
-        (Some(Flow::Uninstall), Screen::Uninstalling | Screen::UninstallFailed) => 1,
+        (
+            Some(Flow::Uninstall),
+            Screen::Uninstalling | Screen::UninstallFailed | Screen::AdminCommand,
+        ) => 1,
         (Some(Flow::Uninstall), Screen::UninstallDone) => 2,
         _ => 0,
     }
@@ -131,7 +138,11 @@ fn rail_index(flow: Option<Flow>, screen: Screen) -> usize {
 fn glow_kind(screen: Screen, outcome: Option<&Outcome>) -> GlowKind {
     match screen {
         Screen::Idle | Screen::Closed => GlowKind::Idle,
-        Screen::InstallWelcome | Screen::UninstallConfirm => GlowKind::Idle,
+        // Nothing ran and nothing failed: the command and the hand-off wait for the person.
+        Screen::InstallWelcome
+        | Screen::UninstallConfirm
+        | Screen::AdminCommand
+        | Screen::HandedOff => GlowKind::Idle,
         Screen::Installing
         | Screen::UpdateWaiting
         | Screen::UpdateApplying
@@ -158,7 +169,10 @@ pub struct UiModel {
     pub(crate) version: String,
     pub(crate) publisher: Option<String>,
     pub(crate) location: Option<String>,
+    pub(crate) all_users_location: Option<String>,
     pub(crate) size_bytes: Option<u64>,
+    /// The command of [`EngineMsg::AdminCommand`], shown verbatim and never run.
+    pub(crate) admin_command: Option<String>,
     pub(crate) icon: Option<ImageData>,
     steps: u16,
     caption: Option<(u64, u64)>,
@@ -178,6 +192,7 @@ pub struct UiModel {
     pub(crate) rail_since: Duration,
     pub(crate) done_since: [Option<Duration>; 3],
     pub(crate) launch: bool,
+    pub(crate) all_users: bool,
     minimize: bool,
     pub(crate) closing_since: Option<Duration>,
     pub(crate) dim_since: Option<Duration>,
@@ -193,7 +208,9 @@ impl UiModel {
             version: String::new(),
             publisher: None,
             location: None,
+            all_users_location: None,
             size_bytes: None,
+            admin_command: None,
             icon: None,
             steps: 0,
             caption: None,
@@ -213,6 +230,7 @@ impl UiModel {
             rail_since: Duration::ZERO,
             done_since: [None; 3],
             launch: true,
+            all_users: false,
             minimize: false,
             closing_since: None,
             dim_since: None,
@@ -268,6 +286,10 @@ impl UiModel {
         self.launch = on;
     }
 
+    pub(crate) fn set_all_users(&mut self, on: bool) {
+        self.all_users = on;
+    }
+
     /// The bar's value at `t`: the tween toward the latest target.
     pub(crate) fn bar_value(&self, t: Duration) -> f32 {
         let e = anim::eased(Easing::QuadOut, t, self.bar_since, BAR_MS);
@@ -287,6 +309,7 @@ impl UiModel {
             outcome: self.state.outcome().cloned(),
             known: self.known,
             launch: self.launch,
+            all_users: self.all_users,
             prompt: self.state.open_prompt(),
             cancellable: self.state.cancellable(),
         }
@@ -308,6 +331,7 @@ impl UiModel {
                 self.version = app.version.clone();
                 self.publisher = app.publisher.clone();
                 self.location = details.location.clone();
+                self.all_users_location = details.all_users_location.clone();
                 self.size_bytes = details.size_bytes;
                 self.icon = app.icon_png.as_deref().and_then(|b| icon::decode(b).ok());
                 self.opened = t;
@@ -337,6 +361,7 @@ impl UiModel {
                     }
                 }
             }
+            EngineMsg::AdminCommand { command } => self.admin_command = Some(command.clone()),
             EngineMsg::Outcome(Outcome::Updated) => self.closing_since = Some(t),
             EngineMsg::Outcome(Outcome::Uninstalled { .. }) => self.dim_since = Some(t),
             _ => {}
@@ -489,6 +514,8 @@ impl UiModel {
                     // button (which the update window lacks) and Enter acknowledge it.
                     K::RolledBack if finish_ok => vec![c(ChoiceValue::Acknowledge)],
                     K::RolledBack => vec![],
+                    // The only thing to answer; Esc and the window's close button close it.
+                    K::AdminCommand | K::HandedOff => vec![c(ChoiceValue::Close)],
                 }
             }
             None => vec![UiMsg::Cancel],

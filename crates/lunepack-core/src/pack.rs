@@ -360,6 +360,15 @@ pub fn check_pe_stub(bytes: &[u8], target: Target, console: bool) -> Result<(), 
     check_pe_hardened(bytes, machine, subsystem)
 }
 
+/// Checks that `bytes` can be the update service (`lunepack-service.exe`, M10-D7) of `target`: the
+/// hardening of [`check_runtime_image`]'s Windows rule (M7-D10) with the console subsystem (the
+/// service control manager starts it with no window, and `--self-test` runs it from a console).
+/// Any other target is [`RuntimeImageError::Format`]. Bounds-checked; never panics.
+pub fn check_service_image(bytes: &[u8], target: Target) -> Result<(), RuntimeImageError> {
+    let machine = windows_machine(target).ok_or(RuntimeImageError::Format)?;
+    check_pe_hardened(bytes, machine, SUBSYSTEM_CONSOLE)
+}
+
 fn check_macho_runtime(bytes: &[u8], target: Target) -> Result<(), RuntimeImageError> {
     use RuntimeImageError as E;
     if target == Target::MacosUniversal {

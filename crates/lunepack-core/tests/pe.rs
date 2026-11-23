@@ -5,7 +5,9 @@ use lunepack_core::pe::{
     MACHINE_ARM64, MACHINE_X86_64, PeError, PeHeaders, PeImage, SUBSYSTEM_CONSOLE, SUBSYSTEM_GUI,
     is_c_runtime, manifest_is_hardened,
 };
-use lunepack_core::{RuntimeImageError as E, Target, check_pe_stub, check_runtime_image};
+use lunepack_core::{
+    RuntimeImageError as E, Target, check_pe_stub, check_runtime_image, check_service_image,
+};
 use lunepack_core::{check_ui_image, pack::classify};
 use lunepack_testkit::exe_headers::{self, HARDENED_MANIFEST, PeSpec, pe_image};
 
@@ -274,5 +276,55 @@ fn windows_stub_checks() {
             false
         ),
         Err(E::PeMalformed)
+    );
+}
+
+#[test]
+fn windows_service_checks() {
+    let console = hardened(MACHINE_X86_64, SUBSYSTEM_CONSOLE);
+    let gui = hardened(MACHINE_X86_64, SUBSYSTEM_GUI);
+    assert_eq!(check_service_image(&console, Target::WindowsX86_64), Ok(()));
+    assert_eq!(
+        check_service_image(&gui, Target::WindowsX86_64),
+        Err(E::Subsystem),
+        "the service is a console binary"
+    );
+    assert_eq!(
+        check_service_image(&console, Target::WindowsAarch64),
+        Err(E::Machine)
+    );
+    assert_eq!(
+        check_service_image(
+            &hardened(MACHINE_ARM64, SUBSYSTEM_CONSOLE),
+            Target::WindowsAarch64
+        ),
+        Ok(())
+    );
+    for target in [Target::LinuxX86_64, Target::MacosUniversal] {
+        assert_eq!(check_service_image(&console, target), Err(E::Format));
+    }
+    // The same hardening rules as every shipped Windows binary: a missing manifest, a missing
+    // dependent-load flag and a C runtime import are each refused.
+    let broken = |edit: &dyn Fn(&mut PeSpec)| {
+        let mut spec = PeSpec::hardened(SUBSYSTEM_CONSOLE);
+        edit(&mut spec);
+        check_service_image(&pe_image(MACHINE_X86_64, &spec), Target::WindowsX86_64)
+    };
+    assert_eq!(broken(&|s| s.manifest = None), Err(E::Manifest));
+    assert_eq!(
+        broken(&|s| s.dependent_load_flags = None),
+        Err(E::DependentLoadFlags)
+    );
+    assert_eq!(
+        broken(&|s| s.imports.push("VCRUNTIME140.dll".to_owned())),
+        Err(E::CRuntime)
+    );
+    assert_eq!(
+        check_service_image(b"MZ", Target::WindowsX86_64),
+        Err(E::Format)
+    );
+    assert_eq!(
+        check_service_image(&[], Target::WindowsX86_64),
+        Err(E::Format)
     );
 }
