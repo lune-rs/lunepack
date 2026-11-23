@@ -2086,6 +2086,11 @@ parent and inheritable ACLs never decide a mode. The engine checks `R`, `R/app`,
 every directory above it up to `/` (`/opt`, `/Library`, `/Library/Application Support`, ...), so a group-
 or world-writable ancestor stops the engine.
 
+Everything else a root process makes (the version tree, the record's files, the integration entries) takes the
+process's file-creation mask, and `pkexec` keeps the caller's. Every process of the runtime and of the service
+that stands as root on Linux or macOS therefore sets its mask to `0o022` as its first action, so the tree is
+readable by every user and writable by root alone whatever mask the session that started it carried.
+
 ### 20.3 The endpoint and the client's checks
 
 | Item | Linux | macOS |

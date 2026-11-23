@@ -1034,10 +1034,16 @@ service ever ran, or when the unit is gone) receives no update and no document. 
 (M11-D2): the client streams bytes and the daemon copies them into `R/.lunepack/machine/incoming`, so it never
 reads from a file, FIFO, device or socket a user chose. A user can hold the socket for one connection (the daemon
 serves one at a time, with the deadlines of FORMAT.md 19.6; a second client waits in the queue and its hello
-times out at ten seconds), which is the same denial the Windows pipe allows.
+times out at ten seconds, which the client reports as `busy`), which is the same denial the Windows pipe allows.
 
 **The tree and its ancestors** (M11-D7). The engine does not trust the default umask or inheritance: it creates
-each directory with mode 0700, sets owner 0:0 and the exact mode, syncs it and checks it, and at the start of every
+each directory with mode 0700, sets owner 0:0 and the exact mode, syncs it and checks it. That covers the
+protected directories only: everything else a root process creates (the version tree, the record's files, the
+integration entries) takes the process's file-creation mask, and `pkexec` keeps the caller's. So every process
+of the runtime and the service that stands as root on Linux or macOS sets its mask to `0o022` as its first action
+(`lunepack_os_linux::set_root_umask`, `lunepack_os_macos::set_root_umask`), whatever the session that started it
+carried: a permissive one (`umask 0`) does not leave a tree another user can overwrite, and a hardened one
+(`umask 077`) does not leave one the other users cannot read. At the start of every
 operation it checks `R`, `R/app`, `R/.lunepack`, `R/.lunepack/state` and `R/.lunepack/machine` and **every
 directory above `R` up to `/`**: owned by uid 0, no write for others, group write only for gid 0 (macOS: and
 gid 80, `admin`, because macOS ships group-writable folders in the path, such as `/Applications`), no access

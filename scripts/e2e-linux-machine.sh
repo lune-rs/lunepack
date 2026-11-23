@@ -54,6 +54,8 @@
 #       and uninstalls through pkexec of the runtime inside R (a rule for that path only)
 #   13  a setup file with a flipped byte (verify, nothing under /opt but nothing), and R's parent
 #       made group-writable (not_protected)
+#   14  installs under umask 077 and 000, as root and through pkexec: nothing under R is group- or
+#       world-writable, and the standard user can read the tree and the desktop entry and run the app
 #
 # bash 3.2 compatible (D30) on the host; the inside part runs in the container's bash 5.
 set -euo pipefail

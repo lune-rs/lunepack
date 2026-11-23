@@ -46,6 +46,10 @@ fn main() -> ExitCode {
     // First, before any library load: only System32 from here on (M7-D10).
     #[cfg(windows)]
     lunepack_os_windows::harden_dll_search();
+    // Every root mode of a machine install (the pkexec child, `--all-users` under sudo, the
+    // installer package's postinstall, the root repair and uninstall) creates files from here on:
+    // none of them takes the caller's mask (M11-D7).
+    root_umask();
     // `apply-and-restart` waits for its parent by default (C4): named now, before anything else,
     // so the parent cannot have exited and had its pid reused by the time the target is read.
     let parent = initial_parent();
@@ -162,6 +166,27 @@ fn main() -> ExitCode {
     };
     ExitCode::from(kind.code())
 }
+
+/// A process that stands as root on Linux or macOS sets its file-creation mask to `0o022` before
+/// it creates anything: pkexec keeps the caller's mask, so a session with `umask 077` (or `0`)
+/// would otherwise make the all-users tree unreadable (or writable) for the other users. Anything
+/// else keeps the mask it was started with.
+#[cfg(target_os = "linux")]
+fn root_umask() {
+    if lunepack_os_linux::effective_uid() == 0 {
+        lunepack_os_linux::set_root_umask();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn root_umask() {
+    if lunepack_os_macos::effective_uid() == 0 {
+        lunepack_os_macos::set_root_umask();
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn root_umask() {}
 
 /// Windows: phase 1 of the hand-off; it prints nothing when phase 2 was started (M7-D5).
 #[cfg(windows)]

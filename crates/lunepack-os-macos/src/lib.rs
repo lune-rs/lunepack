@@ -89,6 +89,20 @@ pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Sets this process's file-creation mask to `0o022` and returns the previous one.
+///
+/// Every process that stands as root when it creates the files of a machine install calls this
+/// first (M11-D7): the installer package's postinstall and a root shell may carry any mask, and
+/// what the staging, the machine record and the app bundle are made with must not depend on it.
+/// `0o022` leaves every tree readable by everyone and writable by nobody but root; the protected
+/// directories get their exact modes from `Protect` regardless.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn set_root_umask() -> u32 {
+    // SAFETY: umask(2) has no preconditions and cannot fail; it only changes this process's mask.
+    u32::from(unsafe { libc::umask(0o022) })
+}
+
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

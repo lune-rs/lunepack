@@ -35,6 +35,19 @@ pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Sets this process's file-creation mask to `0o022` and returns the previous one.
+///
+/// Every process that stands as root when it creates the files of a machine install calls this
+/// first (M11-D7): pkexec keeps the caller's mask and a root shell may carry a hardened or a
+/// permissive one, and what the staging, the machine record and the integration entries are made
+/// with must not depend on it. `0o022` leaves every tree readable by everyone and writable by
+/// nobody but root; the protected directories get their exact modes from `Protect` regardless.
+#[allow(unsafe_code, clippy::useless_conversion)]
+pub fn set_root_umask() -> u32 {
+    // SAFETY: `umask` has no preconditions and cannot fail; it only changes this process's mask.
+    u32::from(unsafe { libc::umask(0o022) })
+}
+
 /// [`Elevation`] through pkexec.
 #[derive(Debug, Clone)]
 pub struct PkexecElevation {

@@ -10,6 +10,12 @@ fn main() -> ExitCode {
     // First, before any library load: only System32 from here on (M7-D10).
     #[cfg(windows)]
     lunepack_os_windows::harden_dll_search();
+    // The service stands as root: its unit says `UMask=0022` already, and a launchd daemon starts
+    // with 022, but it takes no mask from anywhere else either (M11-D7).
+    #[cfg(target_os = "linux")]
+    lunepack_os_linux::set_root_umask();
+    #[cfg(target_os = "macos")]
+    lunepack_os_macos::set_root_umask();
     // The one place the command line is read.
     let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
     let mode = match args::parse(&argv) {

@@ -812,6 +812,47 @@ PY
   check "nothing is left" nothing_left
 }
 
+# Whatever the caller's file-creation mask, what a root install makes is readable and runnable by
+# every user and writable by root alone (M11-D7): nothing under R is group- or world-writable and
+# nothing of the app tree or the integration is unreadable. A hardened session (077) must not hide
+# the app from the other users; a permissive one (000) must not open the tree to them.
+umask_tree_ok() { # MASK-LABEL
+  local bad
+  bad=$(find "$R" -xdev ! -type l -perm /022 2>/dev/null | head -n 3)
+  eq "$1: nothing under R is group- or world-writable" "$bad" ""
+  bad=$(find "$R/app" "$R/.lunepack/state" -xdev ! -type l ! -perm -004 2>/dev/null | head -n 3)
+  eq "$1: everything in the tree and the record is readable by others" "$bad" ""
+  bad=$(find "$R/app" "$R/.lunepack/state" -xdev -type d ! -perm -005 2>/dev/null | head -n 3)
+  eq "$1: every directory can be entered by others" "$bad" ""
+  bad=$(find "$R/app/1.0.0/bin" -xdev -type f ! -perm -005 2>/dev/null | head -n 3)
+  eq "$1: the programs can be run by others" "$bad" ""
+  eq "$1: the desktop entry's mode" "$(stat -c %a "/usr/local/share/applications/$APP.desktop")" 644
+  eq "$1: the applications folder's mode" "$(stat -c %a /usr/local/share/applications)" 755
+  check "$1: the standard user can run the app" as_user "$R/current/bin/e2e-app"
+  check "$1: the standard user can read the desktop entry" as_user cat "/usr/local/share/applications/$APP.desktop"
+}
+
+row_umask() {
+  row "14 installs under a hardened and a permissive umask"
+  local setup mask rc
+  setup=$(setup_of 1.0.0)
+  for mask in 077 000; do
+    rc=$(rc_of bash -c 'umask "$1"; exec "$2" --all-users --silent' _ "$mask" "$setup")
+    eq "root's --all-users under umask $mask: installed (0)" "$rc" 0
+    umask_tree_ok "root, umask $mask"
+    eq "uninstall under umask $mask (0)" "$(rc_of bash -c 'umask "$1"; exec "$2" uninstall' _ "$mask" "$R/current/bin/lunepack-runtime")" 0
+    check "nothing is left after umask $mask" nothing_left
+  done
+  # The pkexec child keeps the caller's mask: the same install through pkexec of a hardened user.
+  allow_pkexec "$setup"
+  rc=$(rc_of as_user bash -c 'umask 077; exec "$1" --all-users' _ "$setup")
+  eq "through pkexec under umask 077: installed (0)" "$rc" 0
+  forbid_pkexec
+  umask_tree_ok "pkexec, umask 077"
+  eq "uninstall (0)" "$(rc_of "$R/current/bin/lunepack-runtime" uninstall)" 0
+  check "nothing is left after the pkexec install" nothing_left
+}
+
 # ---- the run -----------------------------------------------------------------------------------
 
 run_rows() {
@@ -838,6 +879,7 @@ run_rows() {
   row_uninstall
   row_pkexec
   row_flipped_setup_and_parent
+  row_umask
 
   echo
   if [ "$FAILURES" -ne 0 ]; then

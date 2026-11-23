@@ -35,6 +35,7 @@ mod xdg;
 #[cfg(target_os = "linux")]
 pub use elevate::{
     PKEXEC, PKEXEC_DECLINED, PKEXEC_NO_AGENT, PkexecChild, PkexecElevation, effective_uid,
+    set_root_umask,
 };
 #[cfg(target_os = "linux")]
 pub use policy::{FilePolicy, MAX_POLICY_BYTES, POLICY_DIR};
