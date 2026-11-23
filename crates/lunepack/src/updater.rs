@@ -34,11 +34,11 @@ use lunepack_core::update_config::MAX_UPDATE_CONFIG_BYTES;
 use lunepack_core::{
     AppId, BlockingResponse, BlockingTransport, CancelToken, Channel, ClockReading, Codec,
     Documents, FileKind, Fs, Hasher, IntegrationError, IntegrationRequest, Limits, OsIntegration,
-    Phase, Progress, ReadAt, RelPath, Request, Rng, RootNaming, RootWalk, Sha256Digest, SourceFor,
-    StageEnv, StageError, StageInput, Target, Transport, TransportError, TrustedRoot, UpdateConfig,
-    UpdateConfigError, UserLayout, VerifiedEntry, VerifiedManifest, Verifier, Version,
-    raised_floors, read_entry, select_candidate, verify_first_install_keys, verify_manifest,
-    verify_payload_manifest,
+    PatchSource, Phase, Progress, ReadAt, RelPath, Request, Rng, RootNaming, RootWalk,
+    Sha256Digest, SourceFor, StageEnv, StageError, StageInput, Target, Transport, TransportError,
+    TrustedRoot, UpdateConfig, UpdateConfigError, UserLayout, VerifiedEntry, VerifiedManifest,
+    Verifier, Version, raised_floors, read_entry, select_candidate, verify_first_install_keys,
+    verify_manifest, verify_payload_manifest,
 };
 use lunepack_core::{
     LayoutError, LayoutScheme, LocationReason, PublisherCheck, PublisherPolicy, SignedTree,
@@ -740,6 +740,10 @@ pub struct Downloaded {
     unchanged: Vec<Option<PathBuf>>,
     frames: HashMap<Sha256Digest, PathBuf>,
     pack: Option<PathBuf>,
+    /// Per manifest entry: the delta patch chosen for it (M12-D5), its bytes in the cache.
+    patches: Vec<Option<PatchSource>>,
+    /// The delta file the patches come from, for the cache's housekeeping.
+    delta: Option<Sha256Digest>,
     options: DownloadOptions,
 }
 
@@ -748,6 +752,7 @@ impl fmt::Debug for Downloaded {
         f.debug_struct("Downloaded")
             .field("info", &self.info)
             .field("frames", &self.frames.len())
+            .field("patches", &self.patches.iter().flatten().count())
             .field("pack", &self.pack.is_some())
             .finish_non_exhaustive()
     }
@@ -1521,10 +1526,27 @@ async fn download(
         let current = snap.record().current.as_ref().map(|c| c.version.clone());
         let manifest = Arc::clone(&info.manifest);
         let frames = frames_of(&manifest);
+        // M12-D5: the delta whose `from` is the installed version's text, byte for byte (build
+        // metadata included). Per-user installs only: a machine stage uploads frames (step 6).
+        let delta_at = match (&inner.layout, &current) {
+            (Layout::User { .. }, Some(v)) => {
+                let text = v.to_string();
+                manifest.deltas().iter().position(|d| d.from_text() == text)
+            }
+            _ => None,
+        };
 
         // Cache entries the plan does not name go first (M4-D17).
         let keep_frames: HashSet<Sha256Digest> = frames.iter().map(|(_, f)| f.sha256).collect();
         let keep_packs = HashSet::from([info.pack.sha256]);
+        let (keep_patches, keep_deltas): (HashSet<Sha256Digest>, HashSet<Sha256Digest>) =
+            match delta_at.map(|d| &manifest.deltas()[d]) {
+                Some(d) => (
+                    d.patches().iter().map(|p| p.sha256()).collect(),
+                    HashSet::from([d.file().sha256()]),
+                ),
+                None => (HashSet::new(), HashSet::new()),
+            };
         let tree = on_job(
             &inner,
             Some(&lock),
@@ -1533,7 +1555,12 @@ async fn download(
             move |inner, _| {
                 let cache = inner.cache();
                 cache.ensure_dirs()?;
-                cache.cleanup(&keep_frames, &keep_packs)?;
+                cache.cleanup(&[
+                    (CacheKind::Frame, &keep_frames),
+                    (CacheKind::Pack, &keep_packs),
+                    (CacheKind::Patch, &keep_patches),
+                    (CacheKind::Delta, &keep_deltas),
+                ])?;
                 inner.current_tree(current.as_ref())
             },
         )
@@ -1543,6 +1570,7 @@ async fn download(
         sink.set_phase(Phase::Scan, 0);
         let scan_sink = sink.clone();
         let scan_manifest = Arc::clone(&manifest);
+        let scan_tree = tree.clone();
         let unchanged = on_job(
             &inner,
             Some(&lock),
@@ -1552,7 +1580,7 @@ async fn download(
                 let last = AtomicU64::new(0);
                 Ok(lunepack_core::scan(
                     &scan_manifest,
-                    tree.as_deref(),
+                    scan_tree.as_deref(),
                     &*inner.fs,
                     &*inner.hasher,
                     inner.workers,
@@ -1563,16 +1591,38 @@ async fn download(
         )
         .await?;
 
-        let needed: Vec<FrameNeed> = frames
+        let needed: Vec<(usize, FrameNeed)> = frames
             .iter()
             .filter(|(i, _)| unchanged.get(*i).is_none_or(Option::is_none))
-            .map(|(_, f)| f.clone())
+            .cloned()
             .collect();
+        let mut patches = match (delta_at, tree) {
+            (Some(d), Some(tree)) => {
+                choose_patches(&inner, &lock, &cancel, &sink, &info, d, &unchanged, tree).await?
+            }
+            _ => vec![None; manifest.entries().len()],
+        };
         // The total is what the download will move: `fetch::download` adds it once it has planned.
         sink.set_phase(Phase::Download, 0);
         let ctx = fetch_ctx(&inner, &lock, &cancel, &sink);
-        let fetched = fetch::download(&ctx, &info.pack, &needed).await?;
-        let frames: HashMap<Sha256Digest, PathBuf> = needed
+        let mut delta = None;
+        if let Some(d) = delta_at.filter(|_| patches.iter().any(Option::is_some)) {
+            let file = manifest.deltas()[d].file();
+            delta = Some(file.sha256());
+            let target = PackTarget {
+                url: inner.urls.reference(file)?,
+                size: file.size(),
+                sha256: file.sha256(),
+            };
+            fetch_patches(&inner, &lock, &cancel, &ctx, &target, &mut patches).await?;
+        }
+        let frame_needed: Vec<FrameNeed> = needed
+            .iter()
+            .filter(|(i, _)| patches.get(*i).is_none_or(Option::is_none))
+            .map(|(_, f)| f.clone())
+            .collect();
+        let fetched = fetch::download(&ctx, &info.pack, &frame_needed).await?;
+        let frames: HashMap<Sha256Digest, PathBuf> = frame_needed
             .iter()
             .filter_map(|f| {
                 fetched
@@ -1580,28 +1630,270 @@ async fn download(
                     .map(|p| (f.sha256, p.to_path_buf()))
             })
             .collect();
-        Ok::<_, Error>((unchanged, frames, fetched.pack().map(Path::to_path_buf)))
+        Ok::<_, Error>((
+            unchanged,
+            frames,
+            fetched.pack().map(Path::to_path_buf),
+            patches,
+            delta,
+        ))
     })
     .await;
-    let (unchanged, frames, pack) = result?;
+    let (unchanged, frames, pack, patches, delta) = result?;
     options.progress = callback;
     Ok(Downloaded {
         info,
         unchanged,
         frames,
         pack,
+        patches,
+        delta,
         options,
     })
 }
 
-/// The stage sources: the matching current file, else the cached frame (its expected path, which
-/// the stage reports as `NeedFetch` when missing), else the pack when the entry was moved to it.
+/// The bytes a fetch plan of `spans` (offset, length) over an artifact of `size` bytes moves:
+/// the runs with their merged gaps, or the whole artifact; nothing for no span.
+fn plan_bytes(spans: &[(u64, u64)], size: u64, policy: FetchPolicy) -> u64 {
+    if spans.is_empty() {
+        return 0;
+    }
+    match lunepack_core::plan_fetch(spans, size, policy) {
+        lunepack_core::FetchPlan::FullPack => size,
+        lunepack_core::FetchPlan::Runs(runs) => runs
+            .iter()
+            .fold(0u64, |sum, r| sum.saturating_add(r.last - r.first + 1)),
+    }
+}
+
+/// M12-D5: the patches of delta `d` worth using, per manifest entry. A file not `unchanged` gets
+/// its patch when the current file at its path has exactly the patch's base size and SHA-256
+/// ([`lunepack_core::base_digests`], run only when the delta has a patch for such a file) and the
+/// patch is shorter than the file's frame. Then the whole plan: the bytes of the patches (by
+/// Range runs or the whole delta file) plus those of the remaining frames (runs or the full
+/// pack) must be strictly fewer than the bytes of the plan without patches, else no patch is
+/// used.
+#[allow(clippy::too_many_arguments)]
+async fn choose_patches(
+    inner: &Arc<Inner>,
+    lock: &OpLock,
+    cancel: &CancelToken,
+    sink: &ProgressSink,
+    info: &UpdateInfo,
+    d: usize,
+    unchanged: &[Option<PathBuf>],
+    tree: PathBuf,
+) -> Result<Vec<Option<PatchSource>>, Error> {
+    let manifest = &info.manifest;
+    let entries = manifest.entries();
+    let mut out: Vec<Option<PatchSource>> = vec![None; entries.len()];
+    let delta = &manifest.deltas()[d];
+    let index: HashMap<&RelPath, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.path(), i))
+        .collect();
+    let wanted = delta.patches().iter().any(|p| {
+        index
+            .get(p.path())
+            .is_some_and(|i| unchanged.get(*i).is_none_or(Option::is_none))
+    });
+    if !wanted {
+        return Ok(out);
+    }
+    let digest_manifest = Arc::clone(manifest);
+    let digest_unchanged = unchanged.to_vec();
+    let digest_tree = tree.clone();
+    let digest_sink = sink.clone();
+    let digests = on_job(
+        inner,
+        Some(lock),
+        cancel,
+        "base-digests",
+        move |inner, cancel| {
+            let last = AtomicU64::new(0);
+            Ok(lunepack_core::base_digests(
+                &digest_manifest,
+                &digest_manifest.deltas()[d],
+                &digest_unchanged,
+                Some(&digest_tree),
+                &*inner.fs,
+                &*inner.hasher,
+                inner.workers,
+                cancel,
+                &|p| forward(&digest_sink, &last, &p),
+            )?)
+        },
+    )
+    .await?;
+    for patch in delta.patches() {
+        let Some(&i) = index.get(patch.path()) else {
+            continue;
+        };
+        let VerifiedEntry::File {
+            frame: Some(frame), ..
+        } = &entries[i]
+        else {
+            continue;
+        };
+        if digests.get(i).copied().flatten() != Some(patch.base_sha256())
+            || patch.length() >= frame.length()
+        {
+            continue;
+        }
+        let mut base = tree.clone();
+        for c in patch.path().components() {
+            base.push(c);
+        }
+        out[i] = Some(PatchSource {
+            patch: inner.cache().path(CacheKind::Patch, &patch.sha256()),
+            base,
+            desc: patch.clone(),
+        });
+    }
+
+    // The whole plan, with and without the patches (equal shares counted once).
+    let mut without: Vec<(u64, u64)> = Vec::new();
+    let mut frames_left: Vec<(u64, u64)> = Vec::new();
+    let mut patch_spans: Vec<(u64, u64)> = Vec::new();
+    let (mut seen_frames, mut seen_left, mut seen_patches) =
+        (HashSet::new(), HashSet::new(), HashSet::new());
+    for (i, e) in entries.iter().enumerate() {
+        let VerifiedEntry::File {
+            frame: Some(frame), ..
+        } = e
+        else {
+            continue;
+        };
+        if unchanged.get(i).is_some_and(Option::is_some) {
+            continue;
+        }
+        let span = (frame.offset(), frame.length());
+        if seen_frames.insert(frame.sha256()) {
+            without.push(span);
+        }
+        match &out[i] {
+            Some(p) => {
+                if seen_patches.insert(p.desc.sha256()) {
+                    patch_spans.push((p.desc.offset(), p.desc.length()));
+                }
+            }
+            None => {
+                if seen_left.insert(frame.sha256()) {
+                    frames_left.push(span);
+                }
+            }
+        }
+    }
+    let policy = inner.policy;
+    let pack_size = info.pack.size;
+    let with = plan_bytes(&patch_spans, delta.file().size(), policy).saturating_add(plan_bytes(
+        &frames_left,
+        pack_size,
+        policy,
+    ));
+    if patch_spans.is_empty() || with >= plan_bytes(&without, pack_size, policy) {
+        out.iter_mut().for_each(|p| *p = None);
+    }
+    Ok(out)
+}
+
+/// Fetches the chosen patches of `delta` into `patches/` (M12-D5): by Range runs, or as the whole
+/// delta file (verified, as packs are, M4-D17), which is then split into one cache file per patch.
+/// A patch that did not arrive with its signed SHA-256 loses its patch (its frame is fetched
+/// instead); a delta file the server does not serve (an HTTP error, a wrong size or hash) drops
+/// every patch. Cancel and an interrupted body stay errors, so the next call resumes them.
+async fn fetch_patches(
+    inner: &Arc<Inner>,
+    lock: &OpLock,
+    cancel: &CancelToken,
+    ctx: &FetchCtx,
+    target: &PackTarget,
+    patches: &mut [Option<PatchSource>],
+) -> Result<(), Error> {
+    let mut needs: Vec<FrameNeed> = Vec::new();
+    for p in patches.iter().flatten() {
+        if !needs.iter().any(|n| n.sha256 == p.desc.sha256()) {
+            needs.push(FrameNeed {
+                offset: p.desc.offset(),
+                length: p.desc.length(),
+                sha256: p.desc.sha256(),
+            });
+        }
+    }
+    let fetched = match fetch::download_in(ctx, target, &needs, fetch::Kinds::DELTA).await {
+        Ok(fetched) => fetched,
+        Err(e @ (Error::Cancelled | Error::Incomplete | Error::Fs(_) | Error::WorkerPanicked)) => {
+            return Err(e);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "the delta file cannot be fetched; frames instead");
+            patches.iter_mut().for_each(|p| *p = None);
+            return Ok(());
+        }
+    };
+    let have: HashSet<Sha256Digest> = match fetched.pack() {
+        Some(whole) => {
+            let whole = whole.to_path_buf();
+            on_job(
+                inner,
+                Some(lock),
+                cancel,
+                "delta-split",
+                move |inner, cancel| {
+                    let cache = inner.cache();
+                    let reader = inner.fs.open_read(&whole)?;
+                    let tools = PartTools {
+                        hasher: &*inner.hasher,
+                        cancel,
+                    };
+                    let mut have = HashSet::new();
+                    for n in &needs {
+                        let stored = cache.is_complete(CacheKind::Patch, &n.sha256, n.length)?
+                            || cache.store_frame(
+                                CacheKind::Patch,
+                                &*reader,
+                                n.offset,
+                                n.length,
+                                &n.sha256,
+                                &tools,
+                                &|_| {},
+                            )?;
+                        if stored {
+                            have.insert(n.sha256);
+                        }
+                    }
+                    Ok(have)
+                },
+            )
+            .await?
+        }
+        None => needs
+            .iter()
+            .filter(|n| fetched.frame(&n.sha256).is_some())
+            .map(|n| n.sha256)
+            .collect(),
+    };
+    for p in patches.iter_mut() {
+        if p.as_ref().is_some_and(|p| !have.contains(&p.desc.sha256())) {
+            *p = None;
+        }
+    }
+    Ok(())
+}
+
+/// The stage sources: the matching current file, else the pack when the entry was moved to it,
+/// else its delta patch unless that patch failed in this call (`no_patch`), else the cached frame
+/// (its expected path, which the stage reports as `NeedFetch` when missing), else the pack.
+#[allow(clippy::too_many_arguments)]
 fn sources(
     manifest: &VerifiedManifest,
     unchanged: &[Option<PathBuf>],
     frames: &HashMap<Sha256Digest, PathBuf>,
     pack: Option<&Path>,
     use_pack: &HashSet<usize>,
+    patches: &[Option<PatchSource>],
+    no_patch: &HashSet<usize>,
     cache: &Cache,
 ) -> Vec<SourceFor> {
     manifest
@@ -1620,6 +1912,13 @@ fn sources(
                 return SourceFor::Frame(PathBuf::new());
             };
             let sha = frame.sha256();
+            // An entry moved to the pack failed once, so it is in `no_patch` too.
+            if let Some(patch) = patches.get(i).and_then(Option::as_ref)
+                && !no_patch.contains(&i)
+                && !use_pack.contains(&i)
+            {
+                return SourceFor::Patch(patch.clone());
+            }
             match (frames.get(&sha), pack) {
                 (_, Some(pack)) if use_pack.contains(&i) => SourceFor::Pack(pack.to_path_buf()),
                 (Some(path), _) => SourceFor::Frame(path.clone()),
@@ -1696,6 +1995,8 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
         mut unchanged,
         mut frames,
         mut pack,
+        patches,
+        delta,
         mut options,
     } = downloaded;
     let cancel = options.cancel.clone().unwrap_or_default();
@@ -1716,6 +2017,8 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
         .await?;
         let all_frames = frames_of(&manifest);
         let mut use_pack: HashSet<usize> = HashSet::new();
+        // A path whose patch failed is never given a patch again in this call (D27).
+        let mut no_patch: HashSet<usize> = HashSet::new();
         let (mut range_tried, mut pack_tried) = (false, false);
         let staged = loop {
             let input_sources = sources(
@@ -1724,6 +2027,8 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
                 &frames,
                 pack.as_deref(),
                 &use_pack,
+                &patches,
+                &no_patch,
                 &inner.cache(),
             );
             sink.set_phase(Phase::Stage, file_bytes(&manifest));
@@ -1775,6 +2080,7 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
                     *slot = None;
                 }
             }
+            no_patch.extend(failed.iter().copied());
             let failed_frames: Vec<FrameNeed> = all_frames
                 .iter()
                 .filter(|(i, _)| failed.contains(i))
@@ -1899,6 +2205,8 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
         // The staged manifest's `issued` goes with it: an apply makes it the floor time (P9).
         let staged_issued = info.issued();
         let drop_frames: Vec<Sha256Digest> = all_frames.iter().map(|(_, f)| f.sha256).collect();
+        let drop_patches: Vec<Sha256Digest> =
+            patches.iter().flatten().map(|p| p.desc.sha256()).collect();
         let pack_sha = info.pack.sha256;
         on_job(
             &inner,
@@ -1923,7 +2231,13 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
                 for sha in &drop_frames {
                     let _ = cache.remove_entry(CacheKind::Frame, sha);
                 }
+                for sha in &drop_patches {
+                    let _ = cache.remove_entry(CacheKind::Patch, sha);
+                }
                 let _ = cache.remove_entry(CacheKind::Pack, &pack_sha);
+                if let Some(sha) = &delta {
+                    let _ = cache.remove_entry(CacheKind::Delta, sha);
+                }
                 Ok(())
             },
         )
@@ -1999,6 +2313,7 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
         mut frames,
         mut pack,
         mut options,
+        ..
     } = downloaded;
     let cancel = options.cancel.clone().unwrap_or_default();
     let (sink, mut pump) = progress(Phase::Stage, 0);
@@ -2013,6 +2328,8 @@ async fn stage_machine(inner: Arc<Inner>, downloaded: Downloaded) -> Result<Stag
             unchanged: unchanged.clone(),
             frames: frames.clone(),
             pack: pack.clone(),
+            patches: Vec::new(),
+            delta: None,
             options: DownloadOptions::default(),
         };
         let first = offers(&held);
@@ -3399,7 +3716,7 @@ async fn install_from_payload(
                 let cache = inner.cache();
                 cache.ensure_dirs()?;
                 let keep: HashSet<Sha256Digest> = copy_frames.iter().map(|f| f.sha256).collect();
-                cache.cleanup(&keep, &HashSet::new())?;
+                cache.cleanup(&[(CacheKind::Frame, &keep)])?;
                 let tools = PartTools {
                     hasher: &*inner.hasher,
                     cancel,
@@ -3411,6 +3728,7 @@ async fn install_from_payload(
                     }
                     let added = |n: u64| copy_sink.add_done(n);
                     if !cache.store_frame(
+                        CacheKind::Frame,
                         &*copy_pack,
                         f.offset,
                         f.length,

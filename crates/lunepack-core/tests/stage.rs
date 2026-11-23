@@ -2351,3 +2351,118 @@ fn decode_patch_verified_checks_before_the_decoder_sees_a_byte() {
         FrameError::FileHash
     );
 }
+
+// ---- base digests (M12 step 5, M12-D5) ---------------------------------------------------------
+
+fn digests(
+    m: &VerifiedManifest,
+    unchanged: &[Option<PathBuf>],
+    fs: &dyn Fs,
+    workers: usize,
+    cancel: &CancelToken,
+) -> Result<Vec<Option<lunepack_core::Sha256Digest>>, Error> {
+    lunepack_core::base_digests(
+        m,
+        &m.deltas()[0],
+        unchanged,
+        Some(&current()),
+        fs,
+        &H,
+        workers,
+        cancel,
+        &|_| {},
+    )
+}
+
+/// A same-size base is hashed; a base of another size is never opened; an entry `scan` found
+/// unchanged is not read; a base reached through a symlinked directory is not followed.
+#[test]
+fn base_digests_hash_only_same_size_bases_through_real_directories() {
+    let fx = ChainFixture::fake();
+    let p = pack();
+    let (m, _) = patch_manifest(&fx, &p);
+    let (app, blob) = (index_of_path(&m, "bin/app"), index_of_path(&m, "data/blob"));
+    let [(_, app_base, _), (_, blob_base, _)] = patched();
+    for workers in [1, 4] {
+        let mem = MemFs::new();
+        put(&mem, &current().join("bin/app"), &app_base);
+        let mut longer = blob_base.clone();
+        longer.push(0);
+        put(&mem, &current().join("data/blob"), &longer);
+        let reads = Reads::new(&mem);
+        let got = digests(
+            &m,
+            &vec![None; m.entries().len()],
+            &reads,
+            workers,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        let mut want = vec![None; m.entries().len()];
+        want[app] = Some(H.sha256(&app_base));
+        assert_eq!(got, want);
+        let opened: Vec<PathBuf> = reads
+            .log()
+            .into_iter()
+            .filter(|(what, _)| *what == "open_read")
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(
+            opened,
+            [current().join("bin/app")],
+            "only the same-size base is read"
+        );
+
+        // An entry already unchanged is not read at all.
+        let mut unchanged = vec![None; m.entries().len()];
+        unchanged[app] = Some(current().join("bin/app"));
+        let reads = Reads::new(&mem);
+        let got = digests(&m, &unchanged, &reads, workers, &CancelToken::new()).unwrap();
+        assert!(got.iter().all(Option::is_none));
+        assert!(reads.log().iter().all(|(what, _)| *what != "open_read"));
+    }
+
+    // A symlinked component is not followed.
+    let mem = MemFs::new();
+    put(&mem, &root().join("outside/app"), &app_base);
+    put(&mem, &current().join("data/blob"), &blob_base);
+    mem.symlink("../../outside", &current().join("bin"))
+        .unwrap();
+    let reads = Reads::new(&mem);
+    let got = digests(
+        &m,
+        &vec![None; m.entries().len()],
+        &reads,
+        2,
+        &CancelToken::new(),
+    )
+    .unwrap();
+    let mut want = vec![None; m.entries().len()];
+    want[blob] = Some(H.sha256(&blob_base));
+    assert_eq!(got, want);
+    assert!(
+        reads
+            .log()
+            .iter()
+            .all(|(what, p)| *what != "open_read" || !p.starts_with(root().join("outside"))),
+        "{:?}",
+        reads.log()
+    );
+}
+
+#[test]
+fn base_digests_honour_cancel() {
+    let fx = ChainFixture::fake();
+    let p = pack();
+    let (m, _) = patch_manifest(&fx, &p);
+    let mem = MemFs::new();
+    for (path, base, _) in patched() {
+        put(&mem, &current().join(path), &base);
+    }
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    assert!(matches!(
+        digests(&m, &vec![None; m.entries().len()], &mem, 2, &cancel),
+        Err(Error::Cancelled)
+    ));
+}

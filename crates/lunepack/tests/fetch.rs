@@ -646,9 +646,20 @@ fn cache_cleanup_leaves_only_named_entries() {
         .expect("dir");
     touch(cache.part_path(CacheKind::Pack, &keep_pack));
     touch(cache.path(CacheKind::Pack, &other));
+    // M12: patches and delta files follow the same rule; a kind without a keep set keeps nothing.
+    let keep_patch = sha(b"keep patch");
+    touch(cache.path(CacheKind::Patch, &keep_patch));
+    touch(cache.path(CacheKind::Patch, &other));
+    touch(cache.part_path(CacheKind::Delta, &other));
     cache
-        .cleanup(&HashSet::from([keep_frame]), &HashSet::from([keep_pack]))
+        .cleanup(&[
+            (CacheKind::Frame, &HashSet::from([keep_frame])),
+            (CacheKind::Pack, &HashSet::from([keep_pack])),
+            (CacheKind::Patch, &HashSet::from([keep_patch])),
+        ])
         .expect("cleanup");
+    assert_eq!(names(&*fs, "patches"), vec![keep_patch.to_hex()]);
+    assert!(names(&*fs, "deltas").is_empty());
     assert_eq!(
         names(&*fs, "frames"),
         vec![keep_frame.to_hex(), format!("{}.part", keep_frame.to_hex())]

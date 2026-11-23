@@ -118,7 +118,7 @@ pub use root::{RootDocument, TrustedRoot, advance_root};
 pub use service::{ClientSession, Duplex, ServerSession};
 pub use stage::{
     PatchSource, SourceFor, StageEnv, StageInput, StagedVersion, TreeDifference, TreeMismatch,
-    patch_cost, scan, stage, verify_tree,
+    base_digests, patch_cost, scan, stage, verify_tree,
 };
 pub use state::{
     CurrentRef, Floors, Health, InstallCounters, InstallState, Lifecycle, LifecycleEvent, Loaded,

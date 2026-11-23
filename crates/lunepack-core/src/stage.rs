@@ -29,7 +29,7 @@ use crate::frame::{
     CheckedFrame, decode_patch_verified, decode_verified, decoder_memory, patch_decoder_memory,
 };
 use crate::fs::{FileKind, FileWrite, Fs, FsError, FsErrorKind, Meta};
-use crate::manifest::{VerifiedEntry, VerifiedManifest, VerifiedPatch};
+use crate::manifest::{VerifiedDelta, VerifiedEntry, VerifiedManifest, VerifiedPatch};
 use crate::path::RelPath;
 use crate::progress::{FileProgress, Phase, Progress, Source};
 use crate::target::Target;
@@ -714,6 +714,127 @@ pub fn scan(
             Some(ScanResult::NoMatch) => {}
             Some(ScanResult::Cancelled) | None => cancelled = true,
             Some(ScanResult::Crashed(e)) => return Err(e.into()),
+        }
+    }
+    if cancelled {
+        return Err(Error::Cancelled);
+    }
+    Ok(out)
+}
+
+/// For each patch of `delta` (the chosen delta of a per-user update, M12-D5), the SHA-256 of the
+/// current tree's file at the patch's path, when it is a regular file reached through real
+/// directories only (the walk of [`scan`]: no symlink followed) whose size is the patch's
+/// `base_size`; one entry per manifest entry, `None` everywhere else. Entries `unchanged` (from
+/// [`scan`]) already names are not read, nor is a file of another size. A file that cannot be read
+/// is `None`.
+///
+/// Fails only when `cancel` is cancelled ([`Error::Cancelled`]) or the filesystem fails as a
+/// whole. Hashing runs on up to `workers` threads; [`Phase::Scan`] events (per file,
+/// [`Source::Patch`], total = bytes of the files hashed) are delivered on the calling thread.
+/// The stage hashes a base again before it decodes a patch against it (FORMAT.md 9.3).
+#[allow(clippy::too_many_arguments)]
+pub fn base_digests(
+    manifest: &VerifiedManifest,
+    delta: &VerifiedDelta,
+    unchanged: &[Option<PathBuf>],
+    current_tree: Option<&Path>,
+    fs: &dyn Fs,
+    hasher: &dyn Hasher,
+    workers: usize,
+    cancel: &CancelToken,
+    progress: &dyn Fn(Progress),
+) -> Result<Vec<Option<Sha256Digest>>, Error> {
+    let entries = manifest.entries();
+    let mut out: Vec<Option<Sha256Digest>> = vec![None; entries.len()];
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let Some(root) = current_tree else {
+        return Ok(out);
+    };
+    if !is_kind(fs, root, FileKind::Dir)? {
+        return Ok(out);
+    }
+    let index: BTreeMap<&RelPath, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.path(), i))
+        .collect();
+
+    let mut dirs: BTreeMap<String, bool> = BTreeMap::new();
+    let mut cands: Vec<(usize, &RelPath, u64, PathBuf)> = Vec::new();
+    for patch in delta.patches() {
+        let path = patch.path();
+        let Some(&i) = index.get(path) else {
+            continue;
+        };
+        if unchanged.get(i).is_some_and(Option::is_some) {
+            continue;
+        }
+        let text = path.as_str();
+        let mut parents_ok = true;
+        for (pos, _) in text.match_indices('/') {
+            let prefix = &text[..pos];
+            let ok = match dirs.get(prefix) {
+                Some(&ok) => ok,
+                None => {
+                    let ok = is_kind(fs, &join(root, prefix), FileKind::Dir)?;
+                    dirs.insert(prefix.to_owned(), ok);
+                    ok
+                }
+            };
+            if !ok {
+                parents_ok = false;
+                break;
+            }
+        }
+        if !parents_ok {
+            continue;
+        }
+        let file = join(root, text);
+        match fs.symlink_metadata(&file) {
+            Ok(Some(Meta {
+                kind: FileKind::File,
+                len,
+            })) if len == patch.base_size() => cands.push((i, path, len, file)),
+            Ok(_) => {}
+            Err(e) if e.kind == FsErrorKind::Crashed => return Err(e.into()),
+            Err(_) => {}
+        }
+    }
+
+    let costs = vec![0u64; cands.len()];
+    let mut agg = Agg {
+        phase: Phase::Scan,
+        total: cands.iter().map(|c| c.2).sum(),
+        done: 0,
+        last: vec![0; cands.len()],
+        files: cands.iter().map(|c| (c.1, c.2, Source::Patch)).collect(),
+        progress,
+    };
+    let results = run_pool(
+        workers,
+        u64::MAX,
+        &costs,
+        cancel,
+        |k, report| {
+            let (_, _, size, file) = &cands[k];
+            match hash_file(fs, hasher, cancel, file, *size, report) {
+                Ok(d) => (Ok(d), false),
+                Err(JobErr::Cancelled) => (Err(None), true),
+                Err(JobErr::Dest(e)) => (Err(Some(e)), true),
+                Err(JobErr::Source) => (Ok(None), false),
+            }
+        },
+        |k, done| agg.on(k, done),
+    );
+    let mut cancelled = cancel.is_cancelled();
+    for (k, r) in results.into_iter().enumerate() {
+        match r {
+            Some(Ok(d)) => out[cands[k].0] = d,
+            Some(Err(Some(e))) => return Err(e.into()),
+            Some(Err(None)) | None => cancelled = true,
         }
     }
     if cancelled {
