@@ -64,7 +64,7 @@ fn welcome(ui: &mut Ui<'_>, d: &Draw<'_>) -> Out {
     let mut all_users = offered && d.v.all_users;
     title(ui, d, &strings::install_title(&m.name));
     let scope_note = if all_users {
-        strings::install_scope_all_users()
+        strings::install_scope_all_users(m.env.os)
     } else {
         strings::install_scope()
     };

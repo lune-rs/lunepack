@@ -73,9 +73,21 @@ pub fn install_scope() -> &'static str {
     "Installs for your account only. No administrator rights needed."
 }
 
-/// The welcome screen's line under the title once "Install for all users" is ticked.
-pub fn install_scope_all_users() -> &'static str {
-    "Installs for everyone on this PC. Windows will ask for administrator approval."
+/// The welcome screen's line under the title once "Install for all users" is ticked: it names the
+/// next step of this OS (Windows asks for approval, Linux asks for an administrator's password or
+/// shows a command, macOS continues in Installer).
+pub fn install_scope_all_users(os: Os) -> &'static str {
+    match os {
+        Os::Windows => {
+            "Installs for everyone on this PC. Windows will ask for administrator approval."
+        }
+        Os::Macos => {
+            "Installs for everyone on this Mac. It continues in Installer, which asks for an administrator."
+        }
+        Os::Linux => {
+            "Installs for everyone on this computer. You will be asked for an administrator's password, or shown a command to run as an administrator."
+        }
+    }
 }
 
 /// The label of the welcome screen's all-users checkbox.
@@ -367,5 +379,21 @@ mod tests {
             "Move My App to your Applications folder and open it from there."
         );
         assert_eq!(kind_name(28), "unsupported_location");
+    }
+
+    #[test]
+    fn the_all_users_line_names_the_next_step_of_its_own_os_only() {
+        let windows = install_scope_all_users(Os::Windows);
+        let mac = install_scope_all_users(Os::Macos);
+        let linux = install_scope_all_users(Os::Linux);
+        assert!(windows.contains("Windows will ask for administrator approval"));
+        assert!(mac.contains("Installer") && mac.contains("Mac"));
+        assert!(linux.contains("password") && linux.contains("command"));
+        // No other OS's words leak into a screen.
+        for text in [mac, linux] {
+            assert!(!text.contains("Windows") && !text.contains("PC"), "{text}");
+        }
+        assert!(!linux.contains("Installer") && !linux.contains("Mac"));
+        assert!(!mac.contains("password") && !mac.contains("computer"));
     }
 }
