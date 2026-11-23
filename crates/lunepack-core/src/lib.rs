@@ -71,7 +71,8 @@ pub use fetch::{
 };
 pub use frame::{
     CheckedFrame, FrameDesc, MAX_PATCH_WINDOW, PATCH_WINDOW_ALIGN, StreamDesc, check_file_frame,
-    decode_verified, decoder_memory, is_patch_codec, patch_decoder_memory, patch_window,
+    decode_patch_verified, decode_verified, decoder_memory, is_patch_codec, patch_decoder_memory,
+    patch_window,
 };
 pub use fs::{
     DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, PlaceFacts,
@@ -116,8 +117,8 @@ pub use progress::{FileProgress, Phase, Progress, Source};
 pub use root::{RootDocument, TrustedRoot, advance_root};
 pub use service::{ClientSession, Duplex, ServerSession};
 pub use stage::{
-    SourceFor, StageEnv, StageInput, StagedVersion, TreeDifference, TreeMismatch, scan, stage,
-    verify_tree,
+    PatchSource, SourceFor, StageEnv, StageInput, StagedVersion, TreeDifference, TreeMismatch,
+    patch_cost, scan, stage, verify_tree,
 };
 pub use state::{
     CurrentRef, Floors, Health, InstallCounters, InstallState, Lifecycle, LifecycleEvent, Loaded,

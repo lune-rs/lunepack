@@ -409,6 +409,10 @@ pub enum FrameError {
     /// The decoded file's SHA-256 differs from the signed one.
     #[error("decoded file hash does not match")]
     FileHash,
+    /// A patch's base is not the one it was made against: its size or SHA-256 differs from the
+    /// signed `base_size` or `base_sha256` (FORMAT.md 9.3). The decoder never saw it.
+    #[error("the patch's base does not match")]
+    BaseMismatch,
 }
 
 /// Equality, for tests and for callers that branch on the cause: variants compare by their
@@ -590,16 +594,14 @@ pub enum LayoutError {
 #[non_exhaustive]
 pub enum StageError {
     /// These files (manifest order) could not be placed from their sources: a missing, short or
-    /// corrupt cache file, a pack frame that fails its hash or decode, or a current-tree file that
-    /// no longer matches. The partial tree stays; the caller fetches them and calls again.
+    /// corrupt cache file, a pack frame that fails its hash or decode, a current-tree file that
+    /// no longer matches, or a patch that is missing, short or corrupt, whose base no longer
+    /// matches, or that decodes to anything but the file. The partial tree stays; the caller fetches them and calls again.
     #[error("{} files need fetching", .0.len())]
     NeedFetch(Vec<crate::path::RelPath>),
     /// The cancel token was cancelled; no temporary file is left and a later call resumes.
     #[error("cancelled")]
     Cancelled,
-    /// A source kind this build does not implement (`SourceFor::Patch`, reserved).
-    #[error("unsupported stage source")]
-    Unsupported,
     /// Anything else, a failure of the destination (disk full, permission) included.
     #[error("{0}")]
     Other(#[from] Error),

@@ -18,6 +18,10 @@ use lunepack_core::{
     TreeDifference, VerifiedEntry, VerifiedManifest, decoder_memory, scan, stage, verify_feed,
     verify_manifest, verify_tree,
 };
+use lunepack_core::{
+    DeltaDoc, Encoder, Hasher, ManifestDocument, PatchDoc, PatchSource, PatchView, RelPath, U53,
+    patch_cost,
+};
 use lunepack_testkit::{
     ChainFixture, FakeClock, FakeCodec, FakeHasher, Fault, MemFs, PackBuilder, RecoverMode,
     SUITE_APP_ID, SUITE_CHANNEL, SUITE_T0,
@@ -280,6 +284,8 @@ struct Spy<'a> {
     log: Mutex<Vec<Op>>,
     /// Fail every `create_new` of a temporary file (a full disk).
     fail_tmp: bool,
+    /// Fail every `open_read` of this path (an unreadable file).
+    fail_read: Option<PathBuf>,
 }
 
 impl<'a> Spy<'a> {
@@ -288,6 +294,7 @@ impl<'a> Spy<'a> {
             inner,
             log: Mutex::new(Vec::new()),
             fail_tmp: false,
+            fail_read: None,
         }
     }
     fn ops(&self) -> Vec<Op> {
@@ -303,6 +310,13 @@ impl Fs for Spy<'_> {
         self.inner.read_capped(path, max)
     }
     fn open_read(&self, path: &Path) -> Result<Box<dyn ReadAt>, FsError> {
+        if self.fail_read.as_deref() == Some(path) {
+            return Err(FsError::new(
+                FsErrorKind::Other,
+                path,
+                Some(io::Error::other("unreadable")),
+            ));
+        }
         self.inner.open_read(path)
     }
     fn create_new(&self, path: &Path) -> Result<Box<dyn FileWrite>, FsError> {
@@ -400,6 +414,23 @@ impl Codec for Concurrency {
             std::thread::sleep(Duration::from_millis(1));
         }
         let r = FakeCodec::new().decode(frame, out);
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        r
+    }
+
+    fn decode_patch(
+        &self,
+        patch: &PatchView<'_>,
+        base: &[u8],
+        out: &mut dyn io::Write,
+    ) -> Result<DecodeReport, Error> {
+        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max.fetch_max(now, Ordering::SeqCst);
+        let start = Instant::now();
+        while self.active.load(Ordering::SeqCst) < 2 && start.elapsed() < self.wait {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let r = FakeCodec::new().decode_patch(patch, base, out);
         self.active.fetch_sub(1, Ordering::SeqCst);
         r
     }
@@ -627,17 +658,11 @@ fn a_destination_failure_is_other_not_need_fetch() {
 }
 
 #[test]
-fn patch_sources_are_unsupported_and_sources_must_match_entries() {
+fn sources_must_match_entries() {
     let fx = ChainFixture::fake();
     let p = pack();
     let m = verify(&fx, &p);
     let mem = MemFs::new();
-    let mut sources = frame_sources(&m);
-    sources[0] = SourceFor::Patch;
-    assert!(matches!(
-        simple(&mem, &m, sources, 1),
-        Err(StageError::Unsupported)
-    ));
     let mut sources = frame_sources(&m);
     sources.pop();
     assert!(matches!(
@@ -1724,4 +1749,605 @@ mod real {
             "{got:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Patch sources (M12 step 3, FORMAT.md 9.3).
+
+/// The version patched from.
+const FROM: &str = "1.0.0";
+
+/// The current version's tree, where a patch's base lives.
+fn current() -> PathBuf {
+    versions().join(FROM)
+}
+
+fn patch_path(i: usize) -> PathBuf {
+    root().join(format!("cache/patch-{i}"))
+}
+
+/// The base of each patched file (`pack()`'s "bin/app" and "data/blob") and its codec.
+fn patched() -> [(&'static str, Vec<u8>, CodecId); 2] {
+    [
+        ("bin/app", data(2900, 9), CodecId::BcjX86Lzma2),
+        ("data/blob", data(650, 8), CodecId::Lzma2),
+    ]
+}
+
+/// `pack()`'s manifest with one delta from 1.0.0 patching "bin/app" and "data/blob" (made by
+/// `FakeCodec::encode_patch` against `patched()`'s bases), signed and verified as production
+/// does; with the patches' bytes in path order.
+fn patch_manifest(fx: &ChainFixture<'_>, p: &PackBuilder) -> (VerifiedManifest, Vec<Vec<u8>>) {
+    let new = contents();
+    let mut doc = fx.manifest_document(VERSION, Target::LinuxX86_64, p);
+    let mut file = Vec::new();
+    let mut patches = Vec::new();
+    let mut docs = Vec::new();
+    for (path, base, codec) in patched() {
+        let bytes = FakeCodec::new()
+            .encode_patch(codec, &base, &new[path])
+            .unwrap()
+            .bytes;
+        docs.push(PatchDoc {
+            path: RelPath::parse(path).unwrap(),
+            base_size: U53::new(base.len() as u64).unwrap(),
+            base_sha256: H.sha256(&base),
+            codec: codec.id().to_owned(),
+            offset: U53::new(file.len() as u64).unwrap(),
+            length: U53::new(bytes.len() as u64).unwrap(),
+            sha256: H.sha256(&bytes),
+        });
+        file.extend_from_slice(&bytes);
+        patches.push(bytes);
+    }
+    doc.deltas = Some(vec![DeltaDoc {
+        from: FROM.to_owned(),
+        path: format!("{VERSION}/linux-x86_64.from-{FROM}.delta"),
+        size: U53::new(file.len() as u64).unwrap(),
+        sha256: H.sha256(&file),
+        patches: docs,
+    }]);
+    (verify_doc(fx, &doc), patches)
+}
+
+fn verify_doc(fx: &ChainFixture<'_>, doc: &ManifestDocument) -> VerifiedManifest {
+    let (_, keys) = fx.verified_chain(&[5], 1);
+    let bytes = fx.envelope(PayloadKind::Manifest, &doc.to_payload(), &[5]);
+    let feed_doc = fx.feed_document(
+        1,
+        None,
+        vec![fx.release(VERSION, &[(Target::LinuxX86_64, &bytes)], None)],
+    );
+    let feed_bytes = fx.envelope(PayloadKind::Feed, &feed_doc.to_payload(), &[5]);
+    let feed = verify_feed(
+        &keys,
+        &feed_bytes,
+        &AppId::parse(SUITE_APP_ID).unwrap(),
+        &Channel::parse(SUITE_CHANNEL).unwrap(),
+        &RollbackFloor::default(),
+        &ClockReading::read(&FakeClock::new(SUITE_T0), None),
+        fx.verifier,
+    )
+    .unwrap();
+    let entry = feed.target_entry(0, Target::LinuxX86_64).unwrap();
+    verify_manifest(&keys, &entry, &bytes, fx.hasher, fx.verifier).unwrap()
+}
+
+fn index_of_path(m: &VerifiedManifest, path: &str) -> usize {
+    m.entries()
+        .iter()
+        .position(|e| e.path().as_str() == path)
+        .unwrap()
+}
+
+/// The world for a patch stage: the cache (pack, frames, patches), and the current tree holding
+/// the bases and an unchanged "lib/x.so.1".
+fn seed_patch_world(fs: &dyn Fs, m: &VerifiedManifest, p: &PackBuilder, patches: &[Vec<u8>]) {
+    seed_cache(fs, m, p);
+    for (k, (path, base, _)) in patched().iter().enumerate() {
+        put(fs, &current().join(path), base);
+        put(fs, &patch_path(k), &patches[k]);
+    }
+    put(fs, &current().join("lib/x.so.1"), &data(2000, 2));
+}
+
+/// A mix: the two patched files from their patches, "lib/x.so.1" unchanged, "share/README" from
+/// its frame, everything else from the pack.
+fn patch_sources(m: &VerifiedManifest) -> Vec<SourceFor> {
+    let delta = &m.deltas()[0];
+    m.entries()
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let path = e.path().as_str();
+            if let Some(k) = delta
+                .patches()
+                .iter()
+                .position(|p| p.path().as_str() == path)
+            {
+                SourceFor::Patch(PatchSource {
+                    patch: patch_path(k),
+                    base: current().join(path),
+                    desc: delta.patches()[k].clone(),
+                })
+            } else if path == "lib/x.so.1" {
+                SourceFor::Unchanged(current().join(path))
+            } else if path == "share/README" {
+                SourceFor::Frame(frame_path(i))
+            } else {
+                SourceFor::Pack(pack_path())
+            }
+        })
+        .collect()
+}
+
+fn need_fetch(r: Result<lunepack_core::StagedVersion, StageError>) -> Vec<String> {
+    match r {
+        Err(StageError::NeedFetch(list)) => list.iter().map(|p| p.as_str().to_owned()).collect(),
+        other => panic!("expected NeedFetch, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_mix_of_unchanged_frame_pack_and_patch_sources_stages_the_manifest() {
+    let fx = ChainFixture::fake();
+    let p = pack();
+    let (m, patches) = patch_manifest(&fx, &p);
+    for workers in [1, 4] {
+        let mem = MemFs::new();
+        seed_patch_world(&mem, &m, &p, &patches);
+        let events = Mutex::new(Vec::new());
+        run(
+            &mem,
+            &FakeCodec::new(),
+            &m,
+            patch_sources(&m),
+            workers,
+            256 << 20,
+            &CancelToken::new(),
+            &|e: Progress| {
+                if let Some(f) = e.file {
+                    events
+                        .lock()
+                        .unwrap()
+                        .push((f.path.as_str().to_owned(), f.source));
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(dump(&mem, &tree()), expected_tree(), "workers {workers}");
+        let events = events.into_inner().unwrap();
+        for (path, _, _) in patched() {
+            assert!(
+                events.iter().any(|(p, s)| p == path && *s == Source::Patch),
+                "{path}: no Source::Patch event"
+            );
+        }
+        assert!(
+            events
+                .iter()
+                .any(|(p, s)| p == "lib/x.so.1" && *s == Source::Unchanged)
+        );
+        // The bases are read, never changed.
+        for (path, base, _) in patched() {
+            assert_eq!(
+                mem.read_capped(&current().join(path), 1 << 20).unwrap(),
+                base
+            );
+        }
+    }
+}
+
+#[test]
+fn every_patch_failure_is_need_fetch_of_that_path_alone() {
+    let fx = ChainFixture::fake();
+    let p = pack();
+    let (m, patches) = patch_manifest(&fx, &p);
+    let app = index_of_path(&m, "bin/app");
+    type Setup = Box<dyn Fn(&MemFs, &mut Vec<SourceFor>)>;
+    let cases: Vec<(&str, Setup)> = vec![
+        (
+            "the patch file is missing",
+            Box::new(|fs, _| fs.remove_file(&patch_path(0)).unwrap()),
+        ),
+        (
+            "the patch file is short",
+            Box::new(|fs, _| {
+                let b = fs.read_capped(&patch_path(0), 1 << 20).unwrap();
+                put(fs, &patch_path(0), &b[..b.len() - 1]);
+            }),
+        ),
+        (
+            "the patch bytes are not the signed ones",
+            Box::new(|fs, _| {
+                let mut b = fs.read_capped(&patch_path(0), 1 << 20).unwrap();
+                b[10] ^= 1;
+                put(fs, &patch_path(0), &b);
+            }),
+        ),
+        (
+            "the base is missing",
+            Box::new(|fs, _| fs.remove_file(&current().join("bin/app")).unwrap()),
+        ),
+        (
+            "the base is a directory",
+            Box::new(|fs, _| {
+                fs.remove_file(&current().join("bin/app")).unwrap();
+                fs.create_dir_all(&current().join("bin/app")).unwrap();
+            }),
+        ),
+        (
+            "the base is a symlink to the right bytes",
+            Box::new(|fs, _| {
+                put(fs, &current().join("bin/real"), &data(2900, 9));
+                fs.remove_file(&current().join("bin/app")).unwrap();
+                fs.symlink("real", &current().join("bin/app")).unwrap();
+            }),
+        ),
+        (
+            "the base has another size",
+            Box::new(|fs, _| put(fs, &current().join("bin/app"), &data(2901, 9))),
+        ),
+        (
+            "the base changed after the plan (same size, other bytes)",
+            Box::new(|fs, _| put(fs, &current().join("bin/app"), &data(2900, 7))),
+        ),
+        (
+            "the source names another entry's patch",
+            Box::new(move |_, sources| {
+                let SourceFor::Patch(other) = sources[index_of_blob()].clone() else {
+                    unreachable!()
+                };
+                sources[app] = SourceFor::Patch(other);
+            }),
+        ),
+    ];
+    for (what, setup) in cases {
+        for workers in [1, 3] {
+            let mem = MemFs::new();
+            seed_patch_world(&mem, &m, &p, &patches);
+            let mut sources = patch_sources(&m);
+            setup(&mem, &mut sources);
+            let got = need_fetch(simple(&mem, &m, sources, workers));
+            assert_eq!(got, ["bin/app"], "{what}, workers {workers}");
+            assert!(
+                no_tmp_files(&mem, &partial()),
+                "{what}: a temporary file is left"
+            );
+            let t = dump(&mem, &partial());
+            assert!(
+                !t.contains_key("bin/app"),
+                "{what}: the failed file was placed"
+            );
+            assert_eq!(
+                t.get("data/blob"),
+                Some(&Node::File(data(700, 4))),
+                "{what}: the other patch still applies"
+            );
+        }
+    }
+}
+
+fn index_of_blob() -> usize {
+    let fx = ChainFixture::fake();
+    index_of_path(&verify(&fx, &pack()), "data/blob")
+}
+
+#[test]
+fn an_unreadable_base_is_need_fetch() {
+    let fx = ChainFixture::fake();
+    let p = pack();
+    let (m, patches) = patch_manifest(&fx, &p);
+    let mem = MemFs::new();
+    seed_patch_world(&mem, &m, &p, &patches);
+    let mut spy = Spy::new(&mem);
+    spy.fail_read = Some(current().join("data/blob"));
+    assert_eq!(
+        need_fetch(simple(&spy, &m, patch_sources(&m), 2)),
+        ["data/blob"]
+    );
+    assert!(no_tmp_files(&mem, &partial()));
+}
+
+/// Decodes patches with `FakeCodec`, then changes one output byte: the right size, the wrong
+/// file. Frames decode normally.
+struct WrongOutput;
+
+impl Codec for WrongOutput {
+    fn decode(
+        &self,
+        frame: &FrameView<'_>,
+        out: &mut dyn io::Write,
+    ) -> Result<DecodeReport, Error> {
+        FakeCodec::new().decode(frame, out)
+    }
+
+    fn decode_patch(
+        &self,
+        patch: &PatchView<'_>,
+        base: &[u8],
+        out: &mut dyn io::Write,
+    ) -> Result<DecodeReport, Error> {
+        let mut buf = Vec::new();
+        let report = FakeCodec::new().decode_patch(patch, base, &mut buf)?;
+        buf[0] ^= 1;
+        out.write_all(&buf)
+            .map_err(lunepack_core::error::CodecError::Write)?;
+        Ok(report)
+    }
+}
+
+#[test]
+fn a_patch_decoding_to_another_file_or_failing_is_need_fetch() {
+    let fx = ChainFixture::fake();
+    let p = pack();
+    let (m, patches) = patch_manifest(&fx, &p);
+    for (what, codec) in [
+        ("wrong output", &WrongOutput as &dyn Codec),
+        (
+            "a decode error",
+            &FakeCodec::with_fault(Fault::ErrorMidStream),
+        ),
+        (
+            "one byte too many",
+            &FakeCodec::with_fault(Fault::ExtraBytes),
+        ),
+        (
+            "one byte too few",
+            &FakeCodec::with_fault(Fault::TooFewBytes),
+        ),
+    ] {
+        let mem = MemFs::new();
+        seed_patch_world(&mem, &m, &p, &patches);
+        // Only the patches fail on the wrong-output codec; the faults fail every decode.
+        let sources = patch_sources(&m);
+        let got = need_fetch(run(
+            &mem,
+            codec,
+            &m,
+            sources,
+            2,
+            256 << 20,
+            &CancelToken::new(),
+            &|_| {},
+        ));
+        assert!(
+            got.contains(&"bin/app".to_owned()) && got.contains(&"data/blob".to_owned()),
+            "{what}: {got:?}"
+        );
+        assert!(no_tmp_files(&mem, &partial()), "{what}");
+        let t = dump(&mem, &partial());
+        assert!(
+            !t.contains_key("bin/app") && !t.contains_key("data/blob"),
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn two_patch_jobs_over_the_budget_together_never_run_at_once() {
+    let fx = ChainFixture::fake();
+    let p = pack();
+    let (m, patches) = patch_manifest(&fx, &p);
+    let delta = &m.deltas()[0];
+    let costs: Vec<u64> = delta.patches().iter().map(patch_cost).collect();
+    // The cost is the patch, the base, the codec's decoder memory and the I/O buffer.
+    let first = &delta.patches()[0];
+    assert_eq!(
+        costs[0],
+        first.length()
+            + first.base_size()
+            + lunepack_core::patch_decoder_memory(first.codec(), first.window())
+            + IO_BUFFER_BYTES
+    );
+    let budget = costs[0].max(costs[1]);
+    assert!(costs[0] + costs[1] > budget);
+    // Only the two patches decode through the codec (the rest are unchanged, frames of
+    // `stored`... and pack frames): put the other files in place as unchanged sources.
+    let mem = MemFs::new();
+    seed_patch_world(&mem, &m, &p, &patches);
+    for (path, bytes) in contents() {
+        if !bytes.is_empty() && path != "bin/app" && path != "data/blob" {
+            put(&mem, &current().join(&path), &bytes);
+        }
+    }
+    let sources: Vec<SourceFor> = patch_sources(&m)
+        .into_iter()
+        .zip(m.entries())
+        .map(|(s, e)| match s {
+            SourceFor::Patch(_) => s,
+            _ => SourceFor::Unchanged(current().join(e.path().as_str())),
+        })
+        .collect();
+    let codec = Concurrency::new(Duration::from_millis(200));
+    run(
+        &mem,
+        &codec,
+        &m,
+        sources.clone(),
+        4,
+        budget,
+        &CancelToken::new(),
+        &|_| {},
+    )
+    .unwrap();
+    assert_eq!(codec.max.load(Ordering::SeqCst), 1);
+    // The instrument: with room for both, the two patches do overlap.
+    let mem = MemFs::new();
+    seed_patch_world(&mem, &m, &p, &patches);
+    for (path, bytes) in contents() {
+        if !bytes.is_empty() && path != "bin/app" && path != "data/blob" {
+            put(&mem, &current().join(&path), &bytes);
+        }
+    }
+    let codec = Concurrency::new(Duration::from_millis(500));
+    run(
+        &mem,
+        &codec,
+        &m,
+        sources,
+        4,
+        costs[0] + costs[1],
+        &CancelToken::new(),
+        &|_| {},
+    )
+    .unwrap();
+    assert_eq!(codec.max.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_crash_during_a_patch_stage_never_leaves_a_failed_patch_placed() {
+    let fx = ChainFixture::fake();
+    let p = pack();
+    let (m, patches) = patch_manifest(&fx, &p);
+    // "bin/app"'s base changed: its patch fails, everything else is placed.
+    let fresh = || {
+        let mem = MemFs::new();
+        seed_patch_world(&mem, &m, &p, &patches);
+        put(&mem, &current().join("bin/app"), &data(2900, 7));
+        mem
+    };
+    let probe = fresh();
+    let base = probe.op_count();
+    assert_eq!(
+        need_fetch(simple(&probe, &m, patch_sources(&m), 1)),
+        ["bin/app"]
+    );
+    let ops = probe.op_count() - base;
+    assert!(ops > 20, "{ops} ops");
+    for n in 0..ops {
+        for mode in [RecoverMode::DropVolatile, RecoverMode::KeepVolatile] {
+            let mem = fresh();
+            mem.crash_after(base + n);
+            assert!(simple(&mem, &m, patch_sources(&m), 1).is_err());
+            let disk = mem.recover(mode);
+            let placed = |fs: &MemFs| {
+                fs.symlink_metadata(&tree()).unwrap().is_none()
+                    && (fs.symlink_metadata(&partial()).unwrap().is_none()
+                        || !dump(fs, &partial()).contains_key("bin/app"))
+            };
+            assert!(
+                placed(&disk),
+                "op {n} {mode:?}: the failed patch's file exists"
+            );
+            // A run after the crash: still only that path is asked for, and no file for it.
+            assert_eq!(
+                need_fetch(simple(&disk, &m, patch_sources(&m), 1)),
+                ["bin/app"],
+                "op {n} {mode:?}"
+            );
+            assert!(placed(&disk), "op {n} {mode:?}");
+            assert!(no_tmp_files(&disk, &partial()), "op {n} {mode:?}");
+        }
+    }
+    // And with every source good, a crash at any point resumes to the same tree.
+    let good = || {
+        let mem = MemFs::new();
+        seed_patch_world(&mem, &m, &p, &patches);
+        mem
+    };
+    let probe = good();
+    let base = probe.op_count();
+    simple(&probe, &m, patch_sources(&m), 1).unwrap();
+    let ops = probe.op_count() - base;
+    for n in 0..ops {
+        let mem = good();
+        mem.crash_after(base + n);
+        assert!(simple(&mem, &m, patch_sources(&m), 1).is_err());
+        let disk = mem.recover(RecoverMode::DropVolatile);
+        simple(&disk, &m, patch_sources(&m), 1).unwrap_or_else(|e| panic!("op {n}: {e:?}"));
+        assert_eq!(dump(&disk, &tree()), expected_tree(), "op {n}");
+    }
+}
+
+#[test]
+fn cancel_stays_cancelled_with_patch_sources() {
+    let fx = ChainFixture::fake();
+    let p = pack();
+    let (m, patches) = patch_manifest(&fx, &p);
+    let mem = MemFs::new();
+    seed_patch_world(&mem, &m, &p, &patches);
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let r = run(
+        &mem,
+        &FakeCodec::new(),
+        &m,
+        patch_sources(&m),
+        2,
+        256 << 20,
+        &cancel,
+        &|_| {},
+    );
+    assert!(matches!(r, Err(StageError::Cancelled)), "{r:?}");
+}
+
+#[test]
+fn decode_patch_verified_checks_before_the_decoder_sees_a_byte() {
+    use lunepack_core::decode_patch_verified;
+    use lunepack_core::error::FrameError;
+    let fx = ChainFixture::fake();
+    let p = pack();
+    let (m, patches) = patch_manifest(&fx, &p);
+    let desc = &m.deltas()[0].patches()[0];
+    let (_, base, _) = &patched()[0];
+    let never = FakeCodec::with_fault(Fault::PanicIfCalled);
+    let frame_err = |r: Result<(), Error>| match r {
+        Err(Error::Frame(e)) => e,
+        other => panic!("expected a frame error, got {other:?}"),
+    };
+    let check = |bytes: &[u8], base: &[u8]| {
+        frame_err(decode_patch_verified(
+            desc,
+            bytes,
+            base,
+            &H,
+            &never,
+            &mut Vec::new(),
+        ))
+    };
+    let good = &patches[0];
+    // Length, then the patch hash, then the base's size, then its hash: the codec never runs.
+    assert!(matches!(
+        check(&good[1..], base),
+        FrameError::ByteCount { .. }
+    ));
+    let mut flipped = good.clone();
+    flipped[3] ^= 1;
+    assert_eq!(check(&flipped, base), FrameError::FrameHash);
+    assert_eq!(check(good, &base[1..]), FrameError::BaseMismatch);
+    let mut other = base.clone();
+    other[0] ^= 1;
+    assert_eq!(check(good, &other), FrameError::BaseMismatch);
+    // A bad patch and a bad base: the patch is checked first.
+    assert_eq!(check(&flipped, &other), FrameError::FrameHash);
+    // All good: the file.
+    let mut out = Vec::new();
+    decode_patch_verified(desc, good, base, &H, &FakeCodec::new(), &mut out).unwrap();
+    assert_eq!(out, contents()["bin/app"]);
+    // A codec writing past the size: OutputTooLong, from the writer, whatever the codec says.
+    let r = decode_patch_verified(
+        desc,
+        good,
+        base,
+        &H,
+        &FakeCodec::with_fault(Fault::ExtraBytesIgnoringErrors),
+        &mut Vec::new(),
+    );
+    assert!(
+        matches!(r, Err(Error::Frame(FrameError::OutputTooLong { .. }))),
+        "{r:?}"
+    );
+    // Right size, wrong bytes: FileHash after the decode.
+    assert_eq!(
+        frame_err(decode_patch_verified(
+            desc,
+            good,
+            base,
+            &H,
+            &WrongOutput,
+            &mut Vec::new()
+        )),
+        FrameError::FileHash
+    );
 }

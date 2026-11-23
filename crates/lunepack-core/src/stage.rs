@@ -25,9 +25,11 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use crate::cancel::CancelToken;
 use crate::digest::Sha256Digest;
 use crate::error::{Error, StageError};
-use crate::frame::{CheckedFrame, decode_verified, decoder_memory};
+use crate::frame::{
+    CheckedFrame, decode_patch_verified, decode_verified, decoder_memory, patch_decoder_memory,
+};
 use crate::fs::{FileKind, FileWrite, Fs, FsError, FsErrorKind, Meta};
-use crate::manifest::{VerifiedEntry, VerifiedManifest};
+use crate::manifest::{VerifiedEntry, VerifiedManifest, VerifiedPatch};
 use crate::path::RelPath;
 use crate::progress::{FileProgress, Phase, Progress, Source};
 use crate::target::Target;
@@ -52,8 +54,21 @@ pub enum SourceFor {
     Frame(PathBuf),
     /// The full pack file.
     Pack(PathBuf),
-    /// Reserved: a delta patch. Always [`StageError::Unsupported`].
-    Patch,
+    /// A delta patch against the current tree's file at the entry's path (FORMAT.md 9.3).
+    Patch(PatchSource),
+}
+
+/// A patch source: where the patch's bytes and its base are, and the patch's signed descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchSource {
+    /// A file holding exactly the patch's bytes (its delta-file range).
+    pub patch: PathBuf,
+    /// The base: the file at the entry's path in the current version's tree (the tree's own
+    /// directory, never a link to it), opened the way an [`SourceFor::Unchanged`] source is.
+    pub base: PathBuf,
+    /// The patch, from the verified manifest's delta whose `from` is the current version. Its
+    /// path, size and SHA-256 must be the entry's, else the source is unusable.
+    pub desc: VerifiedPatch,
 }
 
 /// What to stage.
@@ -77,8 +92,9 @@ pub struct StageEnv<'a> {
     pub hasher: &'a dyn Hasher,
     /// Parallel jobs at most; `0` and `1` run inline on the calling thread.
     pub workers: usize,
-    /// The concurrent sum of job costs (`frame.length + decoder_memory(frame) + 256 KiB`) stays at
-    /// or below this, except that a job above it runs alone.
+    /// The concurrent sum of job costs (`frame.length + decoder_memory(frame) + 256 KiB` for a
+    /// frame, `length + base_size + patch_decoder_memory(codec, window) + 256 KiB` for a patch,
+    /// M12-D7) stays at or below this, except that a job above it runs alone.
     pub budget_bytes: u64,
     /// Checked between jobs and on every write.
     pub cancel: &'a CancelToken,
@@ -804,11 +820,12 @@ impl Write for OutWriter<'_> {
 /// `<versions_dir>/<version>.partial`, then renames it to `<versions_dir>/<version>`.
 ///
 /// - Every placed file's bytes match the signed SHA-256 before its final name exists (Frame and
-///   Pack sources through [`decode_verified`], Unchanged through a hashing copy); empty files are
+///   Pack sources through [`decode_verified`], Patch sources through [`decode_patch_verified`]
+///   with the base read and re-hashed here, Unchanged through a hashing copy); empty files are
 ///   created empty; files are created non-executable and made executable only when `exec` is set;
 ///   directories are created; symlinks are created last with the exact signed target text.
-/// - A file whose source fails (hash mismatch, decode error, missing or short source) is
-///   collected, its temporary file deleted, and the others continue: the result is
+/// - A file whose source fails (hash mismatch, decode error, missing or short source, a patch
+///   base that is missing, not a regular file or of another size or hash) is collected, its temporary file deleted, and the others continue: the result is
 ///   [`StageError::NeedFetch`] with those paths in manifest order, and the partial tree stays. A
 ///   failure of the destination is [`StageError::Other`].
 /// - Resume: an existing partial tree is reused. Leftover temporary files, entries the manifest
@@ -824,9 +841,6 @@ pub fn stage(input: &StageInput<'_>, env: &StageEnv<'_>) -> Result<StagedVersion
     let entries = manifest.entries();
     if input.sources.len() != entries.len() {
         return Err(Error::Field("stage sources do not match the manifest entries").into());
-    }
-    if input.sources.iter().any(|s| matches!(s, SourceFor::Patch)) {
-        return Err(StageError::Unsupported);
     }
     if env.cancel.is_cancelled() {
         return Err(StageError::Cancelled);
@@ -899,6 +913,7 @@ pub fn stage(input: &StageInput<'_>, env: &StageEnv<'_>) -> Result<StagedVersion
                 .length()
                 .saturating_add(decoder_memory(f))
                 .saturating_add(IO_BUFFER_BYTES),
+            (Some(_), SourceFor::Patch(p)) => patch_cost(&p.desc),
             _ => IO_BUFFER_BYTES,
         })
         .collect();
@@ -982,8 +997,32 @@ fn progress_source(source: &SourceFor) -> Source {
         SourceFor::Unchanged(_) => Source::Unchanged,
         SourceFor::Frame(_) => Source::Range,
         SourceFor::Pack(_) => Source::FullPack,
-        SourceFor::Patch => Source::Patch,
+        SourceFor::Patch(_) => Source::Patch,
     }
+}
+
+/// A patch job's cost (M12-D7): the patch's bytes and the base the job holds, the codec's
+/// decoder memory for the window, and the I/O buffer.
+pub fn patch_cost(patch: &VerifiedPatch) -> u64 {
+    patch
+        .length()
+        .saturating_add(patch.base_size())
+        .saturating_add(patch_decoder_memory(patch.codec(), patch.window()))
+        .saturating_add(IO_BUFFER_BYTES)
+}
+
+/// Opens `path` for reading when it is a regular file (not a link, not followed) of exactly
+/// `len` bytes: the check of an Unchanged source and of a patch's base.
+fn open_regular(fs: &dyn Fs, path: &Path, len: u64) -> Result<Box<dyn crate::fs::ReadAt>, JobErr> {
+    match fs.symlink_metadata(path) {
+        Ok(Some(Meta {
+            kind: FileKind::File,
+            len: found,
+        })) if found == len => {}
+        Ok(_) => return Err(JobErr::Source),
+        Err(e) => return Err(src_err(e)),
+    }
+    fs.open_read(path).map_err(src_err)
 }
 
 /// Removes whatever is at `path` without following a symlink; nothing there is fine.
@@ -1094,6 +1133,26 @@ fn place(env: &Ctx<'_>, job: &FileJob<'_>, report: &dyn Fn(u64)) -> Result<(), J
 
 fn produce(env: &Ctx<'_>, job: &FileJob<'_>, report: &dyn Fn(u64)) -> Result<(), JobErr> {
     let fs = env.fs;
+    // A patch: its bytes (exactly its signed length) and its base (exactly its signed size, as a
+    // regular file), read before anything is created; every check is decode_patch_verified's.
+    let patch_input = match (job.frame, job.source) {
+        (Some(_), SourceFor::Patch(p)) => {
+            let d = &p.desc;
+            if d.path() != job.path || d.file_size() != job.size || d.file_sha256() != job.sha256 {
+                return Err(JobErr::Source);
+            }
+            let bytes = fs.read_capped(&p.patch, d.length()).map_err(src_err)?;
+            if bytes.len() as u64 != d.length() {
+                return Err(JobErr::Source);
+            }
+            let reader = open_regular(fs, &p.base, d.base_size())?;
+            let len = usize::try_from(d.base_size()).map_err(|_| JobErr::Source)?;
+            let mut base = vec![0u8; len];
+            reader.read_exact_at(0, &mut base).map_err(src_err)?;
+            Some((d, bytes, base))
+        }
+        _ => None,
+    };
     // Read the frame's bytes (exactly its signed length) before creating anything.
     let frame_bytes = match (job.frame, job.source) {
         (Some(frame), SourceFor::Frame(p)) => {
@@ -1115,17 +1174,7 @@ fn produce(env: &Ctx<'_>, job: &FileJob<'_>, report: &dyn Fn(u64)) -> Result<(),
         _ => None,
     };
     let source = match (job.frame, job.source) {
-        (Some(_), SourceFor::Unchanged(p)) => {
-            match fs.symlink_metadata(p) {
-                Ok(Some(Meta {
-                    kind: FileKind::File,
-                    len,
-                })) if len == job.size => {}
-                Ok(_) => return Err(JobErr::Source),
-                Err(e) => return Err(src_err(e)),
-            }
-            Some(fs.open_read(p).map_err(src_err)?)
-        }
+        (Some(_), SourceFor::Unchanged(p)) => Some(open_regular(fs, p, job.size)?),
         _ => None,
     };
     if env.cancel.is_cancelled() {
@@ -1140,7 +1189,11 @@ fn produce(env: &Ctx<'_>, job: &FileJob<'_>, report: &dyn Fn(u64)) -> Result<(),
         written: 0,
         report,
     };
-    if let Some((frame, bytes)) = frame_bytes {
+    if let Some((desc, bytes, base)) = patch_input {
+        if decode_patch_verified(desc, &bytes, &base, env.hasher, env.codec, &mut out).is_err() {
+            return Err(out.take_fail());
+        }
+    } else if let Some((frame, bytes)) = frame_bytes {
         if decode_verified(frame, &bytes, env.hasher, env.codec, &mut out).is_err() {
             return Err(out.take_fail());
         }
@@ -1162,7 +1215,7 @@ fn produce(env: &Ctx<'_>, job: &FileJob<'_>, report: &dyn Fn(u64)) -> Result<(),
             return Err(JobErr::Source);
         }
     } else if job.size != 0 {
-        // A non-empty file without a usable source: only Patch, refused before any job runs.
+        // A non-empty file whose source cannot produce it.
         return Err(JobErr::Source);
     }
     if out.flush().is_err() {

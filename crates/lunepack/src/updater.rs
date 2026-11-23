@@ -1760,9 +1760,6 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
                 Ok(staged) => break staged,
                 Err(StageError::NeedFetch(paths)) => paths,
                 Err(StageError::Cancelled) => return Err(Error::Cancelled),
-                Err(StageError::Unsupported) => {
-                    return Err(Error::Config("the manifest needs an unsupported source"));
-                }
                 Err(StageError::Other(e)) => return Err(e.into()),
                 Err(_) => return Err(Error::Config("stage failed")),
             };
@@ -3479,9 +3476,6 @@ async fn install_from_payload(
             // The frames were hash-checked as they were copied: a failing source is local damage,
             // and there is nothing to fetch it from.
             Err(StageError::NeedFetch(paths)) => return Err(Error::NeedFetchExhausted(paths)),
-            Err(StageError::Unsupported) => {
-                return Err(Error::Config("the manifest needs an unsupported source"));
-            }
             Err(StageError::Other(e)) => return Err(e.into()),
             Err(_) => return Err(Error::Config("stage failed")),
         };

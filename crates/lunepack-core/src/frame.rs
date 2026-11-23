@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::digest::{Sha256Digest, U53};
 use crate::error::{Error, FrameError, Result, Untrusted};
-use crate::traits::{Codec, CodecId, FrameView, HashState, Hasher, StreamView};
+use crate::manifest::VerifiedPatch;
+use crate::traits::{Codec, CodecId, FrameView, HashState, Hasher, PatchView, StreamView};
 use crate::trust::present;
 
 /// Smallest LZMA2 dictionary a descriptor may declare.
@@ -533,6 +534,87 @@ pub fn decode_verified(
     }
     let digest = writer.hash.take().map(|h| h.finalize());
     if digest != Some(frame.file_sha256) {
+        return Err(FrameError::FileHash.into());
+    }
+    Ok(())
+}
+
+/// Verifies and decodes one delta patch (FORMAT.md 9.3), in order, each check before anything it
+/// covers is used: `patch_bytes` is exactly the patch's length; its SHA-256 equals the signed one;
+/// `base` is exactly `base_size` bytes; the base's SHA-256 equals `base_sha256` (the decoder sees
+/// neither the patch nor the base before these pass); the codec decodes into a writer that fails
+/// as soon as the output would exceed the file's size; then the output must be exactly the file's
+/// size, the whole patch consumed, and the output's SHA-256 equal to the file's.
+///
+/// `out` receives decoded bytes as they are produced. **On any error the caller must discard
+/// everything `out` received**; only `Ok(())` means the bytes are the signed file.
+pub fn decode_patch_verified(
+    patch: &VerifiedPatch,
+    patch_bytes: &[u8],
+    base: &[u8],
+    hasher: &dyn Hasher,
+    codec: &dyn Codec,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if patch_bytes.len() as u64 != patch.length() {
+        return Err(FrameError::ByteCount {
+            expected: patch.length(),
+            actual: patch_bytes.len() as u64,
+        }
+        .into());
+    }
+    if hasher.sha256(patch_bytes) != patch.sha256() {
+        return Err(FrameError::FrameHash.into());
+    }
+    if base.len() as u64 != patch.base_size() {
+        return Err(FrameError::BaseMismatch.into());
+    }
+    if hasher.sha256(base) != patch.base_sha256() {
+        return Err(FrameError::BaseMismatch.into());
+    }
+    let view = PatchView {
+        codec: patch.codec(),
+        input: patch_bytes,
+        base_size: patch.base_size(),
+        output_size: patch.file_size(),
+        window: patch.window(),
+    };
+    let mut writer = ExactWriter {
+        inner: out,
+        remaining: patch.file_size(),
+        written: 0,
+        overflowed: false,
+        failed: None,
+        hash: Some(hasher.sha256_start()),
+    };
+    let result = codec.decode_patch(&view, base, &mut writer);
+    if writer.overflowed {
+        return Err(FrameError::OutputTooLong {
+            size: patch.file_size(),
+        }
+        .into());
+    }
+    if let Some(source) = writer.failed.take() {
+        return Err(FrameError::OutputWrite(source).into());
+    }
+    let report = result?;
+    if writer.written != patch.file_size() {
+        return Err(FrameError::OutputTooShort {
+            expected: patch.file_size(),
+            actual: writer.written,
+        }
+        .into());
+    }
+    if report.consumed != [patch.length()] {
+        return Err(FrameError::Consumed {
+            index: 0,
+            consumed: report.consumed.first().copied().unwrap_or(0),
+            length: patch.length(),
+        }
+        .into());
+    }
+    let digest = writer.hash.take().map(|h| h.finalize());
+    if digest != Some(patch.file_sha256()) {
         return Err(FrameError::FileHash.into());
     }
     Ok(())

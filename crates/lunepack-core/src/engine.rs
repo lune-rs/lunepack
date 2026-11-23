@@ -786,8 +786,10 @@ impl<'a> Engine<'a> {
                     } else if let Some(p) = &pack {
                         SourceFor::Pack(p.clone())
                     } else {
+                        // No source for this file: listed, and asked for below before any
+                        // stage runs.
                         missing.push(entry.path().clone());
-                        SourceFor::Patch
+                        continue;
                     }
                 }
                 // Directories, symlinks and empty files take no bytes; the source is ignored.
