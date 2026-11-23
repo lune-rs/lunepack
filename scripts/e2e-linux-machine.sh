@@ -23,7 +23,8 @@
 #      hash of their Dockerfile, like the other suites'; `LUNEPACK_E2E_REMOVE_IMAGES=1` removes the
 #      machine image this run used; `LUNEPACK_E2E_KEEP=1` keeps the container and the directory,
 #      to look at a failed row by hand). Nothing is pruned; no other container, image, network or
-#      volume is touched (the e2e image's two named volumes are the ones scripts/e2e.sh uses).
+#      volume is touched (the build step uses the e2e image's two named volumes,
+#      lunepack-rs-e2e-target and -cargo; scripts/e2e.sh has its own, for an unprivileged user).
 #
 # A skip is not a pass: without Docker the script exits 1, unless LUNEPACK_E2E_REQUIRE=0, which
 # prints SKIP and exits 0. The rows are named in the output; a failed check names what differed
