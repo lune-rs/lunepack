@@ -819,11 +819,14 @@ fn row_delta_update(lab: &mut Lab) -> Vec<String> {
     if lab.is_folder_app() {
         // A folder app's other files did not change: none of them is fetched again (that none was
         // is also what the byte bound above says, for a folder of about 190 files and 80 MB).
+        let mut seen = 0;
         for (path, source) in stage_files(&stdout) {
             if path != "share/delta.bin" && path != "share/version.txt" {
                 assert_eq!(source, "unchanged", "{path} is not fetched again");
+                seen += 1;
             }
         }
+        eprintln!("e2e: row 10: {seen} stage lines of the app's own files, all unchanged");
     }
     lines.extend(apply_delta_update(lab));
     lines
