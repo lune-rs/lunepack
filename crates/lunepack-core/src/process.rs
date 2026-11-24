@@ -322,6 +322,16 @@ pub trait Process: Send + Sync {
     /// that cannot be inspected counts as in use, except one the system denies inspection of by
     /// design (a non-dumpable process of the same user on Linux): that one is judged by its
     /// command line alone (M5-D9).
+    ///
+    /// Windows keeps less than this (M13-D17): a process the adapter cannot open is skipped, not
+    /// counted, and only a process's image is compared with the tree (not its working directory
+    /// or the DLLs it loaded). Counting what cannot be opened would stop collection on every
+    /// machine, since the system's own processes cannot be opened. That is safe for deleting a
+    /// tree because Windows refuses to delete a running image whoever runs it, and
+    /// [`Process::tree_in_use_strict`], the check every removal under a machine install asks,
+    /// adds a probe of the tree's own files for what this scan does not see. So on Windows this
+    /// answer is what a per-user collection and uninstall ask, never the guard of a machine
+    /// install's removal.
     fn tree_in_use(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool>;
 
     /// The check every deletion the privileged engine makes under a machine install's root asks

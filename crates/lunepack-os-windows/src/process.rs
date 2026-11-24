@@ -532,6 +532,14 @@ impl Process for WindowsProcess {
     /// Compares every other process's image with the tree. A process this one cannot open is
     /// skipped, and only a process's image is looked at (not its working directory or the DLLs it
     /// loaded), so this is no guard for a removal: that is [`Process::tree_in_use_strict`].
+    ///
+    /// The skip is deliberate (M13-D17) and differs from the trait's rule that a process that
+    /// cannot be inspected counts as in use: the system's own processes cannot be opened by an
+    /// ordinary user, so counting them would make every scan answer in use and stop collection on
+    /// every Windows machine. It is safe because the OS refuses to delete a running image, which
+    /// is what an unseen process under the tree would hold, and because the removals that matter
+    /// (a machine install's) ask `tree_in_use_strict`, whose file-system probe finds what this
+    /// scan cannot see.
     fn tree_in_use(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
         let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
         let me = std::process::id();
