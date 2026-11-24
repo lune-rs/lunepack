@@ -29,8 +29,8 @@ use lunepack_core::{
     CheckedFrame, CodeSign, Codec, CodecId, DeltaFile, DeltaPatch, Encoder, EntryKind, Hasher,
     InstallMeta, ManifestDocument, PackedFile, PatchChoice, PlanEntry, PlanEntryKind, RelPath,
     ReleaseLayout, STUB_FILE, Sha256Digest, SignItem, Target, UPDATE_CONFIG_FILE, choose_patch,
-    classify, decode_verified, encode_patch_checked, pack_file, patch_candidates, patch_window,
-    sign_plan, validate_tree,
+    classify, decode_verified, encode_patch_checked, is_macho, pack_file, patch_candidates,
+    patch_window, sign_plan, validate_tree,
 };
 
 /// Fixed per-job allowance on top of the input, output and encoder estimates: 16 MiB of slack for
@@ -271,6 +271,80 @@ fn parent_of(path: &str) -> &str {
 /// `Contents/_CodeSignature` (M8-D8). `pack` then never modifies it.
 pub fn is_signed_bundle(input: &Path, target: Target) -> bool {
     target.is_macos() && fs::symlink_metadata(input.join(MACOS_CODE_SIGNATURE_DIR)).is_ok()
+}
+
+/// How many offending paths the refusal of [`check_macos_executable_dirs`] names.
+const MAX_NAMED_FILES: usize = 10;
+
+/// M13-D12: whether `text`, a path of a `macos-*` tree, lies under a `Contents/MacOS` directory of
+/// the bundle or of a nested bundle (ignoring ASCII case, as the file system of a Mac does).
+fn under_macos_dir(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.starts_with("contents/macos/") || lower.contains("/contents/macos/")
+}
+
+/// The rule for a `macos-*` bundle that is, or will be, code-signed (M13-D12): every regular file
+/// under a `Contents/MacOS` (of the bundle or of a nested bundle) is a Mach-O file, except the
+/// bundle's main executable (`install.entry`) and the files `pack` itself places (which a signed
+/// bundle already holds). A signature of a file that is not Mach-O is kept by `codesign` in an
+/// extended attribute of the file, and a pack carries no extended attributes (FORMAT.md 8.1, 17.3), so the
+/// installed bundle would not verify. The same holds, in general, for every signature that depends
+/// on data a pack does not carry; this check covers the one found.
+///
+/// `input` is the tree given to `pack`, before anything is placed. The error names up to
+/// [`MAX_NAMED_FILES`] paths, says why and says what to do.
+pub fn check_macos_executable_dirs(input: &Path, plan: &UpdatePlan<'_>) -> Result<()> {
+    let placed: Vec<String> = if is_signed_bundle(input, plan.target) {
+        placements(plan).into_iter().map(|p| p.path).collect()
+    } else {
+        Vec::new()
+    };
+    let mut offenders: Vec<String> = Vec::new();
+    for (path, full, kind, _) in walk(input)? {
+        let text = path.as_str();
+        if !matches!(kind, Found::File)
+            || !under_macos_dir(text)
+            || text == plan.install.entry.as_str()
+            || placed.iter().any(|p| p == text)
+        {
+            continue;
+        }
+        let read =
+            |e: io::Error| anyhow::Error::new(e).context(format!("cannot read {}", full.display()));
+        let mut head = Vec::new();
+        File::open(&full)
+            .map_err(read)?
+            .take(PLAN_HEAD_BYTES as u64)
+            .read_to_end(&mut head)
+            .map_err(read)?;
+        if !is_macho(&head) {
+            offenders.push(text.to_owned());
+        }
+    }
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    let shown: Vec<&str> = offenders
+        .iter()
+        .take(MAX_NAMED_FILES)
+        .map(String::as_str)
+        .collect();
+    let more = offenders.len().saturating_sub(MAX_NAMED_FILES);
+    bail!(
+        "the bundle is or will be code-signed, but {} file(s) under Contents/MacOS are not Mach-O \
+         executables: {}{}. The signature of such a file is kept in an extended attribute, which a \
+         pack does not carry, so the installed bundle would not verify. Move them under \
+         Contents/Resources (the app can find them from its own path there); only Mach-O files, and \
+         the main executable {}, may sit in Contents/MacOS",
+        offenders.len(),
+        shown.join(", "),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        },
+        plan.install.entry.as_str()
+    );
 }
 
 /// Fails when the input holds a name the update setup reserves (M5-D17): the configuration's file
@@ -1282,6 +1356,9 @@ pub fn build(
         && input.is_dir()
     {
         check_reserved(input, plan)?;
+        if plan.target.is_macos() && (set.os_signing || is_signed_bundle(input, plan.target)) {
+            check_macos_executable_dirs(input, plan)?;
+        }
     }
     assemble(input, &tree)?;
     say(&format!("assemble: copied {}", input.display()))?;

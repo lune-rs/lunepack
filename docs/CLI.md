@@ -541,6 +541,19 @@ each written before hashing so the signed manifest covers them (FORMAT.md 13, 17
   `:` or control character, no leading `.` (FORMAT.md 13.4). Otherwise it is the app id. `pack` still
   packs, and warns on stderr, naming the rule and never the name.
 
+**Files in `Contents/MacOS` (M13-D12).** When the bundle is, or will be, code-signed (it holds
+`Contents/_CodeSignature`, or the config has a `[codesign.macos]` section), `pack` refuses it if any regular
+file under a `Contents/MacOS` directory, of the bundle or of a nested bundle, is not a Mach-O file, except
+the bundle's main executable (`install.entry`) and, in a signed bundle, the files `pack` itself places. The
+error names up to ten of the paths. The reason: `codesign` keeps the signature of a file that is not
+Mach-O in an extended attribute of that file, and a pack carries no extended attributes (FORMAT.md 8.1), so
+the bundle that is installed from the pack would fail `codesign --verify --deep --strict`. Move such files
+(the managed `.dll` files of a .NET app, scripts, data) under `Contents/Resources`, and let the host find
+them there; `examples/dotnet` does this with a host whose app path points at `Contents/Resources/app`. The
+rule is one instance of a general one: a signature must not depend on anything the pack does not carry
+(the extended attributes of a file are the case found). An unsigned bundle with no
+`[codesign.macos]` section is packed as before.
+
 **Signed bundles (M8-D8).** `pack` never modifies a bundle that holds `Contents/_CodeSignature`, since any
 change would break its seal. Such a bundle is packed as it is when every file `pack` would place is
 already in it byte for byte (content and exec bit): the runtime and, with `--ui`, the helper's

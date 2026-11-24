@@ -51,8 +51,8 @@ pub use chain::{
 };
 pub use codesign::{
     ArgvTemplate, Decision, ExpandCtx, Expanded, PlanEntry, PlanEntryKind, PublisherOutcome,
-    SignItem, SignKind, SignPlanError, TemplateError, TemplateRole, decide, macho_slices_signed,
-    pe_is_signed, sign_plan,
+    SignItem, SignKind, SignPlanError, TemplateError, TemplateRole, decide, is_macho,
+    macho_slices_signed, pe_is_signed, sign_plan,
 };
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};

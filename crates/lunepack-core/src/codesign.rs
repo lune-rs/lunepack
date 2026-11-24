@@ -573,8 +573,9 @@ fn fat_header(bytes: &[u8]) -> Option<(bool, bool, usize)> {
     (bytes.len() >= table_end).then_some((big, wide, count as usize))
 }
 
-/// Whether `head` starts like a Mach-O file, thin or universal, of any architecture.
-fn is_macho(head: &[u8]) -> bool {
+/// Whether `head` (the file's first [`PLAN_HEAD_BYTES`] bytes) starts like a Mach-O file, thin or
+/// universal, of any architecture.
+pub fn is_macho(head: &[u8]) -> bool {
     thin_magic(head).is_some() || fat_header(head).is_some()
 }
 
