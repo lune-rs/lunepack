@@ -157,7 +157,11 @@ if [ "$have_bundle" -eq 1 ]; then
   esac
 fi
 
-args=(publish "$project_dir/$app.csproj" -c Release -r "$rid" --self-contained -o "$out" --nologo)
+# The output goes in as the PublishDir property, with a trailing slash, not as `-o <dir>`: the dotnet
+# command line (SDK 10.0.401) fails with "Only one project can be specified" for `-o <dir>` when the
+# directory's own name is `dotnet` (the slash is dropped from `-o`, and the property form with the
+# slash is not mistaken for a second project).
+args=(publish "$project_dir/$app.csproj" -c Release -r "$rid" --self-contained "-p:PublishDir=$out/" --nologo)
 if [ "$have_bundle" -eq 1 ]; then
   args+=("-p:MacBundleHost=$bundle/Contents/MacOS/$app")
 fi

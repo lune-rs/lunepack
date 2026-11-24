@@ -82,7 +82,7 @@ chmod 755 "$stubs/docker"
 stub_dotnet() { # a dotnet that writes the files of a publish into its -o directory
   printf '#!/bin/sh\n%s\n' 'echo "$@" >>"$STUB_DOTNET_LOG"
 while [ "$#" -gt 0 ]; do
-  if [ "$1" = -o ]; then out=$2; fi
+  case $1 in -p:PublishDir=*) out=${1#-p:PublishDir=} ;; esac
   shift
 done
 mkdir -p "$out"

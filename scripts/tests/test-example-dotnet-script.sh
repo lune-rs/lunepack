@@ -81,7 +81,7 @@ out=
 host=
 while [ "$#" -gt 0 ]; do
   case $1 in
-    -o) out=$2 ;;
+    -p:PublishDir=*) out=${1#-p:PublishDir=} ;;
     -p:MacBundleHost=*) host=${1#-p:MacBundleHost=} ;;
   esac
   shift
@@ -107,7 +107,7 @@ check_rid() { # target, rid
   t_check "$1: publishes for $2" out_has " -r $2 "
   t_check "$1: self-contained" out_has " --self-contained "
   t_check "$1: Release" out_has " -c Release "
-  t_check "$1: into the out-dir" out_has " -o $T_TMP/pc-out "
+  t_check "$1: into the out-dir" out_has " -p:PublishDir=$T_TMP/pc-out/ "
   t_check "$1: no bundle property" out_lacks "MacBundleHost"
   t_check "$1: dotnet did not run" test ! -e "$T_TMP/dotnet.args"
 }
@@ -124,7 +124,13 @@ t_check "it passes the host's place" out_has "-p:MacBundleHost=$T_TMP/pc-bundle/
 t_check "dotnet did not run for it either" test ! -e "$T_TMP/dotnet.args"
 
 run_script --print-command linux-x86_64 relative-out
-t_check "a relative out-dir is made absolute" out_has " -o $(cd "$T_TMP" && pwd)/relative-out "
+t_check "a relative out-dir is made absolute" out_has " -p:PublishDir=$(cd "$T_TMP" && pwd)/relative-out/ "
+
+# An out-dir named `dotnet` breaks `dotnet publish -o <dir>` (SDK 10.0.401); the property form with a
+# trailing slash is what the script passes, whatever the name.
+run_script --print-command linux-x86_64 "$T_TMP/x/dotnet"
+t_check "an out-dir named dotnet is passed as PublishDir with a slash" out_has " -p:PublishDir=$T_TMP/x/dotnet/ "
+t_check "and never as -o" out_lacks " -o "
 
 run_script --print-command linux-x86_64 "$T_TMP/pc-out" --macos-bundle
 t_check "a print with a bundle option and no value is a usage error" rc_is 2
