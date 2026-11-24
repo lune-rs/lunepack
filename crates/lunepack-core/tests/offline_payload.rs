@@ -235,8 +235,8 @@ fn a_duplicate_key_reserved_fields_and_oversize_are_refused() {
     let dup = bytes.replacen("{", "{\"payloadType\":\"x\",", 1);
     let got = verify(&fx, &keys, dup.as_bytes(), NOW);
     assert!(matches!(got, Err(Error::Json(_))), "{got:?}");
-    // Reserved members.
-    for member in ["install", "deltas"] {
+    // The reserved member, and `deltas` (defined since M12, FORMAT.md 9.3) that is not a list.
+    for (member, reserved) in [("install", true), ("deltas", false)] {
         let tampered = payload.replacen("{", &format!("{{\"{member}\":{{}},"), 1);
         let got = verify(
             &fx,
@@ -244,10 +244,14 @@ fn a_duplicate_key_reserved_fields_and_oversize_are_refused() {
             &fx.envelope(PayloadKind::Manifest, tampered.as_bytes(), &[5]),
             NOW,
         );
-        assert!(
-            matches!(got, Err(Error::Field("reserved manifest field"))),
-            "{member}: {got:?}"
-        );
+        if reserved {
+            assert!(
+                matches!(got, Err(Error::Field("reserved manifest field"))),
+                "{member}: {got:?}"
+            );
+        } else {
+            assert!(matches!(got, Err(Error::Schema(_))), "{member}: {got:?}");
+        }
     }
     // Over the manifest cap: refused by size before parsing.
     let big = vec![b' '; 64 * 1024 * 1024 + 1];

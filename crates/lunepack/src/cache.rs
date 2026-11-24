@@ -37,13 +37,27 @@ pub enum CacheKind {
     Frame,
     /// `packs/`: a whole pack.
     Pack,
+    /// `patches/`: one delta patch (FORMAT.md 9.3), exactly its bytes.
+    Patch,
+    /// `deltas/`: a whole delta file.
+    Delta,
 }
 
 impl CacheKind {
+    /// Every kind, in the order directories are made and cleaned.
+    pub(crate) const ALL: [CacheKind; 4] = [
+        CacheKind::Frame,
+        CacheKind::Pack,
+        CacheKind::Patch,
+        CacheKind::Delta,
+    ];
+
     fn dir(self) -> &'static str {
         match self {
             CacheKind::Frame => "frames",
             CacheKind::Pack => "packs",
+            CacheKind::Patch => "patches",
+            CacheKind::Delta => "deltas",
         }
     }
 }
@@ -118,11 +132,13 @@ impl Cache {
         self.dir.join(kind.dir())
     }
 
-    /// Creates `frames/` and `packs/` and makes their entries (and the cache directory's own
-    /// entry in its parent) durable, so a synced part is never lost with a volatile directory.
+    /// Creates `frames/`, `packs/`, `patches/` and `deltas/` and makes their entries (and the cache
+    /// directory's own entry in its parent) durable, so a synced part is never lost with a
+    /// volatile directory.
     pub fn ensure_dirs(&self) -> Result<(), FsError> {
-        self.fs.create_dir_all(&self.kind_dir(CacheKind::Frame))?;
-        self.fs.create_dir_all(&self.kind_dir(CacheKind::Pack))?;
+        for kind in CacheKind::ALL {
+            self.fs.create_dir_all(&self.kind_dir(kind))?;
+        }
         self.fs.sync_dir(&self.dir)?;
         if let Some(parent) = self.dir.parent() {
             self.fs.sync_dir(parent)?;
@@ -252,17 +268,16 @@ impl Cache {
         ignore_missing(self.fs.remove_file(&self.meta_path(kind, sha)))
     }
 
-    /// Removes every entry of `frames/` and `packs/` that `keep_frames` and `keep_packs` do not
-    /// name (complete files, parts and sidecars alike), and anything else found there.
-    pub fn cleanup(
-        &self,
-        keep_frames: &HashSet<Sha256Digest>,
-        keep_packs: &HashSet<Sha256Digest>,
-    ) -> Result<(), FsError> {
-        for (kind, keep) in [
-            (CacheKind::Frame, keep_frames),
-            (CacheKind::Pack, keep_packs),
-        ] {
+    /// Removes every entry of `frames/`, `packs/`, `patches/` and `deltas/` that its keep set does
+    /// not name (complete files, parts and sidecars alike), and anything else found there. A kind
+    /// without a keep set in `keep` keeps nothing.
+    pub fn cleanup(&self, keep: &[(CacheKind, &HashSet<Sha256Digest>)]) -> Result<(), FsError> {
+        let none = HashSet::new();
+        for kind in CacheKind::ALL {
+            let keep = keep
+                .iter()
+                .find(|(k, _)| *k == kind)
+                .map_or(&none, |(_, set)| *set);
             let dir = self.kind_dir(kind);
             let entries = match self.fs.list_dir(&dir) {
                 Ok(entries) => entries,
@@ -421,8 +436,10 @@ impl Cache {
     /// when they hash to `sha`, otherwise deletes it. Whether it matched. `cancel` is checked
     /// before every read ([`Error::Cancelled`]); on any error the part is removed. `copied` is
     /// told the size of every chunk written.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn store_frame(
         &self,
+        kind: CacheKind,
         src: &dyn ReadAt,
         offset: u64,
         length: u64,
@@ -430,8 +447,8 @@ impl Cache {
         tools: &PartTools<'_>,
         copied: &dyn Fn(u64),
     ) -> Result<bool, Error> {
-        self.remove_part(CacheKind::Frame, sha)?;
-        let path = self.part_path(CacheKind::Frame, sha);
+        self.remove_part(kind, sha)?;
+        let path = self.part_path(kind, sha);
         let mut part = OpenPart {
             file: self.fs.create_new(&path)?,
             hash: tools.hasher.sha256_start(),
@@ -460,10 +477,10 @@ impl Cache {
         })();
         if let Err(e) = copy {
             drop(part);
-            self.remove_part(CacheKind::Frame, sha)?;
+            self.remove_part(kind, sha)?;
             return Err(e);
         }
-        self.finish_part(CacheKind::Frame, sha, part)
+        self.finish_part(kind, sha, part)
     }
 }
 
@@ -500,6 +517,8 @@ struct RunSlot {
 /// in several overlapping frames goes to each). Runs on a writer job.
 pub(crate) struct RunWriter {
     cache: Cache,
+    /// Where the pieces go: `frames/`, or `patches/` for a delta file's run.
+    kind: CacheKind,
     hasher: Arc<dyn Hasher>,
     slots: Vec<RunSlot>,
     /// Pack offset of the next body byte.
@@ -512,8 +531,10 @@ pub(crate) struct RunWriter {
 }
 
 impl RunWriter {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         cache: Cache,
+        kind: CacheKind,
         hasher: Arc<dyn Hasher>,
         targets: Vec<RunTarget>,
         start: u64,
@@ -523,6 +544,7 @@ impl RunWriter {
     ) -> Self {
         RunWriter {
             cache,
+            kind,
             hasher,
             slots: targets
                 .into_iter()
@@ -560,7 +582,7 @@ impl RunWriter {
                 };
                 let part = self.cache.open_part(
                     &tools,
-                    CacheKind::Frame,
+                    self.kind,
                     &t.sha,
                     t.resume_from,
                     self.validator.as_ref(),
@@ -586,7 +608,7 @@ impl RunWriter {
             let slice = &chunk[(from - chunk_start) as usize..(to - chunk_start) as usize];
             part.file
                 .write_all(slice)
-                .map_err(|e| io_error(e, &self.cache.part_path(CacheKind::Frame, &t.sha)))?;
+                .map_err(|e| io_error(e, &self.cache.part_path(self.kind, &t.sha)))?;
             part.hash.update(slice);
             part.written += slice.len() as u64;
             if part.written == t.length {
@@ -594,7 +616,7 @@ impl RunWriter {
                     continue;
                 };
                 self.slots[i].done = true;
-                if !self.cache.finish_part(CacheKind::Frame, &t.sha, part)? {
+                if !self.cache.finish_part(self.kind, &t.sha, part)? {
                     self.bad.push(t.sha);
                 }
             }
@@ -608,17 +630,15 @@ impl RunWriter {
         let mut any = false;
         for slot in &mut self.slots {
             if let Some(part) = slot.part.as_mut() {
-                part.file.flush().map_err(|e| {
-                    io_error(e, &self.cache.part_path(CacheKind::Frame, &slot.target.sha))
-                })?;
+                part.file
+                    .flush()
+                    .map_err(|e| io_error(e, &self.cache.part_path(self.kind, &slot.target.sha)))?;
                 part.file.sync()?;
                 any = true;
             }
         }
         if any {
-            self.cache
-                .fs
-                .sync_dir(&self.cache.kind_dir(CacheKind::Frame))?;
+            self.cache.fs.sync_dir(&self.cache.kind_dir(self.kind))?;
         }
         Ok(())
     }
@@ -645,6 +665,8 @@ impl RunWriter {
 /// Writes a pack download into `packs/<sha>.part`. Runs on a writer job.
 pub(crate) struct PackWriter {
     cache: Cache,
+    /// `packs/`, or `deltas/` for a whole delta file.
+    kind: CacheKind,
     sha: Sha256Digest,
     size: u64,
     part: OpenPart,
@@ -653,8 +675,10 @@ pub(crate) struct PackWriter {
 impl PackWriter {
     /// `resume_from > 0` appends to the existing part of that length (a matching `206`); `0`
     /// starts an empty part (a `200`, or nothing to resume).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         cache: Cache,
+        kind: CacheKind,
         tools: &PartTools<'_>,
         sha: Sha256Digest,
         size: u64,
@@ -664,7 +688,7 @@ impl PackWriter {
     ) -> Result<Self, Error> {
         let part = cache.open_part(
             tools,
-            CacheKind::Pack,
+            kind,
             &sha,
             resume_from,
             validator.as_ref(),
@@ -672,6 +696,7 @@ impl PackWriter {
         )?;
         Ok(PackWriter {
             cache,
+            kind,
             sha,
             size,
             part,
@@ -692,7 +717,7 @@ impl PackWriter {
         self.part
             .file
             .write_all(chunk)
-            .map_err(|e| io_error(e, &self.cache.part_path(CacheKind::Pack, &self.sha)))?;
+            .map_err(|e| io_error(e, &self.cache.part_path(self.kind, &self.sha)))?;
         self.part.hash.update(chunk);
         self.part.written += len;
         Ok(())
@@ -702,11 +727,9 @@ impl PackWriter {
         self.part
             .file
             .flush()
-            .map_err(|e| io_error(e, &self.cache.part_path(CacheKind::Pack, &self.sha)))?;
+            .map_err(|e| io_error(e, &self.cache.part_path(self.kind, &self.sha)))?;
         self.part.file.sync()?;
-        self.cache
-            .fs
-            .sync_dir(&self.cache.kind_dir(CacheKind::Pack))?;
+        self.cache.fs.sync_dir(&self.cache.kind_dir(self.kind))?;
         Ok(())
     }
 
@@ -716,10 +739,7 @@ impl PackWriter {
             self.sync()?;
             return Ok(WriteReport::Incomplete { bad: Vec::new() });
         }
-        if self
-            .cache
-            .finish_part(CacheKind::Pack, &self.sha, self.part)?
-        {
+        if self.cache.finish_part(self.kind, &self.sha, self.part)? {
             Ok(WriteReport::Complete { bad: Vec::new() })
         } else {
             Ok(WriteReport::PackHashMismatch)
@@ -735,10 +755,14 @@ impl PackWriter {
     /// The response broke its cap: delete the part and its sidecar.
     pub(crate) fn discard(self) -> Result<WriteReport, Error> {
         let PackWriter {
-            cache, sha, part, ..
+            cache,
+            kind,
+            sha,
+            part,
+            ..
         } = self;
         drop(part);
-        cache.remove_part(CacheKind::Pack, &sha)?;
+        cache.remove_part(kind, &sha)?;
         Ok(WriteReport::Stopped)
     }
 }

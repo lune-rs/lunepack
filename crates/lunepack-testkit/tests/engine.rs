@@ -1135,3 +1135,251 @@ fn the_publisher_check_runs_under_the_installed_policy() {
         }
     }
 }
+
+// ---- patches (M12-D6, protocol version 2) --------------------------------------------------------
+
+/// The bytes of `path` in `version`'s tree, as `Machine::write_tree` writes them.
+fn tree_file(version: &str, path: &str) -> Vec<u8> {
+    match path {
+        "app.exe" => format!("entry of {version}").into_bytes(),
+        "readme.txt" => b"unchanged readme".to_vec(),
+        "lib.dll" => format!("library of {version}").into_bytes(),
+        _ => config_bytes(&fx(), version, "stable", 60),
+    }
+}
+
+/// One patch of a delta: the file's path, the patch's SHA-256 and its bytes.
+type Patch = (&'static str, Sha256Digest, Vec<u8>);
+
+/// A release of `version` whose manifest has one delta from `from` (the tree `from` writes) with
+/// a patch, made by `FakeCodec::encode_patch`, for each changed file; with the patches by path.
+fn release_with_delta(
+    fx: &ChainFixture<'_>,
+    version: &str,
+    seq: u64,
+    from: &str,
+) -> (Release, Vec<Patch>) {
+    use lunepack_core::digest::U53;
+    use lunepack_core::{DeltaDoc, Encoder, Hasher, PatchDoc};
+    let pack = release_pack(fx, version, "stable");
+    let mut doc = fx.manifest_document(version, TARGET, &pack);
+    let (mut file, mut docs, mut out) = (Vec::new(), Vec::new(), Vec::new());
+    for path in ["app.exe", "lib.dll", CONFIG] {
+        let base = tree_file(from, path);
+        let new = tree_file(version, path);
+        let bytes = FakeCodec::new()
+            .encode_patch(CodecId::Lzma2, &base, &new)
+            .unwrap()
+            .bytes;
+        let sha = FakeHasher.sha256(&bytes);
+        docs.push(PatchDoc {
+            path: RelPath::parse(path).unwrap(),
+            base_size: U53::new(base.len() as u64).unwrap(),
+            base_sha256: FakeHasher.sha256(&base),
+            codec: "lzma2".to_owned(),
+            offset: U53::new(file.len() as u64).unwrap(),
+            length: U53::new(bytes.len() as u64).unwrap(),
+            sha256: sha,
+        });
+        file.extend_from_slice(&bytes);
+        out.push((path, sha, bytes));
+    }
+    doc.deltas = Some(vec![DeltaDoc {
+        from: from.to_owned(),
+        path: format!("{version}/{}.from-{from}.delta", TARGET.as_str()),
+        size: U53::new(file.len() as u64).unwrap(),
+        sha256: FakeHasher.sha256(&file),
+        patches: docs,
+    }]);
+    let manifest = fx.envelope(PayloadKind::Manifest, &doc.to_payload(), &[5]);
+    let keys = fx.envelope(
+        PayloadKind::Keys,
+        &fx.keyset_document(1, 1, None, 1, &[5]).to_payload(),
+        &[0],
+    );
+    let feed = fx.envelope(
+        PayloadKind::Feed,
+        &fx.feed_document(
+            seq,
+            None,
+            vec![fx.release(version, &[(TARGET, &manifest)], None)],
+        )
+        .to_payload(),
+        &[5],
+    );
+    (
+        Release {
+            keys,
+            feed,
+            manifest,
+            pack,
+        },
+        out,
+    )
+}
+
+/// [`connect`] with the server speaking `server` versions and the client offering `client`.
+fn connect_versions<R>(
+    m: &Machine,
+    engine: &mut Engine<'_>,
+    server: (u32, u32),
+    client: (u32, u32),
+    f: impl FnOnce(&mut ClientSession<MemDuplex>) -> R,
+) -> (R, Result<(), ServiceError>) {
+    let (client_end, server_end) = mem_duplex();
+    thread::scope(|s| {
+        let server = s.spawn(|| {
+            let session =
+                ServerSession::accept_range(server_end, app(), server.0, server.1).expect("hello");
+            let now = || Duration::from_secs(m.monotonic.load(Ordering::SeqCst));
+            serve(session, engine, &now)
+        });
+        let timeouts = ClientTimeouts {
+            hello: Some(Duration::from_secs(10)),
+            answer: Some(Duration::from_secs(30)),
+        };
+        let mut c = ClientSession::connect_range(client_end, app(), timeouts, client.0, client.1)
+            .expect("connect");
+        let r = f(&mut c);
+        drop(c);
+        (r, server.join().expect("server thread"))
+    })
+}
+
+fn put_patches(c: &mut ClientSession<MemDuplex>, patches: &[Patch]) {
+    for (_, sha, bytes) in patches {
+        c.put(ObjectKind::Patch, *sha, bytes.len() as u64, &mut &bytes[..])
+            .unwrap();
+    }
+}
+
+/// The engine stages 1.1.0 from patches alone: each base is read from its own 1.0.0 tree.
+#[test]
+fn the_engine_stages_an_update_from_patches() {
+    let m = Machine::new();
+    let mut engine = m.engine();
+    let (rel, patches) = release_with_delta(&fx(), "1.1.0", 2, "1.0.0");
+    let (outcome, end) = connect(&m, &mut engine, |c| {
+        assert_eq!(c.version(), 2);
+        c.stage_begin(&stable(), &rel.documents()).unwrap();
+        put_patches(c, &patches);
+        c.stage_commit(&mut |_, _| {}).unwrap()
+    });
+    end.unwrap();
+    assert_eq!(outcome, CommitOutcome::Staged(v("1.1.0")));
+    let tree = m.root.join("app").join("1.1.0");
+    for path in ["app.exe", "readme.txt", "lib.dll", CONFIG] {
+        assert_eq!(
+            m.fs.read_capped(&tree.join(path), 1 << 20).unwrap(),
+            tree_file("1.1.0", path),
+            "{path}"
+        );
+    }
+    assert_eq!(m.uploads(), 0);
+}
+
+/// A patch of a delta from another version than the record's current one is `not_in_manifest`;
+/// a listed patch of another size is `size_mismatch`; a repeat is `malformed`.
+#[test]
+fn put_of_a_patch_follows_the_current_version_and_its_size() {
+    let m = Machine::new();
+    let mut engine = m.engine();
+    let (other, other_patches) = release_with_delta(&fx(), "1.1.0", 2, "0.9.0");
+    let (rs, end) = connect(&m, &mut engine, |c| {
+        c.stage_begin(&stable(), &other.documents()).unwrap();
+        let (_, sha, bytes) = &other_patches[0];
+        c.put(ObjectKind::Patch, *sha, bytes.len() as u64, &mut &bytes[..])
+    });
+    end.unwrap();
+    assert_eq!(rs, Err(answered(ErrorCode::NotInManifest)));
+
+    let (rel, patches) = release_with_delta(&fx(), "1.1.0", 2, "1.0.0");
+    let (rs, end) = connect(&m, &mut engine, |c| {
+        c.stage_begin(&stable(), &rel.documents()).unwrap();
+        let (_, sha, bytes) = &patches[0];
+        let longer = [bytes.clone(), vec![0]].concat();
+        let wrong = c.put(
+            ObjectKind::Patch,
+            *sha,
+            longer.len() as u64,
+            &mut &longer[..],
+        );
+        let first = c.put(ObjectKind::Patch, *sha, bytes.len() as u64, &mut &bytes[..]);
+        let again = c.put(ObjectKind::Patch, *sha, bytes.len() as u64, &mut &bytes[..]);
+        (wrong, first, again)
+    });
+    assert_eq!(rs.0, Err(answered(ErrorCode::SizeMismatch)));
+    assert_eq!(rs.1, Ok(()));
+    assert_eq!(rs.2, Err(answered(ErrorCode::Malformed)));
+    assert!(matches!(end, Err(ServiceError::Malformed(_))));
+}
+
+/// A current-tree file changed under the engine (another base than the patch's): `need_fetch`
+/// for that path alone, then its frame stages the version.
+#[test]
+fn a_tampered_base_is_need_fetch_then_the_frame_stages() {
+    let m = Machine::new();
+    let mut engine = m.engine();
+    let (rel, patches) = release_with_delta(&fx(), "1.1.0", 2, "1.0.0");
+    let lib = m.root.join("app").join("1.0.0").join("lib.dll");
+    let mut bad = tree_file("1.0.0", "lib.dll");
+    bad[0] ^= 0x20;
+    m.fs.remove_file(&lib).unwrap();
+    let mut w = m.fs.create_new(&lib).unwrap();
+    std::io::Write::write_all(&mut w, &bad).unwrap();
+    w.sync().unwrap();
+    drop(w);
+    let (outcomes, end) = connect(&m, &mut engine, |c| {
+        c.stage_begin(&stable(), &rel.documents()).unwrap();
+        put_patches(c, &patches);
+        let first = c.stage_commit(&mut |_, _| {}).unwrap();
+        let (sha, bytes) = rel.frame("lib.dll");
+        c.put(ObjectKind::Frame, sha, bytes.len() as u64, &mut &bytes[..])
+            .unwrap();
+        (first, c.stage_commit(&mut |_, _| {}).unwrap())
+    });
+    end.unwrap();
+    match outcomes.0 {
+        CommitOutcome::NeedFetch { paths, .. } => {
+            let names: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
+            assert_eq!(names, ["lib.dll"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(outcomes.1, CommitOutcome::Staged(v("1.1.0")));
+    assert_eq!(
+        m.fs.read_capped(&m.root.join("app").join("1.1.0").join("lib.dll"), 1 << 20)
+            .unwrap(),
+        tree_file("1.1.0", "lib.dll")
+    );
+}
+
+/// Version 1 and 2 meet: a client limited to version 1 stages through a version-2 server with
+/// frames (its patch is refused before a byte is sent), and a version-2 client meets a
+/// version-1 server at version 1, where the server refuses a patch as `malformed`.
+#[test]
+fn version_1_and_version_2_meet() {
+    let m = Machine::new();
+    let mut engine = m.engine();
+    let (rel, patches) = release_with_delta(&fx(), "1.1.0", 2, "1.0.0");
+    let (outcome, end) = connect_versions(&m, &mut engine, (1, 2), (1, 1), |c| {
+        assert_eq!(c.version(), 1);
+        let (_, sha, bytes) = &patches[0];
+        assert!(matches!(
+            c.put(ObjectKind::Patch, *sha, bytes.len() as u64, &mut &bytes[..]),
+            Err(ServiceError::Malformed(_))
+        ));
+        stage_with_pack(c, &rel)
+    });
+    end.unwrap();
+    assert_eq!(outcome, CommitOutcome::Staged(v("1.1.0")));
+
+    let m = Machine::new();
+    let mut engine = m.engine();
+    let (outcome, end) = connect_versions(&m, &mut engine, (1, 1), (1, 2), |c| {
+        assert_eq!(c.version(), 1);
+        stage_with_pack(c, &rel)
+    });
+    end.unwrap();
+    assert_eq!(outcome, CommitOutcome::Staged(v("1.1.0")));
+}

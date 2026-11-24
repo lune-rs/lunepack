@@ -255,6 +255,28 @@ impl std::fmt::Debug for PackTarget {
     }
 }
 
+/// Which cache directories an artifact laid out like a pack goes to: its pieces and its whole file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Kinds {
+    /// Pieces fetched by Range: `frames/` or `patches/`.
+    pub(crate) piece: CacheKind,
+    /// The whole file: `packs/` or `deltas/`.
+    pub(crate) whole: CacheKind,
+}
+
+impl Kinds {
+    /// A pack and its frames.
+    pub(crate) const PACK: Kinds = Kinds {
+        piece: CacheKind::Frame,
+        whole: CacheKind::Pack,
+    };
+    /// A delta file and its patches (FORMAT.md 9.3).
+    pub(crate) const DELTA: Kinds = Kinds {
+        piece: CacheKind::Patch,
+        whole: CacheKind::Delta,
+    };
+}
+
 /// A frame the stage needs from the pack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameNeed {
@@ -368,6 +390,17 @@ pub async fn download(
     pack: &PackTarget,
     needed: &[FrameNeed],
 ) -> Result<Fetched, Error> {
+    download_in(ctx, pack, needed, Kinds::PACK).await
+}
+
+/// [`download`] for any artifact laid out like a pack: `pack` is the whole file (a pack, or a
+/// delta file) and `needed` its pieces (frames, or patches), cached under `kinds`.
+pub(crate) async fn download_in(
+    ctx: &FetchCtx,
+    pack: &PackTarget,
+    needed: &[FrameNeed],
+    kinds: Kinds,
+) -> Result<Fetched, Error> {
     let mut frames: Vec<FrameNeed> = needed.to_vec();
     frames.sort_by_key(|f| (f.offset, f.length));
     let mut seen = HashSet::new();
@@ -382,11 +415,11 @@ pub async fn download(
             cache.ensure_dirs()?;
             // A cached pack is used only after its SHA-256 matches (M4-D17); a mismatch deletes it
             // and the download goes on as if it were absent.
-            let pack_ready = cache.is_complete(CacheKind::Pack, &pack.sha256, pack.size)?
-                && cache.verify_complete(CacheKind::Pack, &pack.sha256, &*hasher, cancel)?;
+            let pack_ready = cache.is_complete(kinds.whole, &pack.sha256, pack.size)?
+                && cache.verify_complete(kinds.whole, &pack.sha256, &*hasher, cancel)?;
             let complete = frames
                 .iter()
-                .map(|f| cache.is_complete(CacheKind::Frame, &f.sha256, f.length))
+                .map(|f| cache.is_complete(kinds.piece, &f.sha256, f.length))
                 .collect::<Result<Vec<bool>, _>>()?;
             Ok((pack_ready, complete))
         })
@@ -396,17 +429,16 @@ pub async fn download(
     if pack_ready {
         // Bytes already on disk count as done up front, so total and done agree (F1).
         ctx.progress_have(pack.size, pack.size);
-        fetched.pack = Some(ctx.cache.path(CacheKind::Pack, &pack.sha256));
+        fetched.pack = Some(ctx.cache.path(kinds.whole, &pack.sha256));
         return Ok(fetched);
     }
     let mut missing = Vec::new();
     for (frame, done) in frames.into_iter().zip(complete) {
         if done {
             ctx.progress_have(frame.length, frame.length);
-            fetched.frames.insert(
-                frame.sha256,
-                ctx.cache.path(CacheKind::Frame, &frame.sha256),
-            );
+            fetched
+                .frames
+                .insert(frame.sha256, ctx.cache.path(kinds.piece, &frame.sha256));
         } else {
             missing.push(frame);
         }
@@ -417,7 +449,7 @@ pub async fn download(
     let spans: Vec<(u64, u64)> = missing.iter().map(|f| (f.offset, f.length)).collect();
     match plan_fetch(&spans, pack.size, ctx.policy) {
         FetchPlan::FullPack => {
-            fetched.pack = Some(fetch_pack(ctx, pack, None).await?);
+            fetched.pack = Some(fetch_pack_in(ctx, pack, None, kinds).await?);
         }
         FetchPlan::Runs(runs) => {
             // The request is the runs, gaps merged into them included.
@@ -426,13 +458,13 @@ pub async fn download(
             for (k, run) in runs.into_iter().enumerate() {
                 let run_frames: Vec<FrameNeed> =
                     run.frames.iter().map(|&i| missing[i].clone()).collect();
-                match fetch_run(ctx, pack, &run, &run_frames).await? {
+                match fetch_run_in(ctx, pack, &run, &run_frames, kinds).await? {
                     FetchOutcome::Done { bad } => {
                         for frame in &run_frames {
                             if !bad.contains(&frame.sha256) {
                                 fetched.frames.insert(
                                     frame.sha256,
-                                    ctx.cache.path(CacheKind::Frame, &frame.sha256),
+                                    ctx.cache.path(kinds.piece, &frame.sha256),
                                 );
                             }
                         }
@@ -444,7 +476,7 @@ pub async fn download(
                         if let Some(p) = &ctx.progress {
                             p.sub_total(run_bytes[k..].iter().fold(0, |s, b| s.saturating_add(*b)));
                         }
-                        fetched.pack = Some(fetch_pack(ctx, pack, Some(response)).await?);
+                        fetched.pack = Some(fetch_pack_in(ctx, pack, Some(response), kinds).await?);
                         return Ok(fetched);
                     }
                 }
@@ -595,6 +627,17 @@ pub async fn fetch_run(
     run: &Run,
     frames: &[FrameNeed],
 ) -> Result<FetchOutcome, Error> {
+    fetch_run_in(ctx, pack, run, frames, Kinds::PACK).await
+}
+
+/// [`fetch_run`] into the cache directories `kinds`.
+async fn fetch_run_in(
+    ctx: &FetchCtx,
+    pack: &PackTarget,
+    run: &Run,
+    frames: &[FrameNeed],
+    kinds: Kinds,
+) -> Result<FetchOutcome, Error> {
     let Some(first) = frames.first().cloned() else {
         return Ok(FetchOutcome::Done { bad: Vec::new() });
     };
@@ -607,9 +650,9 @@ pub async fn fetch_run(
         let first = first.clone();
         job(ctx, "cache-state", move || {
             cache.ensure_dirs()?;
-            let have = cache.part_len(CacheKind::Frame, &first.sha256, first.length)?;
+            let have = cache.part_len(kinds.piece, &first.sha256, first.length)?;
             let validator = (have > 0)
-                .then(|| cache.stored_validator(CacheKind::Frame, &first.sha256, &url_sha256))
+                .then(|| cache.stored_validator(kinds.piece, &first.sha256, &url_sha256))
                 .flatten();
             Ok((have, validator))
         })
@@ -660,6 +703,7 @@ pub async fn fetch_run(
     let report = stream_body(ctx, response, expected, move |token| {
         Ok(Writer::Run(RunWriter::new(
             cache,
+            kinds.piece,
             hasher,
             targets,
             start,
@@ -690,6 +734,16 @@ pub async fn fetch_pack(
     pack: &PackTarget,
     reuse: Option<Response>,
 ) -> Result<PathBuf, Error> {
+    fetch_pack_in(ctx, pack, reuse, Kinds::PACK).await
+}
+
+/// [`fetch_pack`] into the cache directory `kinds.whole`.
+pub(crate) async fn fetch_pack_in(
+    ctx: &FetchCtx,
+    pack: &PackTarget,
+    reuse: Option<Response>,
+    kinds: Kinds,
+) -> Result<PathBuf, Error> {
     let url_sha256 = ctx.hasher.sha256(pack.url.as_bytes());
     let mut reuse = reuse;
     let mut retried = false;
@@ -705,11 +759,9 @@ pub async fn fetch_pack(
                     let pack = pack.clone();
                     job(ctx, "cache-state", move || {
                         cache.ensure_dirs()?;
-                        let have = cache.part_len(CacheKind::Pack, &pack.sha256, pack.size)?;
+                        let have = cache.part_len(kinds.whole, &pack.sha256, pack.size)?;
                         let validator = (have > 0)
-                            .then(|| {
-                                cache.stored_validator(CacheKind::Pack, &pack.sha256, &url_sha256)
-                            })
+                            .then(|| cache.stored_validator(kinds.whole, &pack.sha256, &url_sha256))
                             .flatten();
                         Ok((have, validator))
                     })
@@ -754,6 +806,7 @@ pub async fn fetch_pack(
             };
             Ok(Writer::Pack(PackWriter::new(
                 cache,
+                kinds.whole,
                 &tools,
                 target.sha256,
                 target.size,
@@ -768,7 +821,7 @@ pub async fn fetch_pack(
         };
         match report {
             WriteReport::Complete { .. } => {
-                return Ok(ctx.cache.path(CacheKind::Pack, &pack.sha256));
+                return Ok(ctx.cache.path(kinds.whole, &pack.sha256));
             }
             WriteReport::Incomplete { .. } => return Err(Error::Incomplete),
             WriteReport::PackHashMismatch if !retried => retried = true,

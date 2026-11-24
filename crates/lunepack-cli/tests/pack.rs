@@ -3631,3 +3631,412 @@ fn assemble_needs_update() {
     assert!(err.contains("--assemble needs [update]"), "{err:?}");
     assert!(!dest.exists());
 }
+
+// ---- Deltas (M12 step 4: M12-D3, M12-D4, M12-D7) ----
+
+/// An ELF header of `machine` followed by `body`, so `classify` sees code of that architecture.
+fn elf_with(machine: u16, body: &[u8]) -> Vec<u8> {
+    let mut v = vec![0u8; 64];
+    v[..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    v[4] = 2;
+    v[5] = 1;
+    v[18..20].copy_from_slice(&machine.to_le_bytes());
+    v.extend_from_slice(body);
+    v
+}
+
+/// `base` with a few small edits: what a patch release does to a file.
+fn edited(base: &[u8], seed: u64) -> Vec<u8> {
+    let mut v = base.to_vec();
+    for (i, b) in noise(seed, 8).into_iter().enumerate() {
+        let at = (v.len() / 9) * (i + 1);
+        v[at] ^= b | 1;
+    }
+    let mid = v.len() / 2;
+    v.splice(mid..mid, noise(seed + 1, 300));
+    v
+}
+
+/// The tree of release `n` (1, 2, 3, ...): a text file, two generated binaries (x86-64 and
+/// arm64 ELF) and an incompressible data file edited in every release, a file that never changes,
+/// a file renamed in release 2, a PNG and a file replaced by unrelated bytes in every release.
+fn release_tree(root: &Path, n: u64) {
+    let mut txt = text(30_000);
+    let mut x86 = noise(11, 120_000);
+    let mut arm = noise(12, 120_000);
+    let mut data = noise(13, 80_000);
+    for k in 2..=n {
+        txt.splice(
+            1000 * k as usize..1000 * k as usize,
+            b"a line added in a later release\n".iter().copied(),
+        );
+        x86 = edited(&x86, 100 + k);
+        arm = edited(&arm, 200 + k);
+        data = edited(&data, 300 + k);
+    }
+    write(root, "docs/notes.txt", &txt);
+    write(root, "bin/app", &elf_with(62, &x86));
+    write(root, "bin/app-arm64", &elf_with(183, &arm));
+    write(root, "data.bin", &data);
+    write(root, "same.txt", &text(5_000));
+    write(
+        root,
+        if n == 1 {
+            "old-name.bin"
+        } else {
+            "new-name.bin"
+        },
+        &noise(14, 40_000),
+    );
+    write(root, "assets/logo.png", &png(4_000));
+    write(root, "replaced.bin", &noise(1000 + 2 * n, 30_000));
+}
+
+/// Reads a delta file and decodes every patch against `base` (path -> bytes) the way a client
+/// does; returns path -> decoded bytes.
+fn apply_delta(
+    dir: &Path,
+    manifest: &VerifiedManifest,
+    from: &str,
+    base: &BTreeMap<String, Vec<u8>>,
+) -> BTreeMap<String, Vec<u8>> {
+    let delta = manifest
+        .deltas()
+        .iter()
+        .find(|d| d.from_text() == from)
+        .unwrap_or_else(|| panic!("no delta from {from}"));
+    let bytes = fs::read(dir.join(delta.file().path())).unwrap();
+    delta.file().check_bytes(&bytes, &Sha256Hasher).unwrap();
+    let mut out = BTreeMap::new();
+    for p in delta.patches() {
+        let start = p.offset() as usize;
+        let mut file = Vec::new();
+        lunepack_core::decode_patch_verified(
+            p,
+            &bytes[start..start + p.length() as usize],
+            &base[p.path().as_str()],
+            &Sha256Hasher,
+            &LzmaCodec,
+            &mut file,
+        )
+        .expect("the patch decodes");
+        out.insert(p.path().as_str().to_owned(), file);
+    }
+    out
+}
+
+fn froms(m: &VerifiedManifest) -> Vec<&str> {
+    m.deltas().iter().map(|d| d.from_text()).collect()
+}
+
+impl World {
+    /// Packs release `version` of [`release_tree`] `n` into `dir`.
+    fn pack_release(&self, dir: &Path, version: &str, n: u64, extra: &[&str]) -> Output {
+        let input = tempfile::tempdir().unwrap();
+        release_tree(input.path(), n);
+        let out = self.pack(&Pack {
+            input: input.path(),
+            version,
+            target: host_target(),
+            release_dir: dir,
+            signers: self.all_signers(),
+            epoch: T0,
+            extra: extra.to_vec(),
+        });
+        assert_ok(&out, &format!("pack {version}"));
+        out
+    }
+
+    /// `feed add` of `version` to `channel` in the release dir `name` at `epoch`.
+    fn feed_add(&self, name: &str, channel: &str, version: &str, epoch: u64, extra: &[&str]) {
+        let dir = self.dir.path().join(name);
+        let publisher = self
+            .dir
+            .path()
+            .join(format!("{name}.publisher/lunepack.toml"));
+        let signer = spec(&self.release[0]);
+        let mut args = vec![
+            "--config",
+            s(&publisher),
+            "feed",
+            "add",
+            "--release-dir",
+            s(&dir),
+            "--channel",
+            channel,
+            "--version",
+            version,
+            "--sign",
+            &signer,
+        ];
+        args.extend_from_slice(extra);
+        let out = self.cmd(&args, &[("SOURCE_DATE_EPOCH", &epoch.to_string())]);
+        assert_ok(&out, &format!("feed add {channel} {version}"));
+    }
+}
+
+fn delta_files(dir: &Path, version: &str) -> Vec<String> {
+    let mut out: Vec<String> = fs::read_dir(dir.join(version))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".delta"))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Three releases in one directory: the second gets a delta from the first, the third from both
+/// (highest first). Changed text, x86-64 and arm64 binaries and data get patches that rebuild the
+/// files exactly; an unchanged, a renamed and an unrelated replaced file get none, the last with a
+/// `not-smaller` line. `verify` round-trips every patch and fails on a flipped byte and on a
+/// missing delta file; `inspect` lists the deltas.
+#[test]
+fn deltas_three_releases_verify_and_inspect() {
+    let w = World::new(1, 1);
+    let dir = w.release_dir("rel", &[]);
+    let target = Target::parse(host_target()).unwrap();
+    let first = w.pack_release(&dir, "1.0.0", 1, &[]);
+    assert!(
+        stdout(&first).contains("delta: base(s) none"),
+        "{}",
+        stdout(&first)
+    );
+    assert!(
+        delta_files(&dir, "1.0.0").is_empty(),
+        "a first release has no delta"
+    );
+    let second = w.pack_release(&dir, "2.0.0", 2, &[]);
+    let out = stdout(&second);
+    assert!(out.contains("delta: base(s) 1.0.0"), "{out}");
+    assert!(out.contains("verify: 1 delta file(s) and"), "{out}");
+    assert!(
+        out.contains("no-patch: replaced.bin from 1.0.0: not-smaller"),
+        "the 10% rule: {out}"
+    );
+    let third = w.pack_release(&dir, "3.0.0", 3, &[]);
+    let out = stdout(&third);
+    for from in ["2.0.0", "1.0.0"] {
+        assert!(
+            out.contains(&format!("no-patch: replaced.bin from {from}: not-smaller")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("delta: from {from}: 4 patch(es)")),
+            "{out}"
+        );
+    }
+
+    let (m1, f1) = w.verify(&dir, "1.0.0", target);
+    assert!(m1.deltas().is_empty());
+    let (m2, f2) = w.verify(&dir, "2.0.0", target);
+    let (m3, f3) = w.verify(&dir, "3.0.0", target);
+    assert_eq!(froms(&m2), ["1.0.0"]);
+    assert_eq!(froms(&m3), ["2.0.0", "1.0.0"]);
+    assert_eq!(
+        delta_files(&dir, "3.0.0"),
+        [
+            format!("{}.from-1.0.0.delta", target.as_str()),
+            format!("{}.from-2.0.0.delta", target.as_str())
+        ]
+    );
+    for (m, files, from, base) in [
+        (&m2, &f2, "1.0.0", &f1),
+        (&m3, &f3, "2.0.0", &f2),
+        (&m3, &f3, "1.0.0", &f1),
+    ] {
+        let rebuilt = apply_delta(&dir, m, from, base);
+        let paths: Vec<&str> = rebuilt.keys().map(String::as_str).collect();
+        assert_eq!(
+            paths,
+            ["bin/app", "bin/app-arm64", "data.bin", "docs/notes.txt"],
+            "patched files from {from}"
+        );
+        for (path, bytes) in &rebuilt {
+            assert_eq!(bytes, &files[path], "{path} from {from}");
+        }
+        let delta = m.deltas().iter().find(|d| d.from_text() == from).unwrap();
+        for p in delta.patches() {
+            // Each patch is at least 10% shorter than the frame it replaces.
+            let frame = match file_entry(m, p.path().as_str()) {
+                VerifiedEntry::File { frame, .. } => frame.as_ref().unwrap().length(),
+                _ => unreachable!(),
+            };
+            assert!(p.length() * 10 <= frame * 9, "{}", p.path());
+        }
+    }
+
+    for version in ["1.0.0", "2.0.0", "3.0.0"] {
+        w.feed_add("rel", "stable", version, T0, &[]);
+    }
+    let at = (T0 + 60).to_string();
+    let verified = w.run(&["verify", s(&dir), "--at", &at], &[]);
+    assert_ok(&verified, "verify");
+    let out = stdout(&verified);
+    assert_eq!(out.matches("round-tripped against").count(), 3, "{out}");
+    let inspected = w.run(&["inspect", s(&dir), "--at", &at], &[]);
+    assert_ok(&inspected, "inspect");
+    let out = stdout(&inspected);
+    assert!(out.contains("delta from 2.0.0:"), "{out}");
+    assert!(out.contains("delta from 1.0.0:"), "{out}");
+
+    let delta = dir.join(format!("3.0.0/{}.from-2.0.0.delta", target.as_str()));
+    let good = fs::read(&delta).unwrap();
+    let mut bad = good.clone();
+    bad[good.len() / 2] ^= 0x40;
+    fs::write(&delta, &bad).unwrap();
+    let failed = w.run(&["verify", s(&dir), "--at", &at], &[]);
+    let err = assert_fails(&failed, 1, "verify of a flipped delta byte");
+    assert!(err.contains("from-2.0.0.delta"), "{err}");
+    fs::remove_file(&delta).unwrap();
+    let failed = w.run(&["verify", s(&dir), "--at", &at], &[]);
+    let err = assert_fails(&failed, 1, "verify of a missing delta file");
+    assert!(err.contains("does not exist"), "{err}");
+}
+
+/// Determinism with deltas: the same earlier release and tree give byte-identical pack, delta
+/// file and manifest with 1 and with 4 workers; `--deltas 0` writes exactly what a directory
+/// without the earlier release gets (no `deltas`, no delta file).
+#[test]
+fn deltas_are_deterministic_and_deltas_0_is_the_old_output() {
+    let w = World::new(1, 1);
+    let target = host_target();
+    let dirs: Vec<PathBuf> = ["a", "b", "c"]
+        .iter()
+        .map(|name| {
+            let dir = w.release_dir(name, &[]);
+            w.pack_release(&dir, "1.0.0", 1, &[]);
+            dir
+        })
+        .collect();
+    let fresh = w.release_dir("fresh", &[]);
+    w.pack_release(&dirs[0], "2.0.0", 2, &["--jobs", "1"]);
+    w.pack_release(&dirs[1], "2.0.0", 2, &["--jobs", "4"]);
+    let zero = w.pack_release(&dirs[2], "2.0.0", 2, &["--deltas", "0"]);
+    assert!(!stdout(&zero).contains("delta:"), "{}", stdout(&zero));
+    w.pack_release(&fresh, "2.0.0", 2, &[]);
+    let names = [
+        format!("2.0.0/{target}.pack"),
+        format!("2.0.0/{target}.manifest.json"),
+        format!("2.0.0/{target}.from-1.0.0.delta"),
+    ];
+    for name in &names {
+        assert_eq!(
+            fs::read(dirs[0].join(name)).unwrap(),
+            fs::read(dirs[1].join(name)).unwrap(),
+            "{name} depends on the worker count"
+        );
+    }
+    for name in &names[..2] {
+        assert_eq!(
+            fs::read(dirs[2].join(name)).unwrap(),
+            fs::read(fresh.join(name)).unwrap(),
+            "--deltas 0 changed {name}"
+        );
+    }
+    assert!(delta_files(&dirs[2], "2.0.0").is_empty());
+    let t = Target::parse(target).unwrap();
+    assert!(w.verify(&dirs[2], "2.0.0", t).0.deltas().is_empty());
+    assert_eq!(froms(&w.verify(&dirs[0], "2.0.0", t).0), ["1.0.0"]);
+}
+
+/// M12-D3: each feed contributes its own `--deltas` highest bases, so a stable user gets a patch
+/// even after three betas; an expired feed still selects its bases; a feed whose signature fails
+/// is ignored with a report line while the other feed's bases are used.
+#[test]
+fn deltas_bases_come_from_each_feed() {
+    let w = World::new(1, 1);
+    let target = Target::parse(host_target()).unwrap();
+    let dir = w.release_dir("rel", &[]);
+    w.pack_release(&dir, "1.0.0", 1, &[]);
+    w.feed_add("rel", "stable", "1.0.0", T0, &["--expires-after-days", "1"]);
+    for (n, beta) in ["1.1.0-beta.1", "1.1.0-beta.2", "1.1.0-beta.3"]
+        .iter()
+        .enumerate()
+    {
+        w.pack_release(&dir, beta, 2 + n as u64, &[]);
+        w.feed_add("rel", "beta", beta, T0, &[]);
+    }
+
+    // Ten days on, the stable feed has expired: still a base.
+    let later = |version: &str, extra: &[&str]| {
+        let input = tempfile::tempdir().unwrap();
+        release_tree(input.path(), 6);
+        let out = w.pack(&Pack {
+            input: input.path(),
+            version,
+            target: target.as_str(),
+            release_dir: &dir,
+            signers: w.all_signers(),
+            epoch: T0 + 10 * DAY,
+            extra: extra.to_vec(),
+        });
+        assert_ok(&out, &format!("pack {version}"));
+        stdout(&out)
+    };
+    let out = later("1.1.0", &["--deltas", "1"]);
+    assert!(out.contains("delta: base(s) 1.1.0-beta.3, 1.0.0"), "{out}");
+    let (m, _) = w.verify(&dir, "1.1.0", target);
+    assert_eq!(froms(&m), ["1.1.0-beta.3", "1.0.0"]);
+
+    // A beta feed with a broken signature is ignored; stable's base is still used.
+    let feed = dir.join("feed-beta.json");
+    let text = fs::read_to_string(&feed).unwrap();
+    let at = text.find("\"sig\"").expect("a signature member") + 10;
+    let mut bytes = text.into_bytes();
+    bytes[at] = if bytes[at] == b'A' { b'B' } else { b'A' };
+    fs::write(&feed, &bytes).unwrap();
+    let out = later("1.2.0", &["--deltas", "1"]);
+    assert!(out.contains("delta: feed feed-beta.json ignored:"), "{out}");
+    assert!(out.contains("delta: base(s) 1.0.0"), "{out}");
+    let (m, _) = w.verify(&dir, "1.2.0", target);
+    assert_eq!(froms(&m), ["1.0.0"]);
+}
+
+/// A base whose pack is corrupted is skipped with a report line naming its version; the pack
+/// succeeds with the other base.
+#[test]
+fn deltas_skip_a_corrupted_base() {
+    let w = World::new(1, 1);
+    let target = Target::parse(host_target()).unwrap();
+    let dir = w.release_dir("rel", &[]);
+    w.pack_release(&dir, "1.0.0", 1, &[]);
+    w.pack_release(&dir, "2.0.0", 2, &[]);
+    let pack = dir.join(format!("1.0.0/{}.pack", target.as_str()));
+    let mut bytes = fs::read(&pack).unwrap();
+    bytes[100] ^= 0x01;
+    fs::write(&pack, &bytes).unwrap();
+    let out = stdout(&w.pack_release(&dir, "3.0.0", 3, &[]));
+    assert!(out.contains("delta: base 1.0.0 skipped:"), "{out}");
+    assert!(out.contains("delta: base(s) 2.0.0"), "{out}");
+    let (m, _) = w.verify(&dir, "3.0.0", target);
+    assert_eq!(froms(&m), ["2.0.0"]);
+}
+
+/// M12-D7: a candidate whose estimate is over the whole budget never runs; the file's line says
+/// `memory` with the estimate and the budget; the frames are unaffected and the manifest valid.
+#[test]
+fn deltas_over_the_budget_are_not_run() {
+    let w = World::new(1, 1);
+    let target = Target::parse(host_target()).unwrap();
+    let (dir, plain) = (w.release_dir("rel", &[]), w.release_dir("plain", &[]));
+    for d in [&dir, &plain] {
+        w.pack_release(d, "1.0.0", 1, &[]);
+    }
+    let out = stdout(&w.pack_release(&dir, "2.0.0", 2, &["--memory-budget-mib", "1"]));
+    assert!(
+        out.contains("no-patch: docs/notes.txt from 1.0.0: memory (estimate "),
+        "{out}"
+    );
+    assert!(out.contains("MiB, budget 1 MiB)"), "{out}");
+    assert!(out.contains("delta: from 1.0.0: no patch"), "{out}");
+    assert!(delta_files(&dir, "2.0.0").is_empty());
+    let (m, files) = w.verify(&dir, "2.0.0", target);
+    assert!(m.deltas().is_empty());
+    // The same frames as without the budget's limit and without deltas.
+    w.pack_release(&plain, "2.0.0", 2, &["--deltas", "0"]);
+    assert_eq!(
+        fs::read(dir.join(format!("2.0.0/{}.pack", target.as_str()))).unwrap(),
+        fs::read(plain.join(format!("2.0.0/{}.pack", target.as_str()))).unwrap()
+    );
+    assert_eq!(files.len(), 8);
+}

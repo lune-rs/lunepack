@@ -156,6 +156,49 @@ pub struct FrameView<'a> {
     pub streams: &'a [StreamView<'a>],
 }
 
+/// A delta patch whose hash was verified, ready to decode against its base (FORMAT.md 9.3).
+///
+/// `window` is computed by the core from the signed sizes ([`crate::frame::patch_window`]), never
+/// read from the patch's bytes; a codec checks it again before allocating.
+#[derive(Debug, Clone, Copy)]
+pub struct PatchView<'a> {
+    /// `lzma2`, `bcj-x86+lzma2` or `bcj-arm64+lzma2`.
+    pub codec: CodecId,
+    /// The patch's bytes.
+    pub input: &'a [u8],
+    /// The base file's signed size, at least 1.
+    pub base_size: u64,
+    /// Exact size of the patched file, at least 1.
+    pub output_size: u64,
+    /// The LZMA2 window: `round_up(base_size + output_size, 4096)`, at most 128 MiB.
+    pub window: u64,
+}
+
+impl PatchView<'_> {
+    /// The checks every patch decoder makes before it allocates (FORMAT.md 9.3): a patch codec;
+    /// `base_size` and `output_size` at least 1; `base_len` equal to `base_size`; `window` equal
+    /// to [`crate::frame::patch_window`] of the two sizes and at most
+    /// [`crate::frame::MAX_PATCH_WINDOW`]. Returns the window as the decoder's `u32` dictionary.
+    pub fn check(&self, base_len: usize) -> Result<u32, Error> {
+        use crate::error::CodecError;
+        if !crate::frame::is_patch_codec(self.codec) {
+            return Err(CodecError::Unsupported(self.codec).into());
+        }
+        if self.base_size == 0 || self.output_size == 0 {
+            return Err(CodecError::Corrupt("a patch has an empty base or output").into());
+        }
+        if base_len as u64 != self.base_size {
+            return Err(CodecError::Corrupt("the base is not the patch's base size").into());
+        }
+        let want = crate::frame::patch_window(self.base_size, self.output_size);
+        if want != Some(self.window) || self.window > crate::frame::MAX_PATCH_WINDOW {
+            return Err(CodecError::Corrupt("the patch window is not the format's").into());
+        }
+        u32::try_from(self.window)
+            .map_err(|_| CodecError::Corrupt("the patch window is not the format's").into())
+    }
+}
+
 /// What a decoder consumed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeReport {
@@ -176,6 +219,31 @@ pub struct DecodeReport {
 pub trait Codec: Send + Sync {
     /// Decodes `frame` into `out` and reports the bytes consumed per stream.
     fn decode(&self, frame: &FrameView<'_>, out: &mut dyn Write) -> Result<DecodeReport, Error>;
+
+    /// Decodes `patch` against `base` (the base file's bytes, already checked against the
+    /// patch's `base_sha256` by the caller) into `out`, and reports the one stream's consumed
+    /// bytes (FORMAT.md 9.3). A patch decoder must:
+    /// - refuse, before allocating, a codec other than the three patch ids, a `base.len()` other
+    ///   than `base_size`, and a `window` that is not [`crate::frame::patch_window`] of the sizes
+    ///   or is above [`crate::frame::MAX_PATCH_WINDOW`];
+    /// - allocate no more than two windows and a fixed overhead
+    ///   ([`crate::frame::patch_decoder_memory`]); the base and the patch's bytes are the
+    ///   caller's and are charged apart;
+    /// - produce exactly `output_size` bytes, stopping with an error at the first byte beyond;
+    /// - consume the whole input: trailing bytes after the LZMA2 stream's end are an error;
+    /// - stop on the first write error.
+    ///
+    /// The default refuses every patch ([`CodecError::Unsupported`](crate::error::CodecError));
+    /// it exists for test-only decoders. A shipped adapter implements it.
+    fn decode_patch(
+        &self,
+        patch: &PatchView<'_>,
+        base: &[u8],
+        out: &mut dyn Write,
+    ) -> Result<DecodeReport, Error> {
+        let _ = (base, out);
+        Err(crate::error::CodecError::Unsupported(patch.codec).into())
+    }
 }
 
 /// One encoded stream of an [`EncodedFrame`] (BCJ2 only): what the manifest's `streams` records.
@@ -203,6 +271,15 @@ pub struct EncodedFrame {
     pub streams: Option<Vec<EncodedStream>>,
 }
 
+/// The result of encoding one file as a delta patch (FORMAT.md 9.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedPatch {
+    /// The patch codec.
+    pub codec: CodecId,
+    /// The patch's bytes.
+    pub bytes: Vec<u8>,
+}
+
 /// Frame encoding for one file. The output is deterministic: the same codec and input give the
 /// same bytes, whatever the host or the thread count.
 pub trait Encoder: Send + Sync {
@@ -213,6 +290,31 @@ pub trait Encoder: Send + Sync {
     /// An upper bound, in bytes, on the memory one [`Encoder::encode`] call of `codec` over
     /// `input_len` bytes needs, excluding `input` itself.
     fn encode_memory(&self, codec: CodecId, input_len: u64) -> u64;
+
+    /// Encodes `input` (at least one byte) as a patch against `base` (at least one byte) with one
+    /// of the three patch codecs (FORMAT.md 9.3), deterministically: the same codec, base and
+    /// input give the same bytes on every host. Another codec, or a window
+    /// (`round_up(base.len() + input.len(), 4096)`) above 128 MiB, is an error.
+    ///
+    /// The default refuses every patch; it exists for test-only encoders. A shipped adapter
+    /// implements it.
+    fn encode_patch(
+        &self,
+        codec: CodecId,
+        base: &[u8],
+        input: &[u8],
+    ) -> Result<EncodedPatch, Error> {
+        let _ = (base, input);
+        Err(crate::error::CodecError::Unsupported(codec).into())
+    }
+
+    /// An upper bound, in bytes, on the memory one [`Encoder::encode_patch`] call of `codec`
+    /// with the given window needs, excluding `base` and `input` themselves. The default, for
+    /// test-only encoders, is `u64::MAX`.
+    fn encode_patch_memory(&self, codec: CodecId, window: u64) -> u64 {
+        let _ = (codec, window);
+        u64::MAX
+    }
 }
 
 /// An Ed25519 signer. The private key never leaves the implementation.

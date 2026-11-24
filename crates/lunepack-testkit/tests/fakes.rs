@@ -350,6 +350,65 @@ fn suite_panics(codec: &dyn Codec) -> String {
     }
 }
 
+/// A patch decoder that trusts the patch's own length instead of the signed output size.
+struct PatchIgnoresOutputSize;
+
+impl Codec for PatchIgnoresOutputSize {
+    fn decode(
+        &self,
+        frame: &FrameView<'_>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<DecodeReport, Error> {
+        FakeCodec::new().decode(frame, out)
+    }
+
+    fn decode_patch(
+        &self,
+        patch: &lunepack_core::PatchView<'_>,
+        base: &[u8],
+        out: &mut dyn std::io::Write,
+    ) -> Result<DecodeReport, Error> {
+        // The toy patch is an 8-byte fingerprint, the body and one end byte.
+        let real = patch.input.len().saturating_sub(9) as u64;
+        let view = lunepack_core::PatchView {
+            output_size: real,
+            window: lunepack_core::patch_window(patch.base_size, real).unwrap_or(0),
+            ..*patch
+        };
+        FakeCodec::new().decode_patch(&view, base, out)
+    }
+}
+
+#[test]
+fn codec_suite_catches_a_patch_decoder_that_ignores_the_output_size() {
+    let message = suite_panics(&PatchIgnoresOutputSize);
+    assert!(
+        message.contains("decoded past a smaller output size")
+            || message.contains("a short output decoded"),
+        "{message}"
+    );
+}
+
+/// A decoder without patches: the trait's default refuses them, which the suite does not accept
+/// from an adapter whose encoder patches.
+struct FramesOnly;
+
+impl Codec for FramesOnly {
+    fn decode(
+        &self,
+        frame: &FrameView<'_>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<DecodeReport, Error> {
+        FakeCodec::new().decode(frame, out)
+    }
+}
+
+#[test]
+fn codec_suite_catches_a_decoder_without_patches() {
+    let message = suite_panics(&FramesOnly);
+    assert!(message.contains("patch round trip failed"), "{message}");
+}
+
 #[test]
 fn codec_suite_catches_a_decoder_that_ignores_stream_sizes() {
     let message = suite_panics(&IgnoresStreamSizes);

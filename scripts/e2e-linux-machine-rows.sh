@@ -156,8 +156,18 @@ terminal = false
 EOF
 }
 
+# delta_file TWEAK OUT: 256 KiB of incompressible bytes, the same in every release but for 16 bytes
+# in the middle that TWEAK sets (a number), so a patch from one release to another is a few dozen
+# bytes against a frame of the file's size (M12 step 7). The base bytes are made once per run.
+delta_file() {
+  [ -e "$W/delta-base.bin" ] || head -c 262144 /dev/urandom >"$W/delta-base.bin"
+  cp "$W/delta-base.bin" "$2"
+  printf '%016d' "$1" | dd of="$2" bs=1 seek=131072 conv=notrunc 2>/dev/null
+}
+
 # publish VERSION HEALTH_TIMEOUT [FLAG...]: packs the shell app with the runtime and the service,
-# adds the release to the feed. The flags are lines of the app's `e2e-flags` marker.
+# adds the release to the feed. The flags are lines of the app's `e2e-flags` marker. With
+# DELTA_TWEAK set (`DELTA_TWEAK=1 publish ...`) the release also holds `share/delta.bin`.
 publish() {
   local v=$1 timeout=$2 flag input
   shift 2
@@ -166,6 +176,9 @@ publish() {
   mkdir -p "$input/bin" "$input/share"
   install -m 0755 "$APPSH" "$input/bin/e2e-app"
   printf '%s\n' "$v" >"$input/share/version.txt"
+  if [ -n "${DELTA_TWEAK:-}" ]; then
+    delta_file "$DELTA_TWEAK" "$input/share/delta.bin"
+  fi
   for flag in "$@"; do
     printf '%s\n' "$flag" >>"$input/e2e-flags"
   done
@@ -703,6 +716,42 @@ row_service_switch() {
   check "the previous tree is kept for a rollback" test -d "$R/app/1.9.0"
 }
 
+# An update by delta (M12, protocol version 2): 1.9.2 brings `share/delta.bin`, 1.9.3 changes 16 bytes
+# of it; the packer writes a delta from 1.9.2, the user's `download` fetches the file as a patch,
+# the service stages it from the patch against its own tree, and the update confirms.
+row_update_by_delta() {
+  row "11b the standard user updates by delta through the service (protocol version 2)"
+  local rt=$R/current/bin/lunepack-runtime v
+  for v in 1.9.2 1.9.3; do
+    if [ "$v" = 1.9.2 ]; then
+      DELTA_TWEAK=0 publish "$v" 60
+    else
+      DELTA_TWEAK=7 publish "$v" 60
+      check "the packer wrote the delta from 1.9.2" test -s "$RD/1.9.3/$TARGET.from-1.9.2.delta"
+    fi
+    run as_user "$rt" download --json --expect-version "$v"
+    eq "download stages $v" "$(last_member staged)" true
+    if [ "$v" = 1.9.3 ]; then
+      # The runtime writes at most ten progress lines a second (and a phase's last one), so the
+      # file's own `stage` line may be missing: the download's size says it was a patch, and any
+      # line that is there names the patch.
+      fetched=$(jq -s '[.[] | select(.type=="progress" and .phase=="download")] | last | .done' "$LAST_OUT" 2>/dev/null || echo -1)
+      check "the download fetched a patch, not the file's frame ($fetched bytes)" test "${fetched:--1}" -ge 0 -a "${fetched:--1}" -lt 65536
+      check "every stage line of share/delta.bin names the patch" bash -c '! jq -e "select(.type==\"progress\" and .phase==\"stage\" and .file.path==\"share/delta.bin\" and .file.source!=\"patch\")" "$1" >/dev/null' _ "$LAST_OUT"
+      check "the staged tree has the new bytes" cmp -s "$R/app/1.9.3/share/delta.bin" "$W/in-1.9.3/share/delta.bin"
+    fi
+    reset_outcomes
+    (runuser -u "$UNAME" -- env -i HOME="$UH" PATH=/usr/bin:/bin LUNEPACK_E2E_OUT="$UOUT" \
+      sh -c "sleep 1 & exec \"$rt\" apply-and-restart --json --wait-pid \$! --expect-version $v --no-ui -- --after-update" \
+      >/dev/null 2>&1 </dev/null) || true
+    check "$v confirmed" wait_for 60 has_outcome "$v confirmed"
+    rt=$R/current/bin/lunepack-runtime
+  done
+  eq "R/current follows" "$(current)" 1.9.3
+  check "the installed file is the new one" cmp -s "$R/current/share/delta.bin" "$W/in-1.9.3/share/delta.bin"
+  check "the user cannot write in the tree" bash -c '! runuser -u "$1" -- touch "$2/app/1.9.3/share/x" 2>/dev/null' _ "$UNAME" "$R"
+}
+
 row_uninstall() {
   row "12 the administrator's uninstall"
   local rt=$R/current/bin/lunepack-runtime snap
@@ -876,6 +925,7 @@ run_rows() {
   row_socket
   row_policy
   row_service_switch
+  row_update_by_delta
   row_uninstall
   row_pkexec
   row_flipped_setup_and_parent

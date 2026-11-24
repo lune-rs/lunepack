@@ -1054,3 +1054,116 @@ fn runtime_image_check_for_windows_and_macos() {
         Err(E::Format)
     );
 }
+
+// ---- delta patches (M12 step 4: M12-D4) -------------------------------------------------------
+
+#[test]
+fn patch_candidates_follow_the_class() {
+    use FileClass::*;
+    use lunepack_core::patch_candidates;
+    assert!(patch_candidates(Empty).is_empty());
+    assert_eq!(patch_candidates(Data), [CodecId::Lzma2]);
+    assert_eq!(patch_candidates(Compressed), [CodecId::Lzma2]);
+    assert_eq!(
+        patch_candidates(X86),
+        [CodecId::Lzma2, CodecId::BcjX86Lzma2]
+    );
+    assert_eq!(
+        patch_candidates(Arm64),
+        [CodecId::Lzma2, CodecId::BcjArm64Lzma2]
+    );
+    assert_eq!(
+        patch_candidates(Fat {
+            x86: true,
+            arm64: true
+        }),
+        [CodecId::Lzma2, CodecId::BcjX86Lzma2, CodecId::BcjArm64Lzma2]
+    );
+    assert_eq!(
+        patch_candidates(Fat {
+            x86: false,
+            arm64: true
+        }),
+        [CodecId::Lzma2, CodecId::BcjArm64Lzma2]
+    );
+}
+
+fn delta_patch(codec: CodecId, len: usize) -> lunepack_core::DeltaPatch {
+    lunepack_core::DeltaPatch {
+        codec,
+        bytes: vec![0; len],
+        base_size: 1,
+        base_sha256: FakeHasher.sha256(b"base"),
+    }
+}
+
+#[test]
+fn the_shortest_patch_wins_if_it_is_10_percent_shorter_than_the_frame() {
+    use lunepack_core::{PatchChoice, choose_patch};
+    assert_eq!(choose_patch(Vec::new(), 100), PatchChoice::None);
+    // Shortest wins; on equal length the earlier rank.
+    let pick = choose_patch(
+        vec![
+            delta_patch(CodecId::BcjX86Lzma2, 50),
+            delta_patch(CodecId::Lzma2, 50),
+            delta_patch(CodecId::BcjArm64Lzma2, 60),
+        ],
+        100,
+    );
+    assert_eq!(pick, PatchChoice::Patch(delta_patch(CodecId::Lzma2, 50)));
+    // length × 10 ≤ frame × 9: 90 of 100 is written, 91 is not.
+    assert_eq!(
+        choose_patch(vec![delta_patch(CodecId::Lzma2, 90)], 100),
+        PatchChoice::Patch(delta_patch(CodecId::Lzma2, 90))
+    );
+    assert_eq!(
+        choose_patch(vec![delta_patch(CodecId::Lzma2, 91)], 100),
+        PatchChoice::NotSmaller(91)
+    );
+}
+
+#[test]
+fn a_patch_is_kept_only_after_its_round_trip() {
+    use lunepack_core::encode_patch_checked;
+    let path = RelPath::parse("bin/app").unwrap();
+    let base = b"the old file, version one".repeat(40);
+    let mut input = base.clone();
+    input[500] ^= 0x20;
+    let codec = FakeCodec::new();
+    let patch = encode_patch_checked(
+        &path,
+        CodecId::Lzma2,
+        &base,
+        &input,
+        &codec,
+        &codec,
+        &FakeHasher,
+    )
+    .expect("a good patch is kept");
+    assert_eq!(patch.codec, CodecId::Lzma2);
+    assert_eq!(patch.base_size, base.len() as u64);
+    assert_eq!(patch.base_sha256, FakeHasher.sha256(&base));
+    // A decoder whose output differs fails the round trip, so the candidate is dropped.
+    for fault in [Fault::TooFewBytes, Fault::ExtraBytes, Fault::WrongConsumed] {
+        let bad = FakeCodec::with_fault(fault);
+        assert!(
+            encode_patch_checked(
+                &path,
+                CodecId::Lzma2,
+                &base,
+                &input,
+                &codec,
+                &bad,
+                &FakeHasher
+            )
+            .is_err(),
+            "{fault:?}"
+        );
+    }
+    // Never a patch with stored or bcj2.
+    for id in [CodecId::Stored, CodecId::Bcj2] {
+        assert!(
+            encode_patch_checked(&path, id, &base, &input, &codec, &codec, &FakeHasher).is_err()
+        );
+    }
+}

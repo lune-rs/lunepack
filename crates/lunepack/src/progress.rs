@@ -129,6 +129,12 @@ impl ProgressSink {
         self.shared.mark_dirty();
     }
 
+    /// The current phase's `(total, done)` bytes, read together.
+    pub(crate) fn totals(&self) -> (u64, u64) {
+        let meta = lock(&self.shared.meta);
+        (meta.total, self.shared.done.load(Ordering::SeqCst))
+    }
+
     /// Starts `phase` with `total` bytes to do: `done` goes back to 0 and the file to none. When
     /// the phase it ends has updates the pump has not delivered yet (its own start included), its
     /// last snapshot is queued so the callback still sees it.

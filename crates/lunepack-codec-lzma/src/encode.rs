@@ -4,8 +4,8 @@
 use std::io::{self, Write};
 
 use lunepack_core::error::CodecError;
-use lunepack_core::frame::{MAX_DICT_SIZE, MIN_DICT_SIZE};
-use lunepack_core::{CodecId, EncodedFrame, EncodedStream, Error};
+use lunepack_core::frame::{MAX_DICT_SIZE, MAX_PATCH_WINDOW, MIN_DICT_SIZE, patch_window};
+use lunepack_core::{CodecId, EncodedFrame, EncodedPatch, EncodedStream, Error};
 use lzma_rust2::filter::bcj::BcjWriter;
 use lzma_rust2::filter::bcj2::{Bcj2Options, Bcj2Writer};
 use lzma_rust2::{EncodeMode, Lzma2Options, Lzma2Writer, LzmaOptions, MfType};
@@ -181,6 +181,88 @@ fn bcj2(input: &[u8]) -> Result<EncodedFrame, Error> {
         dict_size: None,
         streams: Some(streams),
     })
+}
+
+/// Encodes `input` as a patch against `base` (FORMAT.md 9.3): one raw LZMA2 stream at the frame
+/// settings ([`options_9e`]) with the window `round_up(base.len() + input.len(), 4096)` as its
+/// dictionary and the base (BCJ filtered, start offset 0, for the BCJ ids) as preset dictionary,
+/// so the first chunk does not reset it; unchunked and single-threaded, like a frame.
+pub(crate) fn encode_patch(
+    codec: CodecId,
+    base: &[u8],
+    input: &[u8],
+) -> Result<EncodedPatch, Error> {
+    if !lunepack_core::is_patch_codec(codec) {
+        return Err(CodecError::Unsupported(codec).into());
+    }
+    if base.is_empty() || input.is_empty() {
+        return Err(encoder_err(io::Error::other(
+            "a patch needs a base and an input",
+        )));
+    }
+    let window = patch_window(base.len() as u64, input.len() as u64)
+        .filter(|w| *w <= MAX_PATCH_WINDOW)
+        .and_then(|w| u32::try_from(w).ok())
+        .ok_or_else(|| encoder_err(io::Error::other("the patch window is above 128 MiB")))?;
+    let preset = match crate::decode::filtered_base(codec, base).map_err(encoder_err)? {
+        Some(filtered) => filtered,
+        None => base.to_vec(),
+    };
+    let mut options = options_9e(window);
+    options.preset_dict = Some(preset);
+    let lz = Lzma2Writer::new(
+        Vec::with_capacity(lzma2_out_max(input.len())),
+        Lzma2Options {
+            lzma_options: options,
+            chunk_size: None,
+        },
+    );
+    let bytes = match codec {
+        CodecId::Lzma2 => {
+            let mut lz = lz;
+            lz.write_all(input).map_err(encoder_err)?;
+            lz.finish().map_err(encoder_err)?
+        }
+        _ => {
+            let mut w = match codec {
+                CodecId::BcjX86Lzma2 => BcjWriter::new_x86(lz, 0),
+                _ => BcjWriter::new_arm64(lz, 0),
+            };
+            w.write_all(input).map_err(encoder_err)?;
+            w.finish()
+                .map_err(encoder_err)?
+                .finish()
+                .map_err(encoder_err)?
+        }
+    };
+    Ok(EncodedPatch { codec, bytes })
+}
+
+/// An upper bound on the bytes one [`encode_patch`] call holds at once with `window`, `base` and
+/// `input` excluded: the encoder state for the window as dictionary (`lzma-rust2`'s estimate),
+/// the preset copy and the output reservation (each at most the window), and for the BCJ ids a
+/// further window for the filter's copy of what it is fed plus its buffer.
+///
+/// Measured by `tests/patch_encode_memory.rs` (release, 64 MiB less 4 KiB window): `lzma2`
+/// peaks at 772,565,077 bytes against this bound's 839,846,972, whatever the split between base
+/// and file; `bcj-x86+lzma2` peaks at 806,119,509 with a 32 MiB file (its extra copy grows with
+/// the file) against 906,955,836.
+pub(crate) fn patch_memory(codec: CodecId, window: u64) -> u64 {
+    let dict = u32::try_from(window.min(MAX_PATCH_WINDOW)).unwrap_or(u32::MAX);
+    let state = u64::from(options_9e(dict).get_memory_usage()) * 1024;
+    // The preset copy the options own (the filtered base for the BCJ ids) and the output
+    // reservation, each at most the window.
+    let preset = window;
+    let out = window.saturating_add(window / 1024).saturating_add(64);
+    // The BCJ ids hold a second copy of the base while it is filtered (at most the window).
+    let bcj = match codec {
+        CodecId::BcjX86Lzma2 | CodecId::BcjArm64Lzma2 => window.saturating_add(BCJ_WRITER_BUFFER),
+        _ => 0,
+    };
+    state
+        .saturating_add(preset)
+        .saturating_add(out)
+        .saturating_add(bcj)
 }
 
 /// An upper bound on the bytes one [`encode`] call holds at once, `input` excluded: the encoder

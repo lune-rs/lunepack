@@ -1,14 +1,15 @@
 //! The machine schemes, the uniform machine layout, the endpoint names, the per-user home of a
 //! machine install and the unix protection rule (M11-D4, M11-D6, M11-D7, M11-D10).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use lunepack_core::endpoint;
 use lunepack_core::layout::{current_target, service_path_in_tree, service_path_in_tree_for};
 use lunepack_core::unix_protect::{self, DirFacts, Reason};
 use lunepack_core::{
     AppId, DirClass, LayoutScheme, MachineLayout, MachineOs, MachineScheme, Projection, RelPath,
-    RootNaming, SERVICE_FILE, SERVICE_FILE_UNIX, Target, UnixOs, Version, machine_user_home,
+    RootNaming, SERVICE_FILE, SERVICE_FILE_UNIX, Target, UnixOs, Version, machine_root,
+    machine_user_home,
 };
 use lunepack_testkit::abs_path;
 
@@ -225,6 +226,143 @@ fn machine_user_home_is_under_the_dot_lunepack_of_the_data_home() {
         machine_user_home(&data, &id("lunepack")),
         data.join("lunepack")
     );
+}
+
+/// M12-D11: every location on a unix target is `/`-separated text equal to its FORMAT 20.9 name on
+/// every host, a Windows host included; Windows machine paths keep the host's own composition.
+#[test]
+fn unix_target_paths_are_slash_separated_on_every_host() {
+    let app = id("org.example.hello");
+    let ver = v("1.2.3");
+    let text = |p: &Path| p.to_str().expect("UTF-8 path").to_owned();
+    let mut got: Vec<(String, String)> = Vec::new();
+    for scheme in [MachineScheme::LINUX, MachineScheme::MACOS] {
+        let home = scheme.home.expect("a unix scheme has a machine home");
+        let r = format!("{home}/org.example.hello");
+        let root = machine_root(Path::new(home), &app);
+        let l = MachineLayout::with_scheme(&root, scheme);
+        for (path, want) in [
+            (root.clone(), r.clone()),
+            (l.app_dir(), format!("{r}/app")),
+            (l.version_dir(&ver), format!("{r}/app/1.2.3")),
+            (l.lunepack_dir(), format!("{r}/.lunepack")),
+            (l.state_dir(), format!("{r}/.lunepack/state")),
+            (l.logs_dir(), format!("{r}/.lunepack/logs")),
+            (l.machine_dir(), format!("{r}/.lunepack/machine")),
+            (l.lock_path(), format!("{r}/.lunepack/machine/lock")),
+            (l.incoming_dir(), format!("{r}/.lunepack/machine/incoming")),
+            (l.service_dir(), format!("{r}/.lunepack/machine/service")),
+            (
+                l.service_version_dir(&ver),
+                format!("{r}/.lunepack/machine/service/1.2.3"),
+            ),
+            (
+                l.service_image(&ver),
+                format!("{r}/.lunepack/machine/service/1.2.3/lunepack-service"),
+            ),
+            (
+                l.stable_service_link().expect("a unix scheme has the link"),
+                format!("{r}/.lunepack/machine/lunepack-service"),
+            ),
+        ] {
+            got.push((text(&path), want));
+        }
+        // The machine view composes the same way, so a byte comparison with the machine layout's
+        // own paths holds on a Windows host too.
+        let view = l.view();
+        let mut views = vec![
+            (view.versions_dir(), format!("{r}/app")),
+            (view.state_dir(), format!("{r}/.lunepack/state")),
+            (view.logs_dir(), format!("{r}/.lunepack/logs")),
+            (view.version_dir(&ver), format!("{r}/app/1.2.3")),
+            (view.swap_slot(), format!("{r}/app/.swap")),
+            (view.out_slot(), format!("{r}/app/.out")),
+            (
+                view.version_config_path(&ver),
+                format!("{r}/app/1.2.3/{}", scheme.view.config),
+            ),
+        ];
+        views.extend(view.current_link().map(|p| (p, format!("{r}/current"))));
+        views.extend(view.bundle_link().map(|p| (p, format!("{r}/bundle"))));
+        views.extend(view.bundle_id_path().map(|p| (p, format!("{r}/bundle.id"))));
+        assert!(views.len() >= 8, "every view builder is checked");
+        for (path, want) in &views {
+            assert_eq!(&text(path), want);
+        }
+        assert_eq!(view.versions_dir(), l.app_dir());
+        assert_eq!(
+            view.versions_dir().as_os_str(),
+            l.app_dir().as_os_str(),
+            "byte equality with the machine layout"
+        );
+    }
+    got.push((
+        text(&machine_user_home(Path::new("<data home>"), &app)),
+        "<data home>/.lunepack/org.example.hello".to_owned(),
+    ));
+    for (path, want) in [
+        (
+            endpoint::socket_path(UnixOs::Linux, &app),
+            "/run/lunepack/org.example.hello.sock",
+        ),
+        (
+            endpoint::socket_path(UnixOs::Macos, &app),
+            "/var/run/lunepack-org.example.hello.sock",
+        ),
+        (
+            endpoint::systemd_socket_unit_path(&app),
+            "/etc/systemd/system/lunepack-org.example.hello.socket",
+        ),
+        (
+            endpoint::systemd_service_unit_path(&app),
+            "/etc/systemd/system/lunepack-org.example.hello.service",
+        ),
+        (
+            endpoint::launchd_plist_path(&app),
+            "/Library/LaunchDaemons/lunepack-org.example.hello.plist",
+        ),
+    ] {
+        got.push((text(&path), want.to_owned()));
+    }
+    assert_eq!(got.len(), 32, "every builder is checked");
+    for (path, want) in &got {
+        assert!(!path.contains('\\'), "a host separator in {path:?}");
+        assert_eq!(path, want);
+    }
+
+    // The Windows scheme composes with the host's separator, byte for byte as before.
+    let root = abs_path("/pf/Hello");
+    let machine = root.join(".lunepack").join("machine");
+    for l in [
+        MachineLayout::new(&root),
+        MachineLayout::with_scheme(&root, MachineScheme::WINDOWS),
+    ] {
+        for (path, want) in [
+            (l.app_dir(), root.join("app")),
+            (l.version_dir(&ver), root.join("app").join("1.2.3")),
+            (l.lunepack_dir(), root.join(".lunepack")),
+            (l.state_dir(), root.join(".lunepack").join("state")),
+            (l.logs_dir(), root.join(".lunepack").join("logs")),
+            (l.machine_dir(), machine.clone()),
+            (l.lock_path(), machine.join("lock")),
+            (l.incoming_dir(), machine.join("incoming")),
+            (l.service_dir(), machine.join("service")),
+            (
+                l.service_version_dir(&ver),
+                machine.join("service").join("1.2.3"),
+            ),
+            (
+                l.service_image(&ver),
+                machine
+                    .join("service")
+                    .join("1.2.3")
+                    .join("lunepack-service.exe"),
+            ),
+        ] {
+            assert_eq!(path.as_os_str(), want.as_os_str());
+        }
+        assert_eq!(l.stable_service_link(), None);
+    }
 }
 
 // ---- endpoints ----------------------------------------------------------------------------------

@@ -2658,3 +2658,82 @@ fn a_failing_pkg_signing_step_leaves_nothing() {
         assert!(names_in(&dir).is_empty(), "{what}: {:?}", names_in(&dir));
     }
 }
+
+/// C2 stage 6 with deltas (M12 step 4): an installer of a release that lists a delta carries that
+/// release's manifest unchanged (with its `deltas`) and no byte of the delta file, and verifies.
+#[test]
+fn setup_of_a_release_with_a_delta_carries_the_manifest_unchanged_and_no_delta() {
+    let w = World::new();
+    let input = w.dir.path().join("input");
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut blob: Vec<u8> = (0..60_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect();
+    let key = w.dir.path().join("release0").with_extension("key");
+    let rel_spec = format!("file:{}", s(&key));
+    let runtime = w.dir.path().join("runtime");
+    let tmp = w.dir.path().join("tmp");
+    for version in ["1.3.0", "1.4.0"] {
+        blob[30_000] ^= 0x55;
+        fs::write(input.join("data/blob.bin"), &blob).unwrap();
+        let out = w.run(
+            &[
+                "pack",
+                "--input",
+                s(&input),
+                "--version",
+                version,
+                "--target",
+                TARGET,
+                "--release-dir",
+                s(&w.release),
+                "--sign",
+                &rel_spec,
+                "--runtime",
+                s(&runtime),
+            ],
+            &[("SOURCE_DATE_EPOCH", &T0.to_string()), ("TMPDIR", s(&tmp))],
+        );
+        assert_ok(&out, &format!("pack {version}"));
+    }
+    let delta = fs::read(w.release_file(&format!("1.4.0/{TARGET}.from-1.3.0.delta")))
+        .expect("1.4.0 has a delta from 1.3.0");
+    let manifest = fs::read(w.release_file(&format!("1.4.0/{TARGET}.manifest.json"))).unwrap();
+    let at = AT.to_string();
+    let out_path = w.dir.path().join("delta-setup");
+    let out = w.run(
+        &[
+            "setup",
+            s(&w.release),
+            "--version",
+            "1.4.0",
+            "--target",
+            TARGET,
+            "--out",
+            s(&out_path),
+            "--at",
+            &at,
+        ],
+        &[],
+    );
+    assert_ok(&out, "setup of 1.4.0");
+    let bytes = fs::read(&out_path).unwrap();
+    let t = trailer_of(&bytes);
+    let start = t.manifest.offset as usize;
+    let manifest_part = &bytes[start..start + t.manifest.length as usize];
+    assert_eq!(
+        manifest_part,
+        manifest.as_slice(),
+        "the manifest is carried unchanged"
+    );
+    assert!(
+        !bytes.windows(delta.len()).any(|w| w == delta.as_slice()),
+        "no delta file in the installer"
+    );
+    check(&bytes).expect("the setup verifies");
+}

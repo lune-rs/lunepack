@@ -347,7 +347,8 @@ impl Clock for FuzzClock {
     }
 }
 
-/// Writes every stream's bytes unchanged and reports them consumed: the identity codec.
+/// Writes every stream's bytes unchanged and reports them consumed: the identity codec, for frames
+/// and patches.
 struct FuzzCodec;
 
 impl Codec for FuzzCodec {
@@ -362,6 +363,20 @@ impl Codec for FuzzCodec {
             consumed.push(stream.input.len() as u64);
         }
         Ok(DecodeReport { consumed })
+    }
+    /// The identity on patches too, after the checks every patch decoder makes (the base is not
+    /// read: the harnesses fuzz what reaches the codec, not a codec).
+    fn decode_patch(
+        &self,
+        patch: &crate::traits::PatchView<'_>,
+        base: &[u8],
+        out: &mut dyn io::Write,
+    ) -> Result<DecodeReport, Error> {
+        patch.check(base.len())?;
+        out.write_all(patch.input).map_err(CodecError::Write)?;
+        Ok(DecodeReport {
+            consumed: vec![patch.input.len() as u64],
+        })
     }
 }
 

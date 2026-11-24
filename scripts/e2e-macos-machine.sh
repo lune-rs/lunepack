@@ -45,6 +45,9 @@
 #   M2  the daemon disabled (`launchctl disable system/<label>`): service_unavailable, then enabled
 #   8   the policy file: disable_self_update (33) and every broken variant
 #   11  an old tree is kept while the user runs from it and collected after
+#   11b an update by delta through the service (protocol version 2, M12): one file changes by 16
+#       bytes, the packer writes the delta, the user's download fetches it as a patch and the
+#       service stages it against its own tree; the update confirms
 #   14  the package again: the same version repairs (installer exits 0), another version fails
 #   12  uninstall: the user's own run shows the command (30); root's refused while the user runs
 #       from the bundle (25), complete after; nothing left
@@ -83,6 +86,7 @@ ROWS=(
   "M2  the daemon disabled with launchctl: service_unavailable"
   "8   the administrator's policy file"
   "11  an old tree kept while the user runs from it"
+  "11b an update by delta through the service (protocol version 2): the changed file arrives as a patch"
   "14  the package again (same version repairs, another version fails)"
   "12  uninstall (the user's command, root refused while in use, complete, nothing left)"
 )
@@ -341,8 +345,18 @@ sign_adhoc() {
     die "codesign failed for ${1#"$root"/}"
 }
 
+# delta_file TWEAK OUT: 256 KiB of incompressible bytes, the same in every release but for 16 bytes
+# in the middle that TWEAK sets (a number), so a patch from one release to another is a few dozen
+# bytes against a frame of the file's size (M12 step 7). The base bytes are made once per run.
+delta_file() {
+  [ -e "$root/work/delta-base.bin" ] || head -c 262144 /dev/urandom >"$root/work/delta-base.bin"
+  cp "$root/work/delta-base.bin" "$2"
+  printf '%016d' "$1" | dd of="$2" bs=1 seek=131072 conv=notrunc 2>/dev/null
+}
+
 # publish VERSION HEALTH_TIMEOUT [FLAG...]: packs the signed bundle of that version, with the
 # service, into the release directory and adds it to the feed. Flags are lines of `e2e-flags`.
+# With DELTA_TWEAK set (`DELTA_TWEAK=1 publish ...`) the bundle also holds `Contents/Resources/delta.bin`.
 publish() {
   local ver=$1 timeout=$2 flag input asm code
   shift 2
@@ -364,6 +378,9 @@ EOF
   cp "$root/build/e2e_app" "$input/Contents/MacOS/$entry"
   chmod 755 "$input/Contents/MacOS/$entry"
   printf '%s\n' "$ver" >"$input/Contents/Resources/version.txt"
+  if [ -n "${DELTA_TWEAK:-}" ]; then
+    delta_file "$DELTA_TWEAK" "$input/Contents/Resources/delta.bin"
+  fi
   for flag in "$@"; do
     printf '%s\n' "$flag" >>"$input/Contents/Resources/e2e-flags"
   done
@@ -803,6 +820,45 @@ if [ -n "$holder" ]; then
   check "1.9.1 confirmed" update_to 1.9.1
   check "the old tree is collected once nobody runs from it" wait_for 60 bash -c "[ ! -e '$parked' ]"
 fi
+
+row "11b the user's app updates by delta through the service (protocol version 2)"
+# 1.9.2 brings Contents/Resources/delta.bin; 1.9.3 changes 16 bytes of it. The packer writes a delta
+# from 1.9.2, the user's download fetches the file as a patch, the service stages it against its own
+# tree and the update confirms.
+DELTA_TWEAK=0 publish 1.9.2 60
+run as_user "$B/Contents/MacOS/lunepack-runtime" download --json --expect-version 1.9.2
+eq "download stages 1.9.2" "$(last_member staged)" true
+reset_outcomes
+(sudo -u "$std" env -i HOME="$std_home" PATH=/usr/bin:/bin LUNEPACK_E2E_OUT="$outcome" \
+  sh -c "sleep 1 & exec \"$B/Contents/MacOS/lunepack-runtime\" apply-and-restart --json --wait-pid \$! --expect-version 1.9.2 --no-ui -- --after-update" \
+  >/dev/null 2>&1 </dev/null) || true
+check "1.9.2 confirmed" wait_for 120 has_outcome "1.9.2 confirmed"
+DELTA_TWEAK=7 publish 1.9.3 60
+check "the packer wrote the delta from 1.9.2" test -s "$rd/1.9.3/$target.from-1.9.2.delta"
+run as_user "$B/Contents/MacOS/lunepack-runtime" download --json --expect-version 1.9.3
+eq "download stages 1.9.3" "$(last_member staged)" true
+# The runtime writes at most ten progress lines a second (and a phase's last one), so the file's own
+# `stage` line may be missing: the download's size says it was a patch, and any line that is there
+# names the patch.
+fetched=$(/usr/bin/python3 - "$LAST_OUT" <<'PY'
+import json, sys
+done = -1
+for line in open(sys.argv[1]):
+    o = json.loads(line)
+    if o.get("type") == "progress" and o.get("phase") == "download":
+        done = o["done"]
+print(done)
+PY
+)
+check "the download fetched a patch, not the file's frame ($fetched bytes)" test "$fetched" -ge 0 -a "$fetched" -lt 65536
+check "every stage line of delta.bin names the patch" bash -c '! grep -F "\"phase\":\"stage\"" "$1" | grep -F "\"file\":{\"path\":\"Contents/Resources/delta.bin\"," | grep -qvF "\"source\":\"patch\""' _ "$LAST_OUT"
+reset_outcomes
+(sudo -u "$std" env -i HOME="$std_home" PATH=/usr/bin:/bin LUNEPACK_E2E_OUT="$outcome" \
+  sh -c "sleep 1 & exec \"$B/Contents/MacOS/lunepack-runtime\" apply-and-restart --json --wait-pid \$! --expect-version 1.9.3 --no-ui -- --after-update" \
+  >/dev/null 2>&1 </dev/null) || true
+check "1.9.3 confirmed" wait_for 120 has_outcome "1.9.3 confirmed"
+eq "the bundle holds 1.9.3" "$(version_of_bundle)" 1.9.3
+check "the bundle's delta.bin is the new one" cmp -s "$B/Contents/Resources/delta.bin" "$root/work/in-1.9.3/Contents/Resources/delta.bin"
 
 row "14 the package again"
 installed_version=$(version_of_bundle)

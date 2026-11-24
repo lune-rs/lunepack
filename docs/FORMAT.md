@@ -11,7 +11,7 @@ All readers run the same core code, so every rule below holds for all of them al
 A reader that meets anything this document does not allow MUST reject the whole document (fail
 closed). There is no "best effort" mode and no warning-only path.
 
-Decisions behind the format: `docs/DECISIONS.md` D6, D7, D21, D24, D25 and D33. The threat model
+Decisions behind the format: `docs/DECISIONS.md` D6, D7, D8, D21, D24, D25 and D33. The threat model
 is `docs/THREAT-MODEL.md`.
 
 ## 1. Artifacts and names
@@ -25,12 +25,13 @@ A release directory on any static host holds:
 | `feed-<channel>.json` | `feed`: one per channel, listing every target | the key set's release threshold |
 | `<ver>/<target>.manifest.json` | `manifest`: one per release and target | the key set's release threshold |
 | `<ver>/<target>.pack` | pack: the release's file frames (section 9) | not signed itself; bound by size and SHA-256 in the manifest |
+| `<ver>/<target>.from-<old>.delta` | delta file: the patches from release `<old>` to this one (section 9.3), zero or more per release and target | not signed itself; bound by size and SHA-256 in the manifest's `deltas` |
 
 - `<k>` is the root version in decimal without leading zeros. `<channel>` is a channel id
   (section 10.5). `<ver>` is the release's version string exactly as in the feed (section 10.3).
   `<target>` is a target id (section 10.4).
-- Delta files (`<ver>/<target>.from-<old>.delta`) are reserved names; their format is defined by a
-  later revision and v1 readers never fetch them.
+- `<old>` in a delta file's name is the base release's version string exactly as in the
+  manifest's `deltas[].from` (section 9.3).
 - Installers (`.exe`, `.dmg`, `.zip`, `.pkg`, `.tar.xz`, Linux `-setup`) are not part of the format;
   they carry the documents above unchanged.
 - The writer MUST use exactly these names. Readers resolve the references inside documents
@@ -190,6 +191,9 @@ Readers MUST enforce these caps before the work they bound:
 | releases in a feed | 10,000 |
 | entries in a manifest | 200,000 |
 | LZMA2 dictionary per stream | 16 MiB |
+| deltas in a manifest | 16 |
+| patches in a delta | 200,000 |
+| LZMA2 window of a patch (base and file together, section 9.3) | 128 MiB (134,217,728) |
 | JSON nesting depth | 32 |
 
 A manifest is additionally capped by the size its feed entry signs (section 7.1), which a reader
@@ -432,6 +436,34 @@ An artifact reference is `{path, size, sha256}`:
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "exec": false
     }
+  ],
+  "deltas": [
+    {
+      "from": "1.1.0",
+      "path": "1.2.0/linux-x86_64.from-1.1.0.delta",
+      "size": 196608,
+      "sha256": "7d1a54127b222502f5b79b5fb0803061152a44f92b37e23c6527baf665d4da9a",
+      "patches": [
+        {
+          "path": "bin/hello",
+          "base_size": 1040384,
+          "base_sha256": "4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce",
+          "codec": "bcj-x86+lzma2",
+          "offset": 0,
+          "length": 131072,
+          "sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+        },
+        {
+          "path": "lib/libhello.so.1",
+          "base_size": 1998848,
+          "base_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d",
+          "codec": "lzma2",
+          "offset": 131072,
+          "length": 65536,
+          "sha256": "e7f6c011776e8db7cd330b54174fd76f7d0216b612387a5ffcfb81e6f0919683"
+        }
+      ]
+    }
   ]
 }
 ```
@@ -445,7 +477,7 @@ An artifact reference is `{path, size, sha256}`:
 | `pack` | artifact reference (7.1) to the release's pack; `size` may be 0 when no entry has a frame |
 | `entries` | 0 to 200,000 entries (8.1); the set passes the tree rules (10.2) |
 | `install` | reserved: defined by a later revision, for install metadata a client needs before it downloads (such as a minimum OS). The entry point, name and icon are in the tree's update configuration (section 13), which the manifest covers by its file hash. v1 writers MUST NOT write it, and v1 readers reject a manifest that carries it |
-| `deltas` | reserved: defined by a later revision (per-file delta assets). v1 writers MUST NOT write it, and v1 readers reject a manifest that carries it |
+| `deltas` | optional: 1 to 16 deltas (9.3), each the patches from one earlier release. Absent when the release has none; a writer never writes an empty list. Not a critical feature: a reader that uses no delta still installs the release correctly from the pack |
 
 - The reader checks the manifest's byte length and SHA-256 against the feed's artifact reference
   **before** opening the envelope; then the envelope is signed by the key set's release threshold.
@@ -540,6 +572,75 @@ covers a full-pack download.
 
 Decoder memory per frame is bounded by the signed dictionary sizes: one dictionary for the LZMA2
 variants, the sum of three for `bcj2`, plus a small fixed overhead.
+
+### 9.3 Delta files and patches
+
+A delta lets a client that has release `from` installed rebuild a changed file from its own copy of
+that file (the base) and a patch, instead of downloading the file's frame. Each element of the
+manifest's `deltas` describes one delta file:
+
+| Field | Rule |
+|---|---|
+| `from` | the base release's version string (10.3); its precedence MUST be strictly below the manifest's `version`, and no two deltas of a manifest may have `from` of equal precedence |
+| `path`, `size`, `sha256` | artifact reference (7.1) to the delta file, `size ≥ 1` |
+| `patches` | 1 to 200,000 patches |
+
+Each patch:
+
+| Field | Rule |
+|---|---|
+| `path` | names a `file` entry of this manifest with `size ≥ 1`; at most one patch per path in a delta |
+| `base_size` | integer ≥ 1: the base file's size |
+| `base_sha256` | SHA-256 of the base file's bytes; MUST differ from the entry's `sha256` |
+| `codec` | `lzma2`, `bcj-x86+lzma2` or `bcj-arm64+lzma2`, compared byte for byte (`stored` and `bcj2` MUST be rejected; an unknown id fails the manifest as in 9.0) |
+| `offset`, `length` | `length ≥ 1` and `offset + length ≤` the delta file's `size` (computed without overflow): the patch is the delta file's bytes `offset .. offset + length` |
+| `sha256` | SHA-256 of the patch's bytes |
+
+- **Codec meaning.** A patch is one raw LZMA2 stream whose preset dictionary is the base: the
+  decoder starts with the base's bytes already in its dictionary, and the stream's first chunk does
+  not reset it. For the BCJ ids, the base is passed through the same BCJ filter (start offset 0)
+  before it becomes the dictionary, and the decoded output through the inverse filter, as for a
+  frame of that id. There is no `dict_size` field.
+- **Window.** The LZMA2 window of a patch is `base_size` plus the entry's `size`, rounded up to a
+  multiple of 4096. It MUST be at most 134,217,728 (128 MiB); a reader checks it from the signed
+  sizes before allocating anything, and never truncates the base to fit. Files of about 64 MiB
+  and larger therefore have no patch and are fetched as frames.
+- Patches may overlap or repeat inside a delta file, and bytes no patch covers are allowed. Every
+  rule of this section fails the whole manifest, like any other field rule.
+- Unknown members of a delta or patch object are ignored (3.2); duplicate keys are rejected (3.1).
+
+**Choosing a delta.** A client uses only the delta whose `from` is byte-equal to the version
+string of its installed release (precedence is not enough: two versions may differ only in build
+metadata), and for a file only the patch whose `base_size` and `base_sha256` equal its installed
+file at that path. Anything else is fetched as before (the file's frame, or the pack); a patch that
+fails any check below is discarded and the file is fetched from its frame. Patches are an
+optimisation: they never change which bytes are installed.
+
+**Decoding rules.** A reader rebuilding a file from a patch MUST, in this order:
+
+1. read exactly `length` bytes of the patch (a different count is an error);
+2. check the patch's SHA-256 against the signed `sha256` before any decoder sees a byte;
+3. check that the base file has exactly `base_size` bytes and that their SHA-256 equals
+   `base_sha256`, before the base is used;
+4. allocate decoder state only within the memory bound below (at most two windows plus the codec's
+   fixed overhead);
+5. decode so that the output is exactly the entry's `size` bytes: stop with an error as soon as the
+   output would exceed `size`, and reject a short output;
+6. require that the LZMA2 stream is consumed exactly: no trailing input after its end;
+7. check the SHA-256 of the output against the entry's `sha256` before the file is placed.
+
+On any error the decoded output is discarded and never placed. Decoder memory per patch is bounded
+by at most two windows plus the codec's fixed overhead: a decoder may hold the window twice while
+it grows it. The base (and its filtered copy for the BCJ ids) and the patch's bytes are the
+caller's and are charged apart.
+
+**Writer.** A writer writes one delta file per delta, named `<ver>/<target>.from-<from>.delta` with
+`<from>` the delta's `from` text; its patches in the manifest's entry order, back to back from
+offset 0 with no padding; and the deltas sorted by `from` precedence, highest first. A delta with no
+patch is not written or listed, and a manifest without deltas has no `deltas` field. Which files
+get a patch is the writer's choice and not a format rule: a writer may leave out any patch, for
+instance one that is not smaller than the file's frame, or one whose encoder would not fit the
+writer's memory budget.
 
 ## 10. Shared rules
 
@@ -1826,7 +1927,7 @@ This location is a **cross-version contract**: every later library version must 
 including `last_run`, 12.9) there. Another user's home is never read or written, and an uninstall removes
 only the uninstalling user's.
 
-## 19. Privileged service protocol, version 1
+## 19. Privileged service protocol, versions 1 and 2
 
 The update service of a per-machine install (18.3 on Windows, 20.3 to 20.5 on Linux and macOS) and the copies
 of the library and the runtime that talk to it share this protocol, over a named pipe on Windows and a unix
@@ -1872,7 +1973,7 @@ the connection. After an answer the client may send another request on the same 
 |---|---|---|
 | `status` | `status{current, previous, pending, staged, service, self_update_disabled}` | Reports the machine record: `previous`, `pending` (`{version, attempts}`) and `staged` are `null` when there is none; `service` is the running service binary's version. No secrets. |
 | `stage_begin{channel, documents}` + data | `stage_ready{version}`, `no_update`, or an error | `documents` is the array of `{kind, bytes}` the data frames carry, concatenated in that order: `root` documents first (ascending, at most 16), then exactly one `keys`, one `feed` and one `manifest`; every size from 1 to FORMAT 4's cap for its kind. The service verifies the chain against the machine record's root and floors, raises the stored floors, and selects the update the feed offers this machine itself (11.4); the client's choice is never trusted. `channel` must be the installed tree's. |
-| `put{kind, sha256, size}` + data | `put_ok` | Uploads one object (`kind` is `pack` or `frame`) of exactly `size` bytes (at least 1). Accepted only if the verified manifest lists exactly that hash and size; each object at most once; valid only after `stage_ready`. |
+| `put{kind, sha256, size}` + data | `put_ok` | Uploads one object (`kind` is `pack` or `frame`; from version 2 also `patch`, 19.9) of exactly `size` bytes (at least 1). Accepted only if the verified manifest lists exactly that hash and size; each object at most once; valid only after `stage_ready`. |
 | `stage_commit` | zero or more `progress{done, total}`, then `staged{version}` or `need_fetch{paths, more}` | Builds the candidate's tree from the verified bytes, runs the publisher check (RUNTIME.md), records it as staged. `need_fetch` names (at most 64) release paths still missing; the client uploads them and commits again. At most three commits per connection. |
 | `apply{version}` | `applied{version, token}` | Makes the staged version current and pending its health check and refreshes the launcher, the uninstall entry and the shortcuts. |
 | `attempt{version}` | `attempt{outcome, ...}` | A start of the pending version without a token: `supervised`, or `counted{attempts, token}`, or `rolled_back{current}`, or `not_pending` (19.5). |
@@ -2007,6 +2108,33 @@ restart. A second client is not refused: it waits in the socket's queue until th
 and a client whose hello does not arrive within its own deadline (ten seconds in the library and the
 runtime) ends with `service_unavailable`, reason `timeout`. The server takes no decision from who the peer
 is: any local user may talk to it. The client's checks of the socket and of the peer are 20.3.
+
+### 19.9 Version 2 (M12-D6)
+
+Version 2 is version 1 plus one value: `put` may carry `kind` `patch`, a delta patch of the manifest
+(9.3). Every other request, answer, member, error code, deadline and limit is version 1's, byte for byte;
+a build that speaks version 2 still speaks version 1 (its hello offers `1..=2`), so either side of any
+build meets the other at the highest version both speak.
+
+- In a session at version 1, `put{kind:"patch"}` is a member value outside version 1's closed set:
+  `malformed`, and the connection ends. A version-1 client never sends one.
+- At version 2, `put{kind:"patch", sha256, size}` is accepted only when the verified manifest has a delta
+  whose `from` is, byte for byte, the text of the machine record's current version and that delta lists
+  a patch with that `sha256`; otherwise `not_in_manifest`. `size` must be the patch's `length`
+  (`size_mismatch`); a repeat is `malformed`, as for every object.
+- The service never takes a base from the client: at `stage_commit` it reads the base of each patch from
+  its own current tree, joined from the entry's path under the protected current tree, and checks and
+  decodes it as 9.3 says: the open checks only the last component for a regular file of `base_size`
+  (an intermediate link is not refused, and the tree's links come only from a signed manifest and are
+  confined to the tree), and the base is hash-checked against the signed manifest before decode and the
+  output against the entry's hash, so the binding is the hash check, not the walk. Its sources per file are, in order: the unchanged current file, an uploaded frame, the
+  uploaded pack, an uploaded patch; so a frame or the pack a client sends after a failed patch always
+  wins, and a patch that fails is answered as that path in `need_fetch`, like a missing frame.
+- No message carries a file-system path or a base digest the manifest does not already hold, and no
+  error code is new.
+
+A client that meets a version-1 service uploads no patch: it fetches the frames of the files it planned to
+patch before its first `stage_commit`.
 
 ## 20. Linux and macOS per-machine layout
 

@@ -95,6 +95,11 @@ pub struct Release {
     pub shell: bool,
     /// `[install] autostart`: the install writes a LaunchAgent (M8-D12).
     pub autostart: bool,
+    /// Bytes of `Contents/Resources/delta.bin` (0: no file): incompressible filler, the same in
+    /// every release but for 16 bytes in the middle that `delta_tweak` sets (M12 step 7).
+    pub delta_bytes: usize,
+    /// Which 16 bytes `delta.bin` has in the middle (0: the filler as it is).
+    pub delta_tweak: u8,
 }
 
 impl Release {
@@ -105,6 +110,8 @@ impl Release {
             health_timeout_secs: 20,
             shell: false,
             autostart: false,
+            delta_bytes: 0,
+            delta_tweak: 0,
         }
     }
 }
@@ -117,6 +124,20 @@ const V3_CRASH: Release = Release {
     health_timeout_secs: 20,
     shell: false,
     autostart: false,
+    delta_bytes: 0,
+    delta_tweak: 0,
+};
+
+/// The size of `Contents/Resources/delta.bin` of the delta rows' releases.
+const DELTA_BYTES: usize = 256 << 10;
+const D1: Release = Release {
+    delta_bytes: DELTA_BYTES,
+    ..V1
+};
+const D2: Release = Release {
+    delta_bytes: DELTA_BYTES,
+    delta_tweak: 0x5A,
+    ..V2
 };
 
 pub type RowFn = fn(&Bins) -> Vec<String>;
@@ -147,6 +168,24 @@ pub const ROWS: &[Row] = &[
         id: "3",
         name: "update to 1.1.0 through the library and through the command line",
         run: row_update,
+        ci_only: false,
+    },
+    Row {
+        id: "3c",
+        name: "update by delta: the changed file arrives as a patch",
+        run: row_delta_update,
+        ci_only: false,
+    },
+    Row {
+        id: "3d",
+        name: "delta fallback: the installed base file changed by one byte",
+        run: row_delta_base_changed,
+        ci_only: false,
+    },
+    Row {
+        id: "3e",
+        name: "delta fallback: the delta file is not served",
+        run: row_delta_missing,
         ci_only: false,
     },
     Row {
@@ -246,6 +285,24 @@ fn write_file(path: &Path, bytes: &[u8], exec: bool) {
     std::fs::write(path, bytes).expect("write file");
     let mode = if exec { 0o755 } else { 0o644 };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("set mode");
+}
+
+/// The bytes of `Contents/Resources/delta.bin` of a release: a deterministic incompressible
+/// stream (xorshift), the same for every release, with 16 bytes in the middle XORed with `tweak`.
+fn delta_content(len: usize, tweak: u8) -> Vec<u8> {
+    let mut x = 0xD17A_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut bytes = Vec::with_capacity(len + 8);
+    while bytes.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    bytes.truncate(len);
+    for byte in bytes.iter_mut().skip(len / 2).take(16) {
+        *byte ^= tweak;
+    }
+    bytes
 }
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
@@ -628,6 +685,13 @@ impl World {
             format!("{}\n", release.version).as_bytes(),
             false,
         );
+        if release.delta_bytes > 0 {
+            write_file(
+                &input.join("Contents/Resources/delta.bin"),
+                &delta_content(release.delta_bytes, release.delta_tweak),
+                false,
+            );
+        }
         if !release.flags.is_empty() {
             write_file(
                 &input.join("Contents/Resources/e2e-flags"),
@@ -661,6 +725,13 @@ impl World {
     }
 
     fn publish_with(&self, release: &Release, signer: Option<Signer>) {
+        self.publish_opts(release, signer, false);
+    }
+
+    /// Packs `release` (and lets nothing but the `.delta` files out when `drop_deltas`: they are
+    /// removed from the release directory after the manifest and the feed were written, so the
+    /// signed manifest lists what the server does not have, the fallback of M12-D5).
+    fn publish_opts(&self, release: &Release, signer: Option<Signer>, drop_deltas: bool) {
         let input = self.bundle_input(release);
         if signer.is_some() {
             // Only code `codesign` can seal: no text framework, no script.
@@ -708,7 +779,31 @@ impl World {
             "--config",
             &base,
         ]);
+        if drop_deltas {
+            for entry in std::fs::read_dir(self.release_dir.join(release.version))
+                .expect("the release's directory")
+            {
+                let path = entry.expect("entry").path();
+                if path.extension().is_some_and(|e| e == "delta") {
+                    std::fs::remove_file(&path).expect("remove a delta file");
+                }
+            }
+        }
         self.sync();
+    }
+
+    /// The delta files the release directory holds for `version`, by file name, sorted.
+    fn delta_files(&self, version: &str) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.release_dir.join(version))
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".delta"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
     }
 
     /// Packs `release` as a code-signed bundle (M8-D8): the plain bundle with real Mach-O files,
@@ -1330,6 +1425,175 @@ fn row_update(bins: &Bins) -> Vec<String> {
     lines
 }
 
+/// Installs the delta rows' 1.0.0 from its `.dmg`, runs it once and returns the world and the
+/// first-install lines.
+fn delta_install(bins: &Bins) -> (World, Vec<String>) {
+    let w = World::new(bins);
+    w.publish(&D1);
+    let dmg = w.build_dmg("1.0.0");
+    assert_eq!(w.install_from_dmg(&dmg), 0, "the installer's exit code");
+    w.assert_installed("1.0.0");
+    w.run_app(&w.entry(), &[]);
+    let lines = w.expect_lines(&first_install_lines(), false);
+    (w, lines)
+}
+
+/// The `source` of every `stage` progress line of the runtime's JSON Lines `stdout` that names
+/// `path`. The runtime writes at most ten progress lines a second and a stage phase's last one, so
+/// a small file's own line may not be among them: rows use this only as a consistency check
+/// (every line that is there names the right source), never to demand a line.
+fn file_sources(stdout: &str, path: &str) -> Vec<String> {
+    let needle = format!("\"file\":{{\"path\":\"{path}\",");
+    let mut sources = Vec::new();
+    for line in stdout.lines() {
+        if line.starts_with("{\"schema\":1,\"type\":\"progress\",\"phase\":\"stage\"")
+            && line.contains(&needle)
+            && let Some(rest) = line.split("\"source\":\"").nth(1)
+            && let Some(source) = rest.split('"').next()
+        {
+            sources.push(source.to_owned());
+        }
+    }
+    sources
+}
+
+/// The bytes the download fetched: `done` of the last `download`-phase progress line (a phase's
+/// last snapshot is always delivered). A patch is a few dozen bytes; the file's frame is its size.
+fn download_bytes(stdout: &str) -> u64 {
+    let head = "{\"schema\":1,\"type\":\"progress\",\"phase\":\"download\",\"done\":";
+    stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix(head))
+        .filter_map(|rest| rest.split(',').next()?.parse::<u64>().ok())
+        .next_back()
+        .expect("a download progress line")
+}
+
+/// Stages 1.1.0 with `download --json` from the live bundle's runtime; returns its stdout (the
+/// rows assert on the progress lines of RUNTIME.md schema 1, not on log text).
+fn delta_download(w: &World) -> String {
+    let (code, stdout) = w.runtime(&["download", "--json"]);
+    assert_eq!(code, 0, "download exited {code}");
+    assert!(
+        last_line(&stdout).contains("\"version\":\"1.1.0\",\"staged\":true"),
+        "download stages 1.1.0"
+    );
+    assert_eq!(
+        w.record().and_then(|r| r.staged),
+        Some("1.1.0".to_owned()),
+        "the record names the staged version"
+    );
+    stdout
+}
+
+/// Applies the staged 1.1.0 through the app, which confirms it, and checks that the bundle now
+/// holds the 1.1.0 bytes of `delta.bin`. Returns the outcome lines.
+fn delta_apply(w: &World) -> Vec<String> {
+    w.run_app(&w.entry(), &["--update", "--no-ui"]);
+    let lines = w.expect_lines(&confirmed_update_lines("1.0.0", "1.1.0"), false);
+    w.wait_runtime_gone();
+    assert_eq!(
+        w.bundle_version().as_deref(),
+        Some("1.1.0"),
+        "B holds 1.1.0"
+    );
+    assert_eq!(
+        std::fs::read(w.bundle().join("Contents/Resources/delta.bin")).expect("the new file"),
+        delta_content(DELTA_BYTES, D2.delta_tweak),
+        "the updated bundle's delta.bin"
+    );
+    let r = w.record().expect("a record");
+    assert_eq!(r.current.as_deref(), Some("1.1.0"));
+    assert_eq!(r.previous.as_deref(), Some("1.0.0"));
+    assert!(r.bad.is_empty(), "nothing is marked bad");
+    assert_no_quarantine(&w.bundle());
+    lines
+}
+
+const DELTA_PATH: &str = "Contents/Resources/delta.bin";
+
+/// Row 3c: 1.1.0 changes 16 bytes of one file; the packer writes a delta from 1.0.0, `download`
+/// fetches that file as a patch, the update applies and confirms.
+fn row_delta_update(bins: &Bins) -> Vec<String> {
+    let (w, mut lines) = delta_install(bins);
+    w.publish(&D2);
+    assert_eq!(
+        w.delta_files("1.1.0"),
+        [format!("{TARGET}.from-1.0.0.delta")],
+        "the packer wrote the delta from 1.0.0"
+    );
+    let before = w.requests().len();
+    let stdout = delta_download(&w);
+    let fetched = download_bytes(&stdout);
+    assert!(
+        fetched < DELTA_BYTES as u64 / 4,
+        "the download fetched {fetched} bytes: the file's frame, not a patch"
+    );
+    let sources = file_sources(&stdout, DELTA_PATH);
+    assert!(
+        sources.iter().all(|s| s == "patch"),
+        "delta.bin arrives as a patch: {sources:?}"
+    );
+    assert!(
+        w.requests()[before..]
+            .iter()
+            .any(|u| u.contains(".from-1.0.0.delta")),
+        "the delta file was never requested"
+    );
+    lines.extend(delta_apply(&w));
+    lines
+}
+
+/// Row 3d: the installed copy of the base file differs by one byte, so no patch can apply to it:
+/// the file arrives as its frame by `range`, the rest of the update is unchanged.
+fn row_delta_base_changed(bins: &Bins) -> Vec<String> {
+    let (w, mut lines) = delta_install(bins);
+    w.publish(&D2);
+    let base = w.bundle().join(DELTA_PATH);
+    let mut bytes = std::fs::read(&base).expect("the installed base file");
+    bytes[100] ^= 1;
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o644))
+        .expect("make the base file writable");
+    std::fs::write(&base, bytes).expect("change the installed base file");
+    let stdout = delta_download(&w);
+    let fetched = download_bytes(&stdout);
+    assert!(
+        fetched >= DELTA_BYTES as u64,
+        "the download fetched {fetched} bytes: not the file's frame"
+    );
+    let sources = file_sources(&stdout, DELTA_PATH);
+    assert!(
+        sources.iter().all(|s| s == "range"),
+        "delta.bin is fetched by range, never as a patch: {sources:?}"
+    );
+    lines.extend(delta_apply(&w));
+    lines
+}
+
+/// Row 3e: the signed manifest lists the delta but the server has no such file: the failed patch
+/// is not retried, the file arrives as its frame by `range`, and the update completes.
+fn row_delta_missing(bins: &Bins) -> Vec<String> {
+    let (w, mut lines) = delta_install(bins);
+    w.publish_opts(&D2, None, true);
+    assert!(
+        w.delta_files("1.1.0").is_empty(),
+        "the delta file is gone from the release directory"
+    );
+    let stdout = delta_download(&w);
+    let fetched = download_bytes(&stdout);
+    assert!(
+        fetched >= DELTA_BYTES as u64,
+        "the download fetched {fetched} bytes: not the file's frame"
+    );
+    let sources = file_sources(&stdout, DELTA_PATH);
+    assert!(
+        sources.iter().all(|s| s == "range"),
+        "delta.bin falls back to range: {sources:?}"
+    );
+    lines.extend(delta_apply(&w));
+    lines
+}
+
 /// Row 4: 1.2.0 crashes on start; the applier swaps 1.1.0 back and marks 1.2.0 bad.
 fn row_crash_rolls_back(bins: &Bins) -> Vec<String> {
     let w = World::new(bins);
@@ -1426,6 +1690,8 @@ const fn with(base: Release, flags: &'static [&'static str], health: u64) -> Rel
         health_timeout_secs: health,
         shell: base.shell,
         autostart: base.autostart,
+        delta_bytes: base.delta_bytes,
+        delta_tweak: base.delta_tweak,
     }
 }
 

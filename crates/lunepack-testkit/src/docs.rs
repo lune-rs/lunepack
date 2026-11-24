@@ -266,6 +266,7 @@ impl ChainFixture<'_> {
             issued: u53(SUITE_T0),
             pack: self.artifact_ref(&format!("{version}/{}.pack", target.as_str()), &pack.bytes),
             entries: pack.entries.clone(),
+            deltas: None,
         }
     }
 

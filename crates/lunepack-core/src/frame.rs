@@ -13,13 +13,42 @@ use serde::{Deserialize, Serialize};
 
 use crate::digest::{Sha256Digest, U53};
 use crate::error::{Error, FrameError, Result, Untrusted};
-use crate::traits::{Codec, CodecId, FrameView, HashState, Hasher, StreamView};
+use crate::manifest::VerifiedPatch;
+use crate::traits::{Codec, CodecId, FrameView, HashState, Hasher, PatchView, StreamView};
 use crate::trust::present;
 
 /// Smallest LZMA2 dictionary a descriptor may declare.
 pub const MIN_DICT_SIZE: u64 = 4096;
 /// Largest LZMA2 dictionary a descriptor may declare (16 MiB).
 pub const MAX_DICT_SIZE: u64 = 16 * 1024 * 1024;
+/// Largest LZMA2 window of a delta patch (FORMAT.md 9.3, D8): 128 MiB. The window holds the base
+/// as preset dictionary and the patched file, so files of about 64 MiB and up get no patch.
+pub const MAX_PATCH_WINDOW: u64 = 128 * 1024 * 1024;
+/// The granule a patch window is rounded up to (FORMAT.md 9.3).
+pub const PATCH_WINDOW_ALIGN: u64 = 4096;
+
+/// The LZMA2 window of a patch from a base of `base_size` bytes to a file of `size` bytes
+/// (FORMAT.md 9.3): `base_size + size` rounded up to a multiple of [`PATCH_WINDOW_ALIGN`]. `None`
+/// when the sum or the rounding overflows; the caller compares the result with
+/// [`MAX_PATCH_WINDOW`].
+pub const fn patch_window(base_size: u64, size: u64) -> Option<u64> {
+    match base_size.checked_add(size) {
+        Some(sum) => match sum.checked_add(PATCH_WINDOW_ALIGN - 1) {
+            Some(up) => Some(up / PATCH_WINDOW_ALIGN * PATCH_WINDOW_ALIGN),
+            None => None,
+        },
+        None => None,
+    }
+}
+
+/// Whether `codec` may encode a delta patch (FORMAT.md 9.3): the three LZMA2 variants, never
+/// `stored` or `bcj2`.
+pub const fn is_patch_codec(codec: CodecId) -> bool {
+    matches!(
+        codec,
+        CodecId::Lzma2 | CodecId::BcjX86Lzma2 | CodecId::BcjArm64Lzma2
+    )
+}
 /// Decoder memory beyond the signed dictionaries, per codec (M4-D13). Each constant is the peak
 /// heap measured by `lunepack-codec-lzma/tests/memory.rs` (a counting allocator, a frame at the
 /// 16 MiB maximum dictionary), minus the dictionaries, times at least 1.25, rounded up to the next
@@ -320,6 +349,21 @@ pub fn decoder_memory(frame: &CheckedFrame) -> u64 {
         + overhead
 }
 
+/// Decoder memory a patch may need (M12-D7, the stage's budget input): two windows plus the
+/// overhead constant of its codec. Measured by `lunepack-codec-lzma/tests/patch_memory.rs`:
+/// `lzma-rust2` 0.25 starts the window as a copy of the base and grows it geometrically, and the
+/// last growth holds the old block (half the window to just under it, depending on the base's
+/// size) and the whole window at once, so the peak is below two windows plus the reader's state.
+/// The base itself, and the patch's bytes, are the caller's and are charged apart.
+pub fn patch_decoder_memory(codec: CodecId, window: u64) -> u64 {
+    let overhead = match codec {
+        CodecId::BcjX86Lzma2 => DECODER_OVERHEAD_BCJ_X86_LZMA2_BYTES,
+        CodecId::BcjArm64Lzma2 => DECODER_OVERHEAD_BCJ_ARM64_LZMA2_BYTES,
+        _ => DECODER_OVERHEAD_LZMA2_BYTES,
+    };
+    window.saturating_mul(2).saturating_add(overhead)
+}
+
 /// A checked frame split over its (hash-verified) bytes, ready for the codec.
 pub(crate) struct ParsedFrame<'a> {
     codec: CodecId,
@@ -490,6 +534,87 @@ pub fn decode_verified(
     }
     let digest = writer.hash.take().map(|h| h.finalize());
     if digest != Some(frame.file_sha256) {
+        return Err(FrameError::FileHash.into());
+    }
+    Ok(())
+}
+
+/// Verifies and decodes one delta patch (FORMAT.md 9.3), in order, each check before anything it
+/// covers is used: `patch_bytes` is exactly the patch's length; its SHA-256 equals the signed one;
+/// `base` is exactly `base_size` bytes; the base's SHA-256 equals `base_sha256` (the decoder sees
+/// neither the patch nor the base before these pass); the codec decodes into a writer that fails
+/// as soon as the output would exceed the file's size; then the output must be exactly the file's
+/// size, the whole patch consumed, and the output's SHA-256 equal to the file's.
+///
+/// `out` receives decoded bytes as they are produced. **On any error the caller must discard
+/// everything `out` received**; only `Ok(())` means the bytes are the signed file.
+pub fn decode_patch_verified(
+    patch: &VerifiedPatch,
+    patch_bytes: &[u8],
+    base: &[u8],
+    hasher: &dyn Hasher,
+    codec: &dyn Codec,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if patch_bytes.len() as u64 != patch.length() {
+        return Err(FrameError::ByteCount {
+            expected: patch.length(),
+            actual: patch_bytes.len() as u64,
+        }
+        .into());
+    }
+    if hasher.sha256(patch_bytes) != patch.sha256() {
+        return Err(FrameError::FrameHash.into());
+    }
+    if base.len() as u64 != patch.base_size() {
+        return Err(FrameError::BaseMismatch.into());
+    }
+    if hasher.sha256(base) != patch.base_sha256() {
+        return Err(FrameError::BaseMismatch.into());
+    }
+    let view = PatchView {
+        codec: patch.codec(),
+        input: patch_bytes,
+        base_size: patch.base_size(),
+        output_size: patch.file_size(),
+        window: patch.window(),
+    };
+    let mut writer = ExactWriter {
+        inner: out,
+        remaining: patch.file_size(),
+        written: 0,
+        overflowed: false,
+        failed: None,
+        hash: Some(hasher.sha256_start()),
+    };
+    let result = codec.decode_patch(&view, base, &mut writer);
+    if writer.overflowed {
+        return Err(FrameError::OutputTooLong {
+            size: patch.file_size(),
+        }
+        .into());
+    }
+    if let Some(source) = writer.failed.take() {
+        return Err(FrameError::OutputWrite(source).into());
+    }
+    let report = result?;
+    if writer.written != patch.file_size() {
+        return Err(FrameError::OutputTooShort {
+            expected: patch.file_size(),
+            actual: writer.written,
+        }
+        .into());
+    }
+    if report.consumed != [patch.length()] {
+        return Err(FrameError::Consumed {
+            index: 0,
+            consumed: report.consumed.first().copied().unwrap_or(0),
+            length: patch.length(),
+        }
+        .into());
+    }
+    let digest = writer.hash.take().map(|h| h.finalize());
+    if digest != Some(patch.file_sha256()) {
         return Err(FrameError::FileHash.into());
     }
     Ok(())

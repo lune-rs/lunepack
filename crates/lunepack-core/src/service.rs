@@ -1,4 +1,5 @@
-//! The service protocol, version 1 (M10-D1, C8): the conversation between an app's copy of the
+//! The service protocol, versions 1 and 2 (M10-D1, C8; version 2 adds `put` of kind `patch`,
+//! M12-D6, and is otherwise version 1 byte for byte): the conversation between an app's copy of the
 //! library (the client) and the machine install's LocalSystem service (the server) over a duplex
 //! byte channel. Pure: the codec and both session types work over any [`Duplex`]; no pipe, clock or
 //! file is touched here. Deadlines are set only through [`Duplex::set_read_deadline`].
@@ -44,8 +45,11 @@ use crate::version::Version;
 
 /// The lowest protocol version this build speaks.
 pub const PROTOCOL_MIN: u32 = 1;
-/// The highest protocol version this build speaks.
-pub const PROTOCOL_MAX: u32 = 1;
+/// The highest protocol version this build speaks: version 2 is version 1 plus `put` of kind
+/// `patch` (M12-D6).
+pub const PROTOCOL_MAX: u32 = 2;
+/// The first protocol version with `put{kind:"patch"}`.
+pub const PROTOCOL_PATCH: u32 = 2;
 /// Frame kind of a message frame.
 pub const KIND_MESSAGE: u8 = 1;
 /// Frame kind of a data frame.
@@ -202,6 +206,8 @@ wire_enum! {
         Pack => "pack",
         /// One compressed file (a frame).
         Frame => "frame",
+        /// One delta patch (FORMAT.md 9.3); version 2 and above only.
+        Patch => "patch",
     }
 }
 
@@ -1207,7 +1213,17 @@ impl<D: Duplex> ServerSession<D> {
     /// Reads the client's hello and answers it for the app `app`. No common version answers
     /// `unsupported` and returns [`ServiceError::Unsupported`] with the client's range; a malformed
     /// hello closes without an answer.
-    pub fn accept(mut io: D, app: AppId) -> Result<ServerSession<D>, ServiceError> {
+    pub fn accept(io: D, app: AppId) -> Result<ServerSession<D>, ServiceError> {
+        Self::accept_range(io, app, PROTOCOL_MIN, PROTOCOL_MAX)
+    }
+
+    /// [`ServerSession::accept`] speaking only `min..=max` (tests: a server of an older build).
+    pub fn accept_range(
+        mut io: D,
+        app: AppId,
+        min: u32,
+        max: u32,
+    ) -> Result<ServerSession<D>, ServiceError> {
         io.set_read_deadline(Some(SERVER_HELLO_DEADLINE))
             .map_err(|e| ServiceError::Io(e.kind()))?;
         let hello = match read_frame(&mut io)? {
@@ -1215,7 +1231,7 @@ impl<D: Duplex> ServerSession<D> {
             Some(Frame::Data(_)) => return Err(ServiceError::Malformed("data before the hello")),
             Some(Frame::Message(body)) => ClientHello::decode(&body)?,
         };
-        let answer = negotiate(hello, PROTOCOL_MIN, PROTOCOL_MAX)?;
+        let answer = negotiate(hello, min.max(PROTOCOL_MIN), max.min(PROTOCOL_MAX))?;
         write_frame(&mut io, KIND_MESSAGE, &answer.encode()?)?;
         match answer {
             ServerHello::Version(version) => Ok(ServerSession {
@@ -1290,6 +1306,15 @@ impl<D: Duplex> ServerSession<D> {
         if msg.app != self.app {
             self.end_with(ErrorCode::WrongApp);
             return Err(ServiceError::WrongApp);
+        }
+        // A kind a version does not know is a member value outside its closed set.
+        if let Request::Put {
+            kind: ObjectKind::Patch,
+            ..
+        } = msg.request
+            && self.version < PROTOCOL_PATCH
+        {
+            return Err(self.fail(ServiceError::Malformed("put of a patch below version 2")));
         }
         Ok(Some(msg.request))
     }
@@ -1591,6 +1616,9 @@ impl<D: Duplex> ClientSession<D> {
         size: u64,
         source: &mut dyn Read,
     ) -> Result<(), ServiceError> {
+        if kind == ObjectKind::Patch && self.version < PROTOCOL_PATCH {
+            return Err(ServiceError::Malformed("put of a patch below version 2"));
+        }
         self.send(Request::Put { kind, sha256, size })?;
         self.stream(source, size)?;
         match self.answer()? {

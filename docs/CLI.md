@@ -280,12 +280,13 @@ their compiled-in root. The config keeps the original root, and `verify` walks t
 ### `lunepack pack`
 
 Packages a build-output directory into `<version>/<target>.pack` and `<version>/<target>.manifest.json`
-in the release directory.
+in the release directory, with a delta file `<version>/<target>.from-<from>.delta` per earlier release
+it patches from ("Deltas" below).
 
 ```
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
-    [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--service <SERVICE>] [--config <CONFIG>]
+    [--deltas <N>] [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--service <SERVICE>] [--config <CONFIG>]
 
 lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runtime <RUNTIME>
     [--ui <UI>] --assemble <DIR> [--config <CONFIG>]
@@ -297,7 +298,9 @@ lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runt
   `macos-universal`, `linux-x86_64`, `linux-aarch64`.
 - `--jobs`: encoder threads (default: the available parallelism). The output does not depend on it.
 - `--memory-budget-mib`: memory budget of the encoders (default 2048). A file that needs more than the
-  whole budget is encoded alone.
+  whole budget is encoded alone; a delta patch candidate that needs more is not encoded at all (below).
+- `--deltas <N>`: how many earlier releases to patch from, per feed (default 3, `0` for none, at most
+  16); see "Deltas".
 - `--app-id`: when given, it must equal the config's.
 - `--runtime`: the static runtime to place beside the entry. Required when the config has `[update]`,
   refused without it (see "Self-updating apps").
@@ -323,18 +326,64 @@ lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runt
   release.
 
 Pre-checks run before any encoding: `keys.json` verifies; every `--sign` key is in the key set and
-inside its window; the signers reach the threshold; the manifest and pack do not exist yet; the target
-is valid for this host (below).
+inside its window; the signers reach the threshold; the manifest, the pack and the delta files do not
+exist yet; the target is valid for this host (below).
 
 The stages, in order (C2): (1) assemble: copy the input into a temporary directory (removed on success
 and on every error); (2) code-sign: the OS sign stage, the developer's argv templates run over the items of the sign plan,
 inner to outer, when the config has a `[codesign.<os>]` section for the target's OS ("Code signing"),
 nothing otherwise; (3) hash every file; (4) pack: choose the smallest codec per file, round-trip it through the decoder a client uses,
-and lay the frames out; (5) sign the manifest. `pack` then verifies its own output the way a client
-does (a throwaway feed signed by the same signers, `verify_manifest`, the pack against the manifest's
-size and SHA-256, every frame decoded) and only then writes the pack and, last, the manifest. Neither is
+and lay the frames out; then the delta patches ("Deltas"); (5) sign the manifest. `pack` then verifies
+its own output the way a client does (a throwaway feed signed by the same signers, `verify_manifest`,
+the pack against the manifest's size and SHA-256, every frame decoded, every delta file and patch
+against the manifest) and only then writes the pack, the delta files and, last, the manifest. None is
 ever overwritten. Stdout has one line per stage and the totals: files, input bytes, pack bytes, files
-per codec and the candidates that were dropped, with reasons.
+per codec and the candidates that were dropped, with reasons, then the delta report. A signed manifest
+over the format's 64 MiB cap is an error that names `--deltas`.
+
+#### Deltas (M12, FORMAT.md 9.3)
+
+An update can download a small patch against the file the user already has instead of the file's
+frame. `pack` writes, for each earlier release it patches from (a *base*), one delta file
+`<version>/<target>.from-<base>.delta` holding the patches back to back, and lists it in the signed
+manifest's `deltas`; installers carry the manifest unchanged and no delta file.
+
+Bases (M12-D3). The candidates are the version directories of the release directory with lower
+precedence than `--version` that hold `<target>.manifest.json`. Every `feed-<channel>.json` is
+verified under `keys.json`, without the time checks `pack` skips on every document it reads (expiry
+and key windows: an expired feed still names its releases);
+a feed that does not verify is ignored with a report line. With at least one usable feed, the bases
+are the union of each feed's `--deltas` highest candidates it lists for the target, so a stable user
+still gets a patch after several betas; with no usable feed, the `--deltas` highest candidates. At
+most the 16 highest are kept. A base's manifest is verified the way `verify` does (through the feed's
+entry; with no feed, the way `setup` does, release keys valid at the writer's time) and its pack must
+match the manifest's size and SHA-256; a base that fails either, or one of whose files does not decode
+from its pack, is skipped with a report line naming its version.
+
+Patches (M12-D4). A file gets a patch from a base when it has at least one byte, the base has a file
+at the same path with at least one byte and another SHA-256, and the window (`base size + file size`
+rounded up to 4096) is at most 128 MiB, so files of about 64 MiB and up get none. A renamed file gets
+none. The candidates are `lzma2`, plus `bcj-x86+lzma2` or `bcj-arm64+lzma2` (both for a fat Mach-O
+with both) for code of that architecture, each encoded at the frame settings and round-tripped
+through the client's own patch decoder; the shortest is written only if it is at least 10% shorter
+than the file's frame. A delta with no patch is not written. Every changed file without a patch gets
+one report line, `no-patch: <path> from <base>: <reason>`, the reason one of `window` (over 128 MiB),
+`memory` (with the estimate and the budget in MiB), `not-smaller` (the 10% rule) or `failed` (the
+encode or the round trip failed; the candidate is also listed as `dropped`).
+
+Time and memory (M12-D7). Each candidate is one job of the encoders' memory gate, estimated as the
+encoder's memory for its window plus the base and the file; at a 64 MiB window that is about 0.85 GB
+(`lzma2`) and 0.9 GB (BCJ), at the 128 MiB cap about 1.7 to 1.8 GB. A candidate whose estimate is over
+the whole `--memory-budget-mib` is not run: the file keeps its frame and its report line says
+`memory`. So the delta files depend on the budget as well as on the tree, the keys, the clock, the
+earlier releases and the feeds in the directory; given those, the output is byte for byte the same
+for any `--jobs`. A large changed file costs about 20 s per candidate at a 64 MiB window (up to
+about a minute at the cap), with up to two candidates per base and three bases by default; lower
+`--deltas` to pack faster. Measured on real 30 to 32 MB executables with one base and the defaults, the whole
+`pack` took 41 to 68 s and peaked at about 1.8 GB of process memory (DECISIONS.md D8).
+
+Upload order: the pack and the delta files first, then the manifest, then the feed (`feed add`), so a
+client never sees a manifest whose files are missing.
 
 Hosts and file kinds (M3-D10): `exec` is taken from the Unix mode (`mode & 0o111 != 0`). A Windows host
 cannot know the bits, so it marks no file executable and refuses `linux-*` and `macos-*` targets.
@@ -715,7 +764,12 @@ lunepack verify <DIR> [--at <AT>] [--config <CONFIG>]
 Checks a directory the way a client does, in the client's order: the root walk (`root-<k>.json` from the
 config's root), `keys.json`, every `feed-*.json` (the channel comes from the file name; a name that is
 not a channel is an error), and for every release and target the manifest through the feed's reference,
-the pack against the manifest's size and SHA-256, and every frame through the decoder. A manifest no feed
+the pack against the manifest's size and SHA-256, and every frame through the decoder; then every delta
+file a verified manifest lists: its size and SHA-256 and every patch's SHA-256, and, when the base
+release is among the verified manifests, every patch decoded against the base's file read back from the
+base's pack (the base file must be that release's file at the path, of the patch's base size and
+SHA-256). A delta whose base is not in the directory is reported as not round-tripped, which is not an
+error; a missing or changed delta file is. A manifest no feed
 references is listed as `unreferenced` and does not change the exit status. One line per document is
 printed; the exit status is 0 only if every check held. `--at` checks at that Unix time (expiry and key
 windows) instead of the system clock.
@@ -729,7 +783,9 @@ lunepack inspect <DIR> [--at <AT>] [--channel <CHANNEL>] [--version <VERSION>] [
 
 Runs the same verification as `verify` first and shows nothing if it fails. Then it prints a summary:
 the key set (version, threshold, key ids, windows), each feed (seq, issued, expires, releases and
-targets, rollout) and each manifest (entry counts, input and pack bytes, files per codec, ratio).
+targets, rollout) and each manifest (entry counts, input and pack bytes, files per codec, ratio, and
+per delta: the base, the delta file's size, the patch count and the patch bytes against the bytes of
+the frames they replace).
 `--channel`, `--version` and `--target` narrow the output. `--entries` lists every entry: path, type,
 size, exec, codec and frame length. It reads the config for the root only and never resolves a signer.
 

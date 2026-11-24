@@ -70,7 +70,9 @@ pub use fetch::{
     plan_fetch,
 };
 pub use frame::{
-    CheckedFrame, FrameDesc, StreamDesc, check_file_frame, decode_verified, decoder_memory,
+    CheckedFrame, FrameDesc, MAX_PATCH_WINDOW, PATCH_WINDOW_ALIGN, StreamDesc, check_file_frame,
+    decode_patch_verified, decode_verified, decoder_memory, is_patch_codec, patch_decoder_memory,
+    patch_window,
 };
 pub use fs::{
     DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, PlaceFacts,
@@ -85,8 +87,8 @@ pub use layout::{
     BundleDiscovery, BundleProbe, Discovery, LayoutScheme, LocationReason, MachineLayout,
     MachineOs, MachineScheme, NameRule, Projection, RootChoice, RootNaming, SERVICE_FILE,
     SERVICE_FILE_UNIX, UnixOs, UserLayout, bundle_orphaned, bundle_replaced, check_place, discover,
-    discover_bundle, ensure_no_foreign_record, is_tombstone_of, machine_user_home, macos_name_ok,
-    read_bundle_identity, reconcile_bundle, reconcile_current, remove_tombstones,
+    discover_bundle, ensure_no_foreign_record, is_tombstone_of, machine_root, machine_user_home,
+    macos_name_ok, read_bundle_identity, reconcile_bundle, reconcile_current, remove_tombstones,
     resolve_bundle_target, resolve_root, resolve_root_scoped, root_valid_for_uninstall,
     set_bundle_pointer, tombstone_name, tree_candidates, version_config_path, windows_name_ok,
     write_bundle_identity,
@@ -97,12 +99,13 @@ pub use lifecycle::{
 };
 pub use limits::Limits;
 pub use manifest::{
-    EntryDoc, ManifestDocument, VerifiedEntry, VerifiedManifest, read_entry, verify_manifest,
-    verify_payload_manifest,
+    DeltaDoc, EntryDoc, ManifestDocument, PatchDoc, VerifiedDelta, VerifiedEntry, VerifiedManifest,
+    VerifiedPatch, read_entry, verify_manifest, verify_payload_manifest,
 };
 pub use pack::{
-    FileClass, PackedFile, ReleaseLayout, RuntimeImageError, candidates, check_pe_stub,
-    check_runtime_image, check_service_image, check_ui_image, classify, pack_file,
+    DeltaFile, DeltaPatch, FileClass, FinishedRelease, PackedFile, PatchChoice, ReleaseLayout,
+    RuntimeImageError, candidates, check_pe_stub, check_runtime_image, check_service_image,
+    check_ui_image, choose_patch, classify, encode_patch_checked, pack_file, patch_candidates,
 };
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
@@ -114,8 +117,8 @@ pub use progress::{FileProgress, Phase, Progress, Source};
 pub use root::{RootDocument, TrustedRoot, advance_root};
 pub use service::{ClientSession, Duplex, ServerSession};
 pub use stage::{
-    SourceFor, StageEnv, StageInput, StagedVersion, TreeDifference, TreeMismatch, scan, stage,
-    verify_tree,
+    PatchSource, SourceFor, StageEnv, StageInput, StagedVersion, TreeDifference, TreeMismatch,
+    base_digests, patch_cost, scan, stage, verify_tree,
 };
 pub use state::{
     CurrentRef, Floors, Health, InstallCounters, InstallState, Lifecycle, LifecycleEvent, Loaded,
@@ -125,8 +128,9 @@ pub use state::{
 pub use stub::{LaunchTarget, STUB_CONTRACT_VERSION, STUB_FILE, StubError, launch_target};
 pub use target::Target;
 pub use traits::{
-    Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,
-    HashState, Hasher, PublisherCheck, Rng, SignatureAlg, SignedTree, Signer, StreamView, Verifier,
+    Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedPatch, EncodedStream,
+    Encoder, FrameView, HashState, Hasher, PatchView, PublisherCheck, Rng, SignatureAlg,
+    SignedTree, Signer, StreamView, Verifier,
 };
 pub use traits::{
     DirClass, Elevated, ElevatedChild, Elevation, MachinePolicy, PolicySource, Protect,

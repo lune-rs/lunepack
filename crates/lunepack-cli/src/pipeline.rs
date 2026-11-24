@@ -26,9 +26,11 @@ use lunepack_core::update_config::{
     UI_FILE, UI_FILE_WINDOWS, config_path, runtime_file, ui_file,
 };
 use lunepack_core::{
-    CodeSign, Codec, CodecId, Encoder, EntryKind, Hasher, InstallMeta, ManifestDocument,
-    PackedFile, PlanEntry, PlanEntryKind, RelPath, ReleaseLayout, STUB_FILE, Sha256Digest,
-    SignItem, Target, UPDATE_CONFIG_FILE, pack_file, sign_plan, validate_tree,
+    CheckedFrame, CodeSign, Codec, CodecId, DeltaFile, DeltaPatch, Encoder, EntryKind, Hasher,
+    InstallMeta, ManifestDocument, PackedFile, PatchChoice, PlanEntry, PlanEntryKind, RelPath,
+    ReleaseLayout, STUB_FILE, Sha256Digest, SignItem, Target, UPDATE_CONFIG_FILE, choose_patch,
+    classify, decode_verified, encode_patch_checked, pack_file, patch_candidates, patch_window,
+    sign_plan, validate_tree,
 };
 
 /// Fixed per-job allowance on top of the input, output and encoder estimates: 16 MiB of slack for
@@ -787,20 +789,20 @@ fn run_job(
     pack_file(&bytes, encoder, codec, hasher).with_context(|| format!("cannot pack {}", job.path))
 }
 
-/// Stage 4: encodes `jobs` on up to `workers` threads within `budget` bytes (see [`estimate`]).
+/// Runs `jobs` on up to `workers` threads within `budget` bytes: `est` is a job's share of the
+/// budget, `run` the job.
 ///
 /// Workers take indices in order; a taken job always runs to the end, and once any job fails no
 /// further job is taken. Results are kept by index, so the output does not depend on `workers` or
 /// on timing, and the error returned is the lowest-index one: every index below a failed one was
 /// taken before it, and so ran.
-pub fn pack_jobs(
-    jobs: &[Job],
+fn run_gated<J: Sync, R: Send>(
+    jobs: &[J],
     workers: usize,
     budget: u64,
-    encoder: &dyn Encoder,
-    codec: &dyn Codec,
-    hasher: &dyn Hasher,
-) -> Result<Vec<PackedFile>> {
+    est: &(dyn Fn(&J) -> u64 + Sync),
+    run: &(dyn Fn(&J) -> Result<R> + Sync),
+) -> Result<Vec<R>> {
     let gate = Gate {
         in_use: Mutex::new(0),
         freed: Condvar::new(),
@@ -808,8 +810,7 @@ pub fn pack_jobs(
     };
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
-    let slots: Mutex<Vec<Option<Result<PackedFile>>>> =
-        Mutex::new((0..jobs.len()).map(|_| None).collect());
+    let slots: Mutex<Vec<Option<Result<R>>>> = Mutex::new((0..jobs.len()).map(|_| None).collect());
     let threads = workers.clamp(1, jobs.len().max(1));
     std::thread::scope(|s| {
         for _ in 0..threads {
@@ -820,8 +821,8 @@ pub fn pack_jobs(
                     }
                     let i = next.fetch_add(1, Ordering::AcqRel);
                     let Some(job) = jobs.get(i) else { break };
-                    let permit = gate.admit(estimate(job.size, encoder));
-                    let result = run_job(job, encoder, codec, hasher);
+                    let permit = gate.admit(est(job));
+                    let result = run(job);
                     drop(permit);
                     if result.is_err() {
                         stop.store(true, Ordering::Release);
@@ -835,11 +836,365 @@ pub fn pack_jobs(
     let mut out = Vec::with_capacity(jobs.len());
     for (i, slot) in slots.into_iter().enumerate() {
         match slot {
-            Some(Ok(packed)) => out.push(packed),
+            Some(Ok(done)) => out.push(done),
             Some(Err(e)) => return Err(e),
             // Only possible after an error, which is returned first, at a lower index.
             None => bail!("internal error: job {i} did not run"),
         }
+    }
+    Ok(out)
+}
+
+/// Stage 4: encodes `jobs` on up to `workers` threads within `budget` bytes (see [`estimate`]),
+/// through the memory gate of [`run_gated`]: the output does not depend on `workers` or on timing.
+pub fn pack_jobs(
+    jobs: &[Job],
+    workers: usize,
+    budget: u64,
+    encoder: &dyn Encoder,
+    codec: &dyn Codec,
+    hasher: &dyn Hasher,
+) -> Result<Vec<PackedFile>> {
+    run_gated(
+        jobs,
+        workers,
+        budget,
+        &|job: &Job| estimate(job.size, encoder),
+        &|job: &Job| run_job(job, encoder, codec, hasher),
+    )
+}
+
+/// Bytes in a MiB, for the report.
+const MIB: u64 = 1024 * 1024;
+
+/// One file of an earlier release that a patch may start from (M12-D4): a non-empty file entry of
+/// its verified manifest and the checked frame that holds it in that release's pack.
+#[derive(Debug, Clone)]
+pub struct BaseFile {
+    /// The entry's size, at least 1.
+    pub size: u64,
+    /// The entry's SHA-256.
+    pub sha256: Sha256Digest,
+    /// Its frame in the base's pack.
+    pub frame: CheckedFrame,
+}
+
+/// An earlier release of the same app and target, opened and verified (M12-D3).
+#[derive(Debug, Clone)]
+pub struct BaseRelease {
+    /// Its version text, verbatim: the delta's `from`.
+    pub version: String,
+    /// Its pack file, whose size and SHA-256 equalled its manifest's reference when opened.
+    pub pack: PathBuf,
+    /// Its non-empty file entries.
+    pub files: BTreeMap<RelPath, BaseFile>,
+}
+
+/// The memory gate's estimate of one patch candidate (M12-D7): the encoder's bound for the window,
+/// plus the base and the file it holds.
+pub fn patch_estimate(
+    encoder: &dyn Encoder,
+    codec: CodecId,
+    window: u64,
+    base_size: u64,
+    size: u64,
+) -> u64 {
+    encoder
+        .encode_patch_memory(codec, window)
+        .saturating_add(base_size)
+        .saturating_add(size)
+}
+
+/// One patch candidate to encode: a file of the new tree against its base file, with one codec.
+struct PatchJob {
+    /// Index of the base in [`Settings::bases`].
+    base: usize,
+    /// The first path with this content, for messages.
+    path: RelPath,
+    /// Where to read the new file.
+    file: PathBuf,
+    /// Its size and SHA-256 from the hash stage.
+    size: u64,
+    sha256: Sha256Digest,
+    /// The base file.
+    from: BaseFile,
+    codec: CodecId,
+    /// Its share of the memory budget ([`patch_estimate`]).
+    est: u64,
+}
+
+/// What one patch job ended with; only a changed input file is an error of the whole pack.
+enum PatchOutcome {
+    /// Encoded and round-tripped.
+    Patch(DeltaPatch),
+    /// The encode or the round trip failed: the reason.
+    Dropped(String),
+    /// The base file could not be read back from its pack: the reason. The whole base is skipped.
+    BaseFailed(String),
+}
+
+/// One base's version text and its patches, by path.
+type BaseDelta = (String, Vec<(RelPath, DeltaPatch)>);
+
+/// One candidate of one (base, file): the job that runs it, or the estimate that kept it from
+/// running (M12-D7).
+enum Cand {
+    Job(usize),
+    Memory(u64),
+}
+
+/// What the plan holds for one changed file and one base.
+enum PlanKind {
+    /// The window is over the cap (M12-D4): the window, if it is a number at all.
+    Window(Option<u64>),
+    /// The candidates, in rank order.
+    Cands(Vec<(CodecId, Cand)>),
+}
+
+struct FilePlan {
+    base: usize,
+    item: usize,
+    kind: PlanKind,
+}
+
+/// The base file's bytes, decoded from the base's pack through the client's own
+/// [`decode_verified`]: the frame hash before decoding, the file's size and hash after.
+fn read_base(
+    pack: &Path,
+    from: &BaseFile,
+    hasher: &dyn Hasher,
+    codec: &dyn Codec,
+) -> Result<Vec<u8>> {
+    let mut file = File::open(pack).with_context(|| format!("cannot read {}", pack.display()))?;
+    file.seek(SeekFrom::Start(from.frame.offset()))
+        .with_context(|| format!("cannot read {}", pack.display()))?;
+    let mut bytes = vec![0u8; usize::try_from(from.frame.length())?];
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("cannot read {}", pack.display()))?;
+    let mut out = Vec::with_capacity(usize::try_from(from.size)?);
+    decode_verified(&from.frame, &bytes, hasher, codec, &mut out)?;
+    Ok(out)
+}
+
+fn run_patch_job(
+    job: &PatchJob,
+    bases: &[BaseRelease],
+    encoder: &dyn Encoder,
+    codec: &dyn Codec,
+    hasher: &dyn Hasher,
+) -> Result<PatchOutcome> {
+    let pack = &bases
+        .get(job.base)
+        .context("internal error: a patch job without its base")?
+        .pack;
+    let base = match read_base(pack, &job.from, hasher, codec) {
+        Ok(base) => base,
+        Err(e) => {
+            return Ok(PatchOutcome::BaseFailed(format!(
+                "{} does not decode from its pack: {e:#}",
+                job.path
+            )));
+        }
+    };
+    let input = fs::read(&job.file).with_context(|| format!("cannot read {}", job.path))?;
+    if input.len() as u64 != job.size || hasher.sha256(&input) != job.sha256 {
+        bail!("{}: file changed after hashing", job.path);
+    }
+    Ok(
+        match encode_patch_checked(&job.path, job.codec, &base, &input, encoder, codec, hasher) {
+            Ok(patch) => PatchOutcome::Patch(patch),
+            Err(e) => PatchOutcome::Dropped(format!("{:#}", anyhow::Error::new(e))),
+        },
+    )
+}
+
+/// The delta stage (M12-D3, M12-D4, M12-D7), after the frames are chosen: every non-empty file of
+/// the new tree whose base has a non-empty file at the same path with another SHA-256 is encoded
+/// against it with each patch codec of its class, through the memory gate; each candidate is
+/// round-tripped; the shortest is kept if it is at least 10% shorter than the file's frame.
+/// A candidate whose estimate is over the whole budget is never started. A base whose file does
+/// not decode from its pack is skipped whole. Every changed file without a patch, every dropped
+/// candidate and every skipped base is one line of `lines`.
+///
+/// Returns, per base with at least one patch and in [`Settings::bases`] order, its version text
+/// and its patches. Jobs are kept by index, so the result does not depend on the worker count.
+fn delta_stage(
+    tree: &Path,
+    items: &[Item],
+    job_of: &[Option<usize>],
+    frame_len: &[u64],
+    set: &Settings<'_>,
+    lines: &mut Vec<String>,
+) -> Result<Vec<BaseDelta>> {
+    type Key = (usize, u64, [u8; 32], u64, [u8; 32], CodecId);
+    let mut jobs: Vec<PatchJob> = Vec::new();
+    let mut dedup: HashMap<Key, usize> = HashMap::new();
+    let mut plans: Vec<FilePlan> = Vec::new();
+    let mut classes: HashMap<usize, lunepack_core::FileClass> = HashMap::new();
+    for (b, base) in set.bases.iter().enumerate() {
+        for (i, item) in items.iter().enumerate() {
+            let ItemKind::File { size, sha256, .. } = &item.kind else {
+                continue;
+            };
+            let Some(from) = base.files.get(&item.path) else {
+                continue;
+            };
+            if *size == 0 || from.size == 0 || from.sha256 == *sha256 {
+                continue;
+            }
+            let window = patch_window(from.size, *size);
+            let Some(window) = window.filter(|w| *w <= set.patch_window_cap) else {
+                plans.push(FilePlan {
+                    base: b,
+                    item: i,
+                    kind: PlanKind::Window(window),
+                });
+                continue;
+            };
+            let class = match classes.get(&i) {
+                Some(class) => *class,
+                None => {
+                    // Classification reads the content only (M3-D6); the job reads it again and
+                    // compares it with the hash stage's SHA-256.
+                    let full = tree.join(item.path.as_str());
+                    let bytes =
+                        fs::read(&full).with_context(|| format!("cannot read {}", item.path))?;
+                    let class = classify(&bytes);
+                    classes.insert(i, class);
+                    class
+                }
+            };
+            let mut cands = Vec::new();
+            for codec in patch_candidates(class) {
+                let est = patch_estimate(set.encoder, codec, window, from.size, *size);
+                if est > set.budget {
+                    cands.push((codec, Cand::Memory(est)));
+                    continue;
+                }
+                let key = (
+                    b,
+                    from.size,
+                    *from.sha256.as_bytes(),
+                    *size,
+                    *sha256.as_bytes(),
+                    codec,
+                );
+                let j = *dedup.entry(key).or_insert_with(|| {
+                    jobs.push(PatchJob {
+                        base: b,
+                        path: item.path.clone(),
+                        file: tree.join(item.path.as_str()),
+                        size: *size,
+                        sha256: *sha256,
+                        from: from.clone(),
+                        codec,
+                        est,
+                    });
+                    jobs.len() - 1
+                });
+                cands.push((codec, Cand::Job(j)));
+            }
+            plans.push(FilePlan {
+                base: b,
+                item: i,
+                kind: PlanKind::Cands(cands),
+            });
+        }
+    }
+    let outcomes = run_gated(
+        &jobs,
+        set.workers,
+        set.budget,
+        &|job: &PatchJob| job.est,
+        &|job: &PatchJob| run_patch_job(job, set.bases, set.encoder, set.codec, set.hasher),
+    )?;
+    let mut base_failed: Vec<Option<&str>> = vec![None; set.bases.len()];
+    for (job, outcome) in jobs.iter().zip(&outcomes) {
+        if let PatchOutcome::BaseFailed(why) = outcome {
+            base_failed[job.base].get_or_insert(why.as_str());
+        }
+    }
+
+    let mut out = Vec::new();
+    for (b, base) in set.bases.iter().enumerate() {
+        let from = &base.version;
+        if let Some(why) = base_failed[b] {
+            lines.push(format!("delta: base {from} skipped: {why}"));
+            continue;
+        }
+        let mut patches = Vec::new();
+        let mut frames_replaced = 0u64;
+        for plan in plans.iter().filter(|p| p.base == b) {
+            let path = &items[plan.item].path;
+            let frame = job_of
+                .get(plan.item)
+                .copied()
+                .flatten()
+                .and_then(|j| frame_len.get(j))
+                .copied()
+                .unwrap_or(0);
+            let cands = match &plan.kind {
+                PlanKind::Window(window) => {
+                    let shown =
+                        window.map_or_else(|| "over u64".to_owned(), |w| format!("{w} bytes"));
+                    lines.push(format!(
+                        "no-patch: {path} from {from}: window ({shown}, above {} bytes)",
+                        set.patch_window_cap
+                    ));
+                    continue;
+                }
+                PlanKind::Cands(cands) => cands,
+            };
+            let (mut kept, mut memory, mut failed) = (Vec::new(), None::<u64>, false);
+            for (codec, cand) in cands {
+                match cand {
+                    Cand::Memory(est) => memory = Some(memory.map_or(*est, |m| m.min(*est))),
+                    Cand::Job(j) => match outcomes.get(*j) {
+                        Some(PatchOutcome::Patch(p)) => kept.push(p.clone()),
+                        Some(PatchOutcome::Dropped(why)) => {
+                            failed = true;
+                            lines.push(format!(
+                                "dropped: patch {path} from {from} {}: {why}",
+                                codec.id()
+                            ));
+                        }
+                        _ => bail!("internal error: a patch job without its outcome"),
+                    },
+                }
+            }
+            match choose_patch(kept, frame) {
+                PatchChoice::Patch(p) => {
+                    frames_replaced = frames_replaced.saturating_add(frame);
+                    patches.push((path.clone(), p));
+                }
+                other => {
+                    let why = if let Some(est) = memory {
+                        format!(
+                            "memory (estimate {} MiB, budget {} MiB)",
+                            est.div_ceil(MIB),
+                            set.budget / MIB
+                        )
+                    } else if failed {
+                        "failed".to_owned()
+                    } else if let PatchChoice::NotSmaller(len) = other {
+                        format!("not-smaller (patch {len} bytes, frame {frame} bytes)")
+                    } else {
+                        "failed".to_owned()
+                    };
+                    lines.push(format!("no-patch: {path} from {from}: {why}"));
+                }
+            }
+        }
+        if patches.is_empty() {
+            lines.push(format!("delta: from {from}: no patch"));
+            continue;
+        }
+        let bytes: u64 = patches.iter().map(|(_, p)| p.bytes.len() as u64).sum();
+        lines.push(format!(
+            "delta: from {from}: {} patch(es), {bytes} bytes for {frames_replaced} bytes of frames",
+            patches.len()
+        ));
+        out.push((from.clone(), patches));
     }
     Ok(out)
 }
@@ -861,6 +1216,9 @@ pub struct Report {
     pub per_codec: BTreeMap<&'static str, usize>,
     /// Candidates dropped: the path, the codec and the reason.
     pub dropped: Vec<(String, CodecId, String)>,
+    /// The delta stage's lines (M12-D4): skipped bases, dropped patch candidates, every changed
+    /// file without a patch and one summary per base, in base and then path order.
+    pub deltas: Vec<String>,
 }
 
 /// Settings of [`build`].
@@ -882,6 +1240,11 @@ pub struct Settings<'a> {
     pub hasher: &'a dyn Hasher,
     /// The runtime and update configuration to place after assemble, when `[update]` is set.
     pub update: Option<UpdatePlan<'a>>,
+    /// The earlier releases patches are made from (M12-D3), highest first; empty for none.
+    pub bases: &'a [BaseRelease],
+    /// The largest patch window (FORMAT.md 9.3): [`lunepack_core::MAX_PATCH_WINDOW`], smaller only
+    /// in tests.
+    pub patch_window_cap: u64,
 }
 
 /// The unsigned result of stages 1 to 5.
@@ -890,6 +1253,8 @@ pub struct Built {
     pub manifest: ManifestDocument,
     /// The pack bytes.
     pub pack: Vec<u8>,
+    /// The delta files, in the manifest's `deltas` order.
+    pub deltas: Vec<DeltaFile>,
     /// Counts for the output.
     pub report: Report,
 }
@@ -996,6 +1361,22 @@ pub fn build(
         }
     }
 
+    let deltas = if set.bases.is_empty() {
+        Vec::new()
+    } else {
+        let frame_len: Vec<u64> = packed
+            .iter()
+            .map(|p| p.frame.as_ref().map_or(0, |f| f.bytes.len() as u64))
+            .collect();
+        let deltas = delta_stage(&tree, &items, &job_of, &frame_len, set, &mut report.deltas)?;
+        say(&format!(
+            "delta: {} base(s), {} delta file(s)",
+            set.bases.len(),
+            deltas.len()
+        ))?;
+        deltas
+    };
+
     // Each frame is dropped right after its last user is added, so the peak stays near one copy
     // of the frames (the layout holds its own).
     let mut last_use = vec![0usize; jobs.len()];
@@ -1038,10 +1419,14 @@ pub fn build(
             }
         }
     }
-    let (manifest, pack) = layout.finish(issued, set.hasher)?;
+    for (from, patches) in deltas {
+        layout.add_delta(&from, patches)?;
+    }
+    let release = layout.finish_release(issued, set.hasher)?;
     Ok(Built {
-        manifest,
-        pack,
+        manifest: release.manifest,
+        pack: release.pack,
+        deltas: release.deltas,
         report,
     })
 }
@@ -1099,6 +1484,8 @@ mod tests {
             codec: &LzmaCodec,
             hasher: &Sha256Hasher,
             update: None,
+            bases: &[],
+            patch_window_cap: lunepack_core::MAX_PATCH_WINDOW,
         };
         let layout = ReleaseLayout::new(
             AppId::parse("org.example.app").unwrap(),
@@ -1176,6 +1563,131 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Builds release `version` of `files` (path -> bytes) with `bases`, the window cap `cap` and
+    /// `workers`; returns the build and the work dir that holds nothing after.
+    fn build_release(
+        files: &[(&str, Vec<u8>)],
+        version: &str,
+        bases: &[BaseRelease],
+        cap: u64,
+        workers: usize,
+    ) -> Built {
+        let input = tempfile::tempdir().unwrap();
+        for (path, bytes) in files {
+            fs::write(input.path().join(path), bytes).unwrap();
+        }
+        let work = tempfile::tempdir().unwrap();
+        let set = Settings {
+            workers,
+            budget: 1 << 30,
+            code_sign: &crate::NoCodeSign,
+            os_signing: false,
+            encoder: &LzmaCodec,
+            codec: &LzmaCodec,
+            hasher: &Sha256Hasher,
+            update: None,
+            bases,
+            patch_window_cap: cap,
+        };
+        let layout = ReleaseLayout::new(
+            AppId::parse("org.example.app").unwrap(),
+            version,
+            Target::LinuxX86_64,
+        )
+        .unwrap();
+        build(
+            input.path(),
+            work.path(),
+            layout,
+            Target::LinuxX86_64,
+            1_800_000_000,
+            &set,
+            &mut |_| Ok(()),
+        )
+        .unwrap()
+    }
+
+    /// The base a built release makes once its pack is written to `dir`.
+    fn base_of(built: &Built, version: &str, dir: &Path) -> BaseRelease {
+        let pack = dir.join(format!("{version}.pack"));
+        fs::write(&pack, &built.pack).unwrap();
+        let mut files = BTreeMap::new();
+        for e in &built.manifest.entries {
+            if let (Some(size), Some(sha256), Some(frame)) = (e.size, e.sha256, &e.frame) {
+                let frame = frame
+                    .check(size.get(), sha256, built.pack.len() as u64)
+                    .unwrap();
+                files.insert(
+                    e.path.clone(),
+                    BaseFile {
+                        size: size.get(),
+                        sha256,
+                        frame,
+                    },
+                );
+            }
+        }
+        BaseRelease {
+            version: version.to_owned(),
+            pack,
+            files,
+        }
+    }
+
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn edit(mut v: Vec<u8>) -> Vec<u8> {
+        let at = v.len() / 2;
+        v[at] ^= 0x5A;
+        v
+    }
+
+    /// M12-D4 `window`, with the cap lowered through the test seam: a changed file whose window
+    /// (`round_up(base + size, 4096)`) is over the cap gets a `window` line and no candidate; one
+    /// at exactly the cap gets its patch. The result does not depend on the worker count.
+    #[test]
+    fn a_window_over_the_cap_gets_no_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (small, big) = (noise(1, 2000), noise(2, 3000));
+        let v1 = build_release(
+            &[("small.bin", small.clone()), ("big.bin", big.clone())],
+            "1.0.0",
+            &[],
+            lunepack_core::MAX_PATCH_WINDOW,
+            1,
+        );
+        let base = [base_of(&v1, "1.0.0", dir.path())];
+        let v2 = [("small.bin", edit(small)), ("big.bin", edit(big))];
+        let one = build_release(&v2, "2.0.0", &base, 4096, 1);
+        assert_eq!(
+            one.report.deltas,
+            [
+                "no-patch: big.bin from 1.0.0: window (8192 bytes, above 4096 bytes)".to_owned(),
+                format!(
+                    "delta: from 1.0.0: 1 patch(es), {} bytes for 2000 bytes of frames",
+                    one.deltas[0].bytes.len()
+                ),
+            ]
+        );
+        let patches = &one.manifest.deltas.as_ref().unwrap()[0].patches;
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].path.as_str(), "small.bin");
+        let four = build_release(&v2, "2.0.0", &base, 4096, 4);
+        assert_eq!(four.manifest, one.manifest);
+        assert_eq!(four.deltas, one.deltas);
+        assert_eq!(four.pack, one.pack);
     }
 
     #[test]
