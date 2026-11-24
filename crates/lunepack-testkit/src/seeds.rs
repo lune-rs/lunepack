@@ -11,15 +11,16 @@ use std::path::{Path, PathBuf};
 
 use lunepack_core::fuzz::{
     FRAME_HEADER_LEN, FUZZ_APP_ID, FUZZ_TARGET, FUZZ_VERSION, HTTP_HEADER_LEN, STATE_NAME_SEQ,
+    deltas_file_bytes,
 };
 use lunepack_core::service;
 use lunepack_core::state::{self, MAX_RECORD_BYTES};
 use lunepack_core::trust::PublicKey;
 use lunepack_core::{
-    AppId, ByteRange, Channel, CodecId, ContentRange, CurrentRef, DeltaPatch, EnvelopeSignature,
-    Floors, FrameDesc, Fs, Hasher, InstallCounters, InstallState, Loaded, ManifestDocument,
-    PayloadKind, PreviousRef, ReleaseLayout, RootParts, Scope, StagedRef, StreamDesc, Target,
-    Validator, Version, pack_file, write_envelope,
+    AppId, ByteRange, Channel, CodecId, ContentRange, CurrentRef, DeltaDoc, DeltaPatch,
+    EnvelopeSignature, Floors, FrameDesc, Fs, Hasher, InstallCounters, InstallState, Loaded,
+    ManifestDocument, PatchDoc, PayloadKind, PreviousRef, ReleaseLayout, RootParts, Scope,
+    StagedRef, StreamDesc, Target, Validator, Version, pack_file, write_envelope,
 };
 use lunepack_core::{InstallMeta, RelPath, UpdateConfig};
 
@@ -43,6 +44,9 @@ pub struct Seed {
     pub bytes: Vec<u8>,
     /// Whether the harness must take this input all the way through (`fuzz::accepts`).
     pub accepted: bool,
+    /// For a rejected seed whose reason is asserted: text the refusal's error contains. `None`
+    /// for every other seed.
+    pub reason: Option<&'static str>,
 }
 
 struct Out(Vec<Seed>);
@@ -56,12 +60,27 @@ impl Out {
         self.add(harness, format!("bad-{name}"), bytes.into(), false);
     }
 
+    /// A rejected seed whose error must contain `reason`.
+    fn bad_because(
+        &mut self,
+        harness: &'static str,
+        name: &str,
+        reason: &'static str,
+        bytes: impl Into<Vec<u8>>,
+    ) {
+        self.add(harness, format!("bad-{name}"), bytes.into(), false);
+        if let Some(seed) = self.0.last_mut() {
+            seed.reason = Some(reason);
+        }
+    }
+
     fn add(&mut self, harness: &'static str, name: String, bytes: Vec<u8>, accepted: bool) {
         self.0.push(Seed {
             harness,
             name,
             bytes,
             accepted,
+            reason: None,
         });
     }
 }
@@ -79,6 +98,7 @@ pub fn fuzz_seeds() -> Vec<Seed> {
     keys_seeds(&fx, &mut out);
     feed_seeds(&fx, &mut out);
     manifest_seeds(&fx, &mut out);
+    deltas_seeds(&fx, &mut out);
     path_seeds(&mut out);
     tree_seeds(&mut out);
     rules_seeds(&mut out);
@@ -481,6 +501,195 @@ fn delta_manifest_seeds(fx: &ChainFixture<'_>, out: &mut Out) {
         deltas[0].patches[0].base_size = u53(lunepack_core::MAX_PATCH_WINDOW);
     }
     out.bad("manifest", "delta-window-over-128-mib", wide.to_payload());
+}
+
+// ---- the `deltas` member (FORMAT.md 9.3) ---------------------------------------------------------
+
+/// The `deltas` member of `doc` as the harness takes it: the JSON array, nothing around it.
+fn deltas_value(deltas: &[DeltaDoc]) -> Vec<u8> {
+    serde_json::to_vec(deltas).expect("deltas serialise")
+}
+
+/// The writer's deltas of a release with one patch per `from` in `froms` (all of `bin/app`).
+fn writer_deltas(fx: &ChainFixture<'_>, froms: &[&str]) -> Vec<DeltaDoc> {
+    let patches: &[(&str, CodecId)] = &[("bin/app", CodecId::Lzma2)];
+    let list: Vec<(&str, &[(&str, CodecId)])> = froms.iter().map(|f| (*f, patches)).collect();
+    delta_release(fx, &list).deltas.expect("deltas")
+}
+
+fn deltas_seeds(fx: &ChainFixture<'_>, out: &mut Out) {
+    let bad = |out: &mut Out, name: &str, reason: &'static str, deltas: &[DeltaDoc]| {
+        out.bad_because("deltas", name, reason, deltas_value(deltas));
+    };
+    let sha = |len: usize, salt: u8| fx.hasher.sha256(&deltas_file_bytes(len, salt));
+
+    // Accepted.
+    out.ok(
+        "deltas",
+        "one-delta",
+        deltas_value(&writer_deltas(fx, &["0.9.0"])),
+    );
+    out.ok(
+        "deltas",
+        "two-deltas-three-codecs",
+        delta_release(
+            fx,
+            &[
+                (
+                    "0.9.0",
+                    &[
+                        ("bin/app", CodecId::BcjX86Lzma2),
+                        ("lib/x.so.1", CodecId::Lzma2),
+                    ],
+                ),
+                ("1.0.0-beta.2", &[("bin/app", CodecId::BcjArm64Lzma2)]),
+            ],
+        )
+        .deltas
+        .map(|d| deltas_value(&d))
+        .expect("deltas"),
+    );
+    let froms: Vec<String> = (1..=16).map(|i| format!("0.{i}.0")).collect();
+    let froms: Vec<&str> = froms.iter().map(String::as_str).collect();
+    out.ok(
+        "deltas",
+        "sixteen-deltas",
+        deltas_value(&writer_deltas(fx, &froms)),
+    );
+    out.ok(
+        "deltas",
+        "from-build-metadata",
+        deltas_value(&writer_deltas(fx, &["0.9.0+build.7"])),
+    );
+
+    // Rejected, one per rule of `check_deltas`: the writer's document with one thing changed.
+    bad(out, "empty-list", "deltas without a delta", &[]);
+    let mut seventeen = writer_deltas(fx, &froms);
+    let mut extra = seventeen[0].clone();
+    extra.from = "0.17.0".to_owned();
+    seventeen.push(extra);
+    bad(out, "seventeen-deltas", "17 deltas, at most 16", &seventeen);
+
+    let mut deltas = writer_deltas(fx, &["0.9.0"]);
+    deltas[0].from = FUZZ_VERSION.to_owned();
+    bad(
+        out,
+        "from-equal-to-the-release",
+        "delta from a version not below the release",
+        &deltas,
+    );
+    deltas[0].from = "1.0.1".to_owned();
+    bad(
+        out,
+        "from-above-the-release",
+        "delta from a version not below the release",
+        &deltas,
+    );
+
+    let mut deltas = writer_deltas(fx, &["0.8.0", "0.9.0"]);
+    deltas[1].from = "0.9.0+build.7".to_owned();
+    bad(
+        out,
+        "from-equal-precedence",
+        "two deltas from versions of equal precedence",
+        &deltas,
+    );
+
+    let mut deltas = writer_deltas(fx, &["0.9.0"]);
+    deltas[0].size = u53(0);
+    bad(out, "empty-delta-file", "empty delta file", &deltas);
+
+    let mut deltas = writer_deltas(fx, &["0.9.0"]);
+    deltas[0].patches.clear();
+    bad(out, "no-patch", "delta without a patch", &deltas);
+
+    let edit = |edit: &dyn Fn(&mut PatchDoc)| {
+        let mut deltas = writer_deltas(fx, &["0.9.0"]);
+        edit(&mut deltas[0].patches[0]);
+        deltas
+    };
+    let path = |p: &str| RelPath::parse(p).expect("path");
+    bad(
+        out,
+        "patch-for-an-empty-file",
+        "patch for an empty file",
+        &edit(&|p| p.path = path("share/empty")),
+    );
+    bad(
+        out,
+        "patch-for-a-symlink",
+        "patch for a path that is not a file entry",
+        &edit(&|p| p.path = path("lib/x.so")),
+    );
+    bad(
+        out,
+        "patch-for-an-absent-path",
+        "patch for a path that is not a file entry",
+        &edit(&|p| p.path = path("bin/missing")),
+    );
+    let mut deltas = writer_deltas(fx, &["0.9.0"]);
+    let second = deltas[0].patches[0].clone();
+    deltas[0].patches.push(second);
+    bad(
+        out,
+        "two-patches-for-one-file",
+        "two patches for one file in a delta",
+        &deltas,
+    );
+    bad(
+        out,
+        "empty-base",
+        "patch from an empty base",
+        &edit(&|p| p.base_size = u53(0)),
+    );
+    bad(
+        out,
+        "base-is-the-file",
+        "patch whose base is the file itself",
+        &edit(&|p| p.base_sha256 = sha(300, 1)),
+    );
+    bad(
+        out,
+        "codec-stored",
+        "codec not allowed for a patch",
+        &edit(&|p| p.codec = CodecId::Stored.id().to_owned()),
+    );
+    bad(
+        out,
+        "codec-bcj2",
+        "codec not allowed for a patch",
+        &edit(&|p| p.codec = CodecId::Bcj2.id().to_owned()),
+    );
+    bad(
+        out,
+        "codec-unknown",
+        "unknown codec",
+        &edit(&|p| p.codec = "zstd".to_owned()),
+    );
+    bad(
+        out,
+        "empty-patch",
+        "empty patch",
+        &edit(&|p| p.length = u53(0)),
+    );
+    bad(
+        out,
+        "patch-past-the-delta-file-end",
+        "patch outside its delta file",
+        &edit(&|p| p.offset = u53(p.offset.get() + 1)),
+    );
+    bad(
+        out,
+        "patch-offset-overflow",
+        "patch outside its delta file",
+        &edit(&|p| p.offset = u53((1 << 53) - 1)),
+    );
+    bad(
+        out,
+        "window-over-128-mib",
+        "patch window above 128 MiB",
+        &edit(&|p| p.base_size = u53(lunepack_core::MAX_PATCH_WINDOW)),
+    );
 }
 
 fn path_seeds(out: &mut Out) {
@@ -1565,6 +1774,12 @@ fn service_seeds(out: &mut Out) {
         "service",
         "server-v2-put-patch",
         server_stream_range(1, 2, &[put_patch.clone(), data(6, 3)]),
+    );
+    out.bad(
+        "service",
+        "server-v2-put-patch-longer-than-declared",
+        // 4 + 4 bytes of data for a declared 6: the second frame passes the declared length.
+        server_stream_range(1, 2, &[put_patch.clone(), data(4, 3), data(4, 3)]),
     );
     out.bad(
         "service",

@@ -1,7 +1,7 @@
 # Fuzz targets
 
 libFuzzer targets over the untrusted-input harnesses of `lunepack_core::fuzz` (envelopes, root,
-key set, feed, manifest, paths, trees, version/target/id rules, strict JSON, frames, HTTP response
+key set, feed, manifest, a manifest's deltas, paths, trees, version/target/id rules, strict JSON, frames, HTTP response
 headers, the setup-file locator and trailer, the service protocol, the UI frames). Each target
 calls one harness; a harness must return for any input without panicking.
 
@@ -17,7 +17,7 @@ the committed seeds and random and mutated inputs on stable:
     cargo install cargo-fuzz --locked
     cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
 
-Targets: `envelope`, `root`, `keys`, `feed`, `manifest`, `path`, `tree`, `rules`, `json`, `frame`, `http`,
+Targets: `envelope`, `root`, `keys`, `feed`, `manifest`, `deltas`, `path`, `tree`, `rules`, `json`, `frame`, `http`,
 `state`, `update_config`, `setup`, `service`, `ui`.
 If AddressSanitizer does not work on your host, add `-s none`. `corpus/` and `artifacts/` are
 local and gitignored; a crash lands in `artifacts/<target>/`.
@@ -41,6 +41,11 @@ regression case and fix the parser.
 - `root`, `keys`, `feed`, `manifest`: the bytes are a payload; the harness signs it with a built-in
   fake key and runs the real verification function (`advance_root`, `verify_key_set`,
   `verify_feed`, `verify_manifest`).
+- `deltas`: the bytes are the JSON value of the `deltas` member of a manifest (FORMAT.md 9.3). The
+  harness splices them into a fixed valid manifest of `org.example.hello` 1.0.0 for `linux-x86_64`
+  (files `bin/app` of 300 bytes, `lib/x.so.1` of 200, an empty `share/empty`, and the link
+  `lib/x.so`), signs it and runs the same `verify_manifest` call as `manifest`. A patch can name
+  those files; the seeds carry their sizes and hashes.
 - `path`: one entry path. `tree`: lines `f <path>`, `d <path>`, `l <path>><link target>`.
 - `rules`: text through the version, target, app id, channel, algorithm, codec, hex, base64 and
   reference rules. `json`: the strict JSON pre-pass.

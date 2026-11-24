@@ -16,6 +16,7 @@ mod machine;
 mod memfs;
 mod process;
 mod publisher;
+pub mod replay;
 mod rng;
 mod seeds;
 mod signer;
