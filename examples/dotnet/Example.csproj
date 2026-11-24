@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The .NET example app: the same app as the shell app of the end-to-end suite, written against the
+    runtime's command line only. It is published self-contained for one runtime identifier at a time
+    (scripts/build-example-dotnet.sh passes the runtime identifier and the self-contained switch), never as a single file and never
+    trimmed. It has no package reference and no lock file: the SDK version in global.json is the pin.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Example</AssemblyName>
+    <RootNamespace>Example</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <UseAppHost>true</UseAppHost>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!--
+    macOS bundle layout: a signature of a file that is not Mach-O lives in an extended attribute, which a
+    pack does not carry, so only the host may sit in Contents/MacOS and the managed files go under
+    Contents/Resources/app. The host finds them through the app path written into it, which the SDK's
+    own CreateAppHost task sets (no patching of the host afterwards). Runs only when the script passes
+    the property MacBundleHost=<path of the host inside the bundle>; the script then moves the rest of the publish
+    output next to the path the host names.
+  -->
+  <Target Name="ExampleMacBundleHost"
+          AfterTargets="Publish"
+          DependsOnTargets="_GetAppHostPaths;_GetAppHostCreationConfiguration"
+          Condition="'$(MacBundleHost)' != ''">
+    <CreateAppHost AppHostSourcePath="$(AppHostSourcePath)"
+                   AppHostDestinationPath="$(MacBundleHost)"
+                   AppBinaryName="../Resources/app/$(AssemblyName)$(TargetExt)"
+                   IntermediateAssembly="@(IntermediateAssembly->'%(FullPath)')"
+                   EnableMacOSCodeSign="true" />
+  </Target>
+
+</Project>
