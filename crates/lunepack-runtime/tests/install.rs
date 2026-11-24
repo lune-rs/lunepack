@@ -296,7 +296,8 @@ impl Lab {
     }
 
     fn run(&self, runtime: &Path, mode: &str) -> Run {
-        let child = self.command(runtime, mode).spawn().expect("runtime");
+        let child =
+            lunepack_testkit::exec::spawn(&mut self.command(runtime, mode)).expect("runtime");
         Run::of(finish(child))
     }
 

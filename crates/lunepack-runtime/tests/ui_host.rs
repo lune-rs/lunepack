@@ -1618,7 +1618,7 @@ mod native {
 
         fn run_cmd(&self, mut cmd: Command) -> Run {
             let started = Instant::now();
-            let child = cmd.spawn().expect("runtime");
+            let child = lunepack_testkit::exec::spawn(&mut cmd).expect("runtime");
             let out = finish(child);
             Run::of(out, started.elapsed())
         }
@@ -2265,7 +2265,7 @@ mod native {
 
     impl IntoChild for Command {
         fn into_child(mut self) -> Child {
-            self.spawn().expect("runtime")
+            lunepack_testkit::exec::spawn(&mut self).expect("runtime")
         }
     }
 

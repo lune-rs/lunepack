@@ -9,6 +9,7 @@ mod clock;
 mod codec;
 mod docs;
 pub mod exe_headers;
+pub mod exec;
 mod hasher;
 mod http_server;
 mod integration;
