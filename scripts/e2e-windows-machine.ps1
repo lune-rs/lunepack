@@ -1244,7 +1244,7 @@ try {
             $d = URun 'r11f-download' $rt 'download --json --expect-version 1.10.2'
             SameV 'download exit code' $d.ExitCode 0
             $lines = @($d.Output -split "`r?`n")
-            Require (@($lines[-1], $lines[-2]) -match '"staged":true') 'download stages the update'
+            Require (@(@($lines[-1], $lines[-2]) | Where-Object { $_ -match '"staged":true' }).Count -gt 0) 'download stages the update'
             # The runtime writes at most ten progress lines a second (and a phase's last one), so the
             # file's own `stage` line may be missing: the download's size says it was a patch, and any
             # line that is there names the patch.
