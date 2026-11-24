@@ -22,7 +22,8 @@
 //! Environment: `LUNEPACK_E2E_RUNTIME` (the static runtime), `LUNEPACK_E2E_CLI` (`lunepack`),
 //! `LUNEPACK_E2E_APP` (the Rust example app), `LUNEPACK_E2E_SHELL_APP` (the shell app),
 //! `LUNEPACK_E2E_FAKE_UI` (the stand-in UI, `tests/e2e/fake-ui`) and `LUNEPACK_E2E_UI` (the real
-//! `lunepack-ui`). `LUNEPACK_E2E_DOTNET_APP` names the published folder of the .NET example (its
+//! `lunepack-ui`). On macOS `LUNEPACK_E2E_DOTNET_BUNDLE` names the example's app bundle instead.
+//! `LUNEPACK_E2E_DOTNET_APP` names the published folder of the .NET example (its
 //! entry is `Example`; `scripts/build-example-dotnet.sh` makes it); with `LUNEPACK_E2E_REQUIRE=1`
 //! it must be set, and `LUNEPACK_E2E_DOTNET=0` is the one opt-out (the suite prints `SKIPPED`).
 
@@ -115,6 +116,39 @@ fn run(_: &Paths<'_>) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// The .NET example's app bundle of the macOS suite (M13 step 8): `LUNEPACK_E2E_DOTNET_BUNDLE` names
+/// the `.app` that `scripts/build-example-dotnet.sh --macos-bundle` made. `Ok(None)` when its row
+/// is skipped: by name (`LUNEPACK_E2E_DOTNET=0`) or, without `LUNEPACK_E2E_REQUIRE=1`, because no
+/// bundle was given; either way the suite says `SKIPPED` once. An error when the row is required
+/// and the bundle is not usable.
+#[cfg(target_os = "macos")]
+fn dotnet_bundle() -> Result<Option<PathBuf>, String> {
+    const BUNDLE_VAR: &str = "LUNEPACK_E2E_DOTNET_BUNDLE";
+    const DOTNET_VAR: &str = "LUNEPACK_E2E_DOTNET";
+    if std::env::var(DOTNET_VAR).is_ok_and(|v| v == "0") {
+        eprintln!("e2e: SKIPPED: the .NET row ({DOTNET_VAR}=0)");
+        return Ok(None);
+    }
+    let required = std::env::var(REQUIRE_VAR).is_ok_and(|v| v == "1");
+    let Some(bundle) = std::env::var_os(BUNDLE_VAR).map(PathBuf::from) else {
+        if required {
+            return Err(format!(
+                "{REQUIRE_VAR}=1, but {BUNDLE_VAR} is not set ({DOTNET_VAR}=0 skips the .NET row)"
+            ));
+        }
+        eprintln!("e2e: SKIPPED: the .NET row ({BUNDLE_VAR} is not set)");
+        return Ok(None);
+    };
+    if !bundle.join("Contents/MacOS/Example").is_file()
+        || !bundle.join("Contents/Info.plist").is_file()
+    {
+        return Err(format!(
+            "{BUNDLE_VAR} does not name the example's bundle (Contents/Info.plist, Contents/MacOS/Example)"
+        ));
+    }
+    Ok(Some(bundle))
+}
+
 /// The macOS suite (M8 step 10): `scripts/e2e-macos.sh` makes the temporary root and sets `HOME`
 /// and `LUNEPACK_E2E_ROOT`; the rows are in [`macos`].
 #[cfg(target_os = "macos")]
@@ -141,6 +175,13 @@ fn run(paths: &Paths<'_>) -> ExitCode {
         app: paths.app.clone(),
         shell_app: paths.shell.clone(),
         fake_ui: paths.fake_ui.clone(),
+        dotnet_bundle: match dotnet_bundle() {
+            Ok(bundle) => bundle,
+            Err(why) => {
+                eprintln!("e2e: FAIL: {why}");
+                return ExitCode::FAILURE;
+            }
+        },
     };
     let ci = std::env::var("LUNEPACK_E2E_CI").is_ok_and(|v| v == "1");
     match macos::run_all(&bins, ci) {

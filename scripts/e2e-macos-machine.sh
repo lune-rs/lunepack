@@ -51,6 +51,14 @@
 #   14  the package again: the same version repairs (installer exits 0), another version fails
 #   12  uninstall: the user's own run shows the command (30); root's refused while the user runs
 #       from the bundle (25), complete after; nothing left
+#   15  the .NET example (examples/dotnet, M13 step 8) as the app, a bundle with the host alone in
+#       Contents/MacOS and its managed files under Contents/Resources/app: installed by `.pkg`, the
+#       standard user's update through the daemon, a version that crashes on start (rolled back,
+#       not offered again), the fixed version, root's uninstall, nothing left; the bundle passes
+#       `codesign --verify --deep --strict` after every step and carries no `com.apple.cs.*`
+#       attribute. Needs the .NET SDK of examples/dotnet/global.json (its folder: LUNEPACK_E2E_DOTNET_DIR,
+#       else the usual places); `dotnet` missing is a failure and LUNEPACK_E2E_DOTNET=0 skips the
+#       row (SKIPPED). This row has not been run by an agent: it follows rows 2, 3, 4 and 12.
 #
 # The harness never prints an environment dump; a failed check names what differed (versions,
 # outcome words, exit codes, modes). bash 3.2 compatible (the system bash).
@@ -89,6 +97,7 @@ ROWS=(
   "11b an update by delta through the service (protocol version 2): the changed file arrives as a patch"
   "14  the package again (same version repairs, another version fails)"
   "12  uninstall (the user's command, root refused while in use, complete, nothing left)"
+  "15  the .NET example app: install by .pkg, update through the daemon, crash and rollback, the fixed version, uninstall"
 )
 
 dry=0
@@ -191,6 +200,20 @@ limited() {
 
 bhome=$(dscl . -read "/Users/$builder" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
 [ -d "$bhome" ] || die "the administrator's home is not a folder"
+# Row 15 needs the .NET SDK: its folder is found before anything is made or touched.
+dotnet_wanted=1
+dotnet_dir=
+if [ "${LUNEPACK_E2E_DOTNET:-1}" = 0 ]; then
+  dotnet_wanted=0
+else
+  for d in "${LUNEPACK_E2E_DOTNET_DIR:-}" /opt/homebrew/bin /usr/local/share/dotnet /usr/local/bin "$bhome/.dotnet"; do
+    if [ -n "$d" ] && [ -x "$d/dotnet" ]; then
+      dotnet_dir=$d
+      break
+    fi
+  done
+  [ -n "$dotnet_dir" ] || die "refusing to run: dotnet was not found (LUNEPACK_E2E_DOTNET_DIR names its folder; LUNEPACK_E2E_DOTNET=0 skips row 15)"
+fi
 root=$(mktemp -d /private/tmp/lunepack-e2e-mac-machine.XXXXXX)
 root=$(cd "$root" && pwd -P)
 case $root in
@@ -398,6 +421,40 @@ EOF
   chmod -R a+rX "$rd"
 }
 
+# publish_dotnet VERSION HEALTH_TIMEOUT [FLAG...]: as publish, for the .NET example's bundle (row 15):
+# the host alone in Contents/MacOS, its managed files under Contents/Resources/app. Every Mach-O file
+# of the assembled bundle is signed ad hoc, inner first (the runtime, the service, the loose
+# libraries of Contents/Resources/app), then the bundle; `entry` is `Example` while the row runs.
+publish_dotnet() {
+  local ver=$1 timeout=$2 flag input asm code
+  shift 2
+  input=$root/work/in-$ver
+  asm=$root/work/assembled-$ver
+  rm -rf "$input" "$asm"
+  cp -R "$root/build/Example.app" "$input"
+  printf '%s\n' "$ver" >"$input/Contents/Resources/version.txt"
+  for flag in "$@"; do
+    printf '%s\n' "$flag" >>"$input/Contents/Resources/e2e-flags"
+  done
+  chown -R "$builder" "$input"
+  write_config "$ver" "$timeout"
+  cli pack --input "$input" --version "$ver" --target "$target" --runtime "$root/build/lunepack-runtime" \
+    --service "$root/build/lunepack-service" --config "$root/pub/release-$ver.toml" --assemble "$asm" >/dev/null
+  while IFS= read -r code; do
+    if file -b "$code" | grep -q 'Mach-O'; then
+      sign_adhoc "$code"
+    fi
+  done < <(find "$asm/Contents/Resources/app" -type f)
+  for code in "$asm/Contents/MacOS/lunepack-runtime" "$asm/Contents/MacOS/lunepack-service" "$asm"; do
+    sign_adhoc "$code"
+  done
+  cli pack --input "$asm" --version "$ver" --target "$target" \
+    --runtime "$asm/Contents/MacOS/lunepack-runtime" --service "$asm/Contents/MacOS/lunepack-service" \
+    --config "$root/pub/release-$ver.toml" --release-dir "$rd" --sign release >/dev/null
+  cli feed add --release-dir "$rd" --channel stable --version "$ver" --sign release --config "$cfg" >/dev/null
+  chmod -R a+rX "$rd"
+}
+
 # ---- what is installed ------------------------------------------------------------------------
 
 version_of_bundle() {
@@ -517,6 +574,14 @@ chmod -R a+rX "$root/build"
 for f in "$root/build/lunepack-runtime" "$root/build/lunepack-service" "$root/build/e2e_app" "$tdir/release/lunepack"; do
   [ -f "$f" ] || die "the build left no ${f##*/}"
 done
+if [ "$dotnet_wanted" -eq 1 ]; then
+  # The .NET example for this Mac's own target (a thin runtime: never macos-universal), as a bundle.
+  as_builder env PATH="$dotnet_dir:$bhome/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    sh -c "cd '$top' && ./scripts/build-example-dotnet.sh $target '$root/build/dotnet' --macos-bundle '$root/build/Example.app'"
+  [ -x "$root/build/Example.app/Contents/MacOS/Example" ] || die "the build left no .NET bundle"
+  chown -R "$builder" "$root/build"
+  chmod -R a+rX "$root/build"
+fi
 
 # ---- the publisher and the first release ----------------------------------------------------------
 
@@ -895,6 +960,72 @@ sleep 1
 eq "complete when nothing runs from the bundle (0)" "$(rc_of "$rt" uninstall)" 0
 check "nothing of the install is left" nothing_left
 check "no process of ours is left" bash -c '! pgrep -f "lunepack-(runtime|service)" >/dev/null'
+
+row "15 the .NET example app"
+if [ "$dotnet_wanted" -eq 0 ]; then
+  skipped "the .NET row (LUNEPACK_E2E_DOTNET=0)"
+else
+  entry=Example
+  # Strict verification and no signature kept in an extended attribute (M13-D12), after every step.
+  sealed() { # WHAT
+    check "the bundle verifies strictly $1" bash -c '/usr/bin/codesign --verify --deep --strict "$1" >/dev/null 2>&1' _ "$B"
+    check "no file of the bundle carries a com.apple.cs attribute $1" bash -c '! /usr/bin/xattr -lr "$1" 2>/dev/null | grep -q "com.apple.cs"' _ "$B"
+  }
+  publish_dotnet 2.0.0 60
+  pkg15=$root/setup/$app_id-2.0.0-$target.pkg
+  cli setup "$rd" --version 2.0.0 --target "$target" --out "$root/setup/$app_id-2.0.0-$target.dmg" --config "$cfg" >/dev/null
+  chmod -R a+rX "$root/setup"
+  eq "installer exits 0" "$(rc_of limited 600 installer -pkg "$pkg15" -target /)" 0
+  eq "the bundle is version 2.0.0" "$(version_of_bundle)" 2.0.0
+  check "the host is alone in Contents/MacOS besides the runtime and the service" bash -c '[ "$(ls "$1/Contents/MacOS" | sort | tr "\n" " ")" = "Example lunepack-runtime lunepack-service " ]' _ "$B"
+  check "the example's managed files are under Contents/Resources/app" test -f "$B/Contents/Resources/app/Example.dll"
+  sealed "after the install"
+  reset_outcomes
+  check "the user starts the app" as_user "$B/Contents/MacOS/Example"
+  check "and it confirmed or had nothing pending" bash -c 'grep -qE "^2.0.0 (confirmed|nothing-pending)$" "$1"' _ "$outcome"
+
+  # The user's update through the daemon, with no prompt.
+  publish_dotnet 2.1.0 60
+  reset_outcomes
+  app_start --update --no-ui || true
+  check "the app scheduled the update" wait_for 60 has_outcome "2.0.0 apply-scheduled"
+  check "the new version confirmed through the service" wait_for 120 has_outcome "2.1.0 confirmed"
+  eq "the bundle holds 2.1.0 at the same path" "$(version_of_bundle)" 2.1.0
+  sealed "after the update"
+
+  # A version that crashes on start: rolled back, marked bad, not offered again.
+  rt=$B/Contents/MacOS/lunepack-runtime
+  publish_dotnet 2.2.0 20 crash-on-start
+  run as_user "$rt" download --json --expect-version 2.2.0
+  reset_outcomes
+  (sudo -u "$std" env -i HOME="$std_home" PATH=/usr/bin:/bin LUNEPACK_E2E_OUT="$outcome" \
+    sh -c "sleep 1 & exec \"$rt\" apply-and-restart --json --wait-pid \$! --expect-version 2.2.0 --no-ui" \
+    >/dev/null 2>&1 </dev/null) || true
+  check "the bad version crashed on start" wait_for 120 has_outcome "2.2.0 crash"
+  check "and the old one came back" wait_for 120 has_outcome "2.1.0 start"
+  eq "the bundle is back to 2.1.0" "$(version_of_bundle)" 2.1.0
+  run as_user "$rt" check --json
+  eq "the bad version is not offered again" "$(last_member update)" ""
+  sealed "after the rollback"
+
+  # The fixed version.
+  publish_dotnet 2.3.0 60
+  run as_user "$rt" download --json --expect-version 2.3.0
+  reset_outcomes
+  (sudo -u "$std" env -i HOME="$std_home" PATH=/usr/bin:/bin LUNEPACK_E2E_OUT="$outcome" \
+    sh -c "sleep 1 & exec \"$rt\" apply-and-restart --json --wait-pid \$! --expect-version 2.3.0 --no-ui -- --after-update" \
+    >/dev/null 2>&1 </dev/null) || true
+  check "the fixed version confirmed" wait_for 120 has_outcome "2.3.0 confirmed"
+  eq "the bundle holds 2.3.0" "$(version_of_bundle)" 2.3.0
+  sealed "after the fixed version"
+
+  # Root's uninstall, with nothing running from the bundle.
+  sleep 1
+  eq "uninstall (0)" "$(rc_of "$rt" uninstall)" 0
+  check "nothing of the install is left" nothing_left
+  check "no process of ours is left" bash -c '! pgrep -f "lunepack-(runtime|service)" >/dev/null'
+  entry=lunepack-e2e-machine
+fi
 
 echo
 if [ "$FAILURES" -ne 0 ]; then

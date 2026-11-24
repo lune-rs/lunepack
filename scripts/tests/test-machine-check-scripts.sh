@@ -42,11 +42,17 @@ run_cmd bash "$SUITE" --dry-run
 t_check "suite: --dry-run exits 0" rc_is 0
 t_check "suite: --dry-run says nothing runs" out_has "nothing is built, installed or changed"
 rows=$(grep -c '^  SKIPPED  ' "$OUT" || true)
-t_check "suite: --dry-run lists 16 rows, every one SKIPPED" test "$rows" -eq 16
+t_check "suite: --dry-run lists 17 rows, every one SKIPPED" test "$rows" -eq 17
 t_check "suite: --dry-run reports no failure" bash -c '! grep -q "^ *FAIL" "$1"' _ "$OUT"
-for row in "installer -pkg as root" "the supervisor killed" "the daemon disabled" "uninstall" "policy file"; do
+for row in "installer -pkg as root" "the supervisor killed" "the daemon disabled" "uninstall" "policy file" "the .NET example app"; do
   t_check "suite: --dry-run names the row '$row'" out_has "$row"
 done
+
+t_check "suite: the .NET row (15) is listed as SKIPPED" bash -c 'grep -qE "^  SKIPPED  15  the .NET example app" "$1"' _ "$OUT"
+# The row skips by name, and a missing dotnet refuses before anything is made (tested in the order of
+# the guards, on this system's refusals, which come first).
+t_check "suite: row 15 needs dotnet and says how to skip it" grep -q 'LUNEPACK_E2E_DOTNET=0 skips row 15' "$SUITE"
+t_check "suite: row 15 names the SKIPPED opt-out" grep -q 'skipped "the .NET row (LUNEPACK_E2E_DOTNET=0)"' "$SUITE"
 
 run_cmd bash "$SUITE" --dry-run --disposable
 t_check "suite: --dry-run with --disposable is a usage error" rc_is 2

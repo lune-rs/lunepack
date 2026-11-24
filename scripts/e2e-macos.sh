@@ -21,7 +21,17 @@
 # It builds the release `lunepack-runtime` (scripts/build-runtime.sh), `lunepack`, the Rust example
 # app, the stand-in UI (tests/e2e/fake-ui), then runs the test binary crates/lunepack-runtime/tests/e2e
 # with them and with the shell app (tests/e2e/shell-app/app.sh). LUNEPACK_E2E_REQUIRE=1 is set, so a
-# missing piece fails instead of skipping. bash 3.2 compatible.
+# missing piece fails instead of skipping.
+#
+# Row 15 runs the .NET example (examples/dotnet, M13 step 8) as an app bundle for this Mac's own
+# target (a thin runtime, never macos-universal): scripts/build-example-dotnet.sh publishes it
+# self-contained with `--macos-bundle` (the host alone in Contents/MacOS, the rest under
+# Contents/Resources/app) and the packager signs it ad hoc. `dotnet` missing is a failure;
+# LUNEPACK_E2E_DOTNET=0 is the one opt-out, and the suite then prints SKIPPED once. The publish runs
+# with the real HOME (as cargo does: the SDK's package cache is there, and the runtime pack
+# is downloaded once); its output goes under the root. After the suite, a crash report named after
+# lunepack, the e2e apps or the example in the real user's DiagnosticReports is a failure.
+# bash 3.2 compatible.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -164,6 +174,16 @@ cargo build --locked --release -p lunepack-runtime --example e2e_fake_ui
 cp "$tdir/release/examples/e2e_app" "$root/build/e2e_app"
 cp "$tdir/release/examples/e2e_fake_ui" "$root/build/e2e_fake_ui"
 
+# The .NET example, as a bundle for this Mac's own target (before anything moves HOME's files: the
+# publish is the one command that runs with the real HOME).
+dotnet_bundle=
+if [ "${LUNEPACK_E2E_DOTNET:-1}" != 0 ]; then
+  command -v dotnet >/dev/null 2>&1 || die "dotnet is not installed: row 15 needs the SDK of examples/dotnet/global.json (LUNEPACK_E2E_DOTNET=0 skips it)"
+  echo "e2e-macos: publishing the .NET example for $target"
+  HOME=$real_home ./scripts/build-example-dotnet.sh "$target" "$root/build/dotnet" --macos-bundle "$root/build/Example.app"
+  dotnet_bundle=$root/build/Example.app
+fi
+
 shell_app=$top/crates/lunepack-runtime/tests/e2e/shell-app/app.sh
 [ -f "$shell_app" ] || die "the shell app is missing"
 if command -v shellcheck >/dev/null 2>&1; then
@@ -185,7 +205,7 @@ real_reports() {
   local d dirs=()
   while IFS= read -r d; do dirs+=("$d"); done < <(existing_dirs "$real_home/Library/Logs/DiagnosticReports")
   if [ "${#dirs[@]}" -eq 0 ]; then echo 0; return; fi
-  find "${dirs[@]}" -maxdepth 2 \( -name 'lunepack*' -o -name 'e2e_*' -o -name 'e2e-*' \) | wc -l | tr -d ' '
+  find "${dirs[@]}" -maxdepth 2 \( -name 'lunepack*' -o -name 'e2e_*' -o -name 'e2e-*' -o -name 'Example[-_.]*' \) | wc -l | tr -d ' '
 }
 
 # How many entries named after the e2e app the real user's own folders hold.
@@ -234,6 +254,7 @@ LUNEPACK_E2E_ROOT=$root/rows \
   LUNEPACK_E2E_SHELL_APP=$shell_app \
   LUNEPACK_E2E_FAKE_UI=$root/build/e2e_fake_ui \
   LUNEPACK_E2E_UI=$root/build/e2e_fake_ui \
+  LUNEPACK_E2E_DOTNET_BUNDLE=$dotnet_bundle \
   LUNEPACK_E2E_CI=$ci \
   LUNEPACK_E2E_REQUIRE=1 \
   cargo test --locked -p lunepack-runtime --test e2e
