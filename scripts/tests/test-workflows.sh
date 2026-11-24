@@ -335,6 +335,62 @@ unbounded_prompt_calls() {
 }
 t_check "macos-selfsigned.sh: every trust change, codesign and find-identity call is bounded" test -z "$(unbounded_prompt_calls)"
 
+# --- the weekly workflow (M13 step 3) -----------------------------------------------------------
+# The fuzz campaign and cargo-deny: read-only token, started by a schedule, by hand and by a push
+# (never by a pull request), budgets of 300 seconds on the schedule and 600 otherwise, the corpus
+# kept in the Actions cache and the crash inputs as an artifact, the tool installed by an exact version.
+weekly=$repo/.github/workflows/weekly.yml
+
+# weekly_ok <file>: prints one line per problem; nonzero when there is any.
+weekly_ok() {
+  local f=$1 bad=0 perms
+  if [ ! -f "$f" ]; then echo "no weekly.yml"; return 1; fi
+  # The only permission is `contents: read`, and it is the top-level block.
+  perms=$(awk '/^permissions:/ { on = 1; next } on && /^[^ ]/ { exit } on { print }' "$f" | sed 's/[[:space:]]*#.*//; /^[[:space:]]*$/d')
+  if [ "$perms" != "  contents: read" ]; then echo "the top-level permissions are not exactly contents: read"; bad=1; fi
+  if grep -Eq '^[[:space:]]+permissions:' "$f"; then echo "a job sets its own permissions"; bad=1; fi
+  if ! grep -Eq '^  schedule:' "$f"; then echo "no schedule trigger"; bad=1; fi
+  if ! grep -Eq '^  workflow_dispatch:' "$f"; then echo "no workflow_dispatch trigger"; bad=1; fi
+  if ! grep -Eq '^  push:' "$f"; then echo "no push trigger"; bad=1; fi
+  if ! grep -Eq '^      seconds:' "$f" || ! grep -Eq "default: '600'" "$f"; then echo "workflow_dispatch has no seconds input defaulting to 600"; bad=1; fi
+  if grep -Eq '^[[:space:]]*pull_request' "$f"; then echo "a pull_request trigger is not allowed"; bad=1; fi
+  if ! awk '/^  push:/ { on = 1; next } on && /^  [a-z_]+:/ { exit } on { print }' "$f" | grep -q 'paths:'; then echo "the push trigger is not limited to paths"; bad=1; fi
+  if ! grep -q "github.event_name == 'schedule' && '300'" "$f" || ! grep -q "|| '600'" "$f"; then echo "the budget is not 300 on the schedule and 600 otherwise"; bad=1; fi
+  if ! grep -q 'scripts/fuzz.sh --list' "$f"; then echo "the target list does not come from scripts/fuzz.sh --list"; bad=1; fi
+  if ! grep -q 'actions/cache/restore@' "$f" || ! grep -q 'actions/cache/save@' "$f"; then echo "the corpus is not restored from and saved to the Actions cache"; bad=1; fi
+  if ! grep -q 'fuzz-crashes-' "$f"; then echo "the crash inputs are not uploaded"; bad=1; fi
+  if ! grep -q 'fuzz-corpus-' "$f"; then echo "the corpus is not uploaded"; bad=1; fi
+  if ! grep -Eq 'cargo install --locked --version [0-9]+\.[0-9]+\.[0-9]+ cargo-deny' "$f"; then echo "cargo-deny is not installed at an exact version with --locked"; bad=1; fi
+  if ! grep -q 'cargo deny check advisories licenses' "$f"; then echo "cargo deny check advisories licenses is not run"; bad=1; fi
+  if grep -Eq 'continue-on-error|--skip|-s none|detect_leaks=0' "$f"; then echo "a failure or a sanitizer is switched off"; bad=1; fi
+  return "$bad"
+}
+
+RC=0
+weekly_ok "$weekly" >"$OUT" 2>&1 || RC=$?
+t_check "weekly.yml: read-only token, three triggers and no pull request, budgets, cache, artifacts, cargo-deny" rc_is 0
+if [ "$RC" -ne 0 ]; then sed 's/^/    /' "$OUT" >&2; fi
+weekly_seed() { # name, sed expression, expected message
+  sed "$2" "$weekly" >"$T_TMP/weekly-$1.yml"
+  RC=0
+  weekly_ok "$T_TMP/weekly-$1.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded weekly.yml ($1) fails" rc_nonzero
+  t_check "seeded weekly.yml ($1) reports: $3" out_has "$3"
+}
+weekly_seed pr 's|^  push:|  pull_request:\n  push:|' "pull_request trigger"
+weekly_seed no-schedule 's|^  schedule:|  scheduled:|' "no schedule trigger"
+weekly_seed no-dispatch 's|^  workflow_dispatch:|  dispatch:|' "no workflow_dispatch trigger"
+weekly_seed no-push 's|^  push:|  pushes:|' "no push trigger"
+weekly_seed no-paths 's|^    paths:|    pathz:|' "not limited to paths"
+weekly_seed token 's|^  contents: read|  contents: read\n  actions: read|' "not exactly contents: read"
+weekly_seed job-permissions 's|^    timeout-minutes: 30|    timeout-minutes: 30\n    permissions:\n      contents: read|' "sets its own permissions"
+weekly_seed budget 's|&& '"'"'300'"'"'|\&\& '"'"'900'"'"'|' "300 on the schedule"
+weekly_seed no-cache-save 's|actions/cache/save@|actions/cache/other@|' "Actions cache"
+weekly_seed no-crash-artifact 's|fuzz-crashes-|fuzz-c-|' "crash inputs"
+weekly_seed deny-unpinned 's|--version 0.22.0 ||' "exact version"
+weekly_seed continue 's|^    timeout-minutes: 90|    timeout-minutes: 90\n    continue-on-error: true|' "switched off"
+weekly_seed no-list 's|scripts/fuzz.sh --list|scripts/fuzz.sh --all|' "fuzz.sh --list"
+
 # Every tracked shell script that a workflow or another script runs by path must be executable
 # (git mode 100755): a 100644 one fails with "Permission denied" only in CI. Only the
 # scripts/tests/test-*.sh files are exempt, because run.sh runs them through bash.

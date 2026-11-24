@@ -15,13 +15,31 @@ the committed seeds and random and mutated inputs on stable:
 
 ## Run
 
-    cargo install cargo-fuzz --locked
-    cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
+The campaign runner is `scripts/fuzz.sh`; it needs only Docker. It builds a pinned image once
+(`scripts/fuzz.Dockerfile`: the Rust image of the gate by digest, a dated nightly toolchain and
+`cargo-fuzz` at an exact version), runs libFuzzer for each target and prints one line per target
+(runs, corpus files, crashes). It exits non-zero when any target crashed or could not run.
 
-Targets: `envelope`, `root`, `keys`, `feed`, `manifest`, `deltas`, `path`, `tree`, `rules`, `json`, `frame`, `http`,
-`state`, `update_config`, `setup`, `service`, `ui`, `codec`, `patch`.
-If AddressSanitizer does not work on your host, add `-s none`. `corpus/` and `artifacts/` are
-local and gitignored; a crash lands in `artifacts/<target>/`.
+    ./scripts/fuzz.sh --docker --seconds 600              # every target, 600 seconds each
+    ./scripts/fuzz.sh --seconds 60 deltas codec patch      # some targets (Docker is the default)
+    ./scripts/fuzz.sh --list                               # the target names, no Docker
+
+The target list is derived, not typed: the `[[bin]]` names of `fuzz/Cargo.toml`, which must equal the
+harness tables of `lunepack_core::fuzz` and `lunepack_codec_lzma::fuzz` and the files of
+`fuzz/fuzz_targets/` (a difference fails the script). The working corpus of a target is
+`fuzz/corpus/<target>`, started from `fuzz/seeds/<target>`; a crash, timeout, out-of-memory or leak
+input lands in `fuzz/artifacts/<target>/`. Both folders are ignored by git. No sanitizer is switched
+off and no target is skipped to make a run pass: a crash is kept, minimised, committed as a seed and
+fixed. The image's build output lives in two named Docker volumes (`lunepack-rs-fuzz-target`,
+`lunepack-rs-fuzz-cargo`); nothing is pruned.
+
+`.github/workflows/weekly.yml` runs the same script, one job per target, every week (300 seconds
+each), by hand (the `seconds` input, default 600) and on a push that touches the fuzz files (600).
+The corpus is kept in the Actions cache and uploaded as an artifact, and the crash inputs are
+uploaded too. The same workflow runs `cargo deny check advisories licenses` (`deny.toml`).
+
+Running libFuzzer on a host instead needs `cargo install cargo-fuzz --locked` and a nightly
+toolchain; the image exists so that nobody has to.
 
 ## Seeds
 

@@ -1,0 +1,129 @@
+name: weekly
+
+# The fuzz campaign (scripts/fuzz.sh, M13-D9) and the dependency check (cargo-deny, M13-D18).
+# Weekly on a schedule, by hand, and on a push to main or orch/** that touches the fuzz paths. It
+# never runs on a pull request: the jobs fetch the advisory database and spend runner time.
+# Budget per target: 300 seconds on the schedule, the `seconds` input by hand (default 600), 600 on
+# a push. No sanitizer is switched off and no target is skipped to make a run pass; a crash fails
+# its job, and its input is kept as an artifact.
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Seconds of fuzzing for each target'
+        required: false
+        default: '600'
+        type: string
+  push:
+    branches: [main, 'orch/**']
+    paths:
+      - 'fuzz/**'
+      - 'scripts/fuzz.sh'
+      - 'scripts/fuzz.Dockerfile'
+      - 'crates/lunepack-core/src/fuzz.rs'
+      - 'crates/lunepack-codec-lzma/src/fuzz.rs'
+      - 'deny.toml'
+      - '.github/workflows/weekly.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 300 on the schedule; otherwise the input (empty on a push) or 600.
+  FUZZ_BUDGET: ${{ github.event_name == 'schedule' && '300' || github.event.inputs.seconds || '600' }}
+
+jobs:
+  # The targets, from the script that runs them (it fails when the harness tables, fuzz/Cargo.toml
+  # and fuzz/fuzz_targets/ disagree, so a target cannot be left out silently).
+  targets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      # actions/checkout v7.0.1 (lightweight tag, resolves directly to the commit)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: List the targets
+        id: list
+        run: |
+          set -euo pipefail
+          list=$(./scripts/fuzz.sh --list | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "targets: $list"
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+  fuzz:
+    needs: targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.list) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # actions/cache v6.1.0 (lightweight tag, resolves directly to the commit)
+      - name: Restore the corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz ${{ matrix.target }} for ${{ env.FUZZ_BUDGET }} seconds
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz/corpus fuzz/artifacts
+          # The container's user is not the runner's; it needs to add files to what was restored.
+          chmod -R a+rwX fuzz/corpus fuzz/artifacts
+          ./scripts/fuzz.sh --docker --seconds "$FUZZ_BUDGET" "$TARGET"
+      - name: Keep the corpus
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      # actions/upload-artifact (same commit as ci.yml)
+      - name: Upload the corpus
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload the crash inputs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 90
+
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install cargo-deny 0.22.0
+        # Outside the checkout, so rust-toolchain.toml does not apply to the tool's own build.
+        working-directory: ${{ runner.temp }}
+        run: cargo install --locked --version 0.22.0 cargo-deny
+      - name: Advisories and licences
+        run: cargo deny check advisories licenses
