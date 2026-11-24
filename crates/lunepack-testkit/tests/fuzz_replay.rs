@@ -108,7 +108,12 @@ fn every_harness_has_a_fuzz_target_and_both_kinds_of_seed() {
         .expect("fuzz_targets dir")
         .flatten()
         .count();
-    assert_eq!(targets, HARNESSES.len(), "a fuzz target without a harness");
+    // `codec` and `patch` are the codec crate's harnesses (its own replay test covers them).
+    assert_eq!(
+        targets,
+        HARNESSES.len() + 2,
+        "a fuzz target without a harness"
+    );
 }
 
 #[test]

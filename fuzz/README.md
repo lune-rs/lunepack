@@ -2,8 +2,9 @@
 
 libFuzzer targets over the untrusted-input harnesses of `lunepack_core::fuzz` (envelopes, root,
 key set, feed, manifest, a manifest's deltas, paths, trees, version/target/id rules, strict JSON, frames, HTTP response
-headers, the setup-file locator and trailer, the service protocol, the UI frames). Each target
-calls one harness; a harness must return for any input without panicking.
+headers, the setup-file locator and trailer, the service protocol, the UI frames) and of
+`lunepack_codec_lzma::fuzz` (the real LZMA frame and delta-patch decoders: `codec`, `patch`). Each
+target calls one harness; a harness must return for any input without panicking.
 
 This directory is outside the Cargo workspace (root `exclude`) and has its own committed
 `Cargo.lock`, which the boundary check holds to crates.io plus this repository's own crates. It is
@@ -18,7 +19,7 @@ the committed seeds and random and mutated inputs on stable:
     cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
 
 Targets: `envelope`, `root`, `keys`, `feed`, `manifest`, `deltas`, `path`, `tree`, `rules`, `json`, `frame`, `http`,
-`state`, `update_config`, `setup`, `service`, `ui`.
+`state`, `update_config`, `setup`, `service`, `ui`, `codec`, `patch`.
 If AddressSanitizer does not work on your host, add `-s none`. `corpus/` and `artifacts/` are
 local and gitignored; a crash lands in `artifacts/<target>/`.
 
@@ -31,6 +32,13 @@ regenerates them in memory and fails if a committed file differs. To rewrite the
 change:
 
     LUNEPACK_WRITE_SEEDS=1 cargo test -p lunepack-testkit --test fuzz_replay committed_seeds
+
+The `codec` and `patch` seeds are written by the codec crate's own encoder and replayed by its own
+test (the testkit does not depend on the codec crate); rewrite them with:
+
+    LUNEPACK_WRITE_SEEDS=1 cargo test -p lunepack-codec-lzma --test fuzz_replay committed_seeds
+
+and replay them on stable with `cargo test -p lunepack-codec-lzma --locked --test fuzz_replay`.
 
 A crash found by libFuzzer: minimise it, keep the input as a seed, add it to the replay test as a
 regression case and fix the parser.
@@ -69,3 +77,22 @@ regression case and fix the parser.
   decoded and checked against a reducer at the install welcome prompt. The rest is the byte stream.
   Accepted: every frame was valid (and, from the engine, in order) and the stream ended on a frame
   boundary. The seeds include the administrator command at its cap and the refusals around it.
+- `codec`: the bytes are one frame handed to the real decoder (`LzmaCodec::decode`) without the
+  frame-hash check. Big-endian layout: a selector byte (the codec, modulo 5: 0 `stored`, 1 `lzma2`,
+  2 `bcj-x86+lzma2`, 3 `bcj-arm64+lzma2`, 4 `bcj2`), the output size (u32), then one stream header
+  per stream (one stream; four for `bcj2`): dictionary size (u32), decoded size (u32) and, for
+  every stream but the last, its encoded length (u16). The streams' bytes follow in order, the last
+  one taking the rest. The dictionary of a `stored` stream and of `bcj2`'s fourth (RC) stream is
+  read and not passed on. The dictionary size goes to the codec as given (the codec refuses one
+  that is not a power of two between 4 KiB and 16 MiB before it allocates); the declared sizes are
+  reduced modulo 4 MiB + 1, so a run decodes at most 4 MiB. The sink counts and drops the bytes;
+  the harness panics if the decoder wrote more than the output size, or if an `Ok` report does not
+  match the bytes written and the streams.
+- `patch`: the bytes are one delta patch handed to `LzmaCodec::decode_patch` (FORMAT.md 9.3).
+  Layout: a selector byte (the low three bits the codec as in `codec`, so `stored` and `bcj2` reach
+  the codec's own refusal; bit 7 set: the window is given), the length of the base bytes (u16),
+  the declared base size (u32), the declared output size (u32, reduced like the sizes of `codec`),
+  the window (u32, only with bit 7; otherwise the format's window of the two sizes), then the base
+  bytes and the patch's bytes up to the end. A window that is not the format's, or is over
+  128 MiB, is refused by the codec before it allocates. The sink and the panics are as in `codec`;
+  an `Ok` patch must also have consumed all of its input.

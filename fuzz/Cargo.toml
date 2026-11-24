@@ -15,6 +15,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 lunepack-core = { path = "../crates/lunepack-core" }
+lunepack-codec-lzma = { path = "../crates/lunepack-codec-lzma" }
 
 # Standalone: not part of the lunepack workspace.
 [workspace]
@@ -134,6 +135,20 @@ bench = false
 [[bin]]
 name = "ui"
 path = "fuzz_targets/ui.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec"
+path = "fuzz_targets/codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "patch"
+path = "fuzz_targets/patch.rs"
 test = false
 doc = false
 bench = false

@@ -12,6 +12,8 @@
 
 mod decode;
 mod encode;
+#[doc(hidden)]
+pub mod fuzz;
 
 use std::io::Write;
 
