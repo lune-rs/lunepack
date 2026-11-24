@@ -17,6 +17,7 @@ use crate::lab::{
 };
 
 /// One row of the table.
+#[derive(Clone, Copy)]
 pub struct Row {
     pub id: u8,
     pub name: &'static str,
@@ -138,20 +139,67 @@ const V6: Release = Release {
     ..Release::plain("6.0.0")
 };
 
+/// The rows a folder app (the .NET example, about 190 files) runs, by id. Together they cover each
+/// stage of an app's life: the install (1); the update by `check`, `download` and
+/// `apply-and-restart` with the new version's confirm (2); a version that crashes on start, rolled
+/// back and marked bad (3); the fixed version (4); the uninstall (7, which runs from the tree row 4
+/// left); and an update that arrives as a delta (10). Rows 5, 6, 8, 9, 11 and 12 test the runtime
+/// (timeouts, the attempt counter, a file feed, a policy, the delta fallbacks), not the app, and the
+/// two single-file apps already run them. The shell app's log, cut to these rows by [`filter_log`],
+/// is what the folder app's log must equal.
+pub const FOLDER_APP_ROWS: &[u8] = &[1, 2, 3, 4, 7, 10];
+
 /// Runs the whole table on a fresh lab per feed kind, stopping at the first failing row.
 /// Returns the normalised outcome log, or the failure.
 pub fn run_table(bins: &Binaries, app: &App) -> Result<Vec<String>, String> {
+    run_table_of(bins, app, None)
+}
+
+/// Runs the rows of [`FOLDER_APP_ROWS`] and no others, in the table's order, each group in the lab
+/// it has in [`run_table`].
+pub fn run_folder_table(bins: &Binaries, app: &App) -> Result<Vec<String>, String> {
+    run_table_of(bins, app, Some(FOLDER_APP_ROWS))
+}
+
+/// The lines of `log` that belong to the rows `ids` (a row's lines follow its `# row N` line).
+pub fn filter_log(log: &[String], ids: &[u8]) -> Vec<String> {
+    let mut keep = false;
+    let mut out = Vec::new();
+    for line in log {
+        if let Some(n) = line.strip_prefix("# row ") {
+            keep = n.parse::<u8>().is_ok_and(|n| ids.contains(&n));
+        }
+        if keep {
+            out.push(line.clone());
+        }
+    }
+    out
+}
+
+fn run_table_of(bins: &Binaries, app: &App, only: Option<&[u8]>) -> Result<Vec<String>, String> {
+    let picked = |rows: &[Row]| -> Vec<Row> {
+        rows.iter()
+            .filter(|row| only.is_none_or(|ids| ids.contains(&row.id)))
+            .copied()
+            .collect()
+    };
     let mut log = Vec::new();
     for (kind, rows) in [(FeedKind::Http, HTTP_ROWS), (FeedKind::File, FILE_ROWS)] {
-        let mut lab = Lab::new(bins, app, kind);
-        run_rows(&mut lab, rows, &mut log)?;
+        let rows = picked(rows);
+        if !rows.is_empty() {
+            let mut lab = Lab::new(bins, app, kind);
+            run_rows(&mut lab, &rows, &mut log)?;
+        }
     }
-    let mut lab = Lab::new(bins, app, FeedKind::Http);
-    lab.set_publisher_check("enforce");
-    run_rows(&mut lab, ENFORCE_ROWS, &mut log)?;
-    for row in DELTA_ROWS {
+    let rows = picked(ENFORCE_ROWS);
+    if !rows.is_empty() {
         let mut lab = Lab::new(bins, app, FeedKind::Http);
-        run_rows(&mut lab, std::slice::from_ref(row), &mut log)?;
+        lab.set_publisher_check("enforce");
+        run_rows(&mut lab, &rows, &mut log)?;
+    }
+    for row in picked(DELTA_ROWS) {
+        let mut lab = Lab::new(bins, app, FeedKind::Http);
+        run_rows(&mut lab, std::slice::from_ref(&row), &mut log)?;
     }
     Ok(log)
 }
@@ -627,6 +675,23 @@ fn file_sources(stdout: &[u8], path: &str) -> Vec<String> {
     sources
 }
 
+/// Every `(path, source)` of the `stage` progress lines of `stdout` that name a file (the same
+/// lines [`file_sources`] reads, for every path).
+fn stage_files(stdout: &[u8]) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    for line in String::from_utf8_lossy(stdout).lines() {
+        if line.starts_with("{\"schema\":1,\"type\":\"progress\",\"phase\":\"stage\"")
+            && let Some(rest) = line.split("\"file\":{\"path\":\"").nth(1)
+            && let Some(path) = rest.split('"').next()
+            && let Some(rest) = rest.split("\"source\":\"").nth(1)
+            && let Some(source) = rest.split('"').next()
+        {
+            files.push((path.to_owned(), source.to_owned()));
+        }
+    }
+    files
+}
+
 /// The bytes the download fetched: `done` of the last `download`-phase progress line (a phase's
 /// last snapshot is always delivered). A patch is a few dozen bytes; the file's frame is its size.
 fn download_bytes(stdout: &[u8]) -> u64 {
@@ -751,6 +816,15 @@ fn row_delta_update(lab: &mut Lab) -> Vec<String> {
             .any(|u| u.contains(".from-1.0.0.delta")),
         "the delta file was never requested"
     );
+    if lab.is_folder_app() {
+        // A folder app's other files did not change: none of them is fetched again (that none was
+        // is also what the byte bound above says, for a folder of about 190 files and 80 MB).
+        for (path, source) in stage_files(&stdout) {
+            if path != "share/delta.bin" && path != "share/version.txt" {
+                assert_eq!(source, "unchanged", "{path} is not fetched again");
+            }
+        }
+    }
     lines.extend(apply_delta_update(lab));
     lines
 }

@@ -17,6 +17,14 @@
 # GPU or a display: the real UI is only started with a DISPLAY that nothing serves, to see it exit
 # with its typed code. LUNEPACK_E2E_REQUIRE=1 is set, so a missing piece fails instead of skipping.
 #
+# The .NET example (examples/dotnet, M13 step 7) runs a third table: a folder of about 190 files that
+# is published self-contained by scripts/build-example-dotnet.sh for the suite's own Linux target,
+# on the host in the Docker mode (the container has no .NET SDK; it gets the folder read-only) and
+# natively with `--inside` when no folder was handed in (the CI job installs .NET first). Its
+# outcome log must equal the shell app's, cut to the rows it runs (scenarios.rs, FOLDER_APP_ROWS).
+# `dotnet` missing is a failure; LUNEPACK_E2E_DOTNET=0 is the one opt-out, and the suite then prints
+# SKIPPED once.
+#
 # The Docker mode builds the image `lunepack-rs-e2e:<hash>` from scripts/e2e.Dockerfile (once per
 # Dockerfile change), runs `docker run --rm --init` (a reaping PID 1, as on a desktop) with the
 # worktree read-only, as the image's unprivileged user `e2e` (a setup run as root without
@@ -86,10 +94,35 @@ if [ "$inside" -eq 0 ]; then
     echo "e2e: building docker image $image from $dockerfile"
     docker build --quiet -t "$image" - <"$dockerfile" >/dev/null
   fi
+  # The .NET example, published here for the container's architecture (the image has no .NET
+  # SDK) into a directory of this run's own, which the container gets read-only.
+  dotnet_args=(-e LUNEPACK_E2E_DOTNET=0)
+  host_work=
+  # Run by the EXIT trap below.
+  # shellcheck disable=SC2329
+  host_cleanup() {
+    # Only the directory made below.
+    if [ -n "$host_work" ]; then rm -rf "$host_work"; fi
+  }
+  trap host_cleanup EXIT
+  trap 'exit 130' INT TERM
+  if [ "${LUNEPACK_E2E_DOTNET:-1}" != 0 ]; then
+    command -v dotnet >/dev/null 2>&1 || die "dotnet is not installed: the .NET rows need the SDK of examples/dotnet/global.json (LUNEPACK_E2E_DOTNET=0 skips them)"
+    case $(docker image inspect --format '{{.Architecture}}' "$image") in
+      arm64) dotnet_target=linux-aarch64 ;;
+      amd64) dotnet_target=linux-x86_64 ;;
+      *) die "unsupported image architecture" ;;
+    esac
+    host_work=$(mktemp -d "${TMPDIR:-/tmp}/lunepack-e2e-dotnet.XXXXXX")
+    echo "e2e: publishing the .NET example for $dotnet_target"
+    ./scripts/build-example-dotnet.sh "$dotnet_target" "$host_work/app"
+    dotnet_args=(-v "$host_work/app":/dotnet-app:ro -e LUNEPACK_E2E_DOTNET_APP=/dotnet-app)
+  fi
   # RUSTUP_TOOLCHAIN makes rustup use the image's own 1.99.1 instead of installing what
-  # rust-toolchain.toml lists. No host env is passed, no capabilities, no new privileges; the
-  # suite runs as the image's user `e2e`, uid 1000, never as root.
-  exec docker run --rm --init \
+  # rust-toolchain.toml lists. No host env is passed (but the one opt-out above), no capabilities,
+  # no new privileges; the suite runs as the image's user `e2e`, uid 1000, never as root.
+  rc=0
+  docker run --rm --init \
     --name "lunepack-rs-e2e-$$" \
     --user 1000:1000 \
     --cap-drop ALL \
@@ -100,9 +133,11 @@ if [ "$inside" -eq 0 ]; then
     -e CARGO_TARGET_DIR=/target \
     -e CARGO_HOME=/cargo-home \
     -e RUSTUP_TOOLCHAIN=1.99.1 \
+    "${dotnet_args[@]}" \
     -w /src \
     "$image" \
-    ./scripts/e2e.sh --inside
+    ./scripts/e2e.sh --inside || rc=$?
+  exit "$rc"
 fi
 
 # --- inside -----------------------------------------------------------------------------
@@ -141,6 +176,18 @@ cargo build --locked --release -p lunepack-ui
 strip -o "$work/e2e_app" "$tdir/release/examples/e2e_app"
 strip -o "$work/e2e_fake_ui" "$tdir/release/examples/e2e_fake_ui"
 strip -o "$work/lunepack-ui" "$tdir/release/lunepack-ui"
+
+# The .NET example: a folder handed in (the Docker mode), the opt-out, or published here.
+if [ "${LUNEPACK_E2E_DOTNET:-1}" = 0 ]; then
+  unset LUNEPACK_E2E_DOTNET_APP
+elif [ -n "${LUNEPACK_E2E_DOTNET_APP:-}" ]; then
+  [ -f "$LUNEPACK_E2E_DOTNET_APP/Example" ] || die "LUNEPACK_E2E_DOTNET_APP does not name a published folder of the .NET example"
+else
+  command -v dotnet >/dev/null 2>&1 || die "dotnet is not installed: the .NET rows need the SDK of examples/dotnet/global.json (LUNEPACK_E2E_DOTNET=0 skips them)"
+  echo "e2e: publishing the .NET example for $target"
+  ./scripts/build-example-dotnet.sh "$target" "$work/dotnet-app"
+  export LUNEPACK_E2E_DOTNET_APP=$work/dotnet-app
+fi
 
 shell_app=$top/crates/lunepack-runtime/tests/e2e/shell-app/app.sh
 [ -f "$shell_app" ] || die "the shell app is missing"

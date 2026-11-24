@@ -15,12 +15,16 @@
 //! runtime's command line only); the two normalised outcome logs must be equal. The extra
 //! command-line tests (hard kill, nothing staged, planted secrets) are in [`cli_extra`]. The UI
 //! scenarios (M6 step 11: a setup file, a UI that is absent, killed or cannot start) are in [`ui`]:
-//! a table run with both apps like the first, then extras run once.
+//! a table run with both apps like the first, then extras run once. A third app, the .NET
+//! example (M13 step 7), is a folder of about 190 files; it runs the rows of
+//! [`scenarios::FOLDER_APP_ROWS`] and its log must equal the shell app's log cut to those rows.
 //!
 //! Environment: `LUNEPACK_E2E_RUNTIME` (the static runtime), `LUNEPACK_E2E_CLI` (`lunepack`),
 //! `LUNEPACK_E2E_APP` (the Rust example app), `LUNEPACK_E2E_SHELL_APP` (the shell app),
 //! `LUNEPACK_E2E_FAKE_UI` (the stand-in UI, `tests/e2e/fake-ui`) and `LUNEPACK_E2E_UI` (the real
-//! `lunepack-ui`).
+//! `lunepack-ui`). `LUNEPACK_E2E_DOTNET_APP` names the published folder of the .NET example (its
+//! entry is `Example`; `scripts/build-example-dotnet.sh` makes it); with `LUNEPACK_E2E_REQUIRE=1`
+//! it must be set, and `LUNEPACK_E2E_DOTNET=0` is the one opt-out (the suite prints `SKIPPED`).
 
 #[cfg(target_os = "linux")]
 mod cli_extra;
@@ -43,6 +47,13 @@ const SHELL_APP_VAR: &str = "LUNEPACK_E2E_SHELL_APP";
 const FAKE_UI_VAR: &str = "LUNEPACK_E2E_FAKE_UI";
 const UI_VAR: &str = "LUNEPACK_E2E_UI";
 const REQUIRE_VAR: &str = "LUNEPACK_E2E_REQUIRE";
+#[cfg(target_os = "linux")]
+const DOTNET_APP_VAR: &str = "LUNEPACK_E2E_DOTNET_APP";
+#[cfg(target_os = "linux")]
+const DOTNET_VAR: &str = "LUNEPACK_E2E_DOTNET";
+/// The .NET example's entry in its folder (the assembly name of `examples/dotnet`).
+#[cfg(target_os = "linux")]
+const DOTNET_ENTRY: &str = "Example";
 
 fn main() -> ExitCode {
     let paths: Vec<Option<PathBuf>> = [
@@ -186,6 +197,13 @@ fn run(paths: &Paths<'_>) -> ExitCode {
         eprintln!("e2e: FAIL: an app has no file name");
         return ExitCode::FAILURE;
     };
+    let dotnet = match dotnet_app() {
+        Ok(app) => app,
+        Err(why) => {
+            eprintln!("e2e: FAIL: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
     eprintln!("e2e: {}", scenarios::validator_note());
 
     eprintln!("e2e: table 1 of 2: the Rust app ({})", rust_app.name);
@@ -204,7 +222,7 @@ fn run(paths: &Paths<'_>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if !same_logs(&rust_log, &shell_log) {
+    if !same_logs("rust", &rust_log, "shell", &shell_log) {
         return ExitCode::FAILURE;
     }
 
@@ -224,10 +242,34 @@ fn run(paths: &Paths<'_>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if !same_logs(&rust_ui_log, &shell_ui_log) {
+    if !same_logs("rust", &rust_ui_log, "shell", &shell_ui_log) {
         return ExitCode::FAILURE;
     }
     let rust_log: Vec<String> = rust_log.into_iter().chain(rust_ui_log).collect();
+
+    if let Some(dotnet_app) = &dotnet {
+        eprintln!(
+            "e2e: folder table: the .NET app ({}), rows {:?}",
+            dotnet_app.name,
+            scenarios::FOLDER_APP_ROWS
+        );
+        let started = std::time::Instant::now();
+        let dotnet_log = match scenarios::run_folder_table(&bins, dotnet_app) {
+            Ok(log) => log,
+            Err(why) => {
+                eprintln!("e2e: FAIL: the .NET app: {why}");
+                return ExitCode::FAILURE;
+            }
+        };
+        eprintln!(
+            "e2e: the .NET rows took {:.0}s",
+            started.elapsed().as_secs_f32()
+        );
+        let shell_rows = scenarios::filter_log(&shell_log, scenarios::FOLDER_APP_ROWS);
+        if !same_logs(".NET", &dotnet_log, "shell", &shell_rows) {
+            return ExitCode::FAILURE;
+        }
+    }
 
     if let Err(why) = cli_extra::run_all(&bins, &rust_app) {
         eprintln!("e2e: FAIL: {why}");
@@ -239,8 +281,13 @@ fn run(paths: &Paths<'_>) -> ExitCode {
     }
 
     println!(
-        "e2e: outcome log ({} lines, equal for both apps)",
-        rust_log.len()
+        "e2e: outcome log ({} lines, equal for both apps{})",
+        rust_log.len(),
+        if dotnet.is_some() {
+            "; the .NET app's rows equal the shell app's"
+        } else {
+            ""
+        }
     );
     for line in &rust_log {
         println!("{line}");
@@ -249,24 +296,56 @@ fn run(paths: &Paths<'_>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Whether the two apps' outcome logs are equal; prints the first difference when not.
+/// Whether the two outcome logs are equal; prints the first difference when not.
 #[cfg(target_os = "linux")]
-fn same_logs(rust_log: &[String], shell_log: &[String]) -> bool {
-    if rust_log == shell_log {
+fn same_logs(a_name: &str, a: &[String], b_name: &str, b: &[String]) -> bool {
+    if a == b {
         return true;
     }
-    eprintln!("e2e: FAIL: the two apps' outcome logs differ");
-    let at = rust_log
+    eprintln!("e2e: FAIL: the outcome logs of {a_name} and {b_name} differ");
+    let at = a
         .iter()
-        .zip(shell_log)
-        .position(|(a, b)| a != b)
-        .unwrap_or_else(|| rust_log.len().min(shell_log.len()));
+        .zip(b)
+        .position(|(x, y)| x != y)
+        .unwrap_or_else(|| a.len().min(b.len()));
     eprintln!(
-        "  first difference at line {at}:\n    rust:  {:?}\n    shell: {:?}",
-        rust_log.get(at),
-        shell_log.get(at)
+        "  first difference at line {at}:\n    {a_name}: {:?}\n    {b_name}: {:?}",
+        a.get(at),
+        b.get(at)
     );
     false
+}
+
+/// The .NET example as an app of the lab, from the environment. `Ok(None)` when its rows are
+/// skipped: by name (`LUNEPACK_E2E_DOTNET=0`) or, without `LUNEPACK_E2E_REQUIRE=1`, because no
+/// folder was given; either way the suite says `SKIPPED` once. An error when the rows are required
+/// and the folder is not usable.
+#[cfg(target_os = "linux")]
+fn dotnet_app() -> Result<Option<lab::App>, String> {
+    if std::env::var(DOTNET_VAR).is_ok_and(|v| v == "0") {
+        eprintln!("e2e: SKIPPED: the .NET rows ({DOTNET_VAR}=0)");
+        return Ok(None);
+    }
+    let required = std::env::var(REQUIRE_VAR).is_ok_and(|v| v == "1");
+    let Some(folder) = std::env::var_os(DOTNET_APP_VAR).map(PathBuf::from) else {
+        if required {
+            return Err(format!(
+                "{REQUIRE_VAR}=1, but {DOTNET_APP_VAR} is not set ({DOTNET_VAR}=0 skips the .NET rows)"
+            ));
+        }
+        eprintln!("e2e: SKIPPED: the .NET rows ({DOTNET_APP_VAR} is not set)");
+        return Ok(None);
+    };
+    if !folder.join(DOTNET_ENTRY).is_file() {
+        return Err(format!(
+            "{DOTNET_APP_VAR} does not name a folder with the entry {DOTNET_ENTRY}"
+        ));
+    }
+    Ok(Some(lab::App {
+        binary: folder,
+        name: DOTNET_ENTRY.to_owned(),
+        folder: true,
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -275,5 +354,6 @@ fn named_app(binary: &std::path::Path) -> Option<lab::App> {
     Some(lab::App {
         binary: binary.to_owned(),
         name,
+        folder: false,
     })
 }

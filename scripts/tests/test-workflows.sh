@@ -406,4 +406,37 @@ if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   t_check "every tracked scripts/**/*.sh (except tests/test-*.sh) has git mode 100755" test -z "$not_exec"
 fi
 
+# --- the .NET example in the Linux end-to-end job (M13 step 7) ------------------------------
+# The job installs the SDK that examples/dotnet/global.json names (an action pinned to a commit, which
+# the lint above already requires), and no workflow sets the LUNEPACK_E2E_DOTNET=0 opt-out.
+e2e_linux_dotnet_ok() {
+  local block bad=0
+  block=$(job_block "$1" e2e-linux)
+  if [ -z "$block" ]; then echo "no e2e-linux job"; return 1; fi
+  if ! printf '%s\n' "$block" | grep -Eq '^ *- uses: actions/setup-dotnet@[0-9a-f]{40}'; then echo "e2e-linux does not install .NET with a pinned setup-dotnet"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -Fq 'global-json-file: examples/dotnet/global.json'; then echo "e2e-linux does not read examples/dotnet/global.json"; bad=1; fi
+  if grep -v '^ *#' "$1" | grep -q 'LUNEPACK_E2E_DOTNET:\|LUNEPACK_E2E_DOTNET='; then echo "the workflow sets LUNEPACK_E2E_DOTNET (the opt-out)"; bad=1; fi
+  return "$bad"
+}
+
+if [ -f "$ci" ]; then
+  RC=0
+  e2e_linux_dotnet_ok "$ci" >"$OUT" 2>&1 || RC=$?
+  t_check "ci.yml's e2e-linux job installs the pinned .NET SDK and never opts out" rc_is 0
+  if [ "$RC" -ne 0 ]; then sed 's/^/    /' "$OUT" >&2; fi
+  grep -v 'setup-dotnet@' "$ci" >"$T_TMP/no-dotnet.yml" || true
+  RC=0
+  e2e_linux_dotnet_ok "$T_TMP/no-dotnet.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded e2e-linux without setup-dotnet fails" rc_nonzero
+  t_check "seeded missing setup-dotnet reports why" out_has "setup-dotnet"
+  sed 's|^          LUNEPACK_E2E_REQUIRE: .1.$|&\n          LUNEPACK_E2E_DOTNET: "0"|' "$ci" >"$T_TMP/opt-out.yml"
+  RC=0
+  e2e_linux_dotnet_ok "$T_TMP/opt-out.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded opt-out in a workflow fails" rc_nonzero
+  t_check "seeded opt-out reports why" out_has "opt-out"
+  RC=0
+  e2e_linux_dotnet_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "a file with no e2e-linux job fails" rc_nonzero
+fi
+
 t_finish

@@ -66,6 +66,23 @@ run_cmd bash "$SCRIPT" --inside
 t_check "--inside off a systemd container is refused" rc_is 1
 t_check "the refusal says it refuses" out_has "refusing"
 
+# The .NET row (M13 step 7): the host publishes the example, so a missing `dotnet` is a failure
+# before anything is built or started, and LUNEPACK_E2E_DOTNET=0 is the one opt-out.
+tools=$T_TMP/tools
+mkdir -p "$tools"
+for tool in cut shasum sha256sum; do
+  if command -v "$tool" >/dev/null 2>&1; then ln -s "$(command -v "$tool")" "$tools/$tool"; fi
+done
+printf '#!/bin/sh\ncase $1 in\n  version) echo arm64 ;;\n  run) echo "started" >>"$STUB_LOG"; exit 9 ;;\nesac\nexit 0\n' >"$T_TMP/ok-docker"
+chmod 755 "$T_TMP/ok-docker"
+run_cmd env -i PATH="$tools" LUNEPACK_E2E_DOCKER="$T_TMP/ok-docker" STUB_LOG="$T_TMP/docker-started" "$(command -v bash)" "$SCRIPT"
+t_check "without dotnet the host part fails" rc_is 1
+t_check "and says dotnet is not installed" out_has "dotnet is not installed"
+t_check "and how to skip the row" out_has "LUNEPACK_E2E_DOTNET=0"
+t_check "before any container ran" test ! -e "$T_TMP/docker-started"
+t_check "the rows say SKIPPED for the opt-out" grep -q 'SKIPPED: the .NET row (LUNEPACK_E2E_DOTNET=0)' "$ROWS"
+t_check "the .NET row runs last, after every row whose updates it must not meet" bash -c 'awk "/^run_rows\\(\\)/ {on=1} on && /^  row_/ {last=\$1} END {exit last == \"row_dotnet\" ? 0 : 1}" "$1"' _ "$ROWS"
+
 # What the script may remove: its own container and its own temporary directory, nothing by
 # pattern, nothing pruned.
 t_check "no prune anywhere (outside comments)" bash -c '! grep -v "^ *#" "$1" "$2" | grep -nE "prune|rmi -f|rm -rf /|rm -rf \$top|volume rm|network rm"' _ "$SCRIPT" "$ROWS"

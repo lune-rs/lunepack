@@ -77,13 +77,17 @@ pub enum Ui {
     Real,
 }
 
-/// The app under test: its built file and the file name it has in a tree.
+/// The app under test: its built file (or folder) and the file name its entry has in a tree.
 #[derive(Clone)]
 pub struct App {
-    /// The built app.
+    /// The built app: one file, or, for a folder app, the folder.
     pub binary: PathBuf,
     /// The entry's file name in a tree (`e2e_app`).
     pub name: String,
+    /// A folder app (M13 step 7, the .NET example): `binary` is a folder that holds the entry
+    /// `name` and every file the app needs, all of them packed beside the entry. A single-file
+    /// app is just the entry.
+    pub folder: bool,
 }
 
 /// Where the feed is.
@@ -536,8 +540,20 @@ impl Lab {
     pub fn publish_with(&self, release: &Release, drop_deltas: bool) {
         let input = self.work.join(format!("in-{}", release.version));
         let entry = self.entry_rel(release);
-        let bytes = std::fs::read(&self.app.binary).expect("read the app");
-        write_file(&input.join(&entry), &bytes, true);
+        if self.app.folder {
+            // Every file of the folder goes beside the entry, with the mode the publish gave it;
+            // only the entry is made executable besides.
+            let dir = Path::new(&entry).parent().unwrap_or(Path::new(""));
+            copy_tree(&self.app.binary, &input.join(dir));
+            let mut mode = std::fs::metadata(input.join(&entry))
+                .expect("the folder app holds its entry")
+                .permissions();
+            mode.set_mode(0o755);
+            std::fs::set_permissions(input.join(&entry), mode).expect("make the entry executable");
+        } else {
+            let bytes = std::fs::read(&self.app.binary).expect("read the app");
+            write_file(&input.join(&entry), &bytes, true);
+        }
         write_file(
             &input.join("share/version.txt"),
             format!("{}\n", release.version).as_bytes(),
@@ -784,6 +800,11 @@ impl Lab {
     /// The loopback origin (an `http:` lab).
     pub fn origin(&self) -> &FakeOrigin {
         self.origin.as_ref().expect("an http lab")
+    }
+
+    /// Whether the app under test is a folder of files, not one executable.
+    pub fn is_folder_app(&self) -> bool {
+        self.app.folder
     }
 
     /// The app's file name in a tree.
