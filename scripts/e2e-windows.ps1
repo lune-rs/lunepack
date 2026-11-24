@@ -149,7 +149,12 @@ function New-Out([string]$tag) {
 }
 
 function Expect-Lines([string]$file, [string[]]$want, [switch]$Unordered, [int]$seconds = 120) {
-    Wait-Until { @(Read-Lines $file).Count -ge $want.Count } $seconds "$($want.Count) outcome lines"
+    try {
+        Wait-Until { @(Read-Lines $file).Count -ge $want.Count } $seconds "$($want.Count) outcome lines"
+    } catch {
+        # Say what did arrive, so a timeout can be told from a wrong or a missing line.
+        throw "$($_.Exception.Message); got [$(@(Read-Lines $file) -join '; ')]"
+    }
     Start-Sleep -Milliseconds 800
     $got = @(Read-Lines $file)
     if ($Unordered) {

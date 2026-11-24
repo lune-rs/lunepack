@@ -8,7 +8,10 @@
 //! - A detached program starts with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
 //!   CREATE_NO_WINDOW` and also `CREATE_BREAKAWAY_FROM_JOB`, so a job that kills its members on
 //!   close (a CI runner, a launcher) does not take it along; when the job forbids breakaway the
-//!   start is retried without that flag. Its streams are null.
+//!   start is retried without that flag. Its streams are null, and it holds none of the caller's:
+//!   `CreateProcess` hands a child every inheritable handle, so the standard handles of this
+//!   process (the caller's pipes, when a program reads this one's output to its end) are made
+//!   non-inheritable first.
 //! - Waiting opens the pid, checks the creation time on that very handle, then waits on the
 //!   handle: no polling, and no window between the check and the wait in which the pid could be
 //!   reused.
@@ -36,12 +39,16 @@ use lunepack_core::{
     SpawnSpec, WaitOutcome,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, FILETIME, HWND,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, FILETIME,
+    HANDLE_FLAG_INHERIT, HWND, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, SYNCHRONIZE,
+};
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -220,6 +227,26 @@ fn open_process(pid: u32, access: u32) -> io::Result<OwnedHandle> {
     }
     // SAFETY: `raw` is a non-null handle this call just created and nothing else owns.
     Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
+
+/// Makes this process's own standard handles non-inheritable, so a program started after this
+/// call holds none of them. `Stdio::null()` only chooses the child's standard handles: the child
+/// still inherits every other inheritable handle, among them the pipe a parent gave this process
+/// as its output, and then that parent never sees the end of the pipe while the child runs.
+/// Nothing after this call in this process starts a program with an inherited stream (they are
+/// null or piped); a handle that is not a kernel handle (or none) is skipped.
+#[allow(unsafe_code)]
+fn withhold_standard_handles() {
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: `GetStdHandle` takes one constant and returns a handle value, null or invalid.
+        let handle = unsafe { GetStdHandle(which) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: `handle` is this process's own standard handle, not closed by this call; the
+        // mask and the flags are plain integers. A failure leaves the handle as it was.
+        let _ = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+    }
 }
 
 /// The pseudo handle of this process (valid in this process only, never closed).
@@ -475,6 +502,7 @@ impl Process for WindowsProcess {
                 .into());
         }
         let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+        withhold_standard_handles();
         // The handle is dropped without waiting: the program outlives this process.
         match command(spec, flags | CREATE_BREAKAWAY_FROM_JOB)?.spawn() {
             Ok(child) => drop(child),
