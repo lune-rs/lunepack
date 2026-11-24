@@ -774,6 +774,15 @@ references is listed as `unreferenced` and does not change the exit status. One 
 printed; the exit status is 0 only if every check held. `--at` checks at that Unix time (expiry and key
 windows) instead of the system clock.
 
+The trust chain is read by the same code a client runs (the core's root walk, FORMAT.md 5.2 and 11.1), for
+`verify` and for every command that reads a release directory (`inspect`, `pack`, `feed`, `keys`,
+`setup`): for the same compiled-in root, clock and directory, `verify` accepts exactly when a client
+with no stored state accepts. So the walk takes at most 1024 root rotations (a directory with more
+`root-<k>.json` files than that is read only up to the 1024th, and a `keys.json` signed under a later
+root does not verify), the app id of the root the walk ends on must be the config's, and a `root-<k>.json`
+that does not verify fails with its file name. The commands that write a root or a key set check what
+they built through the same walk before they place it.
+
 ### `lunepack inspect`
 
 ```

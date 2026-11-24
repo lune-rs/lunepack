@@ -18,11 +18,11 @@ use lunepack_core::digest::U53;
 use lunepack_core::error::UpdateConfigError;
 use lunepack_core::update_config::MACOS_ENTRY_DIR;
 use lunepack_core::{
-    AppId, ArtifactRef, Channel, ClockReading, CodeSign, DeltaFile, Hasher, InstallMeta, Limits,
-    MAX_PATCH_WINDOW, NameRule, PayloadKind, RelPath, ReleaseDoc, ReleaseLayout, RollbackFloor,
-    Signer, Target, UpdateConfig, VerifiedEntry, VerifiedKeySet, Version, check_pe_stub,
+    AppId, ArtifactRef, Channel, ClockReading, CodeSign, DeltaFile, Hasher, InstallMeta, KeysChain,
+    Limits, MAX_PATCH_WINDOW, NameRule, PayloadKind, RelPath, ReleaseDoc, ReleaseLayout, Signer,
+    Target, UpdateConfig, VerifiedEntry, VerifiedKeySet, Version, check_pe_stub,
     check_runtime_image, check_service_image, check_ui_image, decode_verified, macos_name_ok,
-    next_feed, sign_envelope, verify_feed, verify_manifest, windows_name_ok,
+    next_feed, sign_envelope, verify_manifest, windows_name_ok,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
@@ -208,7 +208,7 @@ fn exists(path: &Path) -> bool {
 /// signed by the same signers.
 #[allow(clippy::too_many_arguments)]
 fn self_verify(
-    keys: &VerifiedKeySet,
+    chain: &KeysChain,
     signers: &[&dyn Signer],
     app_id: &AppId,
     version: &str,
@@ -239,15 +239,9 @@ fn self_verify(
         &verifier,
     )?;
     let reading = ClockReading::read(&crate::config::FixedClock(now), None);
-    let feed = verify_feed(
-        keys,
-        &feed_bytes,
-        app_id,
-        &channel,
-        &RollbackFloor::default(),
-        &reading,
-        &verifier,
-    )?;
+    let feed =
+        release_dir::verify_feed_of(chain, app_id, &channel, &feed_bytes, &reading, &verifier)?;
+    let keys = chain.keys();
     let entry = feed
         .target_entry(0, target)
         .context("the feed lists no manifest for the target")?;
@@ -703,18 +697,19 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
     let skip = ClockReading::read(clock.as_ref(), Some(u64::MAX));
     let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
     let opened = release_dir::open(release_dir_arg, &config, &hasher, &verifier, &skip)?;
-    let Some(keys) = opened.keys else {
+    let Some(chain) = opened.chain else {
         bail!(
             "{} has no keys.json; run `lunepack keys set` first",
             release_dir_arg.display()
         );
     };
+    let keys = chain.keys();
     let signers = args
         .sign
         .iter()
         .map(|s| resolve_signer(config_path, s))
         .collect::<Result<Vec<_>>>()?;
-    check_signers(&signers, &keys, now)?;
+    check_signers(&signers, keys, now)?;
 
     let version_dir = release_dir_arg.join(&args.version);
     let pack_path = version_dir.join(format!("{}.pack", target.as_str()));
@@ -731,7 +726,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
     let bases = release_dir::select_bases(
         &release_dir::BaseQuery {
             dir: release_dir_arg,
-            keys: &keys,
+            chain: &chain,
             app_id: &config.app_id,
             version: &version,
             target,
@@ -804,7 +799,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
     say(&format!("sign: manifest signed by {} key(s)", refs.len()))?;
     check_manifest_size(manifest.len() as u64)?;
     let (frames, patches) = self_verify(
-        &keys,
+        &chain,
         &refs,
         &config.app_id,
         &args.version,

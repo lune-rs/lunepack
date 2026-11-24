@@ -12,9 +12,9 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use lunepack_core::digest::U53;
 use lunepack_core::{
-    AppId, ArtifactRef, Channel, Clock, ClockReading, Hasher, Limits, PayloadKind, ReleaseDoc,
-    RollbackFloor, RolloutDoc, Sha256Digest, Signer, Target, VerifiedFeed, VerifiedKeySet,
-    VerifiedRelease, Version, next_feed, rollout_seed, sign_envelope, verify_feed,
+    AppId, ArtifactRef, Channel, Clock, ClockReading, Hasher, KeysChain, Limits, PayloadKind,
+    ReleaseDoc, RolloutDoc, Sha256Digest, Signer, Target, VerifiedFeed, VerifiedKeySet,
+    VerifiedRelease, Version, next_feed, rollout_seed, sign_envelope,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
@@ -95,6 +95,7 @@ struct Prepared {
     clock: Box<dyn Clock>,
     now: u64,
     keys: VerifiedKeySet,
+    chain: KeysChain,
     signers: Vec<Box<dyn Signer>>,
     prev: Option<VerifiedFeed>,
     /// The publisher state file (M3-R2-D1), its record of this app, and the walked root.
@@ -125,12 +126,13 @@ fn prepare(
     let skip = ClockReading::read(clock.as_ref(), Some(u64::MAX));
     let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
     let opened = release_dir::open(dir, &config, &hasher, &verifier, &skip)?;
-    let Some(keys) = opened.keys else {
+    let Some(chain) = opened.chain else {
         bail!(
             "{} has no keys.json; run `lunepack keys set` first",
             dir.display()
         );
     };
+    let keys = chain.keys().clone();
     let signers = sign
         .iter()
         .map(|s| resolve_signer(config_path, s))
@@ -141,15 +143,7 @@ fn prepare(
     let prev = match read_capped(&dir.join(&name), Limits::V1.feed_doc_bytes)? {
         None => None,
         Some(bytes) => Some(
-            verify_feed(
-                &keys,
-                &bytes,
-                &config.app_id,
-                &channel,
-                &RollbackFloor::default(),
-                &skip,
-                &verifier,
-            )
+            release_dir::verify_feed_of(&chain, &config.app_id, &channel, &bytes, &skip, &verifier)
             .map_err(|e| {
                 anyhow::anyhow!(
                     "the existing {name} does not verify under keys.json: {e}; if it is signed by keys no longer in keys.json, delete it and run `feed add` to start the channel again (its seq restarts from the clock, so publish only with a clock later than the old feed's issue time), or restore the previous keys.json and revoke in two moves"
@@ -185,6 +179,7 @@ fn prepare(
         clock,
         now,
         keys,
+        chain,
         signers,
         prev,
         state,
@@ -250,14 +245,9 @@ fn finish(
 
     let name = feed_file_name(&p.channel);
     let reading = ClockReading::read(p.clock.as_ref(), None);
-    let floor = match &p.prev {
-        Some(prev) => RollbackFloor::default().with_feed_seq(p.channel.clone(), prev.seq()),
-        None => RollbackFloor::default(),
-    };
-    let feed = verify_feed(
-        &p.keys, &bytes, &p.app_id, &p.channel, &floor, &reading, &verifier,
-    )
-    .context("the new feed does not verify (nothing was written)")?;
+    let feed =
+        release_dir::verify_feed_of(&p.chain, &p.app_id, &p.channel, &bytes, &reading, &verifier)
+            .context("the new feed does not verify (nothing was written)")?;
     if p.prev.as_ref().is_some_and(|prev| feed.seq() <= prev.seq()) {
         bail!("the new feed's seq does not rise (nothing was written)");
     }

@@ -10,9 +10,9 @@ use clap::Args;
 use lunepack_core::digest::U53;
 use lunepack_core::encoding::hex_encode;
 use lunepack_core::{
-    ClockReading, Hasher, KeyEntry, KeyRing, PayloadKind, PublicKey, ReleaseKeyEntry,
-    RollbackFloor, RootDocument, Signer, TrustedRoot, VerifiedKeySet, advance_root, next_key_set,
-    rotate_root, sign_envelope, verify_key_set,
+    ClockReading, Floors, Hasher, KeyEntry, KeyRing, KeysChain, PayloadKind, PublicKey,
+    ReleaseKeyEntry, RootDocument, RootWalk, Signer, TrustedRoot, VerifiedKeySet, next_key_set,
+    rotate_root, sign_envelope,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher, generate_key_file};
 
@@ -238,12 +238,12 @@ fn refs(signers: &[Box<dyn Signer>]) -> Vec<&dyn Signer> {
 fn guard_feeds(
     dir: &Path,
     config: &Config,
-    keys: &VerifiedKeySet,
+    chain: &KeysChain,
     reading: &ClockReading,
     allow: bool,
     command: &str,
 ) -> Result<()> {
-    let rejected = unverifiable_feeds(dir, &config.app_id, keys, reading)?;
+    let rejected = unverifiable_feeds(dir, &config.app_id, chain, reading)?;
     if rejected.is_empty() {
         return Ok(());
     }
@@ -277,8 +277,9 @@ pub fn set_keys(config_path: &Path, args: &SetArgs) -> Result<()> {
     let Opened {
         root,
         root_doc_k,
-        keys: prev,
+        chain,
     } = release_dir::open(&args.release_dir, &config, &hasher, &verifier, &reading)?;
+    let prev = chain.as_ref().map(|c| c.keys().clone());
     // Nothing read above is built on until it matches what this publisher last signed (S1).
     let mut state = State::load(&config.state_path)?;
     let record = state.record(&config.app_id);
@@ -372,19 +373,14 @@ pub fn set_keys(config_path: &Path, args: &SetArgs) -> Result<()> {
         &hasher,
         &verifier,
     )?;
-    let verified = verify_key_set(
-        &root,
-        &bytes,
-        &RollbackFloor::default(),
-        &reading,
-        &hasher,
-        &verifier,
-    )
-    .context("the new keys.json does not verify (nothing was written)")?;
+    let built =
+        release_dir::verify_keys_under(&root, &config.app_id, &bytes, &reading, &hasher, &verifier)
+            .context("the new keys.json does not verify (nothing was written)")?;
+    let verified = built.keys().clone();
     guard_feeds(
         &args.release_dir,
         &config,
-        &verified,
+        &built,
         &reading,
         args.allow_unverifiable_feeds,
         "keys set",
@@ -532,8 +528,9 @@ pub fn rotate_root_cmd(config_path: &Path, args: &RotateArgs) -> Result<()> {
     let Opened {
         root,
         root_doc_k,
-        keys: prev,
+        chain,
     } = release_dir::open(&args.release_dir, &config, &hasher, &verifier, &reading)?;
+    let prev = chain.as_ref().map(|c| c.keys().clone());
     // Nothing read above is built on until it matches what this publisher last signed (S1).
     let mut state = State::load(&config.state_path)?;
     let mut record = state.record(&config.app_id);
@@ -608,8 +605,10 @@ pub fn rotate_root_cmd(config_path: &Path, args: &RotateArgs) -> Result<()> {
         &hasher,
         &verifier,
     )?;
-    let new_root = advance_root(&root, &root_bytes, &hasher, &verifier)
+    let mut walk = RootWalk::new(root.clone());
+    walk.advance(&root_bytes, &hasher, &verifier)
         .context("the new root does not verify (nothing was written)")?;
+    let new_root = walk.root().clone();
 
     // keys.json is re-signed under the new root: same keys and windows, version + 1.
     let resigned = match &prev {
@@ -632,19 +631,22 @@ pub fn rotate_root_cmd(config_path: &Path, args: &RotateArgs) -> Result<()> {
                 &hasher,
                 &verifier,
             )?;
-            let verified = verify_key_set(
-                &new_root,
-                &bytes,
-                &RollbackFloor::default(),
-                &reading,
-                &hasher,
-                &verifier,
-            )
-            .context("the re-signed keys.json does not verify (nothing was written)")?;
+            let built = walk
+                .clone()
+                .verify_keys(
+                    &config.app_id,
+                    &Floors::default(),
+                    &bytes,
+                    &reading,
+                    &hasher,
+                    &verifier,
+                )
+                .context("the re-signed keys.json does not verify (nothing was written)")?;
+            let verified = built.keys().clone();
             guard_feeds(
                 &args.release_dir,
                 &config,
-                &verified,
+                &built,
                 &reading,
                 args.allow_unverifiable_feeds,
                 "keys rotate-root",
