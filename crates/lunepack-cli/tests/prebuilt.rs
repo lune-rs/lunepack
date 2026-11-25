@@ -832,6 +832,40 @@ fn check_refuses_what_the_parser_refuses() {
 }
 
 #[test]
+fn check_and_sign_refuse_a_row_above_the_cap_pack_reads() {
+    let w = World::new();
+    let k = w.new_key("project");
+    let good = fs::read_to_string(w.release_list("good.json")).unwrap();
+    // The ui row of the fixture, one byte above the 64 MiB a UI may have.
+    let ui_size = format!(r#""size":{}"#, UI.len());
+    assert!(good.contains(&ui_size), "{good}");
+    let over = good.replacen(&ui_size, &format!(r#""size":{}"#, 64 * 1024 * 1024 + 1), 1);
+    let list = w.path("over.json");
+    fs::write(&list, over).unwrap();
+
+    let res = w.cmd(&["prebuilt", "check", "--list", p(&list), "--json"], &[]);
+    let err = assert_fails(&res, 1, "check, a row above the cap");
+    assert!(
+        err.contains("not accepted") && err.contains("above"),
+        "{err}"
+    );
+    assert!(res.stdout.is_empty(), "nothing on stdout");
+
+    let out = w.path("over.sig.json");
+    let spec = format!("file:{}", p(&k.path));
+    let err = assert_fails(
+        &w.sign(&list, &out, &[&spec], &[&k], None, &[]),
+        1,
+        "sign, a row above the cap",
+    );
+    assert!(
+        err.contains("not accepted") && err.contains("above"),
+        "{err}"
+    );
+    assert!(!out.exists(), "nothing written");
+}
+
+#[test]
 fn fetch_in_a_state_that_is_not_pinned_is_refused_and_makes_nothing() {
     // The shipped state is `no-key`; after the key ceremony it is `none`, and after a release's pin
     // commit `pinned`, where `fetch` would use the network and is not run here.

@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use crate::config::resolve_signer;
 use crate::place;
-use crate::prebuilt::{self, CLI_VERSION, PinState, asset_name, kind_cap};
+use crate::prebuilt::{self, CLI_VERSION, PinState, accept_list, asset_name};
 use crate::project_key::{self, PROJECT_ROOTS, ProjectKeySet};
 
 /// Arguments of `prebuilt list`.
@@ -459,6 +459,7 @@ pub struct CheckArgs {
 pub fn check(args: &CheckArgs) -> Result<()> {
     let bytes = read_doc(&args.list, "--list")?;
     let list = PrebuiltList::from_payload(&bytes).context("the list is not accepted")?;
+    accept_list(&list).context("the list is not accepted")?;
     if args.json {
         return say(&list_json(&list).to_string());
     }
@@ -523,6 +524,7 @@ fn sign_list(
     signers: impl FnOnce() -> Result<Vec<Box<dyn Signer>>>,
 ) -> Result<(Vec<u8>, Chosen)> {
     let list = PrebuiltList::from_payload(list_bytes).context("the list is not accepted")?;
+    accept_list(&list).context("the list is not accepted")?;
     if list.version_text() != cli_version {
         bail!(
             "the list is of version {}, this CLI is version {cli_version}: sign it with the CLI \
@@ -650,6 +652,7 @@ fn verify_documents(
             anyhow!("rehearsal list: it is signed but marked as a rehearsal; pass --allow-rehearsal to check it")
         })?
     };
+    accept_list(&list).context("the signed list is not accepted")?;
     Ok(Verdict { chosen, list })
 }
 
@@ -700,12 +703,6 @@ fn check_dir(list: &PrebuiltList, dir: &Path, all: bool) -> Result<Vec<String>> 
                 "{name}: {} bytes, the list says {}",
                 meta.len(),
                 row.size()
-            ));
-        } else if row.size() > kind_cap(row.kind()) {
-            problems.push(format!(
-                "{name}: the list's size is above the {} bytes pack reads for a {}",
-                kind_cap(row.kind()),
-                row.kind()
             ));
         } else {
             let mut bytes = Vec::new();
@@ -921,6 +918,54 @@ mod tests {
             v.chosen
                 .label()
                 .contains("built-in key set 2, the current one")
+        );
+    }
+
+    /// A list whose `ui` row is one byte above the cap `pack` reads for a UI.
+    fn over_cap_list_bytes() -> Vec<u8> {
+        format!(
+            r#"{{"format":1,"kind":"prebuilt","critical":[],"version":"0.1.0","source_commit":"{COMMIT}","rehearsal":false,"binaries":[{{"kind":"ui","target":"{TARGET}","size":{},"sha256":"{}"}}]}}"#,
+            crate::cmd_pack::MAX_UI_BYTES + 1,
+            Sha256Hasher.sha256(RUNTIME).to_hex()
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_row_above_the_cap_is_refused_by_sign_and_by_verify_without_a_dir() {
+        let k = keys(1);
+        let a = [k.hex[0].as_str()];
+        let roots = [set(1, &a)];
+        let list = over_cap_list_bytes();
+        let err = err_of(sign_list(&roots, &no_flags(), &list, "0.1.0", || {
+            k.signer(0)
+        }));
+        assert!(
+            err.contains("not accepted") && err.contains("above"),
+            "{err}"
+        );
+
+        // A list signed anyway (by another tool) verifies as a signature but is refused.
+        let signer = k.signer(0).unwrap();
+        let refs: Vec<&dyn Signer> = signer.iter().map(|s| s.as_ref()).collect();
+        let envelope = sign_envelope(
+            PayloadKind::Prebuilt,
+            &list,
+            &refs,
+            &Sha256Hasher,
+            &Ed25519Verifier,
+        )
+        .unwrap();
+        let err = err_of(verify_documents(
+            &roots,
+            &no_flags(),
+            &list,
+            &envelope,
+            false,
+        ));
+        assert!(
+            err.contains("not accepted") && err.contains("above"),
+            "{err}"
         );
     }
 

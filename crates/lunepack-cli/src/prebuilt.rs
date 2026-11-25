@@ -99,6 +99,21 @@ pub fn kind_cap(kind: BinaryKind) -> u64 {
     }
 }
 
+/// The CLI's one rule on a parsed list beyond the core's parser: no row's `size` is above the cap
+/// `pack` applies to its kind. `pin_state`, `prebuilt check`, `prebuilt sign` and `prebuilt verify`
+/// all call it, so a list one of them accepts is a list the pin enforcer accepts.
+pub fn accept_list(list: &PrebuiltList) -> Result<()> {
+    match list.rows().iter().find(|r| r.size() > kind_cap(r.kind())) {
+        Some(row) => bail!(
+            "the {} row for {} has a size above the {} bytes pack reads",
+            row.kind(),
+            row.target().as_str(),
+            kind_cap(row.kind())
+        ),
+        None => Ok(()),
+    }
+}
+
 /// The release asset name of a binary: `lunepack-<kind>-<version>-<target>`, plus `.exe` for a
 /// Windows target. Computed, never read from the table.
 pub fn asset_name(kind: BinaryKind, version: &str, target: Target) -> String {
@@ -171,13 +186,8 @@ pub fn pin_state(
     let rehearsal = verified.is_rehearsal();
     let same_version = verified.version_text() == cli_version;
     let list = verified.rehearsal_list();
-    if let Some(row) = list.rows().iter().find(|r| r.size() > kind_cap(r.kind())) {
-        return PinState::Inconsistent(format!(
-            "the {} row for {} has a size above the {} bytes pack reads",
-            row.kind(),
-            row.target().as_str(),
-            kind_cap(row.kind())
-        ));
+    if let Err(e) = accept_list(&list) {
+        return PinState::Inconsistent(format!("{e:#}"));
     }
     match (rehearsal, same_version) {
         (false, true) => PinState::Pinned(list),
