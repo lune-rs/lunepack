@@ -286,10 +286,11 @@ it patches from ("Deltas" below).
 ```
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
-    [--deltas <N>] [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--service <SERVICE>] [--config <CONFIG>]
+    [--deltas <N>] [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--service <SERVICE>]
+    [--require-pinned] [--config <CONFIG>]
 
 lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runtime <RUNTIME>
-    [--ui <UI>] --assemble <DIR> [--config <CONFIG>]
+    [--ui <UI>] --assemble <DIR> [--require-pinned] [--config <CONFIG>]
 ```
 
 - `--version`: SemVer 2.0.0, used verbatim as the directory name. A directory of equal precedence with
@@ -417,6 +418,17 @@ With `[update]` (and then `[install]`, which is required; `[install]` without `[
 - The entry and the icon must be regular files of the input tree (not symlinks, nor behind one), and
   on a non-Windows target the entry must carry the exec bit. An error names the field, `install.entry`
   or `install.icon`, never its value.
+- Each lunepack binary given (`--runtime`, `--ui`, `--stub`, `--service`) is hashed as read, before the
+  stub is stamped and before code signing, and stdout gets one line per binary: `binary: <flag> is a
+  pinned release binary (<kind> <version> <target>)` or `binary: <flag> is a local build`. A binary is
+  pinned only when this CLI is in the state `pinned` (`lunepack prebuilt list` below) and its list has a
+  row of the binary's kind for exactly the pack's `--target` with the binary's size and SHA-256: there is
+  no fallback between `macos-universal` and `macos-x86_64` or `macos-aarch64`, and `--stub` is the kind
+  `stub-console` when `install.terminal` is true and `stub` otherwise. The pack's bytes do not depend on
+  the classification. With `--require-pinned` a local build is an error that names the flag, the file and
+  the command that downloads the pinned binaries, `lunepack prebuilt fetch --target <TARGET> --out <DIR>`;
+  nothing is written. In the state `inconsistent` stderr gets one warning line and every binary is a
+  local build.
 
 Reserved names, each an error before anything is written:
 
@@ -894,6 +906,42 @@ of the pack through its signed frame:
   install record: the first update check in `~/Applications` or `/Applications` adopts it after proving it
   equal to its release (RUNTIME.md, "macOS"); anywhere else it is a development run. `--zip` is refused for
   a Linux or Windows target.
+
+### `lunepack prebuilt list`
+
+Shows the project's key sets compiled into this CLI and the prebuilt lunepack binaries it pins: the
+runtime, UI, service and stubs of the lunepack release of this CLI's own version.
+
+```
+lunepack prebuilt list [--target <TARGET>] [--json]
+```
+
+The CLI carries three things, all part of its source and of its crates.io package: the project's key
+sets (public keys only; `src/project_key.rs`, oldest first, the last one current), the pin table
+`prebuilt.json` and its signed envelope `prebuilt.sig.json` (FORMAT.md 21). At every use (`pack`,
+`prebuilt list`) it decides one state:
+
+| State | Meaning |
+| --- | --- |
+| `no-key` | No project key set: nothing is pinned. A CLI built before the project's key ceremony is in this state. |
+| `none` | A key set, and both list files are empty: nothing is pinned. |
+| `pinned` | The envelope verifies under the current key set, its payload is byte for byte the table, the list is of this CLI's version and is not a rehearsal list: its rows are pinned. |
+| `rehearsal` | As `pinned`, but the list is a rehearsal list: shown, nothing is pinned. |
+| `other-version` | As `pinned`, but the list is of another version: shown, nothing is pinned. |
+| `inconsistent` | Anything else: one list file without the other, a list without a key set, a table that is not the envelope's payload, an envelope that does not verify under the current key set (also one that verifies only under an earlier, retired set), a parse error, or a row whose `size` is above what `pack` reads for its kind. Nothing is pinned. |
+
+No flag, environment variable or file adds to or replaces the compiled-in key sets for these checks.
+
+The text output is a `state:` line (with a `reason:` line in the state `inconsistent`), one `key set
+<n>: threshold <t>, current|retired` line per key set with a `key: <public key> id <key id>` line per
+key (or `key sets: none (no project key has been published)`), and, for a list, a `list:` line (version,
+source commit, rehearsal) and one `binary:` line per row: kind, target, size, SHA-256 and the release
+asset's name, `lunepack-<kind>-<version>-<target>` (plus `.exe` for a `windows-*` target), computed and
+never read from the table. `--target` shows only that target's rows. `--json` prints one object with
+the members `state`, `reason` (null unless `inconsistent`), `roots` (per key set: `version`,
+`threshold`, `current` and `keys`, each with `public` and `id`), `list` (null, or `version`,
+`source_commit` and `rehearsal`) and `binaries` (per row: `kind`, `target`, `size`, `sha256`, `asset`).
+In the state `inconsistent` the command prints its report, then exits 1 with the reason on stderr.
 
 ## The release directory
 

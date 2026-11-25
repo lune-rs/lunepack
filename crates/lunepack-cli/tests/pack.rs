@@ -819,6 +819,53 @@ fn pack_update(
     pack_update_ui(w, input, dir, runtime, None, version, target)
 }
 
+/// M13 step 12: `pack` reports each lunepack binary it is given as a pinned release binary or a
+/// local build; a runtime made here is a local build in every state, and `--require-pinned`
+/// refuses it, naming the flag and the fetch command, before anything is written.
+#[cfg(unix)]
+#[test]
+fn pack_classifies_the_runtime_and_require_pinned_refuses_a_local_build() {
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    let dir = w.release_dir("rel", &[]);
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let pack = |extra: &[&str]| {
+        let mut args = vec!["--runtime", s(&runtime)];
+        args.extend_from_slice(extra);
+        w.pack(&Pack {
+            input: input.path(),
+            version: "1.2.3",
+            target: "linux-x86_64",
+            release_dir: &dir,
+            signers: w.all_signers(),
+            epoch: T0,
+            extra: args,
+        })
+    };
+
+    // A runtime made by this test is never a pinned release binary, in any state.
+    let out = pack(&["--require-pinned"]);
+    let err = assert_fails(&out, 1, "--require-pinned with a local build");
+    assert!(err.contains("--runtime"), "{err}");
+    assert!(err.contains("is a local build"), "{err}");
+    assert!(
+        err.contains("lunepack prebuilt fetch --target linux-x86_64"),
+        "{err}"
+    );
+    assert!(!dir.join("1.2.3").exists(), "nothing is written");
+
+    let out = pack(&[]);
+    assert_ok(&out, "pack without --require-pinned");
+    assert!(
+        stdout(&out).contains("binary: --runtime is a local build"),
+        "{}",
+        stdout(&out)
+    );
+}
+
 /// `pack` with `--runtime` and, when given, `--ui` (M6).
 #[cfg(unix)]
 fn pack_update_ui(

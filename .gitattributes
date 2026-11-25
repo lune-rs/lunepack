@@ -1,1 +1,4 @@
 * text=auto eol=lf
+# The CLI's pinned binary list and its signed envelope are compared byte for byte: no conversion.
+crates/lunepack-cli/prebuilt.json -text
+crates/lunepack-cli/prebuilt.sig.json -text

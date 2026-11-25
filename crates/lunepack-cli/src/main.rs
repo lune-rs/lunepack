@@ -7,6 +7,7 @@
 mod cmd_feed;
 mod cmd_keys;
 mod cmd_pack;
+mod cmd_prebuilt;
 mod cmd_setup;
 mod cmd_verify;
 mod codesign;
@@ -16,6 +17,8 @@ mod pipeline;
 mod pkg;
 mod place;
 mod plist;
+mod prebuilt;
+mod project_key;
 mod release_dir;
 mod stamp;
 mod state;
@@ -66,6 +69,17 @@ enum Command {
     /// Build a Linux setup file: the release's runtime with one version's key set, manifest and
     /// pack, installable offline (`<app_id>-<version>-<target>-setup`).
     Setup(cmd_setup::SetupArgs),
+    /// lunepack's own prebuilt binaries: what this CLI pins.
+    Prebuilt {
+        #[command(subcommand)]
+        command: PrebuiltCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PrebuiltCommand {
+    /// Show the project's key sets compiled into this CLI and the binaries it pins.
+    List(cmd_prebuilt::ListArgs),
 }
 
 #[derive(Subcommand)]
@@ -114,6 +128,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Verify(args) => cmd_verify::verify(&cli.config, &args),
         Command::Inspect(args) => cmd_verify::inspect(&cli.config, &args),
         Command::Setup(args) => cmd_setup::setup(&cli.config, &args),
+        Command::Prebuilt { command } => match command {
+            PrebuiltCommand::List(args) => cmd_prebuilt::list(&args),
+        },
     }
 }
 
