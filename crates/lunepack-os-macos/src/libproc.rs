@@ -1,8 +1,9 @@
 //! The libproc calls behind [`crate::MacProcess`]: process ids, identity, and the three places a
 //! process can hold a directory tree: its executable path, its working directory and its open
 //! vnode files (M5-D9's in-use scan, M8 step 3). Every `unsafe` block is one libproc call on a
-//! buffer this module owns and sizes, with the returned length checked; nothing here allocates
-//! from a count the kernel reports without a cap.
+//! buffer this module owns and sizes, with the returned length checked, or the one view of a
+//! kernel path buffer's `c_char`s as bytes (`vip_bytes`); nothing here allocates from a count
+//! the kernel reports without a cap.
 //!
 //! Hidden from the documentation: the crate's own tests read each source on its own (the premise
 //! that a tree moved by a swap is reported under its new path is measured with these calls, not
@@ -10,7 +11,7 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::OsStr;
+use std::ffi::{CStr, OsStr};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -60,18 +61,22 @@ fn gone(err: &io::Error) -> bool {
     err.raw_os_error() == Some(libc::ESRCH)
 }
 
-/// The path in a fixed NUL-terminated buffer, `None` when empty.
+/// The path in a fixed NUL-terminated buffer (up to the first NUL, or the whole buffer when it has
+/// none), `None` when empty.
 fn path_of(bytes: &[u8]) -> Option<PathBuf> {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    (end > 0).then(|| PathBuf::from(OsStr::from_bytes(&bytes[..end])))
+    let path = CStr::from_bytes_until_nul(bytes).map_or(bytes, CStr::to_bytes);
+    (!path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(path)))
 }
 
-/// The bytes of a `vip_path` (a `[[c_char; 32]; 32]` standing for `[c_char; MAXPATHLEN]`).
-fn vip_bytes(info: &libc::vnode_info_path) -> Vec<u8> {
-    info.vip_path
-        .iter()
-        .flat_map(|row| row.iter().map(|c| *c as u8))
-        .collect()
+/// The bytes of a `vip_path` (a `[[c_char; 32]; 32]` standing for `[c_char; MAXPATHLEN]`), all
+/// 1024 of them, borrowed in place: the in-use scan reads one per open file of every process, so a
+/// copy per byte made each scan slow (M13).
+fn vip_bytes(info: &libc::vnode_info_path) -> &[u8] {
+    let chars: &[libc::c_char] = info.vip_path.as_flattened();
+    // SAFETY: `c_char` is `i8` or `u8`: one byte, alignment 1, every bit pattern valid as `u8`. So
+    // `chars.len()` bytes from its start are initialised memory of the same allocation, borrowed
+    // from `info` for the returned slice's lifetime and not written through.
+    unsafe { std::slice::from_raw_parts(chars.as_ptr().cast::<u8>(), chars.len()) }
 }
 
 /// Every pid on the system, at the moment of the call.
@@ -204,7 +209,7 @@ pub fn cwd_path(pid: u32) -> io::Result<Option<PathBuf>> {
     }
     // SAFETY: the call wrote the whole struct (`got == size`).
     let info = unsafe { info.assume_init() };
-    Ok(path_of(&vip_bytes(&info.pvi_cdir)))
+    Ok(path_of(vip_bytes(&info.pvi_cdir)))
 }
 
 /// The open file descriptors of `pid` with their types; `None` when the process is gone.
@@ -296,7 +301,7 @@ pub fn fd_paths(pid: u32) -> io::Result<Vec<PathBuf>> {
         }
         // SAFETY: the call wrote the whole struct (`got == size`).
         let info = unsafe { info.assume_init() };
-        if let Some(path) = path_of(&vip_bytes(&info.pvip)) {
+        if let Some(path) = path_of(vip_bytes(&info.pvip)) {
             paths.push(path);
         }
     }
