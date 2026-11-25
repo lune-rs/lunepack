@@ -6,7 +6,9 @@ runs for the installer and the applier, it is a command line that an app in any 
 child process to check for an update, download it, learn what happened since its last start,
 confirm that it works and hand a staged update over to be applied. Each command is a thin layer over
 the library calls a Rust app makes (`Updater::check`, `download` and `stage`, `startup`,
-`confirm_healthy`, `apply_and_restart`), so both get the same behaviour and the same errors (D42). The decisions are M5-D11 and M5-D12 in `docs/DECISIONS.md`;
+`confirm_healthy`, `apply_and_restart`), so both get the same behaviour and the same errors (D42).
+`docs/INTEGRATION.md` walks through the command line with a .NET app and real output; a Rust app starts
+from `docs/GETTING-STARTED.md`. The decisions are M5-D11 and M5-D12 in `docs/DECISIONS.md`;
 what the output must never hold is in `docs/THREAT-MODEL.md` ("The Linux runtime").
 
 ## Locating the runtime

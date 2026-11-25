@@ -6,6 +6,10 @@ the signatures are defined in [`docs/FORMAT.md`](FORMAT.md); the decisions behin
 M3-D1 to M3-D13 and M3-R1-D1 in [`docs/DECISIONS.md`](DECISIONS.md); what it defends against is in
 the packager section of [`docs/THREAT-MODEL.md`](THREAT-MODEL.md).
 
+Walk-throughs with real output: [`docs/GETTING-STARTED.md`](GETTING-STARTED.md) (a Rust app),
+[`docs/INTEGRATION.md`](INTEGRATION.md) (an app in any language) and [`docs/KEY-CEREMONY.md`](KEY-CEREMONY.md)
+(making, keeping, rotating and revoking the signing keys).
+
 Exit codes: 0 on success, 1 when a command fails or a check does not hold, 2 on a usage error.
 Errors print as `error: <message>` on stderr. Progress and results print on stdout. No command prints
 a private key, an environment variable's value or a config value.
@@ -26,8 +30,9 @@ or infers the version or the target. Files are classified by their contents, nev
 (M3-D6): PE (`.exe`, `.dll`), ELF (executables and `.so`) and Mach-O (executables, `.dylib`, bundles)
 get the matching filter whatever language produced them; files that are already compressed (zip, gzip,
 xz, zstd, bzip2, 7z, lz4, PNG, JPEG, GIF, WebP, WOFF2, Ogg) are stored; everything else gets LZMA2. A
-file is stored when no candidate is smaller than the file. How a non-Rust app learns that an update
-exists and triggers it from inside the app is not decided yet (it belongs to the client milestone).
+file is stored when no candidate is smaller than the file. An app in any language learns that an update
+exists and triggers it from inside the app through the runtime's command line (`docs/RUNTIME.md`;
+`docs/INTEGRATION.md` walks through it with a .NET app).
 
 ## Configuration: `lunepack.toml`
 
@@ -218,7 +223,8 @@ lunepack keys gen <PATH> [--config <CONFIG>]
 ```
 
 Writes a new private key file (see the key file format) and prints `public: <hex>` and `id: <hex>`
-(the key id, SHA-256 of the public key) on stdout, nothing else.
+(the key id, SHA-256 of the public key) on stdout, nothing else; its own message `wrote the private key to
+<path>` goes to stderr. The directory of `<PATH>` must exist: the command does not create it.
 
 ### `lunepack keys show`
 
@@ -247,7 +253,9 @@ lunepack keys set --release-dir <RELEASE_DIR> --release-key <RELEASE_KEYS> --sig
   reachable with `--allow-older-previous`).
 - `--not-before`, `--not-after`: Unix times. A key already in the previous key set keeps its window
   unless these are given; a new key defaults to `now` .. `now` + two years.
-- `--expires`: when the key set expires (Unix time); none by default.
+- `--expires`: when the key set expires (Unix time); none by default, and not carried over from the
+  previous key set: a `keys set` without it writes a key set with no expiry (its `change:` line says
+  `expires <time> -> none`).
 - `--sign`: root signers; repeat to reach the root's threshold.
 - The version is the previous version + 1.
 - Before it places anything, `keys set` checks every `feed-*.json` in the directory, and every manifest

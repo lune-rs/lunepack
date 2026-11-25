@@ -29,3 +29,12 @@ On macOS a signature of a file that is not Mach-O is kept in an extended attribu
 carry. `--macos-bundle` therefore builds the bundle with the host alone in `Contents/MacOS` and every other
 file under `Contents/Resources/app`; the host's path to them is written by the SDK's own `CreateAppHost`
 task (the `ExampleMacBundleHost` target of `Example.csproj`).
+
+## Packing and running it
+
+[`docs/INTEGRATION.md`](../../docs/INTEGRATION.md) packs this app and drives it through an install, an
+update, a rollback of a version that never confirms and the macOS bundle layout, with real output. In the
+configuration, `[install] entry` is `Example` (`Example.exe` on Windows, `Contents/MacOS/Example` in the
+macOS bundle) and `[update] health_timeout_secs = 5` makes the rollback quick. The marker file `e2e-flags`
+in the packed tree (`exit-without-confirm` and the other lines above) is how a run asks the app to behave
+badly.
