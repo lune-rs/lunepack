@@ -69,7 +69,7 @@ enum Command {
     /// Build a Linux setup file: the release's runtime with one version's key set, manifest and
     /// pack, installable offline (`<app_id>-<version>-<target>-setup`).
     Setup(cmd_setup::SetupArgs),
-    /// lunepack's own prebuilt binaries: what this CLI pins.
+    /// lunepack's own prebuilt binaries: what this CLI pins, and the project's signed list of them.
     Prebuilt {
         #[command(subcommand)]
         command: PrebuiltCommand,
@@ -80,6 +80,12 @@ enum Command {
 enum PrebuiltCommand {
     /// Show the project's key sets compiled into this CLI and the binaries it pins.
     List(cmd_prebuilt::ListArgs),
+    /// Parse a list with this CLI's own parser and print what it read (no key, no network).
+    Check(cmd_prebuilt::CheckArgs),
+    /// Sign a list: write its envelope after checking it under the project's key set.
+    Sign(cmd_prebuilt::SignArgs),
+    /// Check a list's envelope under a key set, and optionally the downloaded files.
+    Verify(cmd_prebuilt::VerifyArgs),
 }
 
 #[derive(Subcommand)]
@@ -130,6 +136,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Setup(args) => cmd_setup::setup(&cli.config, &args),
         Command::Prebuilt { command } => match command {
             PrebuiltCommand::List(args) => cmd_prebuilt::list(&args),
+            PrebuiltCommand::Check(args) => cmd_prebuilt::check(&args),
+            PrebuiltCommand::Sign(args) => cmd_prebuilt::sign(&cli.config, &args),
+            PrebuiltCommand::Verify(args) => cmd_prebuilt::verify(&args),
         },
     }
 }

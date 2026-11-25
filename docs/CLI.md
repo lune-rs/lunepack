@@ -156,7 +156,9 @@ older document back.
 
 - `<name>`: a `[signers.<name>]` entry of the config;
 - `file:<path>`: a PKCS#8 PEM key file;
-- `env:<VAR>`: a PKCS#8 PEM key held in the environment variable `VAR`.
+- `env:<VAR>`: a PKCS#8 PEM key held in the environment variable `VAR`. This is how lunepack's own
+  release workflow hands over its key (`prebuilt sign`); the variable is visible to the process that
+  holds it and to its children, so set it only on the command that needs it.
 
 The distinct signers given must reach the threshold of the document being signed, and each must be a
 key of the root (for `keys.json` and root documents) or of the key set (for manifests and feeds) and
@@ -942,6 +944,129 @@ the members `state`, `reason` (null unless `inconsistent`), `roots` (per key set
 `threshold`, `current` and `keys`, each with `public` and `id`), `list` (null, or `version`,
 `source_commit` and `rehearsal`) and `binaries` (per row: `kind`, `target`, `size`, `sha256`, `asset`).
 In the state `inconsistent` the command prints its report, then exits 1 with the reason on stderr.
+
+### The project's list of prebuilt binaries: `prebuilt check`, `sign` and `verify`
+
+These three commands handle the signed list of a lunepack release's prebuilt binaries (FORMAT.md 21)
+that the release workflow makes and `prebuilt list` and `pack` read. They are for the maintainers of
+lunepack and for anyone who wants to check a release by hand. None of them needs the network.
+
+**Which key set.** A `sign` or `verify` runs under the current built-in key set of this CLI
+(`prebuilt list` shows it) unless the command line names another: `--trusted-key <hex>` (a public key
+as 64 lowercase hex characters; give it 1 to 16 times, with `--threshold <n>` when more than one) on
+`sign` and `verify`, or `--root-version <n>` (an earlier built-in set) on `verify` only. The two never
+go together. These flags are never read from the environment or a config, and every result says which
+set it held under: `verified under built-in key set 2, the current one`, `verified under built-in key
+set 1, which is retired`, or `verified under a key given on the command line, not a built-in one`. A
+given set is built by the same function as a built-in one, so the same rules apply (1 to 16 keys, none
+twice, `1 <= threshold <= keys`). With no built-in key set and no `--trusted-key`, both commands refuse
+with `this CLI has no project key built in`.
+
+#### `lunepack prebuilt check`
+
+```
+lunepack prebuilt check --list <FILE> [--json]
+```
+
+Reads a list with this CLI's own parser and prints what it read; it exits 0 only when the list is
+accepted. It reads nothing but the file: no key, no signature, no network. `--json` prints one object
+with `version`, `source_commit`, `rehearsal` and `binaries` (per row `kind`, `target`, `size`,
+`sha256` and `asset`, the computed release asset name), so a script that reads these values reads what
+the enforcer read.
+
+```
+$ lunepack prebuilt check --list prebuilt-0.1.0.json
+list: version 0.1.0, source commit 0123456789abcdef0123456789abcdef01234567, rehearsal false
+binary: runtime linux-x86_64 size 13 sha256 7fc5036745ec73b6169495830cf3ef3b58127addf27fcc0d0b8fe87b4de5808c asset lunepack-runtime-0.1.0-linux-x86_64
+binary: ui windows-x86_64 size 8 sha256 62ea1f22117e10e5af59aba1dd236f5878e3626bc3767b5ac202c3da8dafe718 asset lunepack-ui-0.1.0-windows-x86_64.exe
+```
+
+A list the parser refuses prints nothing on stdout and `error: the list is not accepted: <rule>` on
+stderr (exit 1): for example a document over 64 KiB, a member given twice, `rehearsal` missing or not
+a boolean, or trailing data.
+
+#### `lunepack prebuilt sign`
+
+```
+lunepack prebuilt sign --list <FILE> --out <FILE> --sign <SPEC>... [--trusted-key <HEX>... [--threshold <N>]]
+```
+
+Signs the exact bytes of the list (no re-serialisation) and writes the envelope
+(`prebuilt-<version>.sig.json`). The list must pass `prebuilt check` and be of this CLI's own version.
+Signers are the specs of "Signer specs" above, resolved with the global `--config` path; `file:` and
+`env:` work when that config does not exist. No key is printed, logged, written to a file or passed as
+an argument, and no new way to load a key exists.
+
+Before anything is written the envelope is verified under the key set. When it does not verify (a
+signer that is not one of the keys, too few signers for the threshold) nothing is written and the error
+names the key ids the set expects and the ids that signed (key ids are public), so a secret that holds
+the wrong key fails closed. The output file is created with `create_new`: an existing file is an error.
+
+In the examples, `$PUBLIC` is the `public:` value `keys gen` printed for a throwaway key made for them;
+the public key and its id are shown shortened (`...`) in the `key:` lines, they are 64 characters long.
+
+```
+$ lunepack prebuilt sign --list prebuilt-0.1.0.json --out prebuilt-0.1.0.sig.json \
+    --sign file:./release-signer.lpk --trusted-key "$PUBLIC"
+envelope written: prebuilt-0.1.0.sig.json
+verified under a key given on the command line, not a built-in one
+key set: threshold 1 of 1
+  key: 930ca1c4...48714 id dbb52593...92d22
+```
+
+`env:<VAR>` is how lunepack's own release workflow hands its project key to this command
+(`--sign env:LUNEPACK_PROJECT_KEY`). The variable is visible to the process that holds it and to its
+children, so it is set on the one step that needs it and nowhere else.
+
+#### `lunepack prebuilt verify`
+
+```
+lunepack prebuilt verify --list <FILE> --sig <FILE> [--root-version <N> | --trusted-key <HEX>... [--threshold <N>]]
+                         [--dir <DIR> [--all]] [--allow-rehearsal] [--json]
+```
+
+Checks a release's list against its envelope: the envelope must verify under the key set, and the
+decoded payload must equal the `--list` file byte for byte. A list whose `rehearsal` is `true` is a
+rehearsal of the release process: it fails with `rehearsal list` unless `--allow-rehearsal` is given,
+and is labelled `rehearsal true` either way.
+
+With `--dir`, the files in that directory (not its subdirectories) are checked against the rows: every
+file that bears a row's asset name must have the row's size and SHA-256; a file named like a lunepack
+binary of the list's version (`lunepack-<kind>-<version>-...`) that no row names is an error; no
+matching file at all is an error; with `--all` every row's file must be present. A symbolic link or
+another file that is not a regular file under a row's name is an error. Files are only read and hashed,
+never run or parsed. The command exits 0 only when everything asked for passed; on any failure it
+prints nothing on stdout and the reasons on stderr.
+
+```
+$ lunepack prebuilt verify --list prebuilt-0.1.0.json --sig prebuilt-0.1.0.sig.json \
+    --trusted-key "$PUBLIC" --dir downloads --all
+list: version 0.1.0, source commit 0123456789abcdef0123456789abcdef01234567, rehearsal false
+binary: runtime linux-x86_64 size 13 sha256 7fc5036745ec73b6169495830cf3ef3b58127addf27fcc0d0b8fe87b4de5808c asset lunepack-runtime-0.1.0-linux-x86_64
+binary: ui windows-x86_64 size 8 sha256 62ea1f22117e10e5af59aba1dd236f5878e3626bc3767b5ac202c3da8dafe718 asset lunepack-ui-0.1.0-windows-x86_64.exe
+verified under a key given on the command line, not a built-in one
+key set: threshold 1 of 1
+  key: 930ca1c4...48714 id dbb52593...92d22
+files: 2 checked, every row present
+```
+
+A file that differs from its row:
+
+```
+$ lunepack prebuilt verify --list prebuilt-0.1.0.json --sig prebuilt-0.1.0.sig.json \
+    --trusted-key "$PUBLIC" --dir downloads
+error: the files do not match the list:
+  lunepack-ui-0.1.0-windows-x86_64.exe: 9 bytes, the list says 8
+```
+
+`--json` prints one object: the members of `prebuilt check --json`, `key_set` (`source`, `built-in` or
+`command-line`; `version` and `current`, null for a given set; `retired`; `threshold`; `keys`, each
+with `public` and `id`; and the `label` sentence above) and `files` (null, or `checked`, the asset
+names that were checked, and `all`).
+
+A pass proves that the holders of the key set signed this list and that the files are the ones it
+names. It says nothing about how the files were built. Check a release with a CLI you obtained before
+it or from crates.io, not with one downloaded together with the files.
 
 ## The release directory
 
