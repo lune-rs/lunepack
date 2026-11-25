@@ -86,6 +86,8 @@ enum PrebuiltCommand {
     Sign(cmd_prebuilt::SignArgs),
     /// Check a list's envelope under a key set, and optionally the downloaded files.
     Verify(cmd_prebuilt::VerifyArgs),
+    /// Download this CLI's pinned binaries of one target and check them against the pins.
+    Fetch(cmd_prebuilt::FetchArgs),
 }
 
 #[derive(Subcommand)]
@@ -139,6 +141,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             PrebuiltCommand::Check(args) => cmd_prebuilt::check(&args),
             PrebuiltCommand::Sign(args) => cmd_prebuilt::sign(&cli.config, &args),
             PrebuiltCommand::Verify(args) => cmd_prebuilt::verify(&args),
+            PrebuiltCommand::Fetch(args) => cmd_prebuilt::fetch(&args),
         },
     }
 }

@@ -830,3 +830,45 @@ fn check_refuses_what_the_parser_refuses() {
     );
     assert!(err.contains("cannot read"), "{err}");
 }
+
+#[test]
+fn fetch_in_a_state_that_is_not_pinned_is_refused_and_makes_nothing() {
+    // The shipped state is `no-key`; after the key ceremony it is `none`, and after a release's pin
+    // commit `pinned`, where `fetch` would use the network and is not run here.
+    let state = {
+        let out = run(&["prebuilt", "list", "--json"], &[]);
+        assert_ok(&out, "prebuilt list --json");
+        json(&out)["state"].as_str().unwrap().to_owned()
+    };
+    if state == "pinned" {
+        return;
+    }
+    let w = World::new();
+    let out_dir = w.path("fetched");
+    for args in [
+        vec!["--target", "linux-x86_64"],
+        // The state wins over a base URL that would be refused, and over a good one.
+        vec![
+            "--target",
+            "linux-x86_64",
+            "--base-url",
+            "ftp://example.com/",
+        ],
+        vec![
+            "--target",
+            "linux-x86_64",
+            "--base-url",
+            "file:///nonexistent/",
+        ],
+        vec!["--target", "plan9-mips", "--kind", "firmware"],
+    ] {
+        let mut full = vec!["prebuilt", "fetch", "--out", p(&out_dir)];
+        full.extend_from_slice(&args);
+        let res = w.cmd(&full, &[]);
+        let err = assert_fails(&res, 1, "fetch in a refused state");
+        assert!(err.contains(&format!("the state {state}")), "{err}");
+        assert_eq!(err.trim_end().lines().count(), 1, "one line: {err}");
+        assert!(res.stdout.is_empty());
+        assert!(!out_dir.exists(), "--out is not made");
+    }
+}

@@ -466,8 +466,10 @@ the two files like any others.
 
 Building the runtime: `scripts/build-runtime.sh <linux-x86_64|linux-aarch64>` runs the static musl
 build (the target must be installed with `rustup target add`; `--print-command` shows the command and
-runs nothing). `pack` does not build the runtime itself in M5; D19's build-from-source waits for a
-published crate (M13).
+runs nothing). `pack` never builds a runtime from source and never touches the network: a runtime
+you built yourself comes from these scripts in a checkout and is passed by path, and the runtime,
+UI, service and stubs of a lunepack release are downloaded, checked against the pins of this CLI,
+with `lunepack prebuilt fetch` (below).
 
 `scripts/build-runtime.sh <macos-aarch64|macos-x86_64|macos-universal>` builds on a macOS host only (the
 Apple linker, `lipo` and `otool`). `macos-universal` builds both slices and joins them with
@@ -1067,6 +1069,47 @@ names that were checked, and `all`).
 A pass proves that the holders of the key set signed this list and that the files are the ones it
 names. It says nothing about how the files were built. Check a release with a CLI you obtained before
 it or from crates.io, not with one downloaded together with the files.
+
+### `lunepack prebuilt fetch`
+
+```
+lunepack prebuilt fetch --target <TARGET> --out <DIR> [--kind <KIND>]... [--base-url <URL>]
+```
+
+Downloads the prebuilt binaries this CLI pins for one target (`linux-x86_64`, `linux-aarch64`,
+`windows-x86_64` or `macos-universal`), checks each against its pinned row and places it in `<DIR>`.
+This is the only command that uses the network for them: `pack` never downloads anything, and
+`pack --require-pinned` names this command when a binary is a local build.
+
+- It needs the state `pinned` (`prebuilt list`). In every other state (`no-key`, `none`, `rehearsal`,
+  `other-version`, `inconsistent`) it exits 1 with one line that names the state (and, for
+  `inconsistent`, the reason), opens no connection and does not create `--out`. The rows come from the
+  state and from nowhere else: never from a file or a list on the network. The state is decided before
+  `--base-url` is looked at.
+- Each file is requested as `<base><asset name>` (`lunepack-<kind>-<version>-<target>`, plus `.exe` for
+  a Windows target). The default base is the GitHub release of this CLI's version,
+  `https://github.com/lune-rs/lunepack/releases/download/v<version>/`. `--base-url` (ending in `/`, one
+  is added when missing) follows the rule of an update feed: `https://`, `file:///`, or `http://` to a
+  loopback address; anything else is refused before any request, without showing the URL. Redirects are
+  followed up to the transport's limit.
+- At most the pinned size plus one byte is read. A body of another size, or with another SHA-256, is
+  refused with the asset's name and the expected and actual size or the two digests; the temporary file
+  is removed and nothing is placed under the asset's name. A file that passed is placed by a rename
+  from a temporary file in `<DIR>`, with mode 0755 on Unix. Nothing downloaded is run, parsed or
+  unpacked.
+- A file already in `<DIR>` under the asset's name with the pinned SHA-256 is left alone (`present`); one
+  with another hash is replaced only after the new file has passed. A link or a directory under that
+  name is an error.
+- `--kind` (`runtime`, `ui`, `service`, `stub`, `stub-console`; repeatable) limits the files to those
+  kinds; the default is every row of the target.
+
+On success each file prints `fetched: <asset> (<size> bytes)` or `present: <asset>`, then a summary
+line. In this CLI as built from the repository, where no project key has been published yet:
+
+```
+$ lunepack prebuilt fetch --target linux-x86_64 --out ./downloads
+error: prebuilt fetch needs this CLI in the state pinned, it is in the state no-key: no project key is built in, so nothing is pinned
+```
 
 ## The release directory
 

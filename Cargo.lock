@@ -2150,11 +2150,13 @@ dependencies = [
  "lunepack-codec-lzma",
  "lunepack-core",
  "lunepack-crypto",
+ "lunepack-http",
  "lunepack-testkit",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
+ "url",
 ]
 
 [[package]]

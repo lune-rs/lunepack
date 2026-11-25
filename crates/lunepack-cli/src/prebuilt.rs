@@ -9,7 +9,16 @@
 //! rehearsal list. [`pin_state`] decides this from parameters; [`compiled_in`] is its one caller
 //! that passes the compiled-in key sets and files.
 
-use lunepack_core::{BinaryKind, Hasher, PrebuiltList, PrebuiltRow, Target, verify_prebuilt};
+use std::fs;
+use std::io::{self, Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use anyhow::{Context, Result, anyhow, bail};
+use lunepack_core::{
+    BinaryKind, BlockingTransport, CancelToken, FeedKind, Hasher, PrebuiltList, PrebuiltRow,
+    Request, Target, verify_prebuilt,
+};
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
 use crate::cmd_pack::{MAX_RUNTIME_BYTES, MAX_SERVICE_BYTES, MAX_STUB_BYTES, MAX_UI_BYTES};
@@ -179,6 +188,299 @@ pub fn pin_state(
             list.version_text()
         )),
     }
+}
+
+// ---- fetch ---------------------------------------------------------------------------------------
+
+/// The base URL of the release assets of `version` when `--base-url` is not given.
+pub fn default_base_url(version: &str) -> String {
+    format!("https://github.com/lune-rs/lunepack/releases/download/v{version}/")
+}
+
+/// One line that says why `fetch` does nothing in `state`, or `None` in the state `pinned`.
+pub fn fetch_refusal(state: &PinState) -> Option<String> {
+    let why = match state {
+        PinState::Pinned(_) => return None,
+        PinState::NoKey => "no project key is built in, so nothing is pinned".to_owned(),
+        PinState::None => "no list is pinned yet".to_owned(),
+        PinState::Rehearsal(_) => "its list is a rehearsal list".to_owned(),
+        PinState::OtherVersion(_) => "its list is of another version".to_owned(),
+        PinState::Inconsistent(reason) => reason.clone(),
+    };
+    Some(format!(
+        "prebuilt fetch needs this CLI in the state pinned, it is in the state {}: {why}",
+        state.name()
+    ))
+}
+
+/// What `prebuilt fetch` was asked for.
+pub struct FetchRequest<'a> {
+    /// The target id whose rows are fetched.
+    pub target: &'a str,
+    /// Only these kinds (kind names); all rows of the target when empty.
+    pub kinds: &'a [String],
+    /// The base URL (`--base-url`), or the default of this CLI's version.
+    pub base_url: Option<&'a str>,
+    /// The directory the files are placed in; made only once a request is about to be sent.
+    pub out: &'a Path,
+}
+
+/// What happened to one file.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Placed {
+    /// Downloaded, checked and placed.
+    Fetched { asset: String, size: u64 },
+    /// Already there with the pinned SHA-256: left alone.
+    Present { asset: String },
+}
+
+/// How many bytes are read from the network or a file at a time.
+const CHUNK: usize = 64 * 1024;
+
+/// Downloads the pinned binaries of one target: for each row, `<base><asset name>`, at most the
+/// pinned size plus one byte read, size and SHA-256 checked, and only then placed in `out`.
+///
+/// Rows come from `state` and nowhere else; in every state but `pinned` nothing happens: no
+/// connection is opened and `out` is not made. The state is decided first, so a refused state wins
+/// over a refused base URL. Nothing downloaded is run, parsed or unpacked. `transport_for` makes
+/// the transport for a base URL that passed the update-feed rule.
+pub fn fetch(
+    state: &PinState,
+    request: &FetchRequest<'_>,
+    transport_for: impl FnOnce(&str, FeedKind) -> Result<Box<dyn BlockingTransport>>,
+) -> Result<Vec<Placed>> {
+    if let Some(refusal) = fetch_refusal(state) {
+        bail!("{refusal}");
+    }
+    let PinState::Pinned(list) = state else {
+        bail!("prebuilt fetch needs this CLI in the state pinned");
+    };
+    let target = Target::parse(request.target).context("--target is not a target id")?;
+    let mut kinds = Vec::new();
+    for text in request.kinds {
+        let kind = BinaryKind::parse(text)
+            .with_context(|| format!("--kind {text:?} is not a binary kind"))?;
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    let rows: Vec<&PrebuiltRow> = list
+        .rows()
+        .iter()
+        .filter(|r| r.target() == target && (kinds.is_empty() || kinds.contains(&r.kind())))
+        .collect();
+    if rows.is_empty() {
+        bail!(
+            "the pinned list has no binary for target {}{}",
+            target.as_str(),
+            if kinds.is_empty() {
+                ""
+            } else {
+                " of the kinds asked for"
+            }
+        );
+    }
+    for kind in &kinds {
+        if !rows.iter().any(|r| r.kind() == *kind) {
+            bail!(
+                "the pinned list has no {kind} binary for target {}",
+                target.as_str()
+            );
+        }
+    }
+
+    let mut base = request
+        .base_url
+        .map_or_else(|| default_base_url(list.version_text()), str::to_owned);
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    let feed_kind =
+        lunepack::check_config_feed(&base).map_err(|e| anyhow!("--base-url is refused: {e}"))?;
+    let transport = transport_for(&base, feed_kind)?;
+
+    fs::create_dir_all(request.out)
+        .with_context(|| format!("cannot create {}", request.out.display()))?;
+    let mut placed = Vec::new();
+    for row in rows {
+        let asset = asset_name(row.kind(), list.version_text(), row.target());
+        let dest = request.out.join(&asset);
+        if present_with_pinned_hash(&dest, row)? {
+            placed.push(Placed::Present { asset });
+            continue;
+        }
+        download(
+            transport.as_ref(),
+            &format!("{base}{asset}"),
+            &asset,
+            row,
+            &dest,
+        )?;
+        placed.push(Placed::Fetched {
+            asset,
+            size: row.size(),
+        });
+    }
+    Ok(placed)
+}
+
+/// Whether `dest` is a regular file that has the row's size and SHA-256. A link or a directory
+/// under the asset's name is an error, never followed.
+fn present_with_pinned_hash(dest: &Path, row: &PrebuiltRow) -> Result<bool> {
+    let meta = match fs::symlink_metadata(dest) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", dest.display())),
+    };
+    if !meta.is_file() {
+        bail!("{} exists and is not a regular file", dest.display());
+    }
+    if meta.len() != row.size() {
+        return Ok(false);
+    }
+    let mut state = Sha256Hasher.sha256_start();
+    let mut file =
+        fs::File::open(dest).with_context(|| format!("cannot read {}", dest.display()))?;
+    let mut buf = vec![0u8; CHUNK];
+    let mut total = 0u64;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("cannot read {}", dest.display()))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        state.update(&buf[..n]);
+    }
+    Ok(total == row.size() && state.finalize() == row.sha256())
+}
+
+/// A temporary file next to its destination, removed unless it was moved into place.
+struct TempFile {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if !self.keep {
+            // Best effort: this call created the file.
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn create_temp(dest: &Path) -> Result<(TempFile, fs::File)> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("the destination has no usable file name")?;
+    for _ in 0..16 {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(
+            "{}{}-{n}-{name}",
+            crate::place::TMP_PREFIX,
+            std::process::id()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o755);
+        match options.open(&path) {
+            Ok(file) => return Ok((TempFile { path, keep: false }, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("cannot create a file in {}", dir.display()));
+            }
+        }
+    }
+    bail!(
+        "cannot find a free temporary name next to {}",
+        dest.display()
+    );
+}
+
+/// Requests `url`, reads at most `row.size() + 1` bytes into a temporary file next to `dest`,
+/// checks the size and SHA-256 and only then moves the file to `dest` (mode 0755 on Unix). Any
+/// failure removes the temporary file and places nothing under the asset's name.
+fn download(
+    transport: &dyn BlockingTransport,
+    url: &str,
+    asset: &str,
+    row: &PrebuiltRow,
+    dest: &Path,
+) -> Result<()> {
+    let response = transport
+        .get(
+            &Request {
+                url: url.to_owned(),
+                range: None,
+                if_range: None,
+            },
+            &CancelToken::new(),
+        )
+        .with_context(|| format!("cannot fetch {asset}"))?;
+    if response.head.status != 200 {
+        bail!(
+            "cannot fetch {asset}: the server answered {}",
+            response.head.status
+        );
+    }
+    let (temp, mut file) = create_temp(dest)?;
+    let mut body = response.body.take(row.size() + 1);
+    let mut state = Sha256Hasher.sha256_start();
+    let mut buf = vec![0u8; CHUNK];
+    let mut total = 0u64;
+    loop {
+        let n = body
+            .read(&mut buf)
+            .with_context(|| format!("cannot read {asset}"))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        state.update(&buf[..n]);
+        file.write_all(&buf[..n])
+            .with_context(|| format!("cannot write {}", temp.path.display()))?;
+    }
+    if total > row.size() {
+        bail!(
+            "{asset} is longer than pinned: expected {} bytes, got more than that (the read stopped at {total})",
+            row.size()
+        );
+    }
+    if total < row.size() {
+        bail!(
+            "{asset} is shorter than pinned: expected {} bytes, got {total}",
+            row.size()
+        );
+    }
+    let digest = state.finalize();
+    if digest != row.sha256() {
+        bail!(
+            "{asset} is not the pinned file: expected sha256 {}, got {}",
+            row.sha256().to_hex(),
+            digest.to_hex()
+        );
+    }
+    file.flush()
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("cannot write {}", temp.path.display()))?;
+    drop(file);
+    let mut temp = temp;
+    #[cfg(unix)]
+    fs::set_permissions(
+        &temp.path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .with_context(|| format!("cannot set the mode of {}", temp.path.display()))?;
+    fs::rename(&temp.path, dest).with_context(|| format!("cannot place {}", dest.display()))?;
+    temp.keep = true;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -509,5 +811,329 @@ mod tests {
             asset_name(BinaryKind::Runtime, "0.1.0", linux),
             "lunepack-runtime-0.1.0-linux-x86_64"
         );
+    }
+
+    // ---- fetch -----------------------------------------------------------------------------------
+
+    use lunepack_testkit::{FakeOrigin, LoopbackServer, TransportFault};
+
+    const ASSET: &str = "lunepack-runtime-0.1.0-linux-x86_64";
+    const SERVICE: &[u8] = b"a service's bytes, a little longer than the runtime's";
+    const SERVICE_ASSET: &str = "lunepack-service-0.1.0-linux-x86_64";
+
+    /// The state `pinned` with a runtime and a service row of the Linux target.
+    fn pinned(k: &Keys) -> PinState {
+        let one = [k.hex[0].as_str()];
+        let t = table(
+            "0.1.0",
+            false,
+            &[
+                row("runtime", TARGET, RUNTIME),
+                row("service", TARGET, SERVICE),
+            ],
+        );
+        let e = sign(&t, &[&k.signers[0]]);
+        let state = pin_state(&[set(1, &one)], &t, &e, "0.1.0");
+        assert_eq!(state.name(), "pinned");
+        state
+    }
+
+    fn fetch_with(state: &PinState, out: &Path, base: &str, kinds: &[&str]) -> Result<Vec<Placed>> {
+        let kinds: Vec<String> = kinds.iter().map(|k| (*k).to_owned()).collect();
+        fetch(
+            state,
+            &FetchRequest {
+                target: TARGET,
+                kinds: &kinds,
+                base_url: Some(base),
+                out,
+            },
+            crate::cmd_prebuilt::transport_for,
+        )
+    }
+
+    fn server() -> LoopbackServer {
+        LoopbackServer::start(FakeOrigin::new()).unwrap()
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn err_text<T>(r: Result<T>) -> String {
+        match r {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    #[test]
+    fn fetch_places_the_pinned_files_over_http_and_over_file() {
+        let k = keys(1);
+        let state = pinned(&k);
+        let dir = tempfile::tempdir().unwrap();
+
+        // A loopback HTTP server; the base URL is given without its closing slash.
+        let srv = server();
+        srv.origin().put(ASSET, RUNTIME);
+        srv.origin().put(SERVICE_ASSET, SERVICE);
+        let out = dir.path().join("http");
+        let placed = fetch_with(&state, &out, &srv.base_url(), &[]).unwrap();
+        assert_eq!(
+            placed,
+            vec![
+                Placed::Fetched {
+                    asset: ASSET.to_owned(),
+                    size: RUNTIME.len() as u64
+                },
+                Placed::Fetched {
+                    asset: SERVICE_ASSET.to_owned(),
+                    size: SERVICE.len() as u64
+                },
+            ]
+        );
+        assert_eq!(fs::read(out.join(ASSET)).unwrap(), RUNTIME);
+        assert_eq!(fs::read(out.join(SERVICE_ASSET)).unwrap(), SERVICE);
+        assert_eq!(
+            files_in(&out),
+            [ASSET, SERVICE_ASSET],
+            "no temporary file is left"
+        );
+        #[cfg(unix)]
+        for name in [ASSET, SERVICE_ASSET] {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(out.join(name)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "{name}");
+        }
+        // A kind filter fetches only that kind.
+        let only = dir.path().join("only");
+        let placed = fetch_with(&state, &only, &srv.base_url(), &["service"]).unwrap();
+        assert_eq!(placed.len(), 1);
+        assert_eq!(files_in(&only), [SERVICE_ASSET]);
+
+        // A file: base: the directory of the release assets.
+        let src = dir.path().join("release");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join(ASSET), RUNTIME).unwrap();
+        fs::write(src.join(SERVICE_ASSET), SERVICE).unwrap();
+        let base = url::Url::from_directory_path(&src).unwrap().to_string();
+        let out = dir.path().join("file");
+        fetch_with(&state, &out, &base, &["runtime"]).unwrap();
+        assert_eq!(fs::read(out.join(ASSET)).unwrap(), RUNTIME);
+        // A file that is not there is a 404 from the directory source.
+        fs::remove_file(src.join(SERVICE_ASSET)).unwrap();
+        let err = err_text(fetch_with(&state, &dir.path().join("f2"), &base, &[]));
+        assert!(err.contains(SERVICE_ASSET) && err.contains("404"), "{err}");
+    }
+
+    #[test]
+    fn fetch_refuses_a_body_that_is_not_the_pin_and_places_nothing() {
+        let k = keys(1);
+        let state = pinned(&k);
+        let dir = tempfile::tempdir().unwrap();
+        let srv = server();
+        let out = dir.path().join("out");
+
+        // A 404: the server has no such file.
+        let err = err_text(fetch_with(&state, &out, &srv.base_url(), &["runtime"]));
+        assert!(err.contains(ASSET) && err.contains("404"), "{err}");
+
+        // Right size, wrong hash: both digests are named.
+        let mut wrong = RUNTIME.to_vec();
+        wrong[0] ^= 1;
+        srv.origin().put(ASSET, wrong.clone());
+        let err = err_text(fetch_with(&state, &out, &srv.base_url(), &["runtime"]));
+        assert!(err.contains(ASSET), "{err}");
+        assert!(
+            err.contains(&Sha256Hasher.sha256(RUNTIME).to_hex()),
+            "{err}"
+        );
+        assert!(err.contains(&Sha256Hasher.sha256(&wrong).to_hex()), "{err}");
+        assert!(
+            files_in(&out).is_empty(),
+            "nothing placed, no temporary file"
+        );
+
+        // Too short.
+        srv.origin().put(ASSET, &RUNTIME[..5]);
+        let err = err_text(fetch_with(&state, &out, &srv.base_url(), &["runtime"]));
+        assert!(err.contains(ASSET) && err.contains("shorter"), "{err}");
+        assert!(
+            err.contains(&format!("expected {} bytes, got 5", RUNTIME.len())),
+            "{err}"
+        );
+
+        // Too long: the server offers more than the pin, and the read stops one byte past it.
+        srv.origin().put(ASSET, RUNTIME);
+        srv.origin().add_fault(TransportFault::ExtraBytes(1000));
+        let err = err_text(fetch_with(&state, &out, &srv.base_url(), &["runtime"]));
+        assert!(err.contains(ASSET) && err.contains("longer"), "{err}");
+        assert!(
+            err.contains(&format!("stopped at {}", RUNTIME.len() + 1)),
+            "{err}"
+        );
+        // A body that never ends is cut at the same point instead of read for ever.
+        srv.origin().set_faults(vec![TransportFault::Endless]);
+        let err = err_text(fetch_with(&state, &out, &srv.base_url(), &["runtime"]));
+        assert!(
+            err.contains(&format!("stopped at {}", RUNTIME.len() + 1)),
+            "{err}"
+        );
+        assert!(
+            files_in(&out).is_empty(),
+            "nothing placed, no temporary file"
+        );
+    }
+
+    #[test]
+    fn fetch_follows_a_redirect() {
+        let k = keys(1);
+        let state = pinned(&k);
+        let dir = tempfile::tempdir().unwrap();
+        let srv = server();
+        srv.origin().put("moved/runtime-bytes", RUNTIME);
+        srv.origin().redirect(ASSET, "moved/runtime-bytes");
+        let out = dir.path().join("out");
+        fetch_with(&state, &out, &srv.base_url(), &["runtime"]).unwrap();
+        assert_eq!(fs::read(out.join(ASSET)).unwrap(), RUNTIME);
+        assert_eq!(
+            srv.origin().requests().len(),
+            2,
+            "the redirect was followed"
+        );
+    }
+
+    #[test]
+    fn fetch_keeps_a_present_file_and_replaces_a_wrong_one_only_after_the_new_one_passed() {
+        let k = keys(1);
+        let state = pinned(&k);
+        let dir = tempfile::tempdir().unwrap();
+        let srv = server();
+        let out = dir.path().join("out");
+        fs::create_dir(&out).unwrap();
+
+        // Present with the pinned hash: left alone, no request.
+        fs::write(out.join(ASSET), RUNTIME).unwrap();
+        let placed = fetch_with(&state, &out, &srv.base_url(), &["runtime"]).unwrap();
+        assert_eq!(
+            placed,
+            vec![Placed::Present {
+                asset: ASSET.to_owned()
+            }]
+        );
+        assert!(srv.origin().requests().is_empty());
+
+        // Present with another hash: replaced when the new file passes ...
+        fs::write(out.join(ASSET), b"an old build").unwrap();
+        srv.origin().put(ASSET, RUNTIME);
+        fetch_with(&state, &out, &srv.base_url(), &["runtime"]).unwrap();
+        assert_eq!(fs::read(out.join(ASSET)).unwrap(), RUNTIME);
+
+        // ... and kept when it does not.
+        fs::write(out.join(ASSET), b"an old build").unwrap();
+        let mut wrong = RUNTIME.to_vec();
+        wrong[1] ^= 1;
+        srv.origin().put(ASSET, wrong);
+        fetch_with(&state, &out, &srv.base_url(), &["runtime"]).unwrap_err();
+        assert_eq!(fs::read(out.join(ASSET)).unwrap(), b"an old build");
+        assert_eq!(files_in(&out), [ASSET]);
+    }
+
+    #[test]
+    fn fetch_refuses_a_base_url_that_is_not_a_feed_url_before_any_request() {
+        let k = keys(1);
+        let state = pinned(&k);
+        let dir = tempfile::tempdir().unwrap();
+        let srv = server();
+        for base in [
+            "http://example.com/",
+            "ftp://example.com/",
+            "https://user:secret@example.com/",
+            "not a url",
+            "file://remote-host/dir/",
+        ] {
+            let out = dir.path().join("out");
+            let err = err_text(fetch_with(&state, &out, base, &[]));
+            assert!(err.contains("--base-url is refused"), "{base}: {err}");
+            assert!(!err.contains("secret"), "the URL is never shown: {err}");
+            assert!(!out.exists(), "{base}: nothing is made");
+        }
+        assert!(srv.origin().requests().is_empty());
+    }
+
+    #[test]
+    fn fetch_refuses_every_state_but_pinned_before_any_request() {
+        let k = keys(1);
+        let one = [k.hex[0].as_str()];
+        let roots = [set(1, &one)];
+        let sign_table = |t: &[u8]| sign(t, &[&k.signers[0]]);
+        let rehearsal = release_table("0.1.0", true);
+        let other = release_table("0.2.0", false);
+        let plain = release_table("0.1.0", false);
+        let states = vec![
+            ("no-key", pin_state(&[], b"", b"", "0.1.0")),
+            ("none", pin_state(&roots, b"", b"", "0.1.0")),
+            (
+                "rehearsal",
+                pin_state(&roots, &rehearsal, &sign_table(&rehearsal), "0.1.0"),
+            ),
+            (
+                "other-version",
+                pin_state(&roots, &other, &sign_table(&other), "0.1.0"),
+            ),
+            ("inconsistent", pin_state(&roots, &plain, b"", "0.1.0")),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let srv = server();
+        srv.origin().put(ASSET, RUNTIME);
+        for (name, state) in &states {
+            assert_eq!(state.name(), *name);
+            let out = dir.path().join(format!("out-{name}"));
+            let err = err_text(fetch_with(state, &out, &srv.base_url(), &[]));
+            assert!(err.contains(&format!("the state {name}")), "{name}: {err}");
+            if *name == "inconsistent" {
+                assert!(err.contains("without its envelope"), "the reason: {err}");
+            }
+            assert!(!out.exists(), "{name}: --out is not made");
+            // The state wins over a refused base URL.
+            let err = err_text(fetch_with(state, &out, "ftp://example.com/", &[]));
+            assert!(err.contains(&format!("the state {name}")), "{name}: {err}");
+        }
+        assert!(
+            srv.origin().requests().is_empty(),
+            "no request in any refused state"
+        );
+    }
+
+    #[test]
+    fn fetch_needs_a_row_for_the_target_and_the_kind_asked_for() {
+        let k = keys(1);
+        let state = pinned(&k);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let ask = |target: &str, kinds: &[&str]| {
+            let kinds: Vec<String> = kinds.iter().map(|k| (*k).to_owned()).collect();
+            err_text(fetch(
+                &state,
+                &FetchRequest {
+                    target,
+                    kinds: &kinds,
+                    base_url: Some("https://example.invalid/"),
+                    out: &out,
+                },
+                |_, _| bail!("no transport is needed"),
+            ))
+        };
+        assert!(ask("windows-x86_64", &[]).contains("no binary for target windows-x86_64"));
+        assert!(ask(TARGET, &["ui"]).contains("no binary for target"));
+        assert!(ask(TARGET, &["runtime", "ui"]).contains("no ui binary"));
+        assert!(ask(TARGET, &["firmware"]).contains("not a binary kind"));
+        assert!(ask("plan9-mips", &[]).contains("not a target id"));
+        assert!(!out.exists());
     }
 }

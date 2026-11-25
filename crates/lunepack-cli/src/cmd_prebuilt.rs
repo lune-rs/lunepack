@@ -16,10 +16,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use lunepack_core::encoding::hex_encode;
 use lunepack_core::{
-    BinaryKind, Hasher, Limits, PayloadKind, PrebuiltList, PrebuiltRow, Signer, Target,
-    TrustedRoot, sign_envelope, verify_prebuilt,
+    BinaryKind, BlockingTransport, FeedKind, Hasher, Limits, PayloadKind, PrebuiltList,
+    PrebuiltRow, Signer, Target, TrustedRoot, sign_envelope, verify_prebuilt,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
+use lunepack_http::{DirSource, UreqOptions, UreqTransport};
 use serde_json::{Value, json};
 
 use crate::config::resolve_signer;
@@ -172,6 +173,79 @@ fn text(report: &Value) -> Vec<String> {
         ));
     }
     lines
+}
+
+// ---- fetch ---------------------------------------------------------------------------------------
+
+/// Arguments of `prebuilt fetch`.
+#[derive(Args)]
+pub struct FetchArgs {
+    /// The target id whose pinned binaries are downloaded, such as `linux-x86_64`.
+    #[arg(long)]
+    target: String,
+    /// The directory to place the files in (made when a download starts).
+    #[arg(long)]
+    out: PathBuf,
+    /// Only this kind (`runtime`, `ui`, `service`, `stub` or `stub-console`); repeat for several.
+    #[arg(long = "kind")]
+    kinds: Vec<String>,
+    /// Where the release assets are, ending in `/`: `https:`, `file:///` or `http:` to a loopback
+    /// address, the rule of an update feed. Default: this version's GitHub release.
+    #[arg(long = "base-url")]
+    base_url: Option<String>,
+}
+
+/// The transport adapters for a base URL that passed the update-feed rule: the directory source
+/// for `file:`, ureq for `https:` and for `http:` to a loopback address (with no proxy, as the
+/// facade does for an update feed). The one place `prebuilt fetch` reaches an adapter.
+pub(crate) fn transport_for(base: &str, kind: FeedKind) -> Result<Box<dyn BlockingTransport>> {
+    Ok(match kind {
+        FeedKind::File => {
+            let url = url::Url::parse(base).context("--base-url is not a URL")?;
+            let root = url
+                .to_file_path()
+                .map_err(|()| anyhow!("--base-url has no local path"))?;
+            Box::new(DirSource::new(root))
+        }
+        FeedKind::Https => Box::new(UreqTransport::new()),
+        FeedKind::HttpLoopback => Box::new(UreqTransport::with_options(&UreqOptions {
+            direct: true,
+            ..UreqOptions::default()
+        })),
+    })
+}
+
+/// `prebuilt fetch`: downloads this CLI's pinned binaries of one target, checks each one's size and
+/// SHA-256 against the pinned row and places it. Needs the state `pinned`; makes no request in any
+/// other state. `pack` never does this itself (M13-D4).
+pub fn fetch(args: &FetchArgs) -> Result<()> {
+    let state = prebuilt::compiled_in();
+    let placed = prebuilt::fetch(
+        &state,
+        &prebuilt::FetchRequest {
+            target: &args.target,
+            kinds: &args.kinds,
+            base_url: args.base_url.as_deref(),
+            out: &args.out,
+        },
+        transport_for,
+    )?;
+    let mut fetched = 0;
+    for p in &placed {
+        match p {
+            prebuilt::Placed::Fetched { asset, size } => {
+                fetched += 1;
+                say(&format!("fetched: {asset} ({size} bytes)"))?;
+            }
+            prebuilt::Placed::Present { asset } => say(&format!("present: {asset}"))?,
+        }
+    }
+    say(&format!(
+        "{} file(s) in {}: {fetched} fetched, {} already present",
+        placed.len(),
+        args.out.display(),
+        placed.len() - fetched
+    ))
 }
 
 // ---- check, sign, verify ---------------------------------------------------------------------------
