@@ -352,10 +352,13 @@ fn exec_of(m: &VerifiedManifest, path: &str) -> bool {
 }
 
 /// The third-party notices the CLI places beside the runtime (M13-D11): the generated file itself.
+/// Unix only, like every test that packs a runtime and calls `assert_notices`.
+#[cfg(unix)]
 const NOTICES: &[u8] = include_bytes!("../THIRD-PARTY-NOTICES.txt");
 
 /// The notices are placed at `path` as the generated file, hashed into the manifest and not
 /// executable.
+#[cfg(unix)]
 fn assert_notices(m: &VerifiedManifest, files: &BTreeMap<String, Vec<u8>>, path: &str) {
     assert_eq!(files[path], NOTICES, "{path}");
     assert!(!exec_of(m, path), "{path} is not exec");
