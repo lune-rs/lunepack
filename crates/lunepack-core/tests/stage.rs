@@ -1632,7 +1632,11 @@ mod real {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir = base.join(format!("lunepack-stage-{}-{nanos}", std::process::id()));
+            // The clock alone can repeat between tests running in parallel (macOS has microsecond
+            // resolution), so a per-process counter keeps the names apart.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = base.join(format!("lunepack-stage-{}-{nanos}-{n}", std::process::id()));
             assert!(fs::symlink_metadata(&dir).is_err());
             fs::create_dir(&dir).unwrap();
             Scratch(dir)
