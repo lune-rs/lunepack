@@ -2,7 +2,7 @@
 //! parsers and verification chain and drop the result, so fuzzing never needs a public "parse
 //! without verifying" API that returns typed values. Hidden from the docs; not part of the API.
 //!
-//! The payload harnesses (`root`, `keys`, `feed`, `manifest`) take the bytes as a payload, wrap them
+//! The payload harnesses (`root`, `keys`, `feed`, `manifest`, `prebuilt`) take the bytes as a payload, wrap them
 //! in an envelope signed by a built-in fake key and run the real verification function, so the
 //! payload parser and every check behind it are reached. The hasher and signature scheme used here
 //! are private to this module, identical in algorithm to the testkit fakes (the testkit's replay
@@ -36,6 +36,7 @@ use crate::limits::Limits;
 use crate::manifest::{ManifestDocument, verify_manifest};
 use crate::pack::{PackedFile, ReleaseLayout};
 use crate::path::{EntryKind, RelPath, fold_key, validate_path, validate_tree};
+use crate::prebuilt::{PrebuiltList, verify_prebuilt};
 use crate::root::{RootDocument, TrustedRoot, advance_root};
 use crate::target::Target;
 use crate::traits::{
@@ -73,11 +74,12 @@ pub const STATE_NAME_SEQ: u64 = 1;
 
 const DAY: u64 = 86_400;
 const ALL_SEEDS: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-const KINDS: [PayloadKind; 4] = [
+const KINDS: [PayloadKind; 5] = [
     PayloadKind::Root,
     PayloadKind::Keys,
     PayloadKind::Feed,
     PayloadKind::Manifest,
+    PayloadKind::Prebuilt,
 ];
 
 /// A harness entry point.
@@ -102,6 +104,7 @@ pub const HARNESSES: &[(&str, Harness)] = &[
     ("setup", setup),
     ("service", service),
     ("ui", ui),
+    ("prebuilt", prebuilt),
 ];
 
 /// Runs the harness `name` and reports whether `data` got all the way through it (`None`: no such
@@ -125,13 +128,15 @@ pub fn accepts(name: &str, data: &[u8]) -> Option<bool> {
         "setup" => setup_run(data),
         "service" => crate::service::fuzz_run(data),
         "ui" => crate::ui::fuzz_run(data),
+        "prebuilt" => prebuilt_run(data),
         _ => return None,
     })
 }
 
-/// Parses `data` as the document `kind` (`envelope`, `root`, `keys`, `feed` or `manifest`) with
-/// the reader's own syntax and schema checks (strict JSON, `format`, `kind`, `critical`, the typed
-/// fields; for `envelope` the key-independent checks of any of the four kinds), without keys or
+/// Parses `data` as the document `kind` (`envelope`, `root`, `keys`, `feed`, `manifest` or
+/// `prebuilt`) with the reader's own syntax and schema checks (strict JSON, `format`, `kind`,
+/// `critical`, the typed fields; for `prebuilt` every payload rule; for `envelope` the
+/// key-independent checks of any of the five kinds), without keys or
 /// signatures. Used by the test that keeps the examples in `docs/FORMAT.md` parsing.
 pub fn parse_example(kind: &str, data: &[u8]) -> Result<(), String> {
     let result = match kind {
@@ -153,6 +158,7 @@ pub fn parse_example(kind: &str, data: &[u8]) -> Result<(), String> {
         "keys" => parse_payload::<KeySetDocument>(data, PayloadKind::Keys).map(|_| ()),
         "feed" => parse_payload::<FeedDocument>(data, PayloadKind::Feed).map(|_| ()),
         "manifest" => parse_payload::<ManifestDocument>(data, PayloadKind::Manifest).map(|_| ()),
+        "prebuilt" => PrebuiltList::from_payload(data).map(|_| ()),
         _ => return Err(format!("unknown example kind {kind:?}")),
     };
     result.map_err(|e| e.to_string())
@@ -253,6 +259,12 @@ pub fn service(data: &[u8]) {
 /// frame was valid and the stream ended on a frame boundary.
 pub fn ui(data: &[u8]) {
     let _ = crate::ui::fuzz_run(data);
+}
+
+/// `data` as the payload of `prebuilt-<version>.sig.json` (FORMAT.md 21), signed by the root key
+/// and verified under root 1 as its key set.
+pub fn prebuilt(data: &[u8]) {
+    let _ = prebuilt_run(data);
 }
 
 // ---- scaffolding: fake hasher, fake signatures, clock, codec -------------------------------------
@@ -522,6 +534,65 @@ fn keys_run(data: &[u8]) -> bool {
         &FuzzVerifier,
     )
     .is_ok()
+}
+
+/// The verdict of the `prebuilt` harness on `data`: `Err` carries the refusal's text. The seed
+/// tests check that each `bad-` seed is refused for the reason its name gives.
+pub fn prebuilt_verdict(data: &[u8]) -> Result<(), String> {
+    let Some(root) = trusted_root() else {
+        return Err("the trusted root fixture could not be built".to_owned());
+    };
+    let bytes = sign_envelope(PayloadKind::Prebuilt, data, &[ROOT_SEED]);
+    let verified = verify_prebuilt(&root, &bytes, &FuzzVerifier);
+    // The bare-payload reader runs the same rules, so it agrees with the envelope reader on every
+    // payload whose envelope is within the cap.
+    let bare = PrebuiltList::from_payload(data);
+    match verified {
+        Ok(v) => {
+            assert_eq!(
+                v.payload(),
+                data,
+                "the verified payload is the signed bytes"
+            );
+            let Ok(bare) = bare else {
+                panic!("the bare-payload reader refused what the envelope reader accepted");
+            };
+            let rehearsal = v.is_rehearsal();
+            assert_eq!(
+                rehearsal,
+                bare.is_rehearsal(),
+                "the two readers' rehearsal flag"
+            );
+            match v.release_list() {
+                Ok(list) => {
+                    assert!(!rehearsal, "release_list gave the rows of a rehearsal list");
+                    assert_eq!(list, bare, "the two readers' lists");
+                }
+                Err(Error::RehearsalList) => {
+                    assert!(rehearsal, "release_list refused a release list");
+                }
+                Err(e) => panic!("release_list refused for another reason: {e}"),
+            }
+            assert!(
+                !bare.rows().is_empty() && bare.rows().len() <= Limits::V1.prebuilt_rows,
+                "row count out of range"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            if bytes.len() as u64 <= Limits::V1.prebuilt_doc_bytes {
+                assert!(
+                    bare.is_err(),
+                    "the bare-payload reader accepted what the envelope reader refused"
+                );
+            }
+            Err(e.to_string())
+        }
+    }
+}
+
+fn prebuilt_run(data: &[u8]) -> bool {
+    prebuilt_verdict(data).is_ok()
 }
 
 fn feed_run(data: &[u8]) -> bool {

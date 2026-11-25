@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lunepack_core::fuzz::{HARNESSES, accepts, deltas_verdict};
+use lunepack_core::fuzz::{HARNESSES, accepts, deltas_verdict, prebuilt_verdict};
 use lunepack_testkit::replay::{mutated_seeds, random_inputs, seed_neighbourhood};
 use lunepack_testkit::{Seed, fuzz_seeds};
 
@@ -192,7 +192,8 @@ replay!(
     update_config,
     setup,
     service,
-    ui
+    ui,
+    prebuilt
 );
 
 #[test]
@@ -215,6 +216,7 @@ fn the_replay_list_covers_every_harness() {
         "setup",
         "service",
         "ui",
+        "prebuilt",
     ]
     .into_iter()
     .collect();
@@ -242,6 +244,37 @@ fn deltas_seeds_are_refused_for_their_reason() {
             assert!(
                 err.contains(reason),
                 "deltas/{}: refused with {err:?}, expected a reason containing {reason:?}",
+                seed.name
+            );
+        }
+    }
+}
+
+/// A `prebuilt` seed is refused for the reason its name gives (the fixture's root and signature are
+/// valid, so the payload is the only thing that can be wrong), and the accepted ones are the three
+/// the format needs: one row, the most rows a list can hold, and a rehearsal list.
+#[test]
+fn prebuilt_seeds_are_refused_for_their_reason() {
+    let seeds = seeds_of("prebuilt");
+    for name in ["ok-one-row", "ok-every-kind-every-target", "ok-rehearsal"] {
+        assert!(
+            seeds.iter().any(|s| s.name == name && s.accepted),
+            "prebuilt: no accepted seed {name}"
+        );
+    }
+    for seed in &seeds {
+        let verdict = prebuilt_verdict(&seed.bytes);
+        if seed.accepted {
+            assert_eq!(verdict, Ok(()), "prebuilt/{}", seed.name);
+            assert_eq!(seed.reason, None, "prebuilt/{}", seed.name);
+        } else {
+            let reason = seed
+                .reason
+                .unwrap_or_else(|| panic!("prebuilt/{} names no reason", seed.name));
+            let err = verdict.expect_err(&seed.name);
+            assert!(
+                err.contains(reason),
+                "prebuilt/{}: refused with {err:?}, expected a reason containing {reason:?}",
                 seed.name
             );
         }

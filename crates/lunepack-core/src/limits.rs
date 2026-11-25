@@ -22,6 +22,9 @@ pub struct Limits {
     pub feed_doc_bytes: u64,
     /// `<ver>/<target>.manifest.json` document bytes.
     pub manifest_doc_bytes: u64,
+    /// `prebuilt-<version>.sig.json` document bytes (FORMAT.md 21), and the bytes of its payload
+    /// kept as a separate file.
+    pub prebuilt_doc_bytes: u64,
     /// Signatures per envelope.
     pub signatures_per_envelope: usize,
     /// Keys in a root.
@@ -42,6 +45,8 @@ pub struct Limits {
     pub patch_window_bytes: u64,
     /// JSON nesting depth.
     pub json_depth: u32,
+    /// Rows in a prebuilt binary list (FORMAT.md 21).
+    pub prebuilt_rows: usize,
 }
 
 impl Limits {
@@ -51,6 +56,7 @@ impl Limits {
         keys_doc_bytes: 64 * 1024,
         feed_doc_bytes: 8 * 1024 * 1024,
         manifest_doc_bytes: 64 * 1024 * 1024,
+        prebuilt_doc_bytes: 64 * 1024,
         signatures_per_envelope: 16,
         root_keys: 16,
         release_keys: 64,
@@ -61,6 +67,7 @@ impl Limits {
         patches_per_delta: 200_000,
         patch_window_bytes: MAX_PATCH_WINDOW,
         json_depth: MAX_JSON_DEPTH,
+        prebuilt_rows: 64,
     };
 }
 

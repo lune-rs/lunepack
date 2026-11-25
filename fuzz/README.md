@@ -2,7 +2,8 @@
 
 libFuzzer targets over the untrusted-input harnesses of `lunepack_core::fuzz` (envelopes, root,
 key set, feed, manifest, a manifest's deltas, paths, trees, version/target/id rules, strict JSON, frames, HTTP response
-headers, the setup-file locator and trailer, the service protocol, the UI frames) and of
+headers, the setup-file locator and trailer, the service protocol, the UI frames, the prebuilt
+binary list) and of
 `lunepack_codec_lzma::fuzz` (the real LZMA frame and delta-patch decoders: `codec`, `patch`). Each
 target calls one harness; a harness must return for any input without panicking.
 
@@ -63,10 +64,12 @@ regression case and fix the parser.
 
 ## Inputs
 
-- `envelope`: the bytes are an envelope, tried as each of the four kinds.
-- `root`, `keys`, `feed`, `manifest`: the bytes are a payload; the harness signs it with a built-in
-  fake key and runs the real verification function (`advance_root`, `verify_key_set`,
-  `verify_feed`, `verify_manifest`).
+- `envelope`: the bytes are an envelope, tried as each of the five kinds.
+- `root`, `keys`, `feed`, `manifest`, `prebuilt`: the bytes are a payload; the harness signs it
+  with a built-in fake key and runs the real verification function (`advance_root`,
+  `verify_key_set`, `verify_feed`, `verify_manifest`, `verify_prebuilt`). `prebuilt` also runs the
+  bare-payload reader (`PrebuiltList::from_payload`) and fails if the two readers disagree, and
+  checks that a rehearsal list's rows never come out of `release_list`.
 - `deltas`: the bytes are the JSON value of the `deltas` member of a manifest (FORMAT.md 9.3). The
   harness splices them into a fixed valid manifest of `org.example.hello` 1.0.0 for `linux-x86_64`
   (files `bin/app` of 300 bytes, `lib/x.so.1` of 200, an empty `share/empty`, and the link

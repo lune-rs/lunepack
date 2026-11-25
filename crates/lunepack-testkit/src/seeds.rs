@@ -110,6 +110,7 @@ pub fn fuzz_seeds() -> Vec<Seed> {
     setup_seeds(&fx, &mut out);
     service_seeds(&mut out);
     ui_seeds(&mut out);
+    prebuilt_seeds(&mut out);
     out.0
 }
 
@@ -130,7 +131,7 @@ fn dummy_envelope(
 
 fn envelope_seeds(fx: &ChainFixture<'_>, out: &mut Out) {
     let pack = sample_pack(fx);
-    let payloads: [(&str, PayloadKind, Vec<u8>); 4] = [
+    let payloads: [(&str, PayloadKind, Vec<u8>); 5] = [
         (
             "root",
             PayloadKind::Root,
@@ -156,6 +157,11 @@ fn envelope_seeds(fx: &ChainFixture<'_>, out: &mut Out) {
             PayloadKind::Manifest,
             fx.manifest_document("1.0.0", FUZZ_TARGET, &pack)
                 .to_payload(),
+        ),
+        (
+            "prebuilt",
+            PayloadKind::Prebuilt,
+            prebuilt_bytes(&prebuilt_payload(1)),
         ),
     ];
     for (name, kind, payload) in &payloads {
@@ -2167,4 +2173,216 @@ fn ui_seeds(out: &mut Out) {
         v
     });
     out.bad("ui", "empty", Vec::new());
+}
+
+// ---- prebuilt (FORMAT.md 21) ---------------------------------------------------------------------
+
+/// The `source_commit` of the prebuilt seeds.
+const PREBUILT_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+const PREBUILT_KINDS: [&str; 5] = ["runtime", "ui", "service", "stub", "stub-console"];
+
+/// Row `n` of the list of every kind for every target: kinds vary fastest.
+fn prebuilt_row(n: usize) -> serde_json::Value {
+    let kind = PREBUILT_KINDS[n % PREBUILT_KINDS.len()];
+    let target = Target::ALL[(n / PREBUILT_KINDS.len()) % Target::ALL.len()].as_str();
+    serde_json::json!({
+        "kind": kind,
+        "target": target,
+        "size": 1000 + n,
+        "sha256": format!("{:064x}", n + 1),
+    })
+}
+
+/// A valid release list (`"rehearsal": false`) of the first `rows` rows of [`prebuilt_row`].
+fn prebuilt_payload(rows: usize) -> serde_json::Value {
+    serde_json::json!({
+        "format": 1,
+        "kind": "prebuilt",
+        "critical": [],
+        "version": "0.1.0",
+        "source_commit": PREBUILT_COMMIT,
+        "rehearsal": false,
+        "binaries": (0..rows).map(prebuilt_row).collect::<Vec<_>>(),
+    })
+}
+
+fn prebuilt_bytes(payload: &serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(payload).expect("payload serialises")
+}
+
+/// The valid one-row list with `edit` applied.
+fn prebuilt_edited(edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+    let mut payload = prebuilt_payload(1);
+    edit(&mut payload);
+    prebuilt_bytes(&payload)
+}
+
+fn prebuilt_seeds(out: &mut Out) {
+    use serde_json::json;
+    let distinct = PREBUILT_KINDS.len() * Target::ALL.len();
+    out.ok("prebuilt", "one-row", prebuilt_bytes(&prebuilt_payload(1)));
+    out.ok(
+        "prebuilt",
+        "every-kind-every-target",
+        prebuilt_bytes(&prebuilt_payload(distinct)),
+    );
+    out.ok(
+        "prebuilt",
+        "rehearsal",
+        prebuilt_edited(|p| p["rehearsal"] = json!(true)),
+    );
+    out.ok(
+        "prebuilt",
+        "unknown-members",
+        prebuilt_edited(|p| {
+            p["note"] = json!({"any": [1, "two"]});
+            p["binaries"][0]["note"] = json!("ignored");
+        }),
+    );
+    out.ok(
+        "prebuilt",
+        "version-with-build-metadata",
+        prebuilt_edited(|p| p["version"] = json!("1.2.3-rc.1+build.5")),
+    );
+
+    let cases: Vec<(&str, &'static str, Vec<u8>)> = vec![
+        (
+            "format-2",
+            "format 2 is not supported",
+            prebuilt_edited(|p| p["format"] = json!(2)),
+        ),
+        (
+            "kind-keys",
+            "payload kind is not prebuilt",
+            prebuilt_edited(|p| p["kind"] = json!("keys")),
+        ),
+        (
+            "critical",
+            "unknown critical feature",
+            prebuilt_edited(|p| p["critical"] = json!(["rows-v2"])),
+        ),
+        ("duplicate-member", "duplicate object key", {
+            let text = String::from_utf8(prebuilt_bytes(&prebuilt_payload(1))).expect("utf-8");
+            text.replacen('{', "{\"version\":\"9.9.9\",", 1)
+                .into_bytes()
+        }),
+        (
+            "version-missing",
+            "version must be a version string",
+            prebuilt_edited(|p| {
+                p.as_object_mut().expect("object").remove("version");
+            }),
+        ),
+        (
+            "version-number",
+            "version must be a version string",
+            prebuilt_edited(|p| p["version"] = json!(1)),
+        ),
+        (
+            "version-not-semver",
+            "not a SemVer 2.0.0 version",
+            prebuilt_edited(|p| p["version"] = json!("v0.1.0")),
+        ),
+        (
+            "source-commit-short",
+            "source_commit must be 40 lowercase hex",
+            prebuilt_edited(|p| p["source_commit"] = json!(&PREBUILT_COMMIT[..39])),
+        ),
+        (
+            "source-commit-uppercase",
+            "source_commit must be 40 lowercase hex",
+            prebuilt_edited(|p| p["source_commit"] = json!(PREBUILT_COMMIT.to_uppercase())),
+        ),
+        (
+            "rehearsal-string",
+            "rehearsal must be true or false",
+            prebuilt_edited(|p| p["rehearsal"] = json!("false")),
+        ),
+        (
+            "rehearsal-missing",
+            "rehearsal must be true or false",
+            prebuilt_edited(|p| {
+                p.as_object_mut().expect("object").remove("rehearsal");
+            }),
+        ),
+        (
+            "binaries-empty",
+            "binaries must be a list of 1 to 64 rows",
+            prebuilt_bytes(&prebuilt_payload(0)),
+        ),
+        (
+            "binaries-not-a-list",
+            "binaries must be a list of 1 to 64 rows",
+            prebuilt_edited(|p| p["binaries"] = prebuilt_row(0)),
+        ),
+        (
+            "65-rows",
+            "65 prebuilt rows, at most 64",
+            prebuilt_edited(|p| {
+                p["binaries"] = json!((0..65).map(prebuilt_row).collect::<Vec<_>>());
+            }),
+        ),
+        (
+            "row-not-an-object",
+            "a row of binaries must be an object",
+            prebuilt_edited(|p| p["binaries"] = json!(["runtime"])),
+        ),
+        (
+            "row-kind-unknown",
+            "a row's kind must be",
+            prebuilt_edited(|p| p["binaries"][0]["kind"] = json!("Runtime")),
+        ),
+        (
+            "row-target-unknown",
+            "unknown target",
+            prebuilt_edited(|p| p["binaries"][0]["target"] = json!("macos-arm64")),
+        ),
+        (
+            "row-target-missing",
+            "a row's target must be a target id",
+            prebuilt_edited(|p| {
+                p["binaries"][0]
+                    .as_object_mut()
+                    .expect("row")
+                    .remove("target");
+            }),
+        ),
+        (
+            "row-size-zero",
+            "a row's size must be an integer of at least 1",
+            prebuilt_edited(|p| p["binaries"][0]["size"] = json!(0)),
+        ),
+        (
+            "row-size-fraction",
+            "a row's size must be an integer of at least 1",
+            prebuilt_edited(|p| p["binaries"][0]["size"] = json!(1000.0)),
+        ),
+        (
+            "row-size-over-2-53",
+            "a row's size must be an integer of at least 1",
+            prebuilt_edited(|p| p["binaries"][0]["size"] = json!(1u64 << 53)),
+        ),
+        (
+            "row-sha256-uppercase",
+            "a row's sha256 must be 64 lowercase hex",
+            prebuilt_edited(|p| p["binaries"][0]["sha256"] = json!(format!("{:064X}", 0xab))),
+        ),
+        (
+            "row-sha256-short",
+            "a row's sha256 must be 64 lowercase hex",
+            prebuilt_edited(|p| p["binaries"][0]["sha256"] = json!(format!("{:063x}", 1))),
+        ),
+        (
+            "duplicate-row",
+            "two rows share a kind and a target",
+            prebuilt_edited(|p| {
+                let mut twin = prebuilt_row(0);
+                twin["size"] = json!(7);
+                p["binaries"] = json!([prebuilt_row(0), twin]);
+            }),
+        ),
+    ];
+    for (name, reason, bytes) in cases {
+        out.bad_because("prebuilt", name, reason, bytes);
+    }
 }

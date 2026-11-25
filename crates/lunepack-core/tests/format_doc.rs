@@ -21,7 +21,7 @@ use lunepack_core::fuzz::parse_example;
 use lunepack_core::service::{ErrorCode, VerifyClass};
 use lunepack_core::{AppId, MachineLayout, MachineScheme, UnixOs, Version, machine_user_home};
 
-const KINDS: [&str; 5] = ["envelope", "root", "keys", "feed", "manifest"];
+const KINDS: [&str; 6] = ["envelope", "root", "keys", "feed", "manifest", "prebuilt"];
 
 /// `(kind, body, first line number)` of every ```` ```json <kind> ```` block.
 fn example_blocks(text: &str) -> Vec<(String, String, usize)> {

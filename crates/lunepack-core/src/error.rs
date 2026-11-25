@@ -607,6 +607,44 @@ pub enum StageError {
     Other(#[from] Error),
 }
 
+/// Which rule of the prebuilt binary list (FORMAT.md 21) a payload broke. No value is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PrebuiltRule {
+    /// `version` is missing or not a string (a string that is not a version is
+    /// [`Error::Version`]).
+    #[error("version must be a version string")]
+    Version,
+    /// `source_commit` is missing or not exactly 40 lowercase hex characters.
+    #[error("source_commit must be 40 lowercase hex characters")]
+    SourceCommit,
+    /// `rehearsal` is missing or not `true` or `false`.
+    #[error("rehearsal must be true or false")]
+    Rehearsal,
+    /// `binaries` is missing, not a list, or empty (more than the cap is [`Error::TooMany`]).
+    #[error("binaries must be a list of 1 to 64 rows")]
+    Binaries,
+    /// A row of `binaries` is not an object.
+    #[error("a row of binaries must be an object")]
+    Row,
+    /// A row's `kind` is missing or not one of `runtime`, `ui`, `service`, `stub`, `stub-console`.
+    #[error("a row's kind must be runtime, ui, service, stub or stub-console")]
+    Kind,
+    /// A row's `target` is missing or not a string (a string that is not a target id is
+    /// [`Error::Target`]).
+    #[error("a row's target must be a target id")]
+    Target,
+    /// A row's `size` is missing or not an integer from 1 to 2^53 - 1.
+    #[error("a row's size must be an integer of at least 1")]
+    Size,
+    /// A row's `sha256` is missing or not exactly 64 lowercase hex characters.
+    #[error("a row's sha256 must be 64 lowercase hex characters")]
+    Sha256,
+    /// Two rows share a `kind` and a `target`.
+    #[error("two rows share a kind and a target")]
+    DuplicateRow,
+}
+
 /// Which rule of the update-config feed (FORMAT.md 13.3) a feed string broke. The string itself is
 /// never shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -1113,4 +1151,11 @@ pub enum Error {
         /// The manifest entry it differs at.
         entry: Option<usize>,
     },
+    /// A rule of the prebuilt binary list (FORMAT.md 21) is broken.
+    #[error("prebuilt list: {0}")]
+    Prebuilt(PrebuiltRule),
+    /// A prebuilt list marked `"rehearsal": true` was asked for as a release list (FORMAT.md 21):
+    /// it never makes a reader accept a binary.
+    #[error("the prebuilt list is a rehearsal list, not a release list")]
+    RehearsalList,
 }

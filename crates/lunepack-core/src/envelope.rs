@@ -20,7 +20,7 @@ use crate::limits::Limits;
 use crate::traits::Verifier;
 use crate::trust::KeyRing;
 
-/// The four document kinds of format v1 (FORMAT.md 1, 2.2).
+/// The five document kinds of format v1 (FORMAT.md 1, 2.2, 21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PayloadKind {
     /// `root-<k>.json`.
@@ -31,6 +31,9 @@ pub enum PayloadKind {
     Feed,
     /// `<ver>/<target>.manifest.json`.
     Manifest,
+    /// `prebuilt-<version>.sig.json`: lunepack's own list of prebuilt binaries (FORMAT.md 21).
+    /// No app reader opens this kind.
+    Prebuilt,
 }
 
 impl PayloadKind {
@@ -41,6 +44,7 @@ impl PayloadKind {
             PayloadKind::Keys => "application/vnd.lunepack.keys.v1+json",
             PayloadKind::Feed => "application/vnd.lunepack.feed.v1+json",
             PayloadKind::Manifest => "application/vnd.lunepack.manifest.v1+json",
+            PayloadKind::Prebuilt => "application/vnd.lunepack.prebuilt.v1+json",
         }
     }
 
@@ -51,6 +55,7 @@ impl PayloadKind {
             PayloadKind::Keys => "keys",
             PayloadKind::Feed => "feed",
             PayloadKind::Manifest => "manifest",
+            PayloadKind::Prebuilt => "prebuilt",
         }
     }
 
@@ -61,6 +66,7 @@ impl PayloadKind {
             PayloadKind::Keys => limits.keys_doc_bytes,
             PayloadKind::Feed => limits.feed_doc_bytes,
             PayloadKind::Manifest => limits.manifest_doc_bytes,
+            PayloadKind::Prebuilt => limits.prebuilt_doc_bytes,
         }
     }
 }

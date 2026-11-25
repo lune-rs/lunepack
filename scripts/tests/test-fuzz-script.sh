@@ -56,7 +56,7 @@ t_check "--list equals the harness tables of the core and the codec crate" test 
 t_check "--list names the codec crate's harnesses" grep -qx patch "$OUT"
 t_check "--list names a core harness" grep -qx deltas "$OUT"
 t_check "--list has one line per target and no duplicates" test "$(wc -l <"$OUT" | tr -d ' ')" = "$(sort -u "$OUT" | wc -l | tr -d ' ')"
-t_check "--list has 19 targets" test "$(wc -l <"$OUT" | tr -d ' ')" = 19
+t_check "--list has 20 targets" test "$(wc -l <"$OUT" | tr -d ' ')" = 20
 
 # --- a difference between the three sources fails -----------------------------------------------
 tree=$T_TMP/tree

@@ -27,6 +27,7 @@ pub mod pack;
 pub mod path;
 pub mod pe;
 pub mod policy;
+pub mod prebuilt;
 pub mod process;
 pub mod progress;
 pub mod root;
@@ -58,8 +59,8 @@ pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
 pub use error::{
     ConnectError, DesktopPathError, ElevationError, Error, FeedRule, LayoutError, LifecycleError,
-    ProtectError, PublisherError, Result, ServiceError, ServiceRegError, StageError, StateError,
-    UpdateConfigError,
+    PrebuiltRule, ProtectError, PublisherError, Result, ServiceError, ServiceRegError, StageError,
+    StateError, UpdateConfigError,
 };
 pub use feed::{
     ArtifactRef, CheckedRef, FeedDocument, FeedTargetEntry, ReleaseDoc, Rollout, RolloutDoc,
@@ -109,6 +110,7 @@ pub use pack::{
 };
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
+pub use prebuilt::{BinaryKind, PrebuiltList, PrebuiltRow, VerifiedPrebuilt, verify_prebuilt};
 pub use process::{
     Child, ChildStdio, ExitKind, Process, ProcessError, ProcessErrorKind, ProcessId, SpawnSpec,
     WaitOutcome,
