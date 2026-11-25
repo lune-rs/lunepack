@@ -189,9 +189,14 @@ Section 4.
   and `crates/lunepack-cli/prebuilt.sig.json` to zero length: a list of the old version beside the new
   version is the state `other-version`, and the unit test over the committed constants fails on `main`
   otherwise.
-- The secret scan's file exception (`FILE_EXCEPTIONS` in `xtask/src/denylist.rs`) names the generated
-  notices file and a rule by its number in the private denylist; if that private list is ever reordered, the
-  exception has to be updated with it. Never write a denylist term anywhere in the repository.
+- The generated notices file, `crates/lunepack-cli/THIRD-PARTY-NOTICES.txt`, may carry a licence text that one
+  rule of the maintainer's private denylist matches. The exception lives in that private file, not here: the
+  maintainer appends `::skip-file:: <repo-relative path>` to the rule's line (for example
+  `some-term ::skip-file:: crates/lunepack-cli/THIRD-PARTY-NOTICES.txt`; several markers, several paths). The
+  scan then skips that rule's hits on content lines of exactly that tracked path, and nothing else (not the path,
+  not commit messages, not other files). A malformed marker is an error naming the line number; a marker naming
+  a path that is not tracked prints a warning naming the rule number. Never write a denylist term anywhere in
+  the repository.
 - `main` is frozen from the commit A that phase 1 builds until the tag: the tag run fails when A..B changes
   any file but the two of the pin commit, so a changelog date added late is enough to fail it.
 

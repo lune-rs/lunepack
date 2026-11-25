@@ -6,6 +6,24 @@
 //! fixed substring. This module never prints a term, a rule's text or a matched line:
 //! reports carry only locations (`path:line`, commit ids) and rule numbers, and a path
 //! that itself matches a rule is shown as `<redacted path #k>`.
+//!
+//! A rule line may carry file exceptions, declared in the private denylist itself so that
+//! tracked code names no rule, no line number and no term:
+//!
+//! ```text
+//! first-term && second-term ::skip-file:: path/in/repo.txt ::skip-file:: other/path.md
+//! ```
+//!
+//! Everything before the first `::skip-file::` is the rule's terms (as without a marker); each
+//! `::skip-file::` is followed by one exact repo-relative path with `/` separators (no globs,
+//! no prefix or suffix match, case-sensitive). A hit of that rule on a content line of that
+//! tracked path (tree, or an added line of a commit in `--range`) is not counted. Nothing else
+//! is skipped: the path itself, the history-path check, commit messages and every other file are
+//! scanned as before, and every other rule still applies to that file. An empty or malformed
+//! path (empty, absolute, with a backslash, a control character, an empty, `.` or `..`
+//! component, or a trailing slash) is a parse error naming the line number only. A named path
+//! that is not a tracked file is a stale marker: it gets a warning naming the rule number only,
+//! and does not fail the scan.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -61,6 +79,21 @@ struct Rule {
     id: usize,
     /// Lowercased, trimmed, non-empty terms; all must occur.
     terms: Vec<String>,
+    /// Exact repo-relative paths whose content lines this rule does not count (`::skip-file::`).
+    skip_files: Vec<String>,
+}
+
+/// Separator that starts a file exception on a rule line (see the module doc).
+const SKIP_FILE_MARKER: &str = "::skip-file::";
+
+/// True for a plain repo-relative path with `/` separators and no `.`/`..`/empty component.
+fn valid_skip_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
 /// A parsed denylist.
@@ -89,15 +122,32 @@ impl Rules {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            let mut segments = line.split(SKIP_FILE_MARKER);
+            let term_part = segments.next().unwrap_or_default();
+            let mut skip_files = Vec::new();
+            for path in segments {
+                let path = path.trim();
+                if !valid_skip_path(path) {
+                    bail!(
+                        "denylist line {}: malformed {SKIP_FILE_MARKER} marker",
+                        idx + 1
+                    );
+                }
+                skip_files.push(path.to_string());
+            }
             let mut terms = Vec::new();
-            for term in line.split("&&") {
+            for term in term_part.split("&&") {
                 let term = term.trim();
                 if term.is_empty() {
                     bail!("denylist line {}: empty term", idx + 1);
                 }
                 terms.push(term.to_lowercase());
             }
-            rules.push(Rule { id: idx + 1, terms });
+            rules.push(Rule {
+                id: idx + 1,
+                terms,
+                skip_files,
+            });
         }
         Ok(Rules(rules))
     }
@@ -139,45 +189,36 @@ impl Rules {
             .map(|r| r.id)
             .collect()
     }
+
+    /// True when rule `rule` declares `path` (exact, repo-relative) as a skipped file.
+    fn skips(&self, rule: usize, path: &str) -> bool {
+        self.0
+            .iter()
+            .any(|r| r.id == rule && r.skip_files.iter().any(|p| p == path))
+    }
+
+    /// Ids of the rules that name a skip-file for which `tracked` is false.
+    fn stale_skip_rules(&self, tracked: impl Fn(&str) -> bool) -> Vec<usize> {
+        self.0
+            .iter()
+            .filter(|r| r.skip_files.iter().any(|p| !tracked(p)))
+            .map(|r| r.id)
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------------------
 // File exceptions
 // ---------------------------------------------------------------------------------------
 
-/// One named rule set that may match inside one named file without counting as a hit.
-#[derive(Debug, Clone, Copy)]
-pub struct FileException {
-    /// Exact repo-relative path with `/` separators (no globs, no prefix or suffix match).
-    pub path: &'static str,
-    /// Ids of the rules (line numbers of the denylist file) that may match in that file's
-    /// content. Every other rule still applies to the file.
-    pub rules: &'static [usize],
-}
-
-/// The exceptions, kept here in public code next to the scanner.
-///
-/// `crates/lunepack-cli/THIRD-PARTY-NOTICES.txt` is generated by `xtask notices` from the
-/// licence notices of everything linked into the released binaries. One of those notices
-/// (an MIT licence text the project must ship in binary copies) names a party that rule 2 of
-/// the maintainer's denylist lists, so the file cannot be written without it and cannot be
-/// shipped without the notice. Only content lines of this one path are excepted, only for
-/// rule 2; the file's path, its commit messages and every other file are scanned as before.
-pub const FILE_EXCEPTIONS: &[FileException] = &[FileException {
-    path: "crates/lunepack-cli/THIRD-PARTY-NOTICES.txt",
-    rules: &[2],
-}];
-
-/// True when a hit of `rule` at `loc` is excepted: a content line (tree or commit diff) of an
-/// excepted path, for a rule the exception names.
-fn excepted(loc: &Loc, rule: usize) -> bool {
-    let path = match loc {
-        Loc::Line { path, .. } | Loc::CommitLine { path, .. } => path,
-        Loc::Path(_) | Loc::CommitObject { .. } | Loc::CommitPath { .. } => return false,
-    };
-    FILE_EXCEPTIONS
-        .iter()
-        .any(|e| e.path == path && e.rules.contains(&rule))
+/// True when a hit of `rule` at `loc` is excepted: a content line (tree or commit diff) of a
+/// path the rule's line declares with `::skip-file::`. A path hit, a commit object or a commit
+/// path is never excepted.
+fn excepted(rules: &Rules, loc: &Loc, rule: usize) -> bool {
+    match loc {
+        Loc::Line { path, .. } | Loc::CommitLine { path, .. } => rules.skips(rule, path),
+        Loc::Path(_) | Loc::CommitObject { .. } | Loc::CommitPath { .. } => false,
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -246,6 +287,8 @@ struct Scan<'a> {
     rules: &'a Rules,
     hits: Vec<Hit>,
     seen: HashSet<Hit>,
+    /// Paths of the tracked files seen by the tree scan.
+    tracked: HashSet<String>,
 }
 
 impl<'a> Scan<'a> {
@@ -254,11 +297,12 @@ impl<'a> Scan<'a> {
             rules,
             hits: Vec::new(),
             seen: HashSet::new(),
+            tracked: HashSet::new(),
         }
     }
 
     fn push(&mut self, loc: Loc, rule: usize) {
-        if excepted(&loc, rule) {
+        if excepted(self.rules, &loc, rule) {
             return;
         }
         let hit = Hit { loc, rule };
@@ -443,6 +487,7 @@ fn scan_tree(git: &Git, top: &Path, scan: &mut Scan) -> Result<()> {
         }
 
         scan.line(&path, || Loc::Path(path.clone()));
+        scan.tracked.insert(path.clone());
 
         let fs_path = top.join(os_path(path_bytes));
         let content: Vec<u8> = match std::fs::symlink_metadata(&fs_path) {
@@ -777,6 +822,9 @@ pub fn run(args: &Args, get_env: impl Fn(&str) -> Option<OsString>) -> Result<u8
     };
     let mut scan = Scan::new(&rules);
     scan_tree(&git, &top, &mut scan)?;
+    for id in rules.stale_skip_rules(|p| scan.tracked.contains(p)) {
+        eprintln!("denylist: warning: rule {id} names a skip-file that is not a tracked file");
+    }
     if let Some(range) = &args.range {
         scan_range(&git, range, &mut scan)?;
     }
