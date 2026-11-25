@@ -36,10 +36,29 @@ undocumented_unsafe_blocks = "deny"
 
     const INHERIT: &str = "[lints]\nworkspace = true\n";
 
+    /// The ten names M13-D5 publishes, written out here so the tests do not read the list they test.
+    const PUBLISHED: [&str; 10] = [
+        "lunepack",
+        "lunepack-cli",
+        "lunepack-codec-lzma",
+        "lunepack-core",
+        "lunepack-crypto",
+        "lunepack-fs",
+        "lunepack-http",
+        "lunepack-os-linux",
+        "lunepack-os-macos",
+        "lunepack-os-windows",
+    ];
+
     fn manifest(name: &str, lints: &str, deps: &str) -> String {
+        let publish = if PUBLISHED.contains(&name) {
+            ""
+        } else {
+            "publish = false\n"
+        };
         format!(
             "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
-             rust-version = \"1.90\"\nlicense = \"MIT OR Apache-2.0\"\npublish = false\n\n\
+             rust-version = \"1.90\"\nlicense = \"MIT OR Apache-2.0\"\n{publish}\n\
              {lints}\n[dependencies]\n{deps}"
         )
     }
@@ -1507,6 +1526,114 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
             *m = m.replace("publish = false", "publish = true")
         });
         assert_has(&fx.run().1, "lunepack-testkit", "publish");
+    }
+
+    // M13-D5: the publish set ---------------------------------------------------------------------
+
+    #[test]
+    fn publish_set_clean_fixture_passes() {
+        let (_, vs) = Fx::clean().run();
+        assert!(vs.is_empty(), "{}", render(&vs));
+    }
+
+    #[test]
+    fn publish_set_member_must_be_publishable() {
+        for name in ["lunepack-core", "lunepack-cli", "lunepack"] {
+            let mut fx = Fx::clean();
+            fx.edit(name, |m| {
+                *m = m.replace("license = ", "publish = false\nlicense = ")
+            });
+            assert_has(&fx.run().1, name, "publish");
+        }
+        // A registry list is not "publishable": only the unset key is.
+        let mut fx = Fx::clean();
+        fx.edit("lunepack-core", |m| {
+            *m = m.replace("license = ", "publish = [\"crates-io\"]\nlicense = ")
+        });
+        assert_has(&fx.run().1, "lunepack-core", "publish");
+    }
+
+    #[test]
+    fn every_member_outside_the_publish_set_must_be_unpublishable() {
+        let mut fx = Fx::clean();
+        fx.edit("lunepack-testkit", |m| {
+            *m = m.replace("publish = false\n", "")
+        });
+        assert_has(&fx.run().1, "lunepack-testkit", "publish");
+        // A binary crate and a crate the role table does not know.
+        for (name, deps) in [("lunepack-runtime", ""), ("lunepack-newcomer", "")] {
+            let mut fx = Fx::clean();
+            fx.crates.insert(name.into(), manifest(name, INHERIT, deps));
+            fx.edit(name, |m| *m = m.replace("publish = false\n", ""));
+            assert_has(&fx.run().1, name, "publish");
+            let mut fx = Fx::clean();
+            fx.crates.insert(name.into(), manifest(name, INHERIT, deps));
+            assert!(!has(&fx.run().1, name, "publish"));
+        }
+    }
+
+    #[test]
+    fn publish_set_member_may_not_depend_on_a_member_outside_it() {
+        // A normal and a build dependency on a binary crate and on the testkit.
+        for (name, line) in [
+            (
+                "lunepack-http",
+                r#"lunepack-runtime = { path = "../lunepack-runtime" }"#,
+            ),
+            (
+                "lunepack-http",
+                r#"lunepack-testkit = { path = "../lunepack-testkit" }"#,
+            ),
+        ] {
+            let mut fx = Fx::clean();
+            fx.crates.insert(
+                "lunepack-runtime".into(),
+                manifest("lunepack-runtime", INHERIT, ""),
+            );
+            fx.add_dep(name, line);
+            assert_has(&fx.run().1, name, "publish-dep");
+        }
+        let mut fx = Fx::clean();
+        fx.append(
+            "lunepack-http",
+            "[build-dependencies]\nlunepack-testkit = { path = \"../lunepack-testkit\" }",
+        );
+        assert_has(&fx.run().1, "lunepack-http", "publish-dep");
+        // A dev-dependency on the testkit is dropped from the package and is allowed.
+        let mut fx = Fx::clean();
+        fx.append(
+            "lunepack-http",
+            "[dev-dependencies]\nlunepack-testkit = { path = \"../lunepack-testkit\" }",
+        );
+        assert!(!has(&fx.run().1, "lunepack-http", "publish-dep"));
+        // A member outside the set may depend on one inside it (the binaries do).
+        let mut fx = Fx::clean();
+        fx.crates.insert(
+            "lunepack-runtime".into(),
+            manifest(
+                "lunepack-runtime",
+                INHERIT,
+                r#"lunepack = { path = "../lunepack" }"#,
+            ),
+        );
+        assert!(!has(&fx.run().1, "lunepack-runtime", "publish-dep"));
+    }
+
+    #[test]
+    fn publish_set_member_may_not_depend_on_a_git_source() {
+        let mut fx = Fx::clean();
+        fx.add_dep(
+            "lunepack-fs",
+            r#"gitdep = { git = "https://example.invalid/gitdep.git" }"#,
+        );
+        assert_has(&fx.run().1, "lunepack-fs", "publish-dep");
+        // A dev-dependency from git is not packaged.
+        let mut fx = Fx::clean();
+        fx.append(
+            "lunepack-fs",
+            "[dev-dependencies]\ngitdep = { git = \"https://example.invalid/gitdep.git\" }",
+        );
+        assert!(!has(&fx.run().1, "lunepack-fs", "publish-dep"));
     }
 
     #[test]

@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-codec-lzma"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-core",
  "lzma-rust2",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64",
  "semver",

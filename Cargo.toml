@@ -4,11 +4,11 @@ members = ["crates/*", "xtask"]
 exclude = ["probes", "fuzz"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/lune-rs/lunepack-rs"
+repository = "https://github.com/lune-rs/lunepack"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -19,18 +19,18 @@ dbg_macro = "deny"
 todo = "deny"
 
 [workspace.dependencies]
-lunepack-core = { path = "crates/lunepack-core" }
+lunepack-core = { path = "crates/lunepack-core", version = "=0.1.0" }
 lunepack-testkit = { path = "crates/lunepack-testkit" }
-lunepack-crypto = { path = "crates/lunepack-crypto" }
-lunepack-codec-lzma = { path = "crates/lunepack-codec-lzma" }
-lunepack-fs = { path = "crates/lunepack-fs" }
-lunepack-http = { path = "crates/lunepack-http" }
-lunepack-os-windows = { path = "crates/lunepack-os-windows" }
-lunepack-os-macos = { path = "crates/lunepack-os-macos" }
-lunepack-os-linux = { path = "crates/lunepack-os-linux" }
-lunepack = { path = "crates/lunepack" }
+lunepack-crypto = { path = "crates/lunepack-crypto", version = "=0.1.0" }
+lunepack-codec-lzma = { path = "crates/lunepack-codec-lzma", version = "=0.1.0" }
+lunepack-fs = { path = "crates/lunepack-fs", version = "=0.1.0" }
+lunepack-http = { path = "crates/lunepack-http", version = "=0.1.0" }
+lunepack-os-windows = { path = "crates/lunepack-os-windows", version = "=0.1.0" }
+lunepack-os-macos = { path = "crates/lunepack-os-macos", version = "=0.1.0" }
+lunepack-os-linux = { path = "crates/lunepack-os-linux", version = "=0.1.0" }
+lunepack = { path = "crates/lunepack", version = "=0.1.0" }
 lunepack-runtime = { path = "crates/lunepack-runtime" }
-lunepack-cli = { path = "crates/lunepack-cli" }
+lunepack-cli = { path = "crates/lunepack-cli", version = "=0.1.0" }
 lunepack-ui-luneui = { path = "crates/lunepack-ui-luneui" }
 
 # Core's pure external crates (M2-D1); the boundary check allowlists exactly these for lunepack-core.

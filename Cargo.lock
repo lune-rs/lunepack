@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "futures",
  "lunepack-codec-lzma",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2159,7 +2159,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-codec-lzma"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-core",
  "lunepack-testkit",
@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "lunepack-testkit",
@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-crypto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2197,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-fs"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "fs4",
  "libc",
@@ -2208,7 +2208,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-http"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "http",
  "hyper-util",
@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-os-linux"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libc",
  "lunepack-core",
@@ -2233,7 +2233,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-os-macos"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "core-foundation 0.10.1",
  "libc",
@@ -2244,7 +2244,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-os-windows"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-core",
  "lunepack-testkit",
@@ -2255,7 +2255,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack",
  "lunepack-codec-lzma",
@@ -2272,7 +2272,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-service"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-codec-lzma",
  "lunepack-core",
@@ -2287,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-stub"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-core",
  "lunepack-crypto",
@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-testkit"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-core",
  "proptest",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-ui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-core",
  "lunepack-os-linux",
@@ -2319,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-ui-luneui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "accesskit_consumer",
  "lune-ui",
@@ -5194,7 +5194,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "cargo_metadata",

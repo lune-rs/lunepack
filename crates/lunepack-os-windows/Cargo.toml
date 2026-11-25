@@ -1,11 +1,16 @@
 [package]
 name = "lunepack-os-windows"
+description = "Windows adapter for lunepack: Start-menu shortcuts and registry entries, process restart, per-machine protection, the service pipe and the publisher check."
+readme = "README.md"
+# The tests (their fixtures, goldens and the fuzz replay) are a checkout's, not a package's.
+exclude = ["/tests"]
+keywords = ["windows", "installer", "updater", "registry", "code-signing"]
+categories = ["os::windows-apis"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 # An allowlisted crate (hard rule 2): a full copy of the workspace lints in which `unsafe_code` is
 # `deny` instead of `forbid`, so the one function that needs it opts in with `#[allow(unsafe_code)]`,

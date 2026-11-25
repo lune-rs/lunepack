@@ -47,6 +47,25 @@ pub const ROLES: &[(&str, Role)] = &[
     ("xtask", Role::Tool),
 ];
 
+/// The publish set (M13-D5): exactly these workspace members may be published to crates.io. Every
+/// other member must say `publish = false`, so a new crate is unpublishable until it is added
+/// here. The binaries (`lunepack-runtime`, `-service`, `-stub`) stay out because their build options
+/// live in `.cargo/config.toml`, which a package does not carry; the UI crates because LuneUI is a
+/// git dependency (D39). `scripts/publish-dry-run.sh` proves the set is complete: it fails unless
+/// exactly these ten names are packaged.
+pub const PUBLISH_SET: &[&str] = &[
+    "lunepack",
+    "lunepack-cli",
+    "lunepack-codec-lzma",
+    "lunepack-core",
+    "lunepack-crypto",
+    "lunepack-fs",
+    "lunepack-http",
+    "lunepack-os-linux",
+    "lunepack-os-macos",
+    "lunepack-os-windows",
+];
+
 /// Crates that may lift `unsafe_code` (M1-D3); `lunepack-ffi` joins here later.
 pub const UNSAFE_ALLOWLIST: &[&str] = &[
     "lunepack-fs",
@@ -1114,8 +1133,22 @@ fn check_package(
             format!("expected {EXPECTED_LICENSE:?}, got {:?}", pkg.license),
         ));
     }
-    if matches!(role, Some(Role::Testkit | Role::Tool)) && pkg.publish.as_deref() != Some(&[]) {
-        out.push(v(name, "publish", "must be `publish = false`"));
+    // The publish set (M13-D5): a member of the set is publishable (no `publish` key), every other
+    // member, known or not, is `publish = false`.
+    if PUBLISH_SET.contains(&name) {
+        if pkg.publish.is_some() {
+            out.push(v(
+                name,
+                "publish",
+                "is in the publish set and must not say `publish = false` or name a registry",
+            ));
+        }
+    } else if pkg.publish.as_deref() != Some(&[]) {
+        out.push(v(
+            name,
+            "publish",
+            "is not in the publish set and must be `publish = false`",
+        ));
     }
 
     // Dependencies.
@@ -1155,6 +1188,29 @@ fn check_dependency(
             return;
         }
     };
+
+    // A published crate is built from its package alone: its normal and build dependencies must
+    // be on crates.io or in the publish set (dev-dependencies are dropped from the package).
+    if dep.kind != DependencyKind::Development && PUBLISH_SET.contains(&package) {
+        if member_dirs.contains_key(dname) && !PUBLISH_SET.contains(&dname) {
+            out.push(v(
+                package,
+                "publish-dep",
+                format!("{kind} dependency on `{dname}`, which is not in the publish set"),
+            ));
+        }
+        if dep
+            .source
+            .as_ref()
+            .is_some_and(|src| src.repr.starts_with("git+"))
+        {
+            out.push(v(
+                package,
+                "publish-dep",
+                format!("{kind} dependency on `{dname}` comes from a git source"),
+            ));
+        }
+    }
 
     if dep.kind != DependencyKind::Development
         && let Some((_, only)) = DEPENDS_ONLY_ON.iter().find(|(p, _)| *p == package)

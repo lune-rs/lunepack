@@ -1,11 +1,16 @@
 [package]
 name = "lunepack-fs"
+description = "Filesystem adapter for lunepack: file operations over std, the OS advisory lock, and the place and exchange primitives the updater needs."
+readme = "README.md"
+# The tests (their fixtures, goldens and the fuzz replay) are a checkout's, not a package's.
+exclude = ["/tests"]
+keywords = ["filesystem", "lock", "atomic", "updater", "installer"]
+categories = ["filesystem"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 # An allowlisted crate (hard rule 2): a full copy of the workspace lints in which `unsafe_code` is
 # `deny` instead of `forbid`, so the few modules that need it opt in with `#![allow(unsafe_code)]`,

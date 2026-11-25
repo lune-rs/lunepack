@@ -1,11 +1,16 @@
 [package]
 name = "lunepack-crypto"
+description = "Hashing, Ed25519 verification and signing adapters for lunepack: SHA-256, strict Ed25519, key files and external signers."
+readme = "README.md"
+# The tests (their fixtures, goldens and the fuzz replay) are a checkout's, not a package's.
+exclude = ["/tests"]
+keywords = ["sha256", "ed25519", "signing", "updater", "verification"]
+categories = ["cryptography"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [lints]
 workspace = true

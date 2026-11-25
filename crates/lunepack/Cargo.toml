@@ -1,11 +1,16 @@
 [package]
 name = "lunepack"
+description = "Update framework for applications: check for, download, verify and stage full and delta updates, then apply them and restart."
+readme = "README.md"
+# The tests (their fixtures, goldens and the fuzz replay) are a checkout's, not a package's.
+exclude = ["/tests"]
+keywords = ["updater", "auto-update", "installer", "delta", "self-update"]
+categories = ["development-tools", "filesystem"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [lints]
 workspace = true
