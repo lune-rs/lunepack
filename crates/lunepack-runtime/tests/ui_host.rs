@@ -1069,8 +1069,10 @@ mod native {
             let t = Instant::now();
             // Never said hello: the headless answer, not the lost one.
             assert_eq!(welcome(&ui, &events), ChoiceValue::Proceed, "exit {code}");
+            // The bound only has to tell the headless answer from a hung wait, with room for a
+            // loaded machine (e25c4ec saw 3.02 s over a 2 s wait under the full gate).
             assert!(
-                t.elapsed() < FAST.hello + Duration::from_secs(1),
+                t.elapsed() < FAST.hello + Duration::from_secs(10),
                 "exit {code}"
             );
             assert_eq!(ui.stopped().map(|s| s.exit_code), Some(Some(code)));
@@ -1095,7 +1097,12 @@ mod native {
             took >= lab.bounds.hello - Duration::from_millis(200),
             "{took:?}"
         );
-        assert!(took < lab.bounds.hello + Duration::from_secs(1), "{took:?}");
+        // Nothing else ends this wait; the upper bound only has to rule out a hang, with room
+        // for a loaded machine (e25c4ec).
+        assert!(
+            took < lab.bounds.hello + Duration::from_secs(10),
+            "{took:?}"
+        );
         ui.close(&events);
         assert!(lab.lines(events).contains(&stop_line("hello_timeout")));
     }
@@ -1149,7 +1156,9 @@ mod native {
     }
 
     fn host_stops_reading_at_each_pre_change_and_rolled_back_prompt() {
-        let bound = FAST.pong_wait + Duration::from_secs(1);
+        // The bound only has to tell "gave up after the ping wait" from a hang, with room for a
+        // loaded machine (e25c4ec saw 3.02 s over a 2 s wait under the full gate).
+        let bound = FAST.pong_wait + Duration::from_secs(10);
         for (flow, kind, want) in [
             (Flow::Install, PromptKind::Welcome, ChoiceValue::Cancel),
             (Flow::Uninstall, PromptKind::Confirm, ChoiceValue::Cancel),
@@ -1332,7 +1341,9 @@ mod native {
         let start_bound = Duration::from_millis(if cfg!(windows) { 3000 } else { 500 });
         assert!(t.elapsed() < start_bound, "start waited");
         let events = lab.events(&ui);
-        assert!(wait_until(FAST.stall + Duration::from_secs(1), || ui
+        // `wait_until` returns when the stall is seen; the 10 s of room is for a loaded machine
+        // (e25c4ec). The next assertion still tells a stall from the hello timeout.
+        assert!(wait_until(FAST.stall + Duration::from_secs(10), || ui
             .stopped()
             .is_some()));
         assert_eq!(ui.stopped().map(|s| s.reason), Some(UiStop::Stalled));
@@ -1350,7 +1361,9 @@ mod native {
         ui.outcome(Outcome::Updated);
         let t = Instant::now();
         ui.close(&events);
-        assert!(t.elapsed() < FAST.close_wait + Duration::from_secs(1));
+        // The bound only has to tell a close that gave up after its wait from a hang, with room
+        // for a loaded machine (e25c4ec).
+        assert!(t.elapsed() < FAST.close_wait + Duration::from_secs(10));
         lab.lines(events);
     }
 
