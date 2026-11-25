@@ -842,4 +842,121 @@ mod denylist {
             out.stderr
         );
     }
+
+    // The file exception (FILE_EXCEPTIONS: rule 2 in the generated notices file). The tests
+    // use made-up terms laid out so that the second line of the throwaway denylist is rule 2.
+    const EXCEPTED: &str = "crates/lunepack-cli/THIRD-PARTY-NOTICES.txt";
+
+    #[test]
+    fn t17_file_exception_skips_only_the_named_rule_in_the_exact_path() {
+        let fx = Fx::new();
+        fx.write(
+            EXCEPTED,
+            "has zqxexc only\nhas zqxthree only\nhas zqxexc and zqxone\n",
+        );
+        fx.commit("init");
+        fx.deny("zqxone\nzqxexc\nzqxthree\n");
+        for args in [&[][..], &["--range", "HEAD"][..]] {
+            let out = fx.scan(args);
+            assert_eq!(out.code, 1, "{args:?}: {}", out.stderr);
+            let l = lines(&out.stdout);
+            // Line 1 (rule 2 only) is skipped; rule 3 and rule 1 still hit.
+            let want_tree = [
+                format!("denylist: {EXCEPTED}:2: rule 3"),
+                format!("denylist: {EXCEPTED}:3: rule 1"),
+            ];
+            if args.is_empty() {
+                assert_eq!(l, want_tree.iter().map(String::as_str).collect::<Vec<_>>());
+            } else {
+                let sha = &fx.git(&["rev-parse", "HEAD"])[..12];
+                assert!(l.contains(&want_tree[0].as_str()), "{l:?}");
+                assert!(l.contains(&want_tree[1].as_str()), "{l:?}");
+                assert!(
+                    l.contains(&format!("denylist: commit {sha} {EXCEPTED}:2: rule 3").as_str()),
+                    "{l:?}"
+                );
+                assert!(
+                    l.contains(&format!("denylist: commit {sha} {EXCEPTED}:3: rule 1").as_str()),
+                    "{l:?}"
+                );
+                assert!(
+                    !l.iter().any(|x| x.contains(":1: rule 2")),
+                    "an excepted line hit: {l:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t18_file_exception_alone_passes_in_tree_and_range() {
+        let fx = Fx::new();
+        fx.write(EXCEPTED, "has zqxexc only\n");
+        fx.write("other.txt", "clean\n");
+        fx.commit("init");
+        fx.deny("zqxone\nzqxexc\n");
+        for args in [&[][..], &["--range", "HEAD"][..]] {
+            let out = fx.scan(args);
+            assert_eq!(out.code, 0, "{args:?}: {}{}", out.stdout, out.stderr);
+            assert_eq!(out.stdout, "");
+            assert!(out.stderr.contains("2 rules, 0 hits"), "{}", out.stderr);
+        }
+    }
+
+    #[test]
+    fn t19_the_excepted_rule_still_hits_in_every_other_path() {
+        let fx = Fx::new();
+        for p in [
+            "other/THIRD-PARTY-NOTICES.txt",
+            "THIRD-PARTY-NOTICES.txt",
+            "x/crates/lunepack-cli/THIRD-PARTY-NOTICES.txt",
+            "crates/lunepack-cli/THIRD-PARTY-NOTICES.txt.bak",
+            "crates/lunepack-cli/THIRD-PARTY-NOTICES.txt2",
+            "crates/lunepack-cli/third-party-notices.txt",
+            "crates/lunepack-cli/THIRD-PARTY-NOTICES.tx",
+            "crates/lunepack-cli/src/THIRD-PARTY-NOTICES.txt",
+            "notes.txt",
+        ] {
+            fx.write(p, "has zqxexc here\n");
+        }
+        fx.commit("init");
+        fx.deny("zqxone\nzqxexc\n");
+        for args in [&[][..], &["--range", "HEAD"][..]] {
+            let out = fx.scan(args);
+            assert_eq!(out.code, 1, "{args:?}: {}", out.stderr);
+            let l = lines(&out.stdout);
+            let tree: Vec<&&str> = l.iter().filter(|x| !x.contains("commit ")).collect();
+            assert_eq!(tree.len(), 9, "{l:?}");
+            for x in &tree {
+                assert!(x.ends_with(":1: rule 2"), "{l:?}");
+            }
+            if !args.is_empty() {
+                assert_eq!(l.len(), 18, "{l:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn t20_file_exception_does_not_cover_the_path_or_the_commit_message() {
+        let fx = Fx::new();
+        fx.write(EXCEPTED, "clean line\n");
+        fx.commit("mentions zqxexc in the message");
+        fx.deny("zqxone\nzqxexc\n");
+        let out = fx.scan(&["--range", "HEAD"]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stdout.contains(" object line "), "{}", out.stdout);
+        assert!(out.stdout.contains(": rule 2"), "{}", out.stdout);
+
+        // A path hit on the excepted file itself is never excepted.
+        let fx = Fx::new();
+        fx.write(
+            "crates/lunepack-cli/THIRD-PARTY-NOTICES.txt",
+            "clean line\n",
+        );
+        fx.commit("init");
+        fx.deny("zqxone\nthird-party-notices\n");
+        let out = fx.scan(&["--range", "HEAD"]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stdout.contains("path "), "{}", out.stdout);
+        assert!(out.stdout.contains("commit "), "{}", out.stdout);
+    }
 }
