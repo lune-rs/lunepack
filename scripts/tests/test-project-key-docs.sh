@@ -35,6 +35,7 @@ HEADING="## The project's key sets"
 NO_KEY_SENTENCE="No project key has been published yet."
 
 # check_key_docs <security-text-file> <list-json-file>: prints every problem, returns 1 if any.
+# shellcheck disable=SC2329 # called through run_cmd or t_check
 check_key_docs() {
   local doc=$1 json=$2 section roots i j keys pub id version threshold state row hex bad=0
   section=$(awk -v h="$HEADING" '$0 == h { on = 1; next } /^## / { on = 0 } on' "$doc")
@@ -74,6 +75,7 @@ check_key_docs() {
     done
   fi
   # Every 64-hex string of the section must be a public key or an id the CLI reported.
+  # shellcheck disable=SC2013 # each match is one 64-hex word, never a line with spaces
   for hex in $(grep -Eo '[0-9a-f]{64}' <<<"$section" | sort -u); do
     case " $keys " in
       *" $hex "*) ;;
@@ -83,7 +85,7 @@ check_key_docs() {
         ;;
     esac
   done
-  return $bad
+  return "$bad"
 }
 
 # --- fixtures ---------------------------------------------------------------------------------------
@@ -218,6 +220,7 @@ real_json=$T_TMP/real.json
 # `prebuilt list --json` exits 1 in the state inconsistent after printing the report; the report is
 # what is read, and the state is the CLI's own test to fail.
 "$REAL_CLI" prebuilt list --json >"$real_json" 2>/dev/null || true
+# shellcheck disable=SC2329 # called through run_cmd or t_check
 has_roots() { jq -e '.roots | type == "array"' "$1" >/dev/null; }
 t_check "the CLI printed a list report with roots" has_roots "$real_json"
 run_cmd check_key_docs "$repo/SECURITY.md" "$real_json"

@@ -26,6 +26,7 @@ repo=$(cd "$here/../.." && pwd)
 t_init
 
 # links_of <file>: the link targets of a Markdown file, one per line.
+# shellcheck disable=SC2329 # called by check_links
 links_of() {
   awk '
     /^[ \t]*(```|~~~)/ { fence = !fence; next }
@@ -49,6 +50,7 @@ links_of() {
 
 # normalise <dir> <relative>: the path of <relative> under <dir> with . and .. folded, or nothing
 # when it leaves the root. <dir> is "" for the root itself.
+# shellcheck disable=SC2329 # called by check_links
 normalise() {
   local dir=$1 rel=$2 part joined
   local -a out
@@ -75,8 +77,10 @@ normalise() {
 
 # check_links <root> <tracked-list-file>: prints one line per dangling link and returns 1 if there
 # is any. <tracked-list-file> holds `git ls-files` of <root>, one path per line.
+# shellcheck disable=SC2329 # called through run_cmd
 check_links() {
   local root=$1 list=$2 md target path dir resolved bad=0
+  # shellcheck disable=SC2094 # $list is only read, by this loop and the grep inside it; nothing writes it
   while IFS= read -r md; do
     case $md in
       *.md) ;;
@@ -116,7 +120,7 @@ check_links() {
       bad=1
     done < <(links_of "$root/$md")
   done <"$list"
-  return $bad
+  return "$bad"
 }
 
 # --- seeded fixture: a repository that models today's dangling links -------------------------------
