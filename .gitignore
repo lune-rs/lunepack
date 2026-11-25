@@ -27,3 +27,7 @@ probe-results/
 /fuzz/artifacts/
 /fuzz/target/
 /fuzz/coverage/
+
+# the .NET example app's build output (examples/dotnet; scripts/build-example-dotnet.sh)
+/examples/dotnet/bin/
+/examples/dotnet/obj/

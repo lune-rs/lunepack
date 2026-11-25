@@ -1,7 +1,8 @@
 # lunepack format v1
 
-Status: **draft**, awaiting approval. Nothing in this document is frozen until it is approved; after
-approval, a change to any MUST or MUST NOT below is a format revision (a new DECISIONS row).
+Status: **approved (format v1); frozen from the first published release.** Until a release is published
+a rule may still be corrected; from then on, a change to any MUST or MUST NOT below is a format revision,
+which the project records in its internal decision log.
 
 This document is normative. The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 "Writer" means the lunepack packager (the only producer of these documents). "Reader" means any
@@ -11,7 +12,8 @@ All readers run the same core code, so every rule below holds for all of them al
 A reader that meets anything this document does not allow MUST reject the whole document (fail
 closed). There is no "best effort" mode and no warning-only path.
 
-Decisions behind the format: `docs/DECISIONS.md` D6, D7, D8, D21, D24, D25 and D33. The threat model
+Decisions behind the format: D6, D7, D8, D21, D24, D25 and D33 of the project's internal decision log, which
+is not part of this repository (each rule they settled is stated in this document). The threat model
 is `docs/THREAT-MODEL.md`.
 
 ## 1. Artifacts and names
@@ -37,6 +39,9 @@ A release directory on any static host holds:
 - The writer MUST use exactly these names. Readers resolve the references inside documents
   (section 7.1) and MUST NOT rely on the names otherwise.
 - Every `.json` artifact is a DSSE envelope (section 2) whose payload is one document (sections 3 and 5–8).
+- A fifth kind, `prebuilt`, is not part of an app's release: `prebuilt-<version>.sig.json` is
+  lunepack's own signed list of the prebuilt binaries of one lunepack release (section 21). No app
+  reader opens it.
 
 ## 2. Envelope
 
@@ -74,7 +79,7 @@ example shows the shape only.)
 ### 2.2 Payload types
 
 `payloadType` is `application/vnd.lunepack.<kind>.v1+json` with `<kind>` one of `root`, `keys`,
-`feed`, `manifest`. The reader knows which kind it is opening and MUST reject any other type,
+`feed`, `manifest`, `prebuilt`. The reader knows which kind it is opening and MUST reject any other type,
 including a different case, extra whitespace or another version. The `v1` in the type and
 `"format": 1` in the payload name the same format version.
 
@@ -163,7 +168,7 @@ Every payload has:
 | Field | Type | Rule |
 |---|---|---|
 | `format` | integer | MUST be `1` |
-| `kind` | string | MUST equal the kind of the payload type (`root`, `keys`, `feed`, `manifest`) |
+| `kind` | string | MUST equal the kind of the payload type (`root`, `keys`, `feed`, `manifest`, `prebuilt`) |
 | `critical` | array of strings | REQUIRED, may be empty; at most 16 entries, each 1–64 bytes of `[a-z0-9-]`, no duplicates |
 
 - **Critical features.** `critical` names features the payload uses that change its meaning. A
@@ -185,6 +190,7 @@ Readers MUST enforce these caps before the work they bound:
 | `keys.json` document bytes | 64 KiB |
 | `feed-<channel>.json` document bytes | 8 MiB (8,388,608) |
 | `<ver>/<target>.manifest.json` document bytes | 64 MiB (67,108,864) |
+| `prebuilt-<version>.sig.json` document bytes, and its payload kept as a separate file (section 21) | 64 KiB |
 | signatures per envelope | 16 |
 | keys in a root | 16 |
 | release keys in a key set | 64 |
@@ -195,6 +201,7 @@ Readers MUST enforce these caps before the work they bound:
 | patches in a delta | 200,000 |
 | LZMA2 window of a patch (base and file together, section 9.3) | 128 MiB (134,217,728) |
 | JSON nesting depth | 32 |
+| rows in a prebuilt list (section 21) | 64 |
 
 A manifest is additionally capped by the size its feed entry signs (section 7.1), which a reader
 checks before downloading more bytes.
@@ -2444,3 +2451,69 @@ macos plist | /Library/LaunchDaemons/lunepack-org.example.hello.plist
 macos launchd socket name | lunepack
 service file (unix) | lunepack-service
 ```
+
+## 21. Prebuilt binary list
+
+lunepack's own releases publish the binaries a packager places into an app (the runtime, the UI, the
+update service and the Windows stubs) as prebuilt files, with one signed list of them per lunepack
+version: `prebuilt-<version>.sig.json`, an envelope (section 2) of kind `prebuilt`, payload type
+`application/vnd.lunepack.prebuilt.v1+json`. `<version>` is the payload's `version`. No app reader
+opens this kind; it is read by lunepack's own CLI and by anyone checking a download of those
+binaries.
+
+```json prebuilt
+{
+  "format": 1,
+  "kind": "prebuilt",
+  "critical": [],
+  "version": "0.1.0",
+  "source_commit": "11bc638e35a0c6311d423720574aa450b719ef56",
+  "rehearsal": false,
+  "binaries": [
+    {
+      "kind": "runtime",
+      "target": "linux-x86_64",
+      "size": 4718592,
+      "sha256": "afafc6d6a7cb1369abfed59823c755f1738b02ad5b6257108236f86b4bbb34c1"
+    },
+    {
+      "kind": "ui",
+      "target": "linux-x86_64",
+      "size": 13631488,
+      "sha256": "4ac1684c1f6a38c745bd4bd5d533e79fac0c0183ef854dbbb209bb0f6d17eb46"
+    },
+    {
+      "kind": "service",
+      "target": "linux-x86_64",
+      "size": 3145728,
+      "sha256": "5a2368f9431046dbd07bbfb92cd6314954f3133f506932903db76e48d0b63495"
+    }
+  ]
+}
+```
+
+| Field | Rule |
+|---|---|
+| `version` | the lunepack version the binaries belong to: a version (10.3) |
+| `source_commit` | the git commit the binaries were built from: exactly 40 lowercase hex characters |
+| `rehearsal` | REQUIRED boolean; `true` marks a list made by a release rehearsal. Any other value, and a missing member, MUST be rejected |
+| `binaries` | 1 to 64 rows (section 4) |
+| `binaries[].kind` | one of `runtime`, `ui`, `service`, `stub`, `stub-console` |
+| `binaries[].target` | a target id (10.4) |
+| `binaries[].size` | integer ≥ 1: the file's length in bytes |
+| `binaries[].sha256` | digest (3.2) of the file's bytes |
+
+- No two rows have the same `kind` and `target`. With five kinds and seven target ids, a v1 list
+  has at most 35 rows; the cap of 64 bounds the work before that rule runs.
+- Unknown members are ignored, at the top level and in rows, as for every payload (3.2).
+- The envelope is signed by the threshold (2.6) of a key set that the verifier already holds: 1 to
+  16 Ed25519 keys (2.5), no key twice, with a threshold `1 ≤ threshold ≤ keys`, as a root's
+  (5.1). lunepack's own CLI has the project's key set compiled in. No root document and no rotation
+  document of section 5 exists for this kind, and it is not signed by release keys (section 6).
+- The signature has no validity period: a reader checks no time, expiry or anti-rollback floor
+  for this kind.
+- A reader that also holds the list as a separate file (the payload alone) MUST compare it byte
+  for byte with the decoded payload of the envelope and use it only when they are equal. The
+  separate file is capped like the document (section 4).
+- A list whose `rehearsal` is `true` MUST NOT make a reader accept a binary. It exists so a release
+  rehearsal signs with the real key while leaving nothing that can pass for a release.

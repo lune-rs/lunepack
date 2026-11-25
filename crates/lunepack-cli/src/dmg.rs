@@ -312,8 +312,9 @@ mod tests {
     /// tests run in parallel threads, and a thread that forks while this one has the script open for
     /// writing leaves a copy of that descriptor in its child until the child's own `exec`, which
     /// outlives this function's close. So the script is run once (`--probe`, answered before any
-    /// other case) until the kernel accepts it: from then on no process holds it open, and no
-    /// later fork can (the descriptor is closed here).
+    /// other case) with [`lunepack_testkit::exec::spawn`], which tries again while the kernel
+    /// refuses it: from then on no process holds it open, and no later fork can (the descriptor is
+    /// closed here).
     fn fake(dir: &Path, body: &str) -> Hdiutil {
         let script = dir.join("hdiutil");
         let calls = dir.join("calls");
@@ -329,22 +330,12 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        let started = Instant::now();
-        loop {
-            match std::process::Command::new(&script).arg("--probe").status() {
-                Ok(status) => {
-                    assert!(status.success(), "the fake's probe failed: {status}");
-                    break;
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy
-                        && started.elapsed() < Duration::from_secs(20) =>
-                {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(e) => panic!("the fake hdiutil cannot be run: {e}"),
-            }
-        }
+        let mut probe = std::process::Command::new(&script);
+        probe.arg("--probe");
+        let status = lunepack_testkit::exec::spawn(&mut probe)
+            .and_then(|mut child| child.wait())
+            .unwrap_or_else(|e| panic!("the fake hdiutil cannot be run: {e}"));
+        assert!(status.success(), "the fake's probe failed: {status}");
         Hdiutil {
             program: script,
             create_timeout: Duration::from_secs(30),

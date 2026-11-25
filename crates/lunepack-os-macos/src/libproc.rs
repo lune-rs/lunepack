@@ -1,8 +1,9 @@
 //! The libproc calls behind [`crate::MacProcess`]: process ids, identity, and the three places a
 //! process can hold a directory tree: its executable path, its working directory and its open
-//! vnode files (M5-D9's in-use scan, M8 step 3). Every `unsafe` block is one libproc call on a
-//! buffer this module owns and sizes, with the returned length checked; nothing here allocates
-//! from a count the kernel reports without a cap.
+//! vnode files (M5-D9's in-use scan, M8 step 3). Every `unsafe` block is one libproc call (or one
+//! `fcntl` or `getattrlist` naming a path) on a buffer this module owns and sizes, with the
+//! returned length checked, or the one view of a kernel path buffer's `c_char`s as bytes
+//! (`vip_bytes`); nothing here allocates from a count the kernel reports without a cap.
 //!
 //! Hidden from the documentation: the crate's own tests read each source on its own (the premise
 //! that a tree moved by a swap is reported under its new path is measured with these calls, not
@@ -10,7 +11,7 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::OsStr;
+use std::ffi::{CStr, OsStr};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -60,18 +61,22 @@ fn gone(err: &io::Error) -> bool {
     err.raw_os_error() == Some(libc::ESRCH)
 }
 
-/// The path in a fixed NUL-terminated buffer, `None` when empty.
+/// The path in a fixed NUL-terminated buffer (up to the first NUL, or the whole buffer when it has
+/// none), `None` when empty.
 fn path_of(bytes: &[u8]) -> Option<PathBuf> {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    (end > 0).then(|| PathBuf::from(OsStr::from_bytes(&bytes[..end])))
+    let path = CStr::from_bytes_until_nul(bytes).map_or(bytes, CStr::to_bytes);
+    (!path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(path)))
 }
 
-/// The bytes of a `vip_path` (a `[[c_char; 32]; 32]` standing for `[c_char; MAXPATHLEN]`).
-fn vip_bytes(info: &libc::vnode_info_path) -> Vec<u8> {
-    info.vip_path
-        .iter()
-        .flat_map(|row| row.iter().map(|c| *c as u8))
-        .collect()
+/// The bytes of a `vip_path` (a `[[c_char; 32]; 32]` standing for `[c_char; MAXPATHLEN]`), all
+/// 1024 of them, borrowed in place: the in-use scan reads one per open file of every process, so a
+/// copy per byte made each scan slow (M13).
+fn vip_bytes(info: &libc::vnode_info_path) -> &[u8] {
+    let chars: &[libc::c_char] = info.vip_path.as_flattened();
+    // SAFETY: `c_char` is `i8` or `u8`: one byte, alignment 1, every bit pattern valid as `u8`. So
+    // `chars.len()` bytes from its start are initialised memory of the same allocation, borrowed
+    // from `info` for the returned slice's lifetime and not written through.
+    unsafe { std::slice::from_raw_parts(chars.as_ptr().cast::<u8>(), chars.len()) }
 }
 
 /// Every pid on the system, at the moment of the call.
@@ -173,8 +178,18 @@ pub fn exe_path(pid: u32) -> io::Result<Option<PathBuf>> {
     Ok(path_of(&buf[..(got as usize).min(buf.len())]))
 }
 
+/// `ENOENT` from a read of one vnode of a live process: the kernel could not take a reference on
+/// the vnode, because it is dead or being reclaimed (its volume was force-unmounted, a FUSE mount
+/// under it was torn down, or it was revoked), or the file system says the file no longer exists.
+/// Either way the file is on no mounted file system, so it lies in no tree, and the answer does not
+/// change on a re-read while the process holds it (M13 step 5: a test process of another program
+/// held one, and every scan of this user failed closed until it ended).
+fn dead_vnode(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ENOENT)
+}
+
 /// Source two: the process's working directory (`PROC_PIDVNODEPATHINFO`). `None` when the process
-/// is gone or has none.
+/// is gone or has none, or when its working directory is a dead vnode ([`dead_vnode`]).
 pub fn cwd_path(pid: u32) -> io::Result<Option<PathBuf>> {
     let Some(pid) = pid_arg(pid) else {
         return Ok(None);
@@ -194,7 +209,11 @@ pub fn cwd_path(pid: u32) -> io::Result<Option<PathBuf>> {
     };
     if got <= 0 {
         let err = io::Error::last_os_error();
-        return if gone(&err) { Ok(None) } else { Err(err) };
+        return if gone(&err) || dead_vnode(&err) {
+            Ok(None)
+        } else {
+            Err(err)
+        };
     }
     if got != size {
         return Err(io::Error::new(
@@ -204,7 +223,7 @@ pub fn cwd_path(pid: u32) -> io::Result<Option<PathBuf>> {
     }
     // SAFETY: the call wrote the whole struct (`got == size`).
     let info = unsafe { info.assume_init() };
-    Ok(path_of(&vip_bytes(&info.pvi_cdir)))
+    Ok(path_of(vip_bytes(&info.pvi_cdir)))
 }
 
 /// The open file descriptors of `pid` with their types; `None` when the process is gone.
@@ -253,8 +272,9 @@ fn list_fds(pid: libc::c_int) -> io::Result<Option<Vec<libc::proc_fdinfo>>> {
 }
 
 /// Source three: the paths of the process's open vnode files (`PROC_PIDLISTFDS`, then
-/// `PROC_PIDFDVNODEPATHINFO` for each vnode descriptor). A descriptor closed between the two calls
-/// is skipped; a process that is gone gives an empty list.
+/// `PROC_PIDFDVNODEPATHINFO` for each vnode descriptor). A descriptor closed between the two calls,
+/// or one whose vnode is dead ([`dead_vnode`]), is skipped; a process that is gone gives an empty
+/// list.
 pub fn fd_paths(pid: u32) -> io::Result<Vec<PathBuf>> {
     let Some(pid) = pid_arg(pid) else {
         return Ok(Vec::new());
@@ -282,8 +302,9 @@ pub fn fd_paths(pid: u32) -> io::Result<Vec<PathBuf>> {
         };
         if got <= 0 {
             let err = io::Error::last_os_error();
-            // The process ended or this descriptor was closed since the list was read.
-            if gone(&err) || err.raw_os_error() == Some(libc::EBADF) {
+            // The process ended or this descriptor was closed since the list was read, or the
+            // descriptor's file is on no mounted file system.
+            if gone(&err) || err.raw_os_error() == Some(libc::EBADF) || dead_vnode(&err) {
                 continue;
             }
             return Err(err);
@@ -296,11 +317,69 @@ pub fn fd_paths(pid: u32) -> io::Result<Vec<PathBuf>> {
         }
         // SAFETY: the call wrote the whole struct (`got == size`).
         let info = unsafe { info.assume_init() };
-        if let Some(path) = path_of(&vip_bytes(&info.pvip)) {
+        if let Some(path) = path_of(vip_bytes(&info.pvip)) {
             paths.push(path);
         }
     }
     Ok(paths)
+}
+
+/// The path of the existing directory or file `path` as the kernel names it, like [`kernel_path`],
+/// but without opening it: `getattrlist` with `ATTR_CMN_FULLPATH`, which reports from the same
+/// source (`vn_getpath`). The in-use scan names its tree this way. A descriptor it opened on the
+/// tree, even for an instant and close-on-exec, is copied into any child another thread of the
+/// caller forks meanwhile, and that child holds it until its exec: a scan that reaches the child
+/// first sees an open file in the tree, a tree in use that nobody uses (M13 step 5).
+pub fn kernel_path_unopened(path: &std::path::Path) -> io::Result<PathBuf> {
+    /// The reply: its length, the reference to the path, then the path (at most `PATH_MAX`
+    /// bytes, NUL included).
+    const REPLY: usize = 4 + 8 + libc::PATH_MAX as usize;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_FULLPATH,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buf = vec![0u8; REPLY];
+    // SAFETY: `c_path` is a NUL-terminated string and `request` a valid `attrlist`, both alive for
+    // the call; `buf` is writable memory of exactly `buf.len()` bytes, the size passed, and the
+    // call writes at most that many.
+    let rc = unsafe {
+        libc::getattrlist(
+            c_path.as_ptr(),
+            (&raw mut request).cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+        )
+    };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "bad ATTR_CMN_FULLPATH reply");
+    let word = |at: usize| -> io::Result<[u8; 4]> {
+        buf.get(at..at + 4)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(invalid)
+    };
+    let total = u32::from_ne_bytes(word(0)?) as usize;
+    // The reference's offset counts from the reference itself (at byte 4).
+    let offset = i32::from_ne_bytes(word(4)?);
+    let length = u32::from_ne_bytes(word(8)?) as usize;
+    let start = usize::try_from(offset)
+        .ok()
+        .and_then(|o| o.checked_add(4))
+        .ok_or_else(invalid)?;
+    let end = start.checked_add(length).ok_or_else(invalid)?;
+    if total > buf.len() || end > total {
+        return Err(invalid());
+    }
+    path_of(&buf[start..end]).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
 }
 
 /// The path of the existing directory or file `path` as the kernel names it (`F_GETPATH`): the

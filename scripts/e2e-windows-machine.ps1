@@ -49,6 +49,13 @@
 #       service stages it against its own tree; the update confirms
 #   12  the administrator's uninstall: refused while the user runs the app, nothing changed;
 #       complete after
+#   N   the .NET example (examples/dotnet, M13 step 9; a folder of about 190 files behind the stub)
+#       as the app, under an app id of its own: the administrator's machine install, the standard
+#       user's plain update through the service with no prompt, a version that crashes on start
+#       (rolled back, marked bad, not offered again), the fixed version, the administrator's
+#       uninstall; nothing left. The app is the folder given with -DotnetApp, else published here
+#       with `dotnet` when it is on the machine; with none the script fails, and
+#       LUNEPACK_E2E_DOTNET=0 skips the row and prints SKIPPED. (The per-machine delta stays row 11b.)
 #
 # The row "Run as administrator without --all-users" (the fixed message box, standing UacElevated)
 # cannot run here: a hosted runner's administrator holds no split token (assumption A5). It is a
@@ -56,7 +63,7 @@
 #
 # The harness never prints environment or registry dumps; a failure names a differing field, and
 # prints only versions, outcome words and exit codes.
-param([switch]$Install)
+param([switch]$Install, [string]$DotnetApp = '')
 $ErrorActionPreference = 'Stop'
 if ($env:CI -eq 'true' -or $env:LUNEPACK_E2E_INSTALL -eq '1') { $Install = $true }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -171,7 +178,12 @@ function New-Out([string]$tag) {
 }
 
 function Expect-Lines([string]$file, [string[]]$want, [switch]$Unordered, [int]$seconds = 120) {
-    Wait-Until { @(Read-Lines $file).Count -ge $want.Count } $seconds "$($want.Count) outcome lines"
+    try {
+        Wait-Until { @(Read-Lines $file).Count -ge $want.Count } $seconds "$($want.Count) outcome lines"
+    } catch {
+        # Say what did arrive, so a timeout can be told from a wrong or a missing line.
+        throw "$($_.Exception.Message); got [$(@(Read-Lines $file) -join '; ')]"
+    }
     Start-Sleep -Milliseconds 800
     $got = @(Read-Lines $file)
     if ($Unordered) {
@@ -426,7 +438,7 @@ function New-App([string]$tag, [string]$entryRel, [string]$entrySource, [string]
         Tag = $tag; Id = $id; BaseName = "Lunepack E2E Machine $hex"
         EntryRel = $entryRel; EntryFile = ($entryRel -split '/')[-1]; EntrySource = $entrySource
         Ui = $ui; Dir = $dir; Cfg = $cfg; Rel = $relDir; RelKey = (Join-Path $dir 'rel0.key')
-        Root = $null; ServiceName = "lunepack-$id"; PipeName = "lunepack-$id"
+        Root = $null; ServiceName = "lunepack-$id"; PipeName = "lunepack-$id"; Folder = $null
     }
     $app.Name = $app.BaseName
     $app.Feed = FileFeed $app.Rel
@@ -449,6 +461,10 @@ function Publish-Version($app, [string]$version, [hashtable]$options = @{}) {
     $in = Join-Path $app.Dir "in-$version"
     $dest = Join-Path $in ($app.EntryRel -replace '/', '\')
     [void][IO.Directory]::CreateDirectory((Split-Path $dest -Parent))
+    if ($app.Folder) {
+        # A folder app (the .NET example): every file of the folder goes beside the entry.
+        Copy-Item -Path (Join-Path $app.Folder '*') -Destination (Split-Path $dest -Parent) -Recurse -Force
+    }
     [IO.File]::Copy($app.EntrySource, $dest, $true)
     if ($options.ContainsKey('Files')) {
         foreach ($name in $options.Files.Keys) {
@@ -702,12 +718,20 @@ function Write-Diagnostics {
     }
 }
 
+# One app per app id (the publisher of another root shares M's id): the one that was installed, else the first.
+function Machine-Apps {
+    return @($apps | Group-Object { $_.Id } | ForEach-Object {
+            $installed = @($_.Group | Where-Object { $_.Root } | Select-Object -First 1)
+            if ($installed.Count -gt 0) { $installed[0] } else { $_.Group[0] }
+        })
+}
+
 function Remove-Everything {
     foreach ($app in $apps) {
         if (-not $app.Root) { continue }
         Stop-Under $app.Root
     }
-    foreach ($app in $apps | Select-Object -First 1) {
+    foreach ($app in Machine-Apps) {
         $name = $app.ServiceName
         if ((Service-State $name) -ne 'MISSING') {
             Native 'sc.exe' @('stop', $name) | Out-Null
@@ -752,7 +776,7 @@ function Remove-Everything {
 # What is left of everything this script made, by name only.
 function Find-Leftovers {
     $left = @()
-    foreach ($app in $apps | Select-Object -First 1) {
+    foreach ($app in Machine-Apps) {
         if ($app.Root -and (Test-Path -LiteralPath $app.Root)) { $left += 'the install folder' }
         if ((Service-State $app.ServiceName) -ne 'MISSING') { $left += 'the service' }
         if (Test-Path -LiteralPath (Join-Path $uninstallKeyRoot $app.Id)) { $left += 'the uninstall key' }
@@ -768,6 +792,46 @@ function Find-Leftovers {
         if (Test-Path -LiteralPath (Join-Path $env:SystemDrive "Users\$($user.Name)")) { $left += 'the user profile folder' }
     }
     return $left
+}
+
+# Every `(path, source)` of the `stage` progress lines of a runtime's `--json` output.
+function Stage-Files([object[]]$lines) {
+    $files = @()
+    foreach ($l in $lines) {
+        if ("$l" -like '*"phase":"stage"*' -and "$l" -like '*"file":{"path":"*') {
+            $f = ("$l" | ConvertFrom-Json).file
+            if ($f) { $files += [pscustomobject]@{ Path = $f.path; Source = $f.source } }
+        }
+    }
+    return $files
+}
+
+# The .NET example's published folder (M13 step 9): the one given with -DotnetApp, else published
+# here with `dotnet` (the SDK of examples/dotnet/global.json, self-contained for win-x64, the output
+# named as PublishDir with a slash: `-o` fails for a folder named `dotnet`). $null, once said
+# SKIPPED, with LUNEPACK_E2E_DOTNET=0. No app available is an error: the row is required.
+function Get-DotnetApp {
+    if ($env:LUNEPACK_E2E_DOTNET -eq '0') {
+        Write-Host 'SKIPPED: the .NET row (LUNEPACK_E2E_DOTNET=0)'
+        return $null
+    }
+    $folder = $DotnetApp
+    if (-not $folder) {
+        if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+            throw 'no .NET app: pass -DotnetApp <the published folder> or install the SDK of examples/dotnet/global.json (LUNEPACK_E2E_DOTNET=0 skips the .NET row)'
+        }
+        $folder = Join-Path $work 'dotnet-app'
+        Write-Host 'e2e-windows-machine: publishing the .NET example for win-x64'
+        # `dotnet` reads global.json from the working directory.
+        Push-Location (Join-Path $repo 'examples\dotnet')
+        try {
+            & dotnet publish Example.csproj -c Release -r win-x64 --self-contained "-p:PublishDir=$folder/" --nologo | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed' }
+        } finally { Pop-Location }
+    }
+    Require (Test-Path -LiteralPath (Join-Path $folder 'Example.exe')) 'the .NET app folder holds Example.exe'
+    Require (-not (Test-Path -LiteralPath (Join-Path $folder 'lunepack-runtime.exe'))) 'the .NET app folder holds no runtime of its own'
+    return (Resolve-Path -LiteralPath $folder).Path
 }
 
 # ---- the work -----------------------------------------------------------------------------------------------------------------
@@ -859,6 +923,8 @@ try {
     if (-not $runInstall) {
         Write-Output 'skipped: the install rows 1 to 12 (they install for all users into the real Program Files and create a local user; they run on CI as an administrator, or with -Install or LUNEPACK_E2E_INSTALL=1 as an administrator on a disposable machine)'
     } else {
+        # The .NET example is required by the install rows: no app is a failure before anything is made.
+        $dotnetFolder = Get-DotnetApp
         $user = New-StandardUser -Prefix 'lpe2em'
         Write-Output "standard user created: $($user.Name)"
         $probeCopy = Join-Path $workDir 'machine_probe.exe'
@@ -1361,6 +1427,72 @@ try {
             SameV 'the service' (Service-State $M.ServiceName) 'MISSING'
             Require (-not (Test-Path -LiteralPath (Common-Shortcut $M))) 'no shortcut'
             Require (-not (Test-Path -LiteralPath (Join-Path $env:SystemDrive "Users\$($user.Name)\AppData\Local\Programs\$($M.BaseName)"))) "no per-user install for the user"
+        }
+
+        # ---- row N: the .NET example (M13 step 9) --------------------------------------------------------------------------------
+        # Its own app id, so nothing of the user's state for the app above is in its way; the machine
+        # holds no install now (rows 9 and 10 left none).
+        if ($dotnetFolder) {
+            Row 'N (the .NET example: machine install, the user''s update through the service, a crash and its rollback, the fixed version, the administrator''s uninstall)' {
+                $N = New-App 'n' 'Example.exe' (Join-Path $dotnetFolder 'Example.exe') $null "org.example.lpe2en$hex"
+                $N.Folder = $dotnetFolder
+                $N.Root = Join-Path $pf $N.BaseName
+                Require (-not (Test-Path -LiteralPath $N.Root)) 'no install of this name is left by the rows before'
+                $keyN = Join-Path $uninstallKeyRoot $N.Id
+                $stubN = Stub-Path $N
+                Publish-Version $N '1.0.0'
+                $setupN = Build-Setup $N '1.0.0' (Join-Path $work 'setup-n')
+                $r = Run-Tool $setupN @('/S', '--all-users') 900
+                SameV 'setup exit code' $r.Code 0
+                Assert-Installed $N '1.0.0'
+                Require (Test-Path -LiteralPath (Join-Path $N.Root 'app\1.0.0\lunepack-runtime.exe')) 'the runtime is beside the entry in the tree'
+                $o = New-Out 'rowN1'
+                $null = UStart 'rn-start' $stubN '' $o
+                Expect-Lines $o @('1.0.0 start', '1.0.0 event first_run', '1.0.0 nothing-pending') -Seconds 240
+
+                # The user's plain update through the service, with no prompt, driven by the app itself.
+                Publish-Version $N '1.1.0'
+                $o = New-Out 'rowN2'
+                $null = UStart 'rn-update' $stubN '--update --no-ui' $o
+                Expect-Lines $o (Confirmed-Lines '1.0.0' '1.1.0') -Seconds 300
+                Wait-Updated $N '1.1.0'
+                Assert-Record $N '1.1.0' '1.0.0' @()
+                Wait-Until { "$(Service-Image $N)" -like '*\service\1.1.0\lunepack-service.exe' } 60 "the service's image to be 1.1.0's"
+
+                # A version that crashes on start: rolled back through the token, marked bad, not offered again.
+                Publish-Version $N '1.2.0' @{ Flags = @('crash-on-start') }
+                $o = New-Out 'rowN3'
+                $null = UStart 'rn-crash' $stubN '--update --no-ui' $o
+                Expect-Lines $o @('1.1.0 start', '1.1.0 nothing-pending', '1.1.0 check 1.2.0', '1.1.0 staged 1.2.0', '1.1.0 apply-scheduled',
+                    '1.2.0 start', '1.2.0 arg after-update', '1.2.0 event updated 1.1.0', '1.2.0 event first_run', '1.2.0 crash',
+                    '1.1.0 start', '1.1.0 arg after-update', '1.1.0 nothing-pending') -Seconds 300
+                Wait-Runtimes-Gone $N
+                Assert-Record $N '1.1.0' $null @('1.2.0')
+                $o = New-Out 'rowN4'
+                $null = UStart 'rn-again' $stubN '--update --no-ui' $o
+                Expect-Lines $o @('1.1.0 start', '1.1.0 nothing-pending', '1.1.0 check none')
+
+                # The fixed version.
+                Publish-Version $N '1.3.0'
+                $o = New-Out 'rowN5'
+                $null = UStart 'rn-fixed' $stubN '--update --no-ui' $o
+                Expect-Lines $o (Confirmed-Lines '1.1.0' '1.3.0') -Seconds 300
+                Wait-Updated $N '1.3.0'
+                Assert-Record $N '1.3.0' '1.1.0' @('1.2.0')
+                Assert-Installed $N '1.3.0'
+
+                # The administrator's uninstall, with nothing of the user's running from R.
+                Stop-Under $N.Root
+                Wait-Until { @(Get-ProcsUnder $N.Root).Count -eq 0 } 30 'the user''s processes to end'
+                $code = Invoke-MachineUninstall $N
+                SameV 'uninstall exit code' $code 0
+                Wait-Until { -not (Test-Path -LiteralPath $N.Root) } 90 'R to go'
+                Wait-Until { -not (Test-Path -LiteralPath $keyN) } 30 'the Uninstall key to go'
+                Require (-not (Test-Path -LiteralPath (Common-Shortcut $N))) 'the shortcut is gone'
+                SameV 'the service' (Service-State $N.ServiceName) 'MISSING'
+                foreach ($d in New-ProgramFilesDirs) { Stop-Under $d.FullName; Remove-Tree $d.FullName }
+                $null = Pending-Deletes -Remove
+            }
         }
     }
 } catch {

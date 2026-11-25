@@ -146,7 +146,9 @@ jobs:
     # (M6 step 11) setup files and a UI that is absent, killed or cannot start. The script builds
     # the stand-in UI and the real `lunepack-ui` itself; nothing needs a GPU or a display (the real
     # UI is started once with a DISPLAY that no server answers, to see it exit with its typed
-    # code). It is not part of the gate; a skip here is a failure (LUNEPACK_E2E_REQUIRE).
+    # code). The .NET example (M13 step 7) runs a third table: the script publishes it with the
+    # SDK installed below. It is not part of the gate; a skip here is a failure
+    # (LUNEPACK_E2E_REQUIRE), and nothing here sets the LUNEPACK_E2E_DOTNET=0 opt-out.
     needs: runtime-musl
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -164,6 +166,12 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends desktop-file-utils
+      # actions/setup-dotnet v6.1.0, the latest release (lightweight tag, resolves directly to the
+      # commit; resolved with `gh api repos/actions/setup-dotnet/git/ref/tags/v6.1.0`). It installs
+      # the exact SDK of examples/dotnet/global.json, which publishes the .NET example the suite runs.
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73
+        with:
+          global-json-file: examples/dotnet/global.json
       - name: End-to-end suite
         env:
           LUNEPACK_E2E_REQUIRE: '1'
@@ -179,13 +187,19 @@ jobs:
     # certificates too (scripts/ci/windows-publisher-test.ps1), and a skipped row fails it. The
     # suite installs for real under the runner's profile. Defender is as the runner image has it;
     # `e2e-windows-defender` is the same with Defender on. A skip is not a pass: the script exits
-    # non-zero on a failed row.
+    # non-zero on a failed row. The .NET example (M13 step 9) is app E of the suite: the script
+    # publishes it with the SDK installed below, and nothing here sets the LUNEPACK_E2E_DOTNET=0 opt-out.
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      # actions/setup-dotnet v6.1.0, as in e2e-linux (lightweight tag, resolves directly to the commit):
+      # the exact SDK of examples/dotnet/global.json, which publishes the .NET example the suite runs.
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73
+        with:
+          global-json-file: examples/dotnet/global.json
       - name: Windows end-to-end suite
         shell: pwsh
         run: ./scripts/e2e-windows.ps1
@@ -205,6 +219,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      # actions/setup-dotnet v6.1.0, as in e2e-linux (lightweight tag, resolves directly to the commit):
+      # the exact SDK of examples/dotnet/global.json, which publishes the .NET example the suite runs.
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73
+        with:
+          global-json-file: examples/dotnet/global.json
       - name: Defender on, with the detection control
         shell: pwsh
         run: ./scripts/ci/defender-on.ps1

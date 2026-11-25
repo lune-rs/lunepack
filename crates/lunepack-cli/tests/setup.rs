@@ -1178,6 +1178,15 @@ fn check_released_tree(
                 if lunepack_core::UpdateConfig::parse(bytes).is_ok()),
             "{what}: the config"
         );
+        // The third-party notices beside the config (M13-D11): the file the CLI embeds.
+        assert_eq!(
+            got.remove("Contents/Resources/lunepack-NOTICES.txt"),
+            Some(Node::File {
+                bytes: include_bytes!("../THIRD-PARTY-NOTICES.txt").to_vec(),
+                exec: false
+            }),
+            "{what}: the notices"
+        );
         if mac.ui {
             let helper = "Contents/Helpers/lunepack-update.app";
             assert_eq!(

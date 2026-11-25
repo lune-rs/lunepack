@@ -1,4 +1,4 @@
-//! Repository maintenance tasks: boundary check, denylist scan and key-file check.
+//! Repository maintenance tasks: boundary check, denylist scan, key-file check and the third-party notices.
 
 use std::process::ExitCode;
 
@@ -14,9 +14,10 @@ fn main() -> ExitCode {
         }
         Some("denylist-scan") => xtask::denylist::main(args),
         Some("key-files") => xtask::keyfiles::main(args),
+        Some("notices") => xtask::notices::main(args),
         other => {
             eprintln!(
-                "xtask: unknown or missing task {other:?}; tasks: check-boundaries, denylist-scan, key-files"
+                "xtask: unknown or missing task {other:?}; tasks: check-boundaries, denylist-scan, key-files, notices"
             );
             ExitCode::from(2)
         }

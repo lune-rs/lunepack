@@ -18,11 +18,11 @@ use lunepack_core::digest::U53;
 use lunepack_core::error::UpdateConfigError;
 use lunepack_core::update_config::MACOS_ENTRY_DIR;
 use lunepack_core::{
-    AppId, ArtifactRef, Channel, ClockReading, CodeSign, DeltaFile, Hasher, InstallMeta, Limits,
-    MAX_PATCH_WINDOW, NameRule, PayloadKind, RelPath, ReleaseDoc, ReleaseLayout, RollbackFloor,
-    Signer, Target, UpdateConfig, VerifiedEntry, VerifiedKeySet, Version, check_pe_stub,
-    check_runtime_image, check_service_image, check_ui_image, decode_verified, macos_name_ok,
-    next_feed, sign_envelope, verify_feed, verify_manifest, windows_name_ok,
+    AppId, ArtifactRef, BinaryKind, Channel, ClockReading, CodeSign, DeltaFile, Hasher,
+    InstallMeta, KeysChain, Limits, MAX_PATCH_WINDOW, NameRule, PayloadKind, RelPath, ReleaseDoc,
+    ReleaseLayout, Signer, Target, UpdateConfig, VerifiedEntry, VerifiedKeySet, Version,
+    check_pe_stub, check_runtime_image, check_service_image, check_ui_image, decode_verified,
+    macos_name_ok, next_feed, sign_envelope, verify_manifest, windows_name_ok,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
@@ -32,19 +32,20 @@ use crate::config::{Config, resolve_signer, writer_clock};
 use crate::pipeline::{self, Settings, UpdatePlan};
 use crate::place;
 use crate::plist;
+use crate::prebuilt::{self, PinState};
 use crate::release_dir;
 use crate::stamp;
 
 /// Prefix of the work dir under the system temp dir.
 pub const WORK_PREFIX: &str = "lunepack-pack-";
 /// Largest `--runtime` file read, in bytes.
-const MAX_RUNTIME_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_RUNTIME_BYTES: u64 = 256 * 1024 * 1024;
 /// Largest `--ui` file read, in bytes.
-const MAX_UI_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_UI_BYTES: u64 = 64 * 1024 * 1024;
 /// Largest `--stub` file read, in bytes.
-const MAX_STUB_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_STUB_BYTES: u64 = 32 * 1024 * 1024;
 /// Largest `--service` file read, in bytes.
-const MAX_SERVICE_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_SERVICE_BYTES: u64 = 32 * 1024 * 1024;
 /// Default memory budget of the pack stage, in MiB.
 const DEFAULT_BUDGET_MIB: u64 = 2048;
 /// Default of `--deltas` (M12-D3).
@@ -118,6 +119,10 @@ pub struct PackArgs {
     /// directory and no signer, and writes nothing to a release.
     #[arg(long)]
     assemble: Option<PathBuf>,
+    /// Refuse a `--runtime`, `--ui`, `--stub` or `--service` that is not a binary this CLI pins
+    /// (the project's signed list for this CLI's version; `lunepack prebuilt list`).
+    #[arg(long = "require-pinned")]
+    require_pinned: bool,
 }
 
 fn say(line: &str) -> Result<()> {
@@ -208,7 +213,7 @@ fn exists(path: &Path) -> bool {
 /// signed by the same signers.
 #[allow(clippy::too_many_arguments)]
 fn self_verify(
-    keys: &VerifiedKeySet,
+    chain: &KeysChain,
     signers: &[&dyn Signer],
     app_id: &AppId,
     version: &str,
@@ -239,15 +244,9 @@ fn self_verify(
         &verifier,
     )?;
     let reading = ClockReading::read(&crate::config::FixedClock(now), None);
-    let feed = verify_feed(
-        keys,
-        &feed_bytes,
-        app_id,
-        &channel,
-        &RollbackFloor::default(),
-        &reading,
-        &verifier,
-    )?;
+    let feed =
+        release_dir::verify_feed_of(chain, app_id, &channel, &feed_bytes, &reading, &verifier)?;
+    let keys = chain.keys();
     let entry = feed
         .target_entry(0, target)
         .context("the feed lists no manifest for the target")?;
@@ -369,6 +368,10 @@ struct UpdateInputs<'a> {
     input: &'a Path,
     /// The `--version` text, written into a stamped stub's version info.
     version_text: &'a str,
+    /// What this CLI pins: each given binary is classified against it as read.
+    pins: &'a PinState,
+    /// `--require-pinned`: a local build is an error.
+    require_pinned: bool,
 }
 
 /// M7-D15, M7-D14 for a `windows-*` target: the install `name` is the install folder's name, the
@@ -447,19 +450,19 @@ fn read_input_icon(input: &Path, icon: &RelPath) -> Result<Vec<u8>> {
     )
 }
 
-/// Checks `--stub`, stamps it (M7-D14), checks the stamped bytes again and returns them.
+/// Checks the `--stub` bytes as read, stamps them (M7-D14), checks the stamped bytes again and
+/// returns them.
 fn prepare_stub(
     config: &Config,
     install: &InstallMeta,
-    path: &Path,
+    bytes: &[u8],
     inputs: &UpdateInputs<'_>,
     version: &Version,
     target: Target,
 ) -> Result<Vec<u8>> {
     let console = install.terminal;
     let kind = if console { "console" } else { "GUI" };
-    let bytes = read_capped(path, "--stub", MAX_STUB_BYTES)?;
-    check_pe_stub(&bytes, target, console)
+    check_pe_stub(bytes, target, console)
         .map_err(|e| anyhow!("--stub is not a {kind} stub for {}: {e}", target.as_str()))?;
     // The input tree is read only when it is one: a bad `--input` fails in `assemble`.
     let icon = pick_icon(config, install, |icon| read_input_icon(inputs.input, icon))?;
@@ -473,7 +476,7 @@ fn prepare_stub(
         original_filename: file,
         icon: icon.as_deref(),
     };
-    let stamped = stamp::stamp(&bytes, &fields).context("--stub cannot be stamped")?;
+    let stamped = stamp::stamp(bytes, &fields).context("--stub cannot be stamped")?;
     check_pe_stub(&stamped, target, console).map_err(|e| {
         anyhow!(
             "the stamped --stub is not a {kind} stub for {}: {e}",
@@ -481,6 +484,51 @@ fn prepare_stub(
         )
     })?;
     Ok(stamped)
+}
+
+/// One lunepack binary given to `pack`, as read.
+struct Given<'a> {
+    flag: &'static str,
+    path: &'a Path,
+    kind: BinaryKind,
+    bytes: &'a [u8],
+}
+
+/// One line per given binary: a pinned release binary (kind, version, target) or a local build.
+/// A binary counts as pinned only by a row of its kind for exactly `target` with its size and
+/// SHA-256, and only in the state `pinned`. With `require`, the first local build is an error.
+fn pin_report(
+    pins: &PinState,
+    target: Target,
+    given: &[Given<'_>],
+    require: bool,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::with_capacity(given.len());
+    for g in given {
+        match pins.pinned_row(g.kind, target, g.bytes, &Sha256Hasher) {
+            Some(row) => {
+                let version = pins.list().map_or("", |l| l.version_text());
+                lines.push(format!(
+                    "binary: {} is a pinned release binary ({} {version} {})",
+                    g.flag,
+                    row.kind(),
+                    row.target().as_str()
+                ));
+            }
+            None if require => bail!(
+                "{} {} is a local build, not a binary this CLI pins as {} for {} (--require-pinned); \
+                 get the pinned binaries with `lunepack prebuilt fetch --target {} --out <dir>` \
+                 (`lunepack prebuilt list` shows what this CLI pins)",
+                g.flag,
+                g.path.display(),
+                g.kind,
+                target.as_str(),
+                target.as_str()
+            ),
+            None => lines.push(format!("binary: {} is a local build", g.flag)),
+        }
+    }
+    Ok(lines)
 }
 
 /// M5-D7: with `[update]` the runtime is required and the update config is written for this
@@ -560,9 +608,14 @@ fn prepare_update(
             Ok::<_, anyhow::Error>(bytes)
         })
         .transpose()?;
-    let stub = inputs
+    // Classified as read, before stamping (M13 step 12).
+    let stub_read = inputs
         .stub
-        .map(|path| prepare_stub(config, &document.install, path, inputs, version, target))
+        .map(|path| read_capped(path, "--stub", MAX_STUB_BYTES))
+        .transpose()?;
+    let stub = stub_read
+        .as_deref()
+        .map(|bytes| prepare_stub(config, &document.install, bytes, inputs, version, target))
         .transpose()?;
     let service = inputs
         .service
@@ -584,6 +637,44 @@ fn prepare_update(
             Ok::<_, anyhow::Error>(bytes)
         })
         .transpose()?;
+    let stub_kind = if document.install.terminal {
+        BinaryKind::StubConsole
+    } else {
+        BinaryKind::Stub
+    };
+    let mut given = vec![Given {
+        flag: "--runtime",
+        path: runtime,
+        kind: BinaryKind::Runtime,
+        bytes: &bytes,
+    }];
+    if let (Some(path), Some(bytes)) = (inputs.ui, ui.as_deref()) {
+        given.push(Given {
+            flag: "--ui",
+            path,
+            kind: BinaryKind::Ui,
+            bytes,
+        });
+    }
+    if let (Some(path), Some(bytes)) = (inputs.stub, stub_read.as_deref()) {
+        given.push(Given {
+            flag: "--stub",
+            path,
+            kind: stub_kind,
+            bytes,
+        });
+    }
+    if let (Some(path), Some(bytes)) = (inputs.service, service.as_deref()) {
+        given.push(Given {
+            flag: "--service",
+            path,
+            kind: BinaryKind::Service,
+            bytes,
+        });
+    }
+    for line in pin_report(inputs.pins, target, &given, inputs.require_pinned)? {
+        say(&line)?;
+    }
     // The helper app's files exist only with a UI, and `[macos] icon` is read only then.
     let (helper_plist, helper_icon) = if target.is_macos() && ui.is_some() {
         let icon = config
@@ -639,6 +730,12 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
             bail!("--assemble needs [update] and [install] in the config");
         }
     }
+    let pins = prebuilt::compiled_in();
+    if let PinState::Inconsistent(reason) = &pins {
+        eprintln!(
+            "warning: this CLI's pinned binary list is inconsistent ({reason}); every binary counts as a local build"
+        );
+    }
     let prepared = prepare_update(
         &config,
         &UpdateInputs {
@@ -648,6 +745,8 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
             service: args.service.as_deref(),
             input: &args.input,
             version_text: &args.version,
+            pins: &pins,
+            require_pinned: args.require_pinned,
         },
         &version,
         target,
@@ -703,18 +802,19 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
     let skip = ClockReading::read(clock.as_ref(), Some(u64::MAX));
     let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
     let opened = release_dir::open(release_dir_arg, &config, &hasher, &verifier, &skip)?;
-    let Some(keys) = opened.keys else {
+    let Some(chain) = opened.chain else {
         bail!(
             "{} has no keys.json; run `lunepack keys set` first",
             release_dir_arg.display()
         );
     };
+    let keys = chain.keys();
     let signers = args
         .sign
         .iter()
         .map(|s| resolve_signer(config_path, s))
         .collect::<Result<Vec<_>>>()?;
-    check_signers(&signers, &keys, now)?;
+    check_signers(&signers, keys, now)?;
 
     let version_dir = release_dir_arg.join(&args.version);
     let pack_path = version_dir.join(format!("{}.pack", target.as_str()));
@@ -731,7 +831,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
     let bases = release_dir::select_bases(
         &release_dir::BaseQuery {
             dir: release_dir_arg,
-            keys: &keys,
+            chain: &chain,
             app_id: &config.app_id,
             version: &version,
             target,
@@ -804,7 +904,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
     say(&format!("sign: manifest signed by {} key(s)", refs.len()))?;
     check_manifest_size(manifest.len() as u64)?;
     let (frames, patches) = self_verify(
-        &keys,
+        &chain,
         &refs,
         &config.app_id,
         &args.version,
@@ -888,5 +988,147 @@ mod tests {
         assert!(check_manifest_size(cap).is_ok());
         let e = check_manifest_size(cap + 1).unwrap_err();
         assert!(format!("{e:#}").contains("--deltas"), "{e:#}");
+    }
+
+    /// A `pinned` state whose list pins `runtime` and `stub` for `windows-x86_64`, signed now by a
+    /// throwaway key with the real writer.
+    fn pinned(runtime: &[u8], stub: &[u8]) -> PinState {
+        use lunepack_core::encoding::hex_encode;
+        use lunepack_crypto::{Ed25519Signer, generate_key_file};
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = generate_key_file(&dir.path().join("k")).unwrap();
+        let signer = Ed25519Signer::from_key_file(&key.path).unwrap();
+        let public = hex_encode(&key.public_key);
+        let row = |kind: &str, bytes: &[u8]| {
+            format!(
+                r#"{{"kind":"{kind}","target":"windows-x86_64","size":{},"sha256":"{}"}}"#,
+                bytes.len(),
+                Sha256Hasher.sha256(bytes).to_hex()
+            )
+        };
+        let table = format!(
+            r#"{{"format":1,"kind":"prebuilt","critical":[],"version":"0.1.0","source_commit":"{}","rehearsal":false,"binaries":[{},{}]}}"#,
+            "a".repeat(40),
+            row("runtime", runtime),
+            row("stub", stub)
+        );
+        let envelope = sign_envelope(
+            PayloadKind::Prebuilt,
+            table.as_bytes(),
+            &[&signer as &dyn Signer],
+            &Sha256Hasher,
+            &Ed25519Verifier,
+        )
+        .unwrap();
+        let keys = [public.as_str()];
+        let roots = [crate::project_key::ProjectKeySet {
+            version: 1,
+            threshold: 1,
+            keys: &keys,
+        }];
+        let state = prebuilt::pin_state(&roots, table.as_bytes(), &envelope, "0.1.0");
+        assert_eq!(state.name(), "pinned");
+        state
+    }
+
+    fn given<'a>(flag: &'static str, kind: BinaryKind, bytes: &'a [u8]) -> Given<'a> {
+        Given {
+            flag,
+            path: Path::new("in/file"),
+            kind,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn pin_report_classifies_the_stub_as_read_and_not_as_stamped() {
+        let (runtime, stub) = (b"runtime bytes".as_slice(), b"MZ stub as read".as_slice());
+        let state = pinned(runtime, stub);
+        let win = Target::parse("windows-x86_64").unwrap();
+        let lines = pin_report(
+            &state,
+            win,
+            &[
+                given("--runtime", BinaryKind::Runtime, runtime),
+                given("--stub", BinaryKind::Stub, stub),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            lines,
+            [
+                "binary: --runtime is a pinned release binary (runtime 0.1.0 windows-x86_64)",
+                "binary: --stub is a pinned release binary (stub 0.1.0 windows-x86_64)",
+            ]
+        );
+        // The stamped bytes differ from the ones the list names: a local build.
+        let mut stamped = stub.to_vec();
+        stamped.extend_from_slice(b" + version info");
+        let lines = pin_report(
+            &state,
+            win,
+            &[given("--stub", BinaryKind::Stub, &stamped)],
+            false,
+        )
+        .unwrap();
+        assert_eq!(lines, ["binary: --stub is a local build"]);
+        // A console stub is classified as `stub-console`, which this list does not pin.
+        let lines = pin_report(
+            &state,
+            win,
+            &[given("--stub", BinaryKind::StubConsole, stub)],
+            false,
+        )
+        .unwrap();
+        assert_eq!(lines, ["binary: --stub is a local build"]);
+    }
+
+    #[test]
+    fn require_pinned_refuses_a_local_build_and_names_the_fetch_command() {
+        let (runtime, stub) = (b"runtime bytes".as_slice(), b"MZ stub".as_slice());
+        let state = pinned(runtime, stub);
+        let win = Target::parse("windows-x86_64").unwrap();
+        let mut other = runtime.to_vec();
+        other[0] ^= 1;
+        for (pins, bytes) in [(&state, other.as_slice()), (&PinState::NoKey, runtime)] {
+            let e = pin_report(
+                pins,
+                win,
+                &[given("--runtime", BinaryKind::Runtime, bytes)],
+                true,
+            )
+            .unwrap_err();
+            let text = format!("{e:#}");
+            assert!(
+                text.contains("--runtime in/file is a local build"),
+                "{text}"
+            );
+            assert!(
+                text.contains("lunepack prebuilt fetch --target windows-x86_64"),
+                "{text}"
+            );
+        }
+        // Pinned for another target: not pinned for this one.
+        let linux = Target::parse("linux-x86_64").unwrap();
+        assert!(
+            pin_report(
+                &state,
+                linux,
+                &[given("--runtime", BinaryKind::Runtime, runtime)],
+                true
+            )
+            .is_err()
+        );
+        // Without the flag the same binaries pass, as local builds.
+        let lines = pin_report(
+            &PinState::NoKey,
+            win,
+            &[given("--runtime", BinaryKind::Runtime, runtime)],
+            false,
+        )
+        .unwrap();
+        assert_eq!(lines, ["binary: --runtime is a local build"]);
     }
 }

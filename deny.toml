@@ -1,0 +1,28 @@
+# cargo-deny configuration (M13-D18): advisories and licences, run by the weekly workflow
+# (.github/workflows/weekly.yml: `cargo deny check advisories licenses`). Not part of the gate and not
+# run on every push, so a new upstream advisory cannot turn unrelated pushes red.
+
+[advisories]
+# The RustSec advisory database, fetched when the check runs. Nothing is ignored here: an advisory
+# that fires is reported and dealt with (a fix, or an entry below with its reason and an expiry
+# note), never silenced in advance.
+ignore = []
+
+[licenses]
+# Exactly the licences the dependency graph needs today (`cargo metadata --locked`, all targets),
+# taken by the cheapest alternative of each `OR` expression: a crate offered under `MIT OR
+# Apache-2.0` needs one of the two, `Apache-2.0 AND ISC` needs both. Any other licence, and a crate
+# with none, fails the check; adding a licence here is a decision, with its reason in the commit.
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.93

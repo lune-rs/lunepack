@@ -25,11 +25,13 @@ fn main() {
 
 #[cfg(windows)]
 mod windows {
+    use std::io::Read as _;
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use std::os::windows::process::CommandExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use lunepack_core::{ChildStdio, ExitKind, Process, ProcessId, SpawnSpec, WaitOutcome};
@@ -66,6 +68,10 @@ mod windows {
         (
             "a_sibling_started_after_a_piped_child_holds_none_of_its_pipes",
             sibling_holds_no_pipe,
+        ),
+        (
+            "a_detached_child_does_not_hold_the_parents_pipe",
+            detached_not_on_parent_pipe,
         ),
         (
             "strict_a_running_exe_in_the_tree_is_in_use",
@@ -723,5 +729,41 @@ mod windows {
             std::thread::sleep(Duration::from_millis(10));
         }
         kill_detached(sibling);
+    }
+
+    /// A program that reads another's output to its end (an app that runs `apply-and-restart`
+    /// with a pipe on the runtime's output) sees the end as soon as that program exits, though
+    /// the detached program it started still runs: the detached one inherits no pipe end.
+    fn detached_not_on_parent_pipe(scratch: &Path) {
+        let pid_file = scratch.join("pid");
+        let mut parent = Reap(
+            Command::new(helper())
+                .args(["detach-then", "exit", "pid-sleep"])
+                .arg(&pid_file)
+                .arg("600")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .expect("spawn the parent"),
+        );
+        let mut out = parent.0.stdout.take().unwrap();
+        let mut err = parent.0.stderr.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let a = out.read_to_end(&mut sink).is_ok();
+            let b = err.read_to_end(&mut sink).is_ok();
+            let _ = tx.send(a && b);
+        });
+        let started = Instant::now();
+        let read = rx.recv_timeout(Duration::from_secs(10));
+        let detached = read_pid_file(&pid_file);
+        let took = started.elapsed();
+        kill_detached(detached);
+        assert_eq!(read, Ok(true), "the pipes did not reach end of file");
+        assert!(took < Duration::from_secs(5), "reading took {took:?}");
+        assert!(parent.0.wait().unwrap().success());
     }
 }

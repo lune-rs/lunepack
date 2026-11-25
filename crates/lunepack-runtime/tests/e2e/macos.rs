@@ -28,6 +28,8 @@ const CHANNEL: &str = "stable";
 const APP_NAME: &str = "Lunepack E2E";
 /// The entry's file name in the bundle (`Contents/MacOS/<ENTRY>`).
 const ENTRY: &str = "lunepack-e2e";
+/// The .NET example's host in its bundle (the assembly name of `examples/dotnet`).
+const DOTNET_ENTRY: &str = "Example";
 const OUT_VAR: &str = "LUNEPACK_E2E_OUT";
 const DETAIL_VAR: &str = "LUNEPACK_E2E_DETAIL";
 const WAIT: Duration = Duration::from_secs(90);
@@ -50,6 +52,10 @@ pub struct Bins {
     pub app: PathBuf,
     pub shell_app: PathBuf,
     pub fake_ui: PathBuf,
+    /// The .NET example as an app bundle (`scripts/build-example-dotnet.sh --macos-bundle`): the
+    /// host alone in `Contents/MacOS`, the rest under `Contents/Resources/app` (M13 step 8). `None`
+    /// when its row is skipped by name (`LUNEPACK_E2E_DOTNET=0`).
+    pub dotnet_bundle: Option<PathBuf>,
 }
 
 /// Who signs a release through the packager's `[codesign.macos]` templates (M9-D2).
@@ -249,6 +255,12 @@ pub const ROWS: &[Row] = &[
         ci_only: false,
     },
     Row {
+        id: "15",
+        name: "the .NET example bundle (ad hoc signed by the packager): install, delta update, crash and rollback, the fixed version, uninstall; codesign-clean throughout",
+        run: row_dotnet,
+        ci_only: false,
+    },
+    Row {
         id: "10",
         name: "uninstall, foreign items kept, a second cycle clean",
         run: row_uninstall,
@@ -285,6 +297,23 @@ fn write_file(path: &Path, bytes: &[u8], exec: bool) {
     std::fs::write(path, bytes).expect("write file");
     let mode = if exec { 0o755 } else { 0o644 };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("set mode");
+}
+
+/// Copies a directory tree: files with their mode, symlinks as symlinks.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create dir");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("entry");
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        let kind = entry.file_type().expect("file type");
+        if kind.is_dir() {
+            copy_tree(&src, &dst);
+        } else if kind.is_symlink() {
+            symlink(std::fs::read_link(&src).expect("read link"), &dst).expect("symlink");
+        } else {
+            std::fs::copy(&src, &dst).expect("copy file");
+        }
+    }
 }
 
 /// The bytes of `Contents/Resources/delta.bin` of a release: a deterministic incompressible
@@ -459,6 +488,8 @@ pub struct World {
     cli_vars: Vec<(String, String)>,
     /// `HOME` as the children see it, when it differs from `home` (a symlink to it).
     home_env: Option<PathBuf>,
+    /// The releases of this world are the .NET example's bundle, not the Rust or shell app's.
+    dotnet: bool,
 }
 
 /// The suite's root, checked: absolute, canonical, and `HOME` of this process inside it.
@@ -529,9 +560,22 @@ impl World {
             extra_vars: Vec::new(),
             cli_vars: Vec::new(),
             home_env: None,
+            dotnet: false,
         };
         w.setup_publisher();
         w
+    }
+
+    /// A world whose releases are the .NET example's bundle (M13 step 8).
+    pub fn dotnet(bins: &Bins) -> World {
+        let mut w = World::build(bins, false);
+        w.dotnet = true;
+        w
+    }
+
+    /// The file name of the entry in `Contents/MacOS`.
+    fn entry_name(&self) -> &'static str {
+        if self.dotnet { DOTNET_ENTRY } else { ENTRY }
     }
 
     /// The live bundle `B`.
@@ -540,7 +584,7 @@ impl World {
     }
 
     pub fn entry(&self) -> PathBuf {
-        self.bundle().join("Contents/MacOS").join(ENTRY)
+        self.bundle().join("Contents/MacOS").join(self.entry_name())
     }
 
     pub fn runtime_in(&self, bundle: &Path) -> PathBuf {
@@ -639,7 +683,7 @@ impl World {
              health_timeout_secs = {timeout}\n\
              \n\
              [install]\n\
-             entry = \"Contents/MacOS/{ENTRY}\"\n\
+             entry = \"Contents/MacOS/{entry}\"\n\
              name = \"{APP_NAME}\"\n\
              comment = \"The lunepack end-to-end app\"\n\
              autostart = {autostart}\n\
@@ -648,6 +692,7 @@ impl World {
             feed = self.feed,
             timeout = release.health_timeout_secs,
             autostart = release.autostart,
+            entry = self.entry_name(),
         );
         std::fs::write(path, text).expect("write config");
     }
@@ -656,6 +701,9 @@ impl World {
     /// framework with the standard `Versions/` symlinks, an executable helper and a data file.
     pub fn bundle_input(&self, release: &Release) -> PathBuf {
         let input = self.work.join(format!("in-{}", release.version));
+        if self.dotnet {
+            return self.dotnet_input(release, input);
+        }
         let app = if release.shell {
             &self.bins.shell_app
         } else {
@@ -712,6 +760,38 @@ impl World {
         input
     }
 
+    /// The bundle input of `release` for the .NET example (M13 step 8): the bundle the build script
+    /// made (the host alone in `Contents/MacOS`, every other file under `Contents/Resources/app`,
+    /// an `Info.plist`), and the files the rows read in `Contents/Resources`.
+    fn dotnet_input(&self, release: &Release, input: PathBuf) -> PathBuf {
+        let bundle = self
+            .bins
+            .dotnet_bundle
+            .as_ref()
+            .expect("the .NET bundle is named by the environment");
+        copy_tree(bundle, &input);
+        write_file(
+            &input.join("Contents/Resources/version.txt"),
+            format!("{}\n", release.version).as_bytes(),
+            false,
+        );
+        if release.delta_bytes > 0 {
+            write_file(
+                &input.join("Contents/Resources/delta.bin"),
+                &delta_content(release.delta_bytes, release.delta_tweak),
+                false,
+            );
+        }
+        if !release.flags.is_empty() {
+            write_file(
+                &input.join("Contents/Resources/e2e-flags"),
+                format!("{}\n", release.flags.join("\n")).as_bytes(),
+                false,
+            );
+        }
+        input
+    }
+
     /// Packs `release` with the real command line (the stand-in UI as the helper), adds it to the
     /// feed and serves it.
     pub fn publish(&self, release: &Release) {
@@ -733,7 +813,7 @@ impl World {
     /// signed manifest lists what the server does not have, the fallback of M12-D5).
     fn publish_opts(&self, release: &Release, signer: Option<Signer>, drop_deltas: bool) {
         let input = self.bundle_input(release);
-        if signer.is_some() {
+        if signer.is_some() && !self.dotnet {
             // Only code `codesign` can seal: no text framework, no script.
             std::fs::remove_dir_all(input.join("Contents/Frameworks")).expect("no framework");
             std::fs::remove_dir_all(input.join("Contents/Helpers")).expect("no helper tool");
@@ -1219,6 +1299,28 @@ pub fn assert_no_quarantine(tree: &Path) {
     assert!(
         !text.contains("com.apple.quarantine"),
         "a quarantine attribute under the bundle"
+    );
+}
+
+/// No extended attribute named like `prefix` anywhere under `tree` (`xattr -lr`).
+fn assert_no_xattr_with(tree: &Path, prefix: &str) {
+    let mut cmd = Command::new("/usr/bin/xattr");
+    cmd.arg("-lr")
+        .arg(tree)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = run_limited(cmd, Duration::from_secs(120), "xattr");
+    let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.rsplit_once(": ").map(|(_, rest)| rest))
+        .filter(|rest| rest.starts_with(prefix))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        names.is_empty(),
+        "an extended attribute named {prefix}* under the bundle: {} of them",
+        names.len()
     );
 }
 
@@ -2590,6 +2692,148 @@ fn row_codesign_templates(bins: &Bins) -> Vec<String> {
     report
 }
 
+/// What the .NET row asks of the live bundle after every install, update and rollback: it passes
+/// `codesign --verify --deep --strict`, and no file of it carries a `com.apple.cs.*` attribute
+/// (a signature kept in an extended attribute is what a pack cannot carry, M13-D12).
+fn assert_sealed(w: &World, what: &str) {
+    assert_verifies(&format!("the live bundle {what}"), &w.bundle());
+    assert_no_xattr_with(&w.bundle(), "com.apple.cs");
+}
+
+/// Row 15 (M13 step 8): the .NET example as an app bundle (the host alone in `Contents/MacOS`,
+/// the managed files under `Contents/Resources/app`), signed ad hoc by the packager's own
+/// `[codesign.macos]` templates, driving only the runtime's command line. Installed from the
+/// `.dmg`; updated by delta (the changed file arrives as a patch, none of the app's own files is
+/// fetched again); a version that crashes on start is rolled back and marked bad; the fixed version
+/// is taken; the app is uninstalled. The bundle verifies strictly after every step and carries no
+/// signature in an extended attribute. The outcome lines are the shell app's for the same steps
+/// (`run_all` compares the update to 1.1.0 with row 9's).
+fn row_dotnet(bins: &Bins) -> Vec<String> {
+    if bins.dotnet_bundle.is_none() {
+        // Skipped by name (`LUNEPACK_E2E_DOTNET=0`): the suite said SKIPPED once.
+        return Vec::new();
+    }
+    const CRASH: Release = Release {
+        version: "1.2.0",
+        flags: &["crash-on-start"],
+        ..D2
+    };
+    const FIXED: Release = Release {
+        version: "1.3.0",
+        ..D2
+    };
+    let w = World::dotnet(bins);
+    w.publish_codesigned(&D1, Signer::AdHoc);
+    let dmg = w.build_dmg_signed("1.0.0");
+    assert_eq!(w.install_from_dmg(&dmg), 0, "the installer's exit code");
+    w.assert_installed("1.0.0");
+    assert_sealed(&w, "after the install");
+    assert_eq!(w.run_app(&w.entry(), &[]), 0, "the entry run directly");
+    let mut lines = w.expect_lines(&first_install_lines(), false);
+
+    // The delta update: 16 bytes of one file changed.
+    w.publish_codesigned(&D2, Signer::AdHoc);
+    assert_eq!(
+        w.delta_files("1.1.0"),
+        [format!("{TARGET}.from-1.0.0.delta")],
+        "the packer wrote the delta from 1.0.0"
+    );
+    let before = w.requests().len();
+    let stdout = delta_download(&w);
+    // The changed file, the re-signed host and the bundle's seal are fetched; the 189 files of the
+    // app are not (they are about 80 MB, 35 MB packed).
+    let fetched = download_bytes(&stdout);
+    assert!(
+        fetched < 4 << 20,
+        "the download fetched {fetched} bytes: the app's own files were fetched again"
+    );
+    let sources = file_sources(&stdout, DELTA_PATH);
+    assert!(
+        sources.iter().all(|s| s == "patch"),
+        "delta.bin arrives as a patch: {sources:?}"
+    );
+    let mut app_files = 0;
+    for line in stdout.lines() {
+        if line.starts_with("{\"schema\":1,\"type\":\"progress\",\"phase\":\"stage\"")
+            && let Some(rest) = line.split("\"file\":{\"path\":\"").nth(1)
+            && let Some((path, rest)) = rest.split_once('"')
+            && path.starts_with("Contents/Resources/app/")
+            && let Some(source) = rest
+                .split("\"source\":\"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+        {
+            assert_eq!(source, "unchanged", "{path} is not fetched again");
+            app_files += 1;
+        }
+    }
+    eprintln!("e2e: row 15: {app_files} stage lines of the app's own files, all unchanged");
+    assert!(
+        w.requests()[before..]
+            .iter()
+            .any(|u| u.contains(".from-1.0.0.delta")),
+        "the delta file was never requested"
+    );
+    lines.extend(delta_apply(&w));
+    assert_sealed(&w, "after the delta update");
+
+    // 1.2.0 crashes on start: the applier swaps 1.1.0 back and marks 1.2.0 bad.
+    w.publish_codesigned(&CRASH, Signer::AdHoc);
+    w.run_app(&w.entry(), &["--update", "--no-ui"]);
+    let want: Vec<String> = [
+        "1.1.0 start",
+        "1.1.0 nothing-pending",
+        "1.1.0 check 1.2.0",
+        "1.1.0 staged 1.2.0",
+        "1.1.0 apply-scheduled",
+        "1.2.0 start",
+        "1.2.0 arg after-update",
+        "1.2.0 event updated 1.1.0",
+        "1.2.0 event first_run",
+        "1.2.0 crash",
+        "1.1.0 start",
+        "1.1.0 arg after-update",
+        "1.1.0 nothing-pending",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    lines.extend(w.expect_lines(&want, false));
+    w.wait_runtime_gone();
+    assert_eq!(
+        w.bundle_version().as_deref(),
+        Some("1.1.0"),
+        "B holds 1.1.0 again"
+    );
+    let r = w.record().expect("a record");
+    assert_eq!(r.current.as_deref(), Some("1.1.0"));
+    assert_eq!(r.bad, ["1.2.0"]);
+    assert_sealed(&w, "after the rollback");
+
+    // The fixed version.
+    w.publish_codesigned(&FIXED, Signer::AdHoc);
+    w.run_app(&w.entry(), &["--update", "--no-ui"]);
+    lines.extend(w.expect_lines(&confirmed_update_lines("1.1.0", "1.3.0"), false));
+    w.wait_runtime_gone();
+    assert_eq!(
+        w.bundle_version().as_deref(),
+        Some("1.3.0"),
+        "B holds 1.3.0"
+    );
+    let r = w.record().expect("a record");
+    assert_eq!(r.current.as_deref(), Some("1.3.0"));
+    assert_eq!(r.bad, ["1.2.0"], "the bad version stays marked");
+    assert_sealed(&w, "after the fixed version");
+    assert_no_quarantine(&w.bundle());
+
+    // The uninstall.
+    let (code, _) = w.runtime(&["uninstall", "--silent"]);
+    assert_eq!(code, 0, "uninstall");
+    assert!(!w.bundle().exists(), "B is gone");
+    assert!(!w.root.exists(), "R is gone");
+    lines
+}
+
 /// Row 13b: the same ad-hoc install, asked through the runtime's command line: `download` runs the
 /// installed tree's policy (`enforce`, the default of a signed pack), the baseline is unsigned, so
 /// the update is staged and the result says `publisher: installed_unsigned` (M9-D9); the update
@@ -2762,6 +3006,7 @@ fn row_open(bins: &Bins) -> Vec<String> {
 pub fn run_all(bins: &Bins, ci: bool) -> Result<Vec<String>, String> {
     let _ = suite_root();
     let mut log = Vec::new();
+    let mut by_row: Vec<(&str, Vec<String>)> = Vec::new();
     for row in ROWS {
         if row.ci_only && !ci {
             eprintln!("e2e: row {} skipped (needs --ci): {}", row.id, row.name);
@@ -2774,7 +3019,8 @@ pub fn run_all(bins: &Bins, ci: bool) -> Result<Vec<String>, String> {
         match result {
             Ok(lines) => {
                 log.push(format!("row {} ok", row.id));
-                log.extend(lines.into_iter().map(|l| format!("  {l}")));
+                log.extend(lines.iter().map(|l| format!("  {l}")));
+                by_row.push((row.id, lines));
             }
             Err(panic) => {
                 let why = panic
@@ -2784,6 +3030,27 @@ pub fn run_all(bins: &Bins, ci: bool) -> Result<Vec<String>, String> {
                     .unwrap_or_else(|| "a panic".to_owned());
                 return Err(format!("row {} ({}): {why}", row.id, row.name));
             }
+        }
+    }
+    // The .NET app's outcome lines for the steps the shell app (row 9) also ran, the update from
+    // 1.0.0 to 1.1.0 after the first install's lines, must be the same.
+    let lines_of = |id: &str| by_row.iter().find(|(i, _)| *i == id).map(|(_, l)| l);
+    if let (Some(shell), Some(dotnet)) = (lines_of("9"), lines_of("15"))
+        && !dotnet.is_empty()
+    {
+        let from = first_install_lines().len();
+        let got = dotnet.get(from..from + shell.len()).unwrap_or_default();
+        if got != shell.as_slice() {
+            let at = shell
+                .iter()
+                .zip(got)
+                .position(|(a, b)| a != b)
+                .unwrap_or_else(|| shell.len().min(got.len()));
+            return Err(format!(
+                "the .NET app's outcome lines differ from the shell app's at line {at}: {:?} against {:?}",
+                got.get(at),
+                shell.get(at)
+            ));
         }
     }
     Ok(log)

@@ -32,6 +32,10 @@ CLI=/e2e/bin/lunepack
 RT=/e2e/bin/lunepack-runtime
 SVC=/e2e/bin/lunepack-service
 APPSH=/e2e/bin/app.sh
+# The .NET example's published folder (row 15; mounted by the host, absent with LUNEPACK_E2E_DOTNET=0).
+DOTNET_DIR=/e2e/dotnet
+# The file name of the app's entry in `bin/`: the shell app's, or `Example` while row 15 runs.
+ENTRY_NAME=e2e-app
 FAILURES=0
 CHECKS=0
 ROW=
@@ -147,7 +151,7 @@ channel = "stable"
 health_timeout_secs = $2
 
 [install]
-entry = "bin/e2e-app"
+entry = "bin/$ENTRY_NAME"
 name = "$NAME"
 comment = "The lunepack machine end-to-end app"
 categories = ["Utility"]
@@ -165,8 +169,19 @@ delta_file() {
   printf '%016d' "$1" | dd of="$2" bs=1 seek=131072 conv=notrunc 2>/dev/null
 }
 
-# publish VERSION HEALTH_TIMEOUT [FLAG...]: packs the shell app with the runtime and the service,
-# adds the release to the feed. The flags are lines of the app's `e2e-flags` marker. With
+# place_app INPUT: puts the app of ENTRY_NAME into INPUT/bin: the shell app, or, for `Example`, every
+# file of the .NET example's folder (the entry and the executable files keep their modes).
+place_app() {
+  if [ "$ENTRY_NAME" = Example ]; then
+    cp -r --preserve=mode "$DOTNET_DIR/." "$1/bin/"
+    chmod 755 "$1/bin/Example"
+  else
+    install -m 0755 "$APPSH" "$1/bin/e2e-app"
+  fi
+}
+
+# publish VERSION HEALTH_TIMEOUT [FLAG...]: packs the app (place_app) with the runtime and the
+# service, adds the release to the feed. The flags are lines of the app's `e2e-flags` marker. With
 # DELTA_TWEAK set (`DELTA_TWEAK=1 publish ...`) the release also holds `share/delta.bin`.
 publish() {
   local v=$1 timeout=$2 flag input
@@ -174,7 +189,7 @@ publish() {
   input=$W/in-$v
   rm -rf "$input"
   mkdir -p "$input/bin" "$input/share"
-  install -m 0755 "$APPSH" "$input/bin/e2e-app"
+  place_app "$input"
   printf '%s\n' "$v" >"$input/share/version.txt"
   if [ -n "${DELTA_TWEAK:-}" ]; then
     delta_file "$DELTA_TWEAK" "$input/share/delta.bin"
@@ -281,7 +296,7 @@ reset_outcomes() { : >"$UOUT"; chown "$UNAME" "$UOUT"; }
 # The standard user starts the installed app, detached from this shell, with the given arguments.
 app_start() {
   runuser -u "$UNAME" -- env -i HOME="$UH" PATH=/usr/bin:/bin LUNEPACK_E2E_OUT="$UOUT" \
-    "$R/current/bin/e2e-app" "$@" >/dev/null 2>&1 </dev/null
+    "$R/current/bin/$ENTRY_NAME" "$@" >/dev/null 2>&1 </dev/null
 }
 
 # The service's running state as `systemctl` says (never fatal).
@@ -902,6 +917,81 @@ row_umask() {
   check "nothing is left after the pkexec install" nothing_left
 }
 
+# The .NET example (a folder of about 190 files) as the app, through root's install, the standard
+# user's update through the service, a crash and its rollback, the fixed version and the
+# uninstall. Its own versions (2.x) come after every other row's, so the other rows' updates never
+# see them; the update stays plain (the per-machine delta is row 11b).
+row_dotnet() {
+  row "15 the .NET example app"
+  if [ "${LUNEPACK_E2E_DOTNET:-1}" = 0 ]; then
+    echo "  SKIPPED: the .NET row (LUNEPACK_E2E_DOTNET=0)"
+    return 0
+  fi
+  if [ ! -x "$DOTNET_DIR/Example" ]; then
+    fail "the .NET example's folder is not mounted at $DOTNET_DIR"
+    return 0
+  fi
+  local setup rc rt
+  ENTRY_NAME=Example
+  publish 2.0.0 60
+  setup=$(setup_of 2.0.0)
+  rc=$(rc_of "$setup" --all-users --silent)
+  eq "root's --all-users installs (0)" "$rc" 0
+  eq "R/current names the installed version" "$(current)" 2.0.0
+  check "the entry is there" test -x "$R/app/2.0.0/bin/Example"
+  check "the runtime is beside it" test -x "$R/app/2.0.0/bin/lunepack-runtime"
+  check "every file of the folder is in the tree" bash -c '[ "$(find "$1" -type f | wc -l)" -ge 190 ]' _ "$R/app/2.0.0/bin"
+  reset_outcomes
+  check "the standard user can run the app" as_user "$R/current/bin/Example"
+  check "its start is told" has_outcome "2.0.0 start"
+  has_outcome "2.0.0 confirmed" || has_outcome "2.0.0 nothing-pending" || fail "the app did not confirm or find nothing pending"
+
+  # The update by the standard user through the app, with no prompt.
+  publish 2.1.0 60
+  reset_outcomes
+  app_start --update --no-ui || true
+  check "the app scheduled the update" wait_for 60 has_outcome "2.0.0 apply-scheduled"
+  check "the new version confirmed through the service" wait_for 60 has_outcome "2.1.0 confirmed"
+  eq "R/current follows the confirm" "$(current)" 2.1.0
+  check "the update marked the arguments" has_outcome "2.1.0 arg after-update"
+  check "an updated event reached the app" has_outcome "2.1.0 event updated 2.0.0"
+  check "no prompt was needed: no pkexec ran" bash -c '! pgrep -x pkexec >/dev/null'
+
+  # A version that crashes on start: rolled back, marked bad, not offered again.
+  rt=$R/current/bin/lunepack-runtime
+  publish 2.2.0 20 crash-on-start
+  run as_user "$rt" download --json --expect-version 2.2.0
+  reset_outcomes
+  (runuser -u "$UNAME" -- env -i HOME="$UH" PATH=/usr/bin:/bin LUNEPACK_E2E_OUT="$UOUT" \
+    sh -c "sleep 1 & exec \"$rt\" apply-and-restart --json --wait-pid \$! --expect-version 2.2.0 --no-ui" \
+    >/dev/null 2>&1 </dev/null) || true
+  check "the bad version crashed on start" wait_for 60 has_outcome "2.2.0 crash"
+  check "and the old one came back" wait_for 60 has_outcome "2.1.0 start"
+  eq "R/current is back" "$(current)" 2.1.0
+  run as_user "$rt" check --json
+  eq "the bad version is not offered again" "$(last_member update)" ""
+
+  # The fixed version.
+  publish 2.3.0 60
+  run as_user "$rt" download --json --expect-version 2.3.0
+  reset_outcomes
+  (runuser -u "$UNAME" -- env -i HOME="$UH" PATH=/usr/bin:/bin LUNEPACK_E2E_OUT="$UOUT" \
+    sh -c "sleep 1 & exec \"$rt\" apply-and-restart --json --wait-pid \$! --expect-version 2.3.0 --no-ui -- --after-update" \
+    >/dev/null 2>&1 </dev/null) || true
+  check "the fixed version confirmed" wait_for 60 has_outcome "2.3.0 confirmed"
+  eq "R/current follows" "$(current)" 2.3.0
+
+  # The administrator's uninstall, with nothing running from R.
+  sleep 1
+  rc=$(rc_of "$R/current/bin/lunepack-runtime" uninstall)
+  eq "uninstall (0)" "$rc" 0
+  eq "the result" "$(last_member outcome)" uninstalled
+  check "nothing of the install is left" nothing_left
+  check "no process of ours is left" bash -c '! pgrep -f "lunepack-(runtime|service)" >/dev/null'
+  ENTRY_NAME=e2e-app
+  rm -rf "$W"/in-2.*
+}
+
 # ---- the run -----------------------------------------------------------------------------------
 
 run_rows() {
@@ -930,6 +1020,7 @@ run_rows() {
   row_pkexec
   row_flipped_setup_and_parent
   row_umask
+  row_dotnet
 
   echo
   if [ "$FAILURES" -ne 0 ]; then

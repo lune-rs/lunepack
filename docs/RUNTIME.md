@@ -6,7 +6,9 @@ runs for the installer and the applier, it is a command line that an app in any 
 child process to check for an update, download it, learn what happened since its last start,
 confirm that it works and hand a staged update over to be applied. Each command is a thin layer over
 the library calls a Rust app makes (`Updater::check`, `download` and `stage`, `startup`,
-`confirm_healthy`, `apply_and_restart`), so both get the same behaviour and the same errors (D42). The decisions are M5-D11 and M5-D12 in `docs/DECISIONS.md`;
+`confirm_healthy`, `apply_and_restart`), so both get the same behaviour and the same errors (D42).
+`docs/INTEGRATION.md` walks through the command line with a .NET app and real output; a Rust app starts
+from `docs/GETTING-STARTED.md`. The decisions are M5-D11 and M5-D12 of the project's internal decision log (not part of this repository);
 what the output must never hold is in `docs/THREAT-MODEL.md` ("The Linux runtime").
 
 ## Locating the runtime
@@ -782,7 +784,9 @@ process of the user that cannot be read counts as in use, with two exceptions: a
 kernel refuses to show beyond its executable is judged by what is readable, and a process whose executable
 file was deleted is judged by its working
 directory and open files alone, counting as in use only if one of them lies in the tree, or if the kernel
-refuses its working directory too (M5-D9 amended by M8-D19). A read that fails on a process that is starting
+refuses its working directory too (M5-D9 amended by M8-D19). A working directory or open file on a volume
+that is gone (force-unmounted, or a FUSE mount torn down) has no path the kernel can give and lies in no tree:
+it is not a failed read, and it does not make the tree in use. A read that fails on a process that is starting
 or ending is repeated up to three more times, ten milliseconds apart, and a process that has meanwhile ended
 is not in use. `docs/THREAT-MODEL.md` lists what that does not see.
 

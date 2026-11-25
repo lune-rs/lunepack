@@ -1379,9 +1379,9 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "futures",
  "lunepack-codec-lzma",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2150,16 +2150,18 @@ dependencies = [
  "lunepack-codec-lzma",
  "lunepack-core",
  "lunepack-crypto",
+ "lunepack-http",
  "lunepack-testkit",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
+ "url",
 ]
 
 [[package]]
 name = "lunepack-codec-lzma"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-core",
  "lunepack-testkit",
@@ -2170,7 +2172,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "lunepack-testkit",
@@ -2183,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-crypto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2197,7 +2199,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-fs"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "fs4",
  "libc",
@@ -2208,7 +2210,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-http"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "http",
  "hyper-util",
@@ -2224,7 +2226,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-os-linux"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libc",
  "lunepack-core",
@@ -2233,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-os-macos"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "core-foundation 0.10.1",
  "libc",
@@ -2244,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-os-windows"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-core",
  "lunepack-testkit",
@@ -2255,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack",
  "lunepack-codec-lzma",
@@ -2272,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-service"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-codec-lzma",
  "lunepack-core",
@@ -2287,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-stub"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-core",
  "lunepack-crypto",
@@ -2299,7 +2301,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-testkit"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-core",
  "proptest",
@@ -2308,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-ui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lunepack-core",
  "lunepack-os-linux",
@@ -2319,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "lunepack-ui-luneui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "accesskit_consumer",
  "lune-ui",
@@ -4328,9 +4330,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -5194,7 +5196,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "cargo_metadata",

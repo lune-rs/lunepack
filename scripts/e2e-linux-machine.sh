@@ -60,6 +60,12 @@
 #       made group-writable (not_protected)
 #   14  installs under umask 077 and 000, as root and through pkexec: nothing under R is group- or
 #       world-writable, and the standard user can read the tree and the desktop entry and run the app
+#   15  the .NET example (examples/dotnet, a folder of about 190 files; M13 step 7) as the app: root's
+#       install, the standard user's update through the service with no prompt, a version that
+#       crashes on start (rolled back, not offered again), the fixed version, the administrator's
+#       uninstall, nothing left. The host publishes the folder with scripts/build-example-dotnet.sh
+#       for the container's architecture (the machine has no .NET SDK) and `dotnet` missing there
+#       is a failure; LUNEPACK_E2E_DOTNET=0 skips the row and the suite says SKIPPED once.
 #
 # bash 3.2 compatible (D30) on the host; the inside part runs in the container's bash 5.
 set -euo pipefail
@@ -148,6 +154,13 @@ if [ "$mode" = host ]; then
     "$docker_cmd" build --quiet -t "$image" - <"$top/scripts/e2e-linux-machine.Dockerfile" >/dev/null
   fi
 
+  dotnet_wanted=1
+  if [ "${LUNEPACK_E2E_DOTNET:-1}" = 0 ]; then
+    dotnet_wanted=0
+  elif ! command -v dotnet >/dev/null 2>&1; then
+    die "dotnet is not installed: row 15 needs the SDK of examples/dotnet/global.json (LUNEPACK_E2E_DOTNET=0 skips it)"
+  fi
+
   work=$(mktemp -d "${TMPDIR:-/tmp}/lunepack-e2e-linux-machine.XXXXXX")
   work=$(cd "$work" && pwd -P)
   mkdir "$work/bin"
@@ -185,6 +198,14 @@ if [ "$mode" = host ]; then
     "$build_image" \
     ./scripts/e2e-linux-machine.sh --build /out
 
+  # The .NET example for row 15, published here: the machine image has no .NET SDK.
+  dotnet_mount=()
+  if [ "$dotnet_wanted" -eq 1 ]; then
+    echo "e2e-linux-machine: publishing the .NET example for $target"
+    "$top/scripts/build-example-dotnet.sh" "$target" "$work/dotnet"
+    dotnet_mount=(-v "$work/dotnet":/e2e/dotnet:ro)
+  fi
+
   echo "e2e-linux-machine: starting the systemd container"
   "$docker_cmd" run -d --name "$container" \
     --privileged --cgroupns=host \
@@ -192,6 +213,7 @@ if [ "$mode" = host ]; then
     --tmpfs /run --tmpfs /run/lock \
     -v "$top":/src:ro \
     -v "$work/bin":/e2e/bin:ro \
+    ${dotnet_mount[@]+"${dotnet_mount[@]}"} \
     "$image" >/dev/null
 
   state=
@@ -211,7 +233,8 @@ if [ "$mode" = host ]; then
   echo "e2e-linux-machine: systemd is $state"
 
   rc=0
-  "$docker_cmd" exec -i "$container" /src/scripts/e2e-linux-machine.sh --inside || rc=$?
+  "$docker_cmd" exec -i -e "LUNEPACK_E2E_DOTNET=$([ "$dotnet_wanted" -eq 1 ] && echo 1 || echo 0)" \
+    "$container" /src/scripts/e2e-linux-machine.sh --inside || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "e2e-linux-machine: FAILED (exit $rc)" >&2
     exit "$rc"

@@ -2,7 +2,7 @@
 //! parsers and verification chain and drop the result, so fuzzing never needs a public "parse
 //! without verifying" API that returns typed values. Hidden from the docs; not part of the API.
 //!
-//! The payload harnesses (`root`, `keys`, `feed`, `manifest`) take the bytes as a payload, wrap them
+//! The payload harnesses (`root`, `keys`, `feed`, `manifest`, `prebuilt`) take the bytes as a payload, wrap them
 //! in an envelope signed by a built-in fake key and run the real verification function, so the
 //! payload parser and every check behind it are reached. The hasher and signature scheme used here
 //! are private to this module, identical in algorithm to the testkit fakes (the testkit's replay
@@ -10,12 +10,17 @@
 //! checks. They are fuzz scaffolding, not an accept-everything mode, and nothing outside this
 //! module can name them.
 //!
+//! The `deltas` harness takes the bytes as the JSON value of a manifest's `deltas` member and
+//! splices them into a fixed valid manifest, which then takes the `manifest` harness's path (one
+//! `verify_manifest` call).
+//!
 //! Every harness must return for any input without panicking, over-allocating or looping. The
 //! `bool` of [`accepts`] says whether the input got all the way through; it exists for the seed
 //! tests and is ignored by the fuzz targets.
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::OnceLock;
 
 use crate::digest::{Sha256Digest, U53};
 use crate::encoding::{base64_decode, hex_decode_array};
@@ -29,11 +34,14 @@ use crate::json::{check_strict, parse_strict};
 use crate::keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 use crate::limits::Limits;
 use crate::manifest::{ManifestDocument, verify_manifest};
+use crate::pack::{PackedFile, ReleaseLayout};
 use crate::path::{EntryKind, RelPath, fold_key, validate_path, validate_tree};
+use crate::prebuilt::{PrebuiltList, verify_prebuilt};
 use crate::root::{RootDocument, TrustedRoot, advance_root};
 use crate::target::Target;
 use crate::traits::{
-    Clock, Codec, CodecId, DecodeReport, FrameView, HashState, Hasher, SignatureAlg, Verifier,
+    Clock, Codec, CodecId, DecodeReport, EncodedFrame, FrameView, HashState, Hasher, SignatureAlg,
+    Verifier,
 };
 use crate::transport::{ByteRange, Head};
 use crate::trust::{ClockReading, PublicKey, RollbackFloor, parse_payload};
@@ -66,11 +74,12 @@ pub const STATE_NAME_SEQ: u64 = 1;
 
 const DAY: u64 = 86_400;
 const ALL_SEEDS: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-const KINDS: [PayloadKind; 4] = [
+const KINDS: [PayloadKind; 5] = [
     PayloadKind::Root,
     PayloadKind::Keys,
     PayloadKind::Feed,
     PayloadKind::Manifest,
+    PayloadKind::Prebuilt,
 ];
 
 /// A harness entry point.
@@ -83,6 +92,7 @@ pub const HARNESSES: &[(&str, Harness)] = &[
     ("keys", keys),
     ("feed", feed),
     ("manifest", manifest),
+    ("deltas", deltas),
     ("path", path),
     ("tree", tree),
     ("rules", rules),
@@ -94,6 +104,7 @@ pub const HARNESSES: &[(&str, Harness)] = &[
     ("setup", setup),
     ("service", service),
     ("ui", ui),
+    ("prebuilt", prebuilt),
 ];
 
 /// Runs the harness `name` and reports whether `data` got all the way through it (`None`: no such
@@ -105,6 +116,7 @@ pub fn accepts(name: &str, data: &[u8]) -> Option<bool> {
         "keys" => keys_run(data),
         "feed" => feed_run(data),
         "manifest" => manifest_run(data),
+        "deltas" => deltas_run(data),
         "path" => path_run(data),
         "tree" => tree_run(data),
         "rules" => rules_run(data),
@@ -116,13 +128,15 @@ pub fn accepts(name: &str, data: &[u8]) -> Option<bool> {
         "setup" => setup_run(data),
         "service" => crate::service::fuzz_run(data),
         "ui" => crate::ui::fuzz_run(data),
+        "prebuilt" => prebuilt_run(data),
         _ => return None,
     })
 }
 
-/// Parses `data` as the document `kind` (`envelope`, `root`, `keys`, `feed` or `manifest`) with
-/// the reader's own syntax and schema checks (strict JSON, `format`, `kind`, `critical`, the typed
-/// fields; for `envelope` the key-independent checks of any of the four kinds), without keys or
+/// Parses `data` as the document `kind` (`envelope`, `root`, `keys`, `feed`, `manifest` or
+/// `prebuilt`) with the reader's own syntax and schema checks (strict JSON, `format`, `kind`,
+/// `critical`, the typed fields; for `prebuilt` every payload rule; for `envelope` the
+/// key-independent checks of any of the five kinds), without keys or
 /// signatures. Used by the test that keeps the examples in `docs/FORMAT.md` parsing.
 pub fn parse_example(kind: &str, data: &[u8]) -> Result<(), String> {
     let result = match kind {
@@ -144,6 +158,7 @@ pub fn parse_example(kind: &str, data: &[u8]) -> Result<(), String> {
         "keys" => parse_payload::<KeySetDocument>(data, PayloadKind::Keys).map(|_| ()),
         "feed" => parse_payload::<FeedDocument>(data, PayloadKind::Feed).map(|_| ()),
         "manifest" => parse_payload::<ManifestDocument>(data, PayloadKind::Manifest).map(|_| ()),
+        "prebuilt" => PrebuiltList::from_payload(data).map(|_| ()),
         _ => return Err(format!("unknown example kind {kind:?}")),
     };
     result.map_err(|e| e.to_string())
@@ -172,6 +187,12 @@ pub fn feed(data: &[u8]) {
 /// `data` as the payload of a manifest reached from a fixed feed entry.
 pub fn manifest(data: &[u8]) {
     let _ = manifest_run(data);
+}
+
+/// `data` as the JSON value of the `deltas` member of a manifest reached from a fixed feed entry
+/// (FORMAT.md 9.3): [`DELTAS_FILES`] are the file entries it can refer to.
+pub fn deltas(data: &[u8]) {
+    let _ = deltas_run(data);
 }
 
 /// `data` as one entry path.
@@ -238,6 +259,12 @@ pub fn service(data: &[u8]) {
 /// frame was valid and the stream ended on a frame boundary.
 pub fn ui(data: &[u8]) {
     let _ = crate::ui::fuzz_run(data);
+}
+
+/// `data` as the payload of `prebuilt-<version>.sig.json` (FORMAT.md 21), signed by the root key
+/// and verified under root 1 as its key set.
+pub fn prebuilt(data: &[u8]) {
+    let _ = prebuilt_run(data);
 }
 
 // ---- scaffolding: fake hasher, fake signatures, clock, codec -------------------------------------
@@ -509,6 +536,65 @@ fn keys_run(data: &[u8]) -> bool {
     .is_ok()
 }
 
+/// The verdict of the `prebuilt` harness on `data`: `Err` carries the refusal's text. The seed
+/// tests check that each `bad-` seed is refused for the reason its name gives.
+pub fn prebuilt_verdict(data: &[u8]) -> Result<(), String> {
+    let Some(root) = trusted_root() else {
+        return Err("the trusted root fixture could not be built".to_owned());
+    };
+    let bytes = sign_envelope(PayloadKind::Prebuilt, data, &[ROOT_SEED]);
+    let verified = verify_prebuilt(&root, &bytes, &FuzzVerifier);
+    // The bare-payload reader runs the same rules, so it agrees with the envelope reader on every
+    // payload whose envelope is within the cap.
+    let bare = PrebuiltList::from_payload(data);
+    match verified {
+        Ok(v) => {
+            assert_eq!(
+                v.payload(),
+                data,
+                "the verified payload is the signed bytes"
+            );
+            let Ok(bare) = bare else {
+                panic!("the bare-payload reader refused what the envelope reader accepted");
+            };
+            let rehearsal = v.is_rehearsal();
+            assert_eq!(
+                rehearsal,
+                bare.is_rehearsal(),
+                "the two readers' rehearsal flag"
+            );
+            match v.release_list() {
+                Ok(list) => {
+                    assert!(!rehearsal, "release_list gave the rows of a rehearsal list");
+                    assert_eq!(list, bare, "the two readers' lists");
+                }
+                Err(Error::RehearsalList) => {
+                    assert!(rehearsal, "release_list refused a release list");
+                }
+                Err(e) => panic!("release_list refused for another reason: {e}"),
+            }
+            assert!(
+                !bare.rows().is_empty() && bare.rows().len() <= Limits::V1.prebuilt_rows,
+                "row count out of range"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            if bytes.len() as u64 <= Limits::V1.prebuilt_doc_bytes {
+                assert!(
+                    bare.is_err(),
+                    "the bare-payload reader accepted what the envelope reader refused"
+                );
+            }
+            Err(e.to_string())
+        }
+    }
+}
+
+fn prebuilt_run(data: &[u8]) -> bool {
+    prebuilt_verdict(data).is_ok()
+}
+
 fn feed_run(data: &[u8]) -> bool {
     let (Some(keys), Some(app), Some(channel)) = (verified_key_set(), app_id(), channel()) else {
         return false;
@@ -527,17 +613,25 @@ fn feed_run(data: &[u8]) -> bool {
 }
 
 fn manifest_run(data: &[u8]) -> bool {
+    matches!(manifest_verify(data), Some(Ok(())))
+}
+
+/// The `manifest` harness's fixture: a verified key set and feed whose entry for [`FUZZ_VERSION`]
+/// on [`FUZZ_TARGET`] names `payload` signed by the fake release key, then the real
+/// [`verify_manifest`]. `None`: the fixture could not be built (never for a fixed fixture).
+/// Shared by `manifest` and `deltas`, so there is one verification path.
+fn manifest_verify(payload: &[u8]) -> Option<Result<(), Error>> {
     let (Some(keys), Some(app), Some(channel)) = (verified_key_set(), app_id(), channel()) else {
-        return false;
+        return None;
     };
-    let manifest_bytes = sign_envelope(PayloadKind::Manifest, data, &[RELEASE_SEED]);
+    let manifest_bytes = sign_envelope(PayloadKind::Manifest, payload, &[RELEASE_SEED]);
     let (Some(format), Some(seq), Some(issued), Some(size)) = (
         u53(1),
         u53(1),
         u53(FUZZ_NOW),
         u53(manifest_bytes.len() as u64),
     ) else {
-        return false;
+        return None;
     };
     let reference = ArtifactRef {
         path: format!("{FUZZ_VERSION}/{}.manifest.json", FUZZ_TARGET.as_str()),
@@ -569,12 +663,97 @@ fn manifest_run(data: &[u8]) -> bool {
         &clock(),
         &FuzzVerifier,
     ) else {
-        return false;
+        return None;
     };
-    let Some(entry) = feed.target_entry(0, FUZZ_TARGET) else {
-        return false;
+    let entry = feed.target_entry(0, FUZZ_TARGET)?;
+    Some(verify_manifest(&keys, &entry, &manifest_bytes, &FuzzHasher, &FuzzVerifier).map(|_| ()))
+}
+
+/// The file entries of the `deltas` harness's manifest, in manifest order: path, size, exec and
+/// the byte pattern whose SHA-256 the entry carries ([`deltas_file_bytes`]). A patch can name any
+/// of them; the empty one and the symlink [`DELTAS_SYMLINK`] let a seed reach the rules about an
+/// empty file and a path that is not a file entry.
+pub const DELTAS_FILES: [(&str, usize, u8, bool); 3] = [
+    ("bin/app", 300, 1, true),
+    ("lib/x.so.1", 200, 2, false),
+    ("share/empty", 0, 3, false),
+];
+/// The symlink entry of the `deltas` harness's manifest.
+pub const DELTAS_SYMLINK: (&str, &str) = ("lib/x.so", "x.so.1");
+
+/// The bytes of a `deltas` fixture file of `len` bytes and pattern `salt`.
+pub fn deltas_file_bytes(len: usize, salt: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(salt))
+        .collect()
+}
+
+/// The fixture manifest's payload without `deltas`: [`FUZZ_VERSION`] for [`FUZZ_TARGET`] with the
+/// entries of [`DELTAS_FILES`] and [`DELTAS_SYMLINK`], every file stored (the frame is not under
+/// test), written by the core's own layout writer.
+fn deltas_base_payload() -> Option<&'static [u8]> {
+    static BASE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    BASE.get_or_init(build_deltas_base_payload).as_deref()
+}
+
+fn build_deltas_base_payload() -> Option<Vec<u8>> {
+    let mut layout = ReleaseLayout::new(app_id()?, FUZZ_VERSION, FUZZ_TARGET).ok()?;
+    for (path, len, salt, exec) in DELTAS_FILES {
+        let bytes = deltas_file_bytes(len, salt);
+        let frame = (!bytes.is_empty()).then(|| EncodedFrame {
+            codec: CodecId::Stored,
+            bytes: bytes.clone(),
+            dict_size: None,
+            streams: None,
+        });
+        let packed = PackedFile {
+            size: bytes.len() as u64,
+            sha256: FuzzHasher.sha256(&bytes),
+            frame,
+            dropped: Vec::new(),
+        };
+        layout
+            .add_file(RelPath::parse(path).ok()?, exec, &packed)
+            .ok()?;
+    }
+    let (link, target) = DELTAS_SYMLINK;
+    layout
+        .add_symlink(RelPath::parse(link).ok()?, target)
+        .ok()?;
+    let (document, _pack) = layout.finish(FUZZ_NOW, &FuzzHasher).ok()?;
+    Some(document.to_payload())
+}
+
+/// The base payload with `value` as its `deltas` member: the bytes are spliced in as they are, so
+/// the strict reader sees exactly what the input says.
+fn deltas_payload(value: &[u8]) -> Option<Vec<u8>> {
+    let (&last, head) = deltas_base_payload()?.split_last()?;
+    if last != b'}' {
+        return None;
+    }
+    let mut payload = Vec::with_capacity(head.len() + value.len() + 12);
+    payload.extend_from_slice(head);
+    payload.extend_from_slice(br#","deltas":"#);
+    payload.extend_from_slice(value);
+    payload.push(b'}');
+    Some(payload)
+}
+
+/// The `deltas` harness: `Ok` when `data` as the `deltas` member passes [`verify_manifest`], else
+/// the error's text (`Err` with a fixture message when the fixture could not be built). For the
+/// seed tests, which assert the reason a `bad-` seed is refused for.
+pub fn deltas_verdict(data: &[u8]) -> Result<(), String> {
+    let Some(payload) = deltas_payload(data) else {
+        return Err("the deltas fixture could not be built".to_owned());
     };
-    verify_manifest(&keys, &entry, &manifest_bytes, &FuzzHasher, &FuzzVerifier).is_ok()
+    match manifest_verify(&payload) {
+        Some(result) => result.map_err(|e| e.to_string()),
+        None => Err("the manifest fixture could not be built".to_owned()),
+    }
+}
+
+fn deltas_run(data: &[u8]) -> bool {
+    deltas_verdict(data).is_ok()
 }
 
 fn path_run(data: &[u8]) -> bool {

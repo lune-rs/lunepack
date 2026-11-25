@@ -787,7 +787,9 @@ mod cases {
                     cmd.env("LUNEPACK_NO_UI", "1");
                 }
             }
-            Run::of(finish(cmd.spawn().expect("setup")))
+            Run::of(finish(
+                lunepack_testkit::exec::spawn(&mut cmd).expect("setup"),
+            ))
         }
 
         #[cfg(windows)]

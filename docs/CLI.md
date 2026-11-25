@@ -3,8 +3,13 @@
 `lunepack` packages an app's build output into a signed release directory that any static host can
 serve, and checks such a directory the way a client does. The directory layout, the documents and
 the signatures are defined in [`docs/FORMAT.md`](FORMAT.md); the decisions behind the tool are
-M3-D1 to M3-D13 and M3-R1-D1 in [`docs/DECISIONS.md`](DECISIONS.md); what it defends against is in
+M3-D1 to M3-D13 and M3-R1-D1 of the project's internal decision log (not part of this repository; the
+rules are stated here); what it defends against is in
 the packager section of [`docs/THREAT-MODEL.md`](THREAT-MODEL.md).
+
+Walk-throughs with real output: [`docs/GETTING-STARTED.md`](GETTING-STARTED.md) (a Rust app),
+[`docs/INTEGRATION.md`](INTEGRATION.md) (an app in any language) and [`docs/KEY-CEREMONY.md`](KEY-CEREMONY.md)
+(making, keeping, rotating and revoking the signing keys).
 
 Exit codes: 0 on success, 1 when a command fails or a check does not hold, 2 on a usage error.
 Errors print as `error: <message>` on stderr. Progress and results print on stdout. No command prints
@@ -26,8 +31,9 @@ or infers the version or the target. Files are classified by their contents, nev
 (M3-D6): PE (`.exe`, `.dll`), ELF (executables and `.so`) and Mach-O (executables, `.dylib`, bundles)
 get the matching filter whatever language produced them; files that are already compressed (zip, gzip,
 xz, zstd, bzip2, 7z, lz4, PNG, JPEG, GIF, WebP, WOFF2, Ogg) are stored; everything else gets LZMA2. A
-file is stored when no candidate is smaller than the file. How a non-Rust app learns that an update
-exists and triggers it from inside the app is not decided yet (it belongs to the client milestone).
+file is stored when no candidate is smaller than the file. An app in any language learns that an update
+exists and triggers it from inside the app through the runtime's command line (`docs/RUNTIME.md`;
+`docs/INTEGRATION.md` walks through it with a .NET app).
 
 ## Configuration: `lunepack.toml`
 
@@ -156,7 +162,9 @@ older document back.
 
 - `<name>`: a `[signers.<name>]` entry of the config;
 - `file:<path>`: a PKCS#8 PEM key file;
-- `env:<VAR>`: a PKCS#8 PEM key held in the environment variable `VAR`.
+- `env:<VAR>`: a PKCS#8 PEM key held in the environment variable `VAR`. This is how lunepack's own
+  release workflow hands over its key (`prebuilt sign`); the variable is visible to the process that
+  holds it and to its children, so set it only on the command that needs it.
 
 The distinct signers given must reach the threshold of the document being signed, and each must be a
 key of the root (for `keys.json` and root documents) or of the key set (for manifests and feeds) and
@@ -216,7 +224,8 @@ lunepack keys gen <PATH> [--config <CONFIG>]
 ```
 
 Writes a new private key file (see the key file format) and prints `public: <hex>` and `id: <hex>`
-(the key id, SHA-256 of the public key) on stdout, nothing else.
+(the key id, SHA-256 of the public key) on stdout, nothing else; its own message `wrote the private key to
+<path>` goes to stderr. The directory of `<PATH>` must exist: the command does not create it.
 
 ### `lunepack keys show`
 
@@ -245,7 +254,9 @@ lunepack keys set --release-dir <RELEASE_DIR> --release-key <RELEASE_KEYS> --sig
   reachable with `--allow-older-previous`).
 - `--not-before`, `--not-after`: Unix times. A key already in the previous key set keeps its window
   unless these are given; a new key defaults to `now` .. `now` + two years.
-- `--expires`: when the key set expires (Unix time); none by default.
+- `--expires`: when the key set expires (Unix time); none by default, and not carried over from the
+  previous key set: a `keys set` without it writes a key set with no expiry (its `change:` line says
+  `expires <time> -> none`).
 - `--sign`: root signers; repeat to reach the root's threshold.
 - The version is the previous version + 1.
 - Before it places anything, `keys set` checks every `feed-*.json` in the directory, and every manifest
@@ -286,10 +297,11 @@ it patches from ("Deltas" below).
 ```
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
-    [--deltas <N>] [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--service <SERVICE>] [--config <CONFIG>]
+    [--deltas <N>] [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--service <SERVICE>]
+    [--require-pinned] [--config <CONFIG>]
 
 lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runtime <RUNTIME>
-    [--ui <UI>] --assemble <DIR> [--config <CONFIG>]
+    [--ui <UI>] --assemble <DIR> [--require-pinned] [--config <CONFIG>]
 ```
 
 - `--version`: SemVer 2.0.0, used verbatim as the directory name. A directory of equal precedence with
@@ -380,7 +392,7 @@ earlier releases and the feeds in the directory; given those, the output is byte
 for any `--jobs`. A large changed file costs about 20 s per candidate at a 64 MiB window (up to
 about a minute at the cap), with up to two candidates per base and three bases by default; lower
 `--deltas` to pack faster. Measured on real 30 to 32 MB executables with one base and the defaults, the whole
-`pack` took 41 to 68 s and peaked at about 1.8 GB of process memory (DECISIONS.md D8).
+`pack` took 41 to 68 s and peaked at about 1.8 GB of process memory (D8 of the project's internal decision log).
 
 Upload order: the pack and the delta files first, then the manifest, then the feed (`feed add`), so a
 client never sees a manifest whose files are missing.
@@ -417,6 +429,17 @@ With `[update]` (and then `[install]`, which is required; `[install]` without `[
 - The entry and the icon must be regular files of the input tree (not symlinks, nor behind one), and
   on a non-Windows target the entry must carry the exec bit. An error names the field, `install.entry`
   or `install.icon`, never its value.
+- Each lunepack binary given (`--runtime`, `--ui`, `--stub`, `--service`) is hashed as read, before the
+  stub is stamped and before code signing, and stdout gets one line per binary: `binary: <flag> is a
+  pinned release binary (<kind> <version> <target>)` or `binary: <flag> is a local build`. A binary is
+  pinned only when this CLI is in the state `pinned` (`lunepack prebuilt list` below) and its list has a
+  row of the binary's kind for exactly the pack's `--target` with the binary's size and SHA-256: there is
+  no fallback between `macos-universal` and `macos-x86_64` or `macos-aarch64`, and `--stub` is the kind
+  `stub-console` when `install.terminal` is true and `stub` otherwise. The pack's bytes do not depend on
+  the classification. With `--require-pinned` a local build is an error that names the flag, the file and
+  the command that downloads the pinned binaries, `lunepack prebuilt fetch --target <TARGET> --out <DIR>`;
+  nothing is written. In the state `inconsistent` stderr gets one warning line and every binary is a
+  local build.
 
 Reserved names, each an error before anything is written:
 
@@ -425,6 +448,8 @@ Reserved names, each an error before anything is written:
 - a file named `lunepack-runtime` or `lunepack-runtime.exe` (any case) in the entry's directory, or a
   file named `lunepack-ui` or `lunepack-ui.exe` there, with or without `--ui`: the runtime starts a
   UI from its own directory, so the name is never left to an app file.
+- a file named `lunepack-NOTICES.txt` (any case) in the entry's directory (`Contents/Resources` for
+  `macos-*`), where `pack` places the third-party notices (below).
 
 The feed (`[update] feed`) must pass the feed rule of FORMAT.md 13.3, which `pack` checks with the same
 function a client runs before its first request: `https://` with a lowercase DNS name or an IPv4
@@ -433,14 +458,27 @@ information, query, fragment, percent-encoding, uppercase or non-canonical form;
 added when missing. `http://` to any other host, `localhost` included, is refused: the error names
 `[update] feed` and the rule that failed and never prints the feed.
 
+Third-party notices (M13-D11): wherever `pack` places the runtime it also places `lunepack-NOTICES.txt`, a
+text file (not executable) beside the runtime, in the entry's directory, or in `Contents/Resources` for
+`macos-*`. It names every Rust package linked into the release binaries (`lunepack-runtime`,
+`lunepack-service`, `lunepack-stub`, `lunepack-ui` and `lunepack`) with its licence and licence texts, and
+holds the bundled font's licence and LuneUI's own notices; an app that ships the runtime thereby ships the
+notices the binaries' licences ask for. The CLI carries the file, `crates/lunepack-cli/THIRD-PARTY-NOTICES.txt`,
+which `cargo run -p xtask -- notices` generates from `cargo metadata` and the gate checks (`notices --check`
+fails when it is stale, or when a package has no licence expression, a licence outside the allowlist or no
+licence text). The notices are bytes of the CLI itself, so the same CLI gives the same pack (C2). A pack
+without a runtime has no notices file, and the app's own licence notices stay the app's to ship.
+
 Determinism (C2) covers the runtime too: the same inputs, runtime bytes, keys and `SOURCE_DATE_EPOCH`
 give a byte-identical configuration, pack and manifest. `verify` accepts the result; `inspect` lists
 the two files like any others.
 
 Building the runtime: `scripts/build-runtime.sh <linux-x86_64|linux-aarch64>` runs the static musl
 build (the target must be installed with `rustup target add`; `--print-command` shows the command and
-runs nothing). `pack` does not build the runtime itself in M5; D19's build-from-source waits for a
-published crate (M13).
+runs nothing). `pack` never builds a runtime from source and never touches the network: a runtime
+you built yourself comes from these scripts in a checkout and is passed by path, and the runtime,
+UI, service and stubs of a lunepack release are downloaded, checked against the pins of this CLI,
+with `lunepack prebuilt fetch` (below).
 
 `scripts/build-runtime.sh <macos-aarch64|macos-x86_64|macos-universal>` builds on a macOS host only (the
 Apple linker, `lipo` and `otool`). `macos-universal` builds both slices and joins them with
@@ -517,7 +555,8 @@ each written before hashing so the signed manifest covers them (FORMAT.md 13, 17
   `Contents/MacOS/<file>` (an executable regular file). The error names `Contents/Info.plist` or
   `[install] entry`, never the value.
 - The runtime is placed beside the entry, `Contents/MacOS/lunepack-runtime` (marked executable), and the
-  update configuration at `Contents/Resources/lunepack-update.json`.
+  update configuration at `Contents/Resources/lunepack-update.json`, with the third-party notices
+  (`lunepack-NOTICES.txt`, not executable) beside it.
 - With `--ui`, the update window is a helper app (M8-D6): the UI binary at
   `Contents/Helpers/lunepack-update.app/Contents/MacOS/lunepack-ui` (executable) with a generated
   `Contents/Info.plist` (`CFBundleExecutable` `lunepack-ui`; `CFBundleIdentifier` the app id with `_` written
@@ -531,8 +570,8 @@ each written before hashing so the signed manifest covers them (FORMAT.md 13, 17
   is refused naming `[macos] icon`, never its content.
 - Reserved, each an error before anything is written: `Contents/Helpers/lunepack-update.app` and
   everything under it, `Contents/Resources/lunepack-setup.payload` (the installer app's payload file), the
-  names `lunepack-update.json` (at any depth), and `lunepack-runtime` and `lunepack-ui` in
-  `Contents/MacOS`. Comparison ignores ASCII case.
+  names `lunepack-update.json` (at any depth), `lunepack-runtime` and `lunepack-ui` in
+  `Contents/MacOS`, and `Contents/Resources/lunepack-NOTICES.txt`. Comparison ignores ASCII case.
 - Symlinks are packed as links, unchanged, and must satisfy FORMAT 10.2: a target stays inside the
   bundle, may pass through other links inside it (a framework's `Versions/Current` → `A` and `Foo` →
   `Versions/Current/Foo` pack as they are), and follows at most 8 of them. Exec bits come from the
@@ -540,6 +579,19 @@ each written before hashing so the signed manifest covers them (FORMAT.md 13, 17
 - The installed bundle's name is `install.name` when it can be a file name: 1 to 200 UTF-8 bytes, no `/`,
   `:` or control character, no leading `.` (FORMAT.md 13.4). Otherwise it is the app id. `pack` still
   packs, and warns on stderr, naming the rule and never the name.
+
+**Files in `Contents/MacOS` (M13-D12).** When the bundle is, or will be, code-signed (it holds
+`Contents/_CodeSignature`, or the config has a `[codesign.macos]` section), `pack` refuses it if any regular
+file under a `Contents/MacOS` directory, of the bundle or of a nested bundle, is not a Mach-O file, except
+the bundle's main executable (`install.entry`) and, in a signed bundle, the files `pack` itself places. The
+error names up to ten of the paths. The reason: `codesign` keeps the signature of a file that is not
+Mach-O in an extended attribute of that file, and a pack carries no extended attributes (FORMAT.md 8.1), so
+the bundle that is installed from the pack would fail `codesign --verify --deep --strict`. Move such files
+(the managed `.dll` files of a .NET app, scripts, data) under `Contents/Resources`, and let the host find
+them there; `examples/dotnet` does this with a host whose app path points at `Contents/Resources/app`. The
+rule is one instance of a general one: a signature must not depend on anything the pack does not carry
+(the extended attributes of a file are the case found). An unsigned bundle with no
+`[codesign.macos]` section is packed as before.
 
 **Signed bundles (M8-D8).** `pack` never modifies a bundle that holds `Contents/_CodeSignature`, since any
 change would break its seal. Such a bundle is packed as it is when every file `pack` would place is
@@ -774,6 +826,15 @@ references is listed as `unreferenced` and does not change the exit status. One 
 printed; the exit status is 0 only if every check held. `--at` checks at that Unix time (expiry and key
 windows) instead of the system clock.
 
+The trust chain is read by the same code a client runs (the core's root walk, FORMAT.md 5.2 and 11.1), for
+`verify` and for every command that reads a release directory (`inspect`, `pack`, `feed`, `keys`,
+`setup`): for the same compiled-in root, clock and directory, `verify` accepts exactly when a client
+with no stored state accepts. So the walk takes at most 1024 root rotations (a directory with more
+`root-<k>.json` files than that is read only up to the 1024th, and a `keys.json` signed under a later
+root does not verify), the app id of the root the walk ends on must be the config's, and a `root-<k>.json`
+that does not verify fails with its file name. The commands that write a root or a key set check what
+they built through the same walk before they place it.
+
 ### `lunepack inspect`
 
 ```
@@ -858,6 +919,206 @@ of the pack through its signed frame:
   install record: the first update check in `~/Applications` or `/Applications` adopts it after proving it
   equal to its release (RUNTIME.md, "macOS"); anywhere else it is a development run. `--zip` is refused for
   a Linux or Windows target.
+
+### `lunepack prebuilt list`
+
+Shows the project's key sets compiled into this CLI and the prebuilt lunepack binaries it pins: the
+runtime, UI, service and stubs of the lunepack release of this CLI's own version.
+
+```
+lunepack prebuilt list [--target <TARGET>] [--json]
+```
+
+The CLI carries three things, all part of its source and of its crates.io package: the project's key
+sets (public keys only; `src/project_key.rs`, oldest first, the last one current), the pin table
+`prebuilt.json` and its signed envelope `prebuilt.sig.json` (FORMAT.md 21). At every use (`pack`,
+`prebuilt list`) it decides one state:
+
+| State | Meaning |
+| --- | --- |
+| `no-key` | No project key set: nothing is pinned. A CLI built before the project's key ceremony is in this state. |
+| `none` | A key set, and both list files are empty: nothing is pinned. |
+| `pinned` | The envelope verifies under the current key set, its payload is byte for byte the table, the list is of this CLI's version and is not a rehearsal list: its rows are pinned. |
+| `rehearsal` | As `pinned`, but the list is a rehearsal list: shown, nothing is pinned. |
+| `other-version` | As `pinned`, but the list is of another version: shown, nothing is pinned. |
+| `inconsistent` | Anything else: one list file without the other, a list without a key set, a table that is not the envelope's payload, an envelope that does not verify under the current key set (also one that verifies only under an earlier, retired set), a parse error, or a row whose `size` is above what `pack` reads for its kind. Nothing is pinned. |
+
+No flag, environment variable or file adds to or replaces the compiled-in key sets for these checks.
+
+The text output is a `state:` line (with a `reason:` line in the state `inconsistent`), one `key set
+<n>: threshold <t>, current|retired` line per key set with a `key: <public key> id <key id>` line per
+key (or `key sets: none (no project key has been published)`), and, for a list, a `list:` line (version,
+source commit, rehearsal) and one `binary:` line per row: kind, target, size, SHA-256 and the release
+asset's name, `lunepack-<kind>-<version>-<target>` (plus `.exe` for a `windows-*` target), computed and
+never read from the table. `--target` shows only that target's rows. `--json` prints one object with
+the members `state`, `reason` (null unless `inconsistent`), `roots` (per key set: `version`,
+`threshold`, `current` and `keys`, each with `public` and `id`), `list` (null, or `version`,
+`source_commit` and `rehearsal`) and `binaries` (per row: `kind`, `target`, `size`, `sha256`, `asset`).
+In the state `inconsistent` the command prints its report, then exits 1 with the reason on stderr.
+
+### The project's list of prebuilt binaries: `prebuilt check`, `sign` and `verify`
+
+These three commands handle the signed list of a lunepack release's prebuilt binaries (FORMAT.md 21)
+that the release workflow makes and `prebuilt list` and `pack` read. They are for the maintainers of
+lunepack and for anyone who wants to check a release by hand. None of them needs the network.
+
+**Which key set.** A `sign` or `verify` runs under the current built-in key set of this CLI
+(`prebuilt list` shows it) unless the command line names another: `--trusted-key <hex>` (a public key
+as 64 lowercase hex characters; give it 1 to 16 times, with `--threshold <n>` when more than one) on
+`sign` and `verify`, or `--root-version <n>` (an earlier built-in set) on `verify` only. The two never
+go together. These flags are never read from the environment or a config, and every result says which
+set it held under: `verified under built-in key set 2, the current one`, `verified under built-in key
+set 1, which is retired`, or `verified under a key given on the command line, not a built-in one`. A
+given set is built by the same function as a built-in one, so the same rules apply (1 to 16 keys, none
+twice, `1 <= threshold <= keys`). With no built-in key set and no `--trusted-key`, both commands refuse
+with `this CLI has no project key built in`.
+
+#### `lunepack prebuilt check`
+
+```
+lunepack prebuilt check --list <FILE> [--json]
+```
+
+Reads a list with this CLI's own parser and prints what it read; it exits 0 only when the list is
+accepted. It reads nothing but the file: no key, no signature, no network. `--json` prints one object
+with `version`, `source_commit`, `rehearsal` and `binaries` (per row `kind`, `target`, `size`,
+`sha256` and `asset`, the computed release asset name), so a script that reads these values reads what
+the enforcer read.
+
+```
+$ lunepack prebuilt check --list prebuilt-0.1.0.json
+list: version 0.1.0, source commit 0123456789abcdef0123456789abcdef01234567, rehearsal false
+binary: runtime linux-x86_64 size 13 sha256 7fc5036745ec73b6169495830cf3ef3b58127addf27fcc0d0b8fe87b4de5808c asset lunepack-runtime-0.1.0-linux-x86_64
+binary: ui windows-x86_64 size 8 sha256 62ea1f22117e10e5af59aba1dd236f5878e3626bc3767b5ac202c3da8dafe718 asset lunepack-ui-0.1.0-windows-x86_64.exe
+```
+
+A list the parser refuses prints nothing on stdout and `error: the list is not accepted: <rule>` on
+stderr (exit 1): for example a document over 64 KiB, a member given twice, `rehearsal` missing or not
+a boolean, or trailing data.
+
+#### `lunepack prebuilt sign`
+
+```
+lunepack prebuilt sign --list <FILE> --out <FILE> --sign <SPEC>... [--trusted-key <HEX>... [--threshold <N>]]
+```
+
+Signs the exact bytes of the list (no re-serialisation) and writes the envelope
+(`prebuilt-<version>.sig.json`). The list must pass `prebuilt check` and be of this CLI's own version.
+Signers are the specs of "Signer specs" above, resolved with the global `--config` path; `file:` and
+`env:` work when that config does not exist. No key is printed, logged, written to a file or passed as
+an argument, and no new way to load a key exists.
+
+Before anything is written the envelope is verified under the key set. When it does not verify (a
+signer that is not one of the keys, too few signers for the threshold) nothing is written and the error
+names the key ids the set expects and the ids that signed (key ids are public), so a secret that holds
+the wrong key fails closed. The output file is created with `create_new`: an existing file is an error.
+
+In the examples, `$PUBLIC` is the `public:` value `keys gen` printed for a throwaway key made for them;
+the public key and its id are shown shortened (`...`) in the `key:` lines, they are 64 characters long.
+
+```
+$ lunepack prebuilt sign --list prebuilt-0.1.0.json --out prebuilt-0.1.0.sig.json \
+    --sign file:./release-signer.lpk --trusted-key "$PUBLIC"
+envelope written: prebuilt-0.1.0.sig.json
+verified under a key given on the command line, not a built-in one
+key set: threshold 1 of 1
+  key: 930ca1c4...48714 id dbb52593...92d22
+```
+
+`env:<VAR>` is how lunepack's own release workflow hands its project key to this command
+(`--sign env:LUNEPACK_PROJECT_KEY`). The variable is visible to the process that holds it and to its
+children, so it is set on the one step that needs it and nowhere else.
+
+#### `lunepack prebuilt verify`
+
+```
+lunepack prebuilt verify --list <FILE> --sig <FILE> [--root-version <N> | --trusted-key <HEX>... [--threshold <N>]]
+                         [--dir <DIR> [--all]] [--allow-rehearsal] [--json]
+```
+
+Checks a release's list against its envelope: the envelope must verify under the key set, and the
+decoded payload must equal the `--list` file byte for byte. A list whose `rehearsal` is `true` is a
+rehearsal of the release process: it fails with `rehearsal list` unless `--allow-rehearsal` is given,
+and is labelled `rehearsal true` either way.
+
+With `--dir`, the files in that directory (not its subdirectories) are checked against the rows: every
+file that bears a row's asset name must have the row's size and SHA-256; a file named like a lunepack
+binary of the list's version (`lunepack-<kind>-<version>-...`) that no row names is an error; no
+matching file at all is an error; with `--all` every row's file must be present. A symbolic link or
+another file that is not a regular file under a row's name is an error. Files are only read and hashed,
+never run or parsed. The command exits 0 only when everything asked for passed; on any failure it
+prints nothing on stdout and the reasons on stderr.
+
+```
+$ lunepack prebuilt verify --list prebuilt-0.1.0.json --sig prebuilt-0.1.0.sig.json \
+    --trusted-key "$PUBLIC" --dir downloads --all
+list: version 0.1.0, source commit 0123456789abcdef0123456789abcdef01234567, rehearsal false
+binary: runtime linux-x86_64 size 13 sha256 7fc5036745ec73b6169495830cf3ef3b58127addf27fcc0d0b8fe87b4de5808c asset lunepack-runtime-0.1.0-linux-x86_64
+binary: ui windows-x86_64 size 8 sha256 62ea1f22117e10e5af59aba1dd236f5878e3626bc3767b5ac202c3da8dafe718 asset lunepack-ui-0.1.0-windows-x86_64.exe
+verified under a key given on the command line, not a built-in one
+key set: threshold 1 of 1
+  key: 930ca1c4...48714 id dbb52593...92d22
+files: 2 checked, every row present
+```
+
+A file that differs from its row:
+
+```
+$ lunepack prebuilt verify --list prebuilt-0.1.0.json --sig prebuilt-0.1.0.sig.json \
+    --trusted-key "$PUBLIC" --dir downloads
+error: the files do not match the list:
+  lunepack-ui-0.1.0-windows-x86_64.exe: 9 bytes, the list says 8
+```
+
+`--json` prints one object: the members of `prebuilt check --json`, `key_set` (`source`, `built-in` or
+`command-line`; `version` and `current`, null for a given set; `retired`; `threshold`; `keys`, each
+with `public` and `id`; and the `label` sentence above) and `files` (null, or `checked`, the asset
+names that were checked, and `all`).
+
+A pass proves that the holders of the key set signed this list and that the files are the ones it
+names. It says nothing about how the files were built. Check a release with a CLI you obtained before
+it or from crates.io, not with one downloaded together with the files.
+
+### `lunepack prebuilt fetch`
+
+```
+lunepack prebuilt fetch --target <TARGET> --out <DIR> [--kind <KIND>]... [--base-url <URL>]
+```
+
+Downloads the prebuilt binaries this CLI pins for one target (`linux-x86_64`, `linux-aarch64`,
+`windows-x86_64`, `macos-universal`, `macos-aarch64` or `macos-x86_64`), checks each against its pinned row and places it in `<DIR>`.
+This is the only command that uses the network for them: `pack` never downloads anything, and
+`pack --require-pinned` names this command when a binary is a local build.
+
+- It needs the state `pinned` (`prebuilt list`). In every other state (`no-key`, `none`, `rehearsal`,
+  `other-version`, `inconsistent`) it exits 1 with one line that names the state (and, for
+  `inconsistent`, the reason), opens no connection and does not create `--out`. The rows come from the
+  state and from nowhere else: never from a file or a list on the network. The state is decided before
+  `--base-url` is looked at.
+- Each file is requested as `<base><asset name>` (`lunepack-<kind>-<version>-<target>`, plus `.exe` for
+  a Windows target). The default base is the GitHub release of this CLI's version,
+  `https://github.com/lune-rs/lunepack/releases/download/v<version>/`. `--base-url` (ending in `/`, one
+  is added when missing) follows the rule of an update feed: `https://`, `file:///`, or `http://` to a
+  loopback address; anything else is refused before any request, without showing the URL. Redirects are
+  followed up to the transport's limit.
+- At most the pinned size plus one byte is read. A body of another size, or with another SHA-256, is
+  refused with the asset's name and the expected and actual size or the two digests; the temporary file
+  is removed and nothing is placed under the asset's name. A file that passed is placed by a rename
+  from a temporary file in `<DIR>`, with mode 0755 on Unix. Nothing downloaded is run, parsed or
+  unpacked.
+- A file already in `<DIR>` under the asset's name with the pinned SHA-256 is left alone (`present`); one
+  with another hash is replaced only after the new file has passed. A link or a directory under that
+  name is an error.
+- `--kind` (`runtime`, `ui`, `service`, `stub`, `stub-console`; repeatable) limits the files to those
+  kinds; the default is every row of the target.
+
+On success each file prints `fetched: <asset> (<size> bytes)` or `present: <asset>`, then a summary
+line. In this CLI as built from the repository, where no project key has been published yet:
+
+```
+$ lunepack prebuilt fetch --target linux-x86_64 --out ./downloads
+error: prebuilt fetch needs this CLI in the state pinned, it is in the state no-key: no project key is built in, so nothing is pinned
+```
 
 ## The release directory
 

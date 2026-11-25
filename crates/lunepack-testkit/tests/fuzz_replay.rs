@@ -10,17 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lunepack_core::fuzz::{HARNESSES, accepts};
+use lunepack_core::fuzz::{HARNESSES, accepts, deltas_verdict, prebuilt_verdict};
+use lunepack_testkit::replay::{mutated_seeds, random_inputs, seed_neighbourhood};
 use lunepack_testkit::{Seed, fuzz_seeds};
-use proptest::prelude::*;
-use proptest::test_runner::{Config, TestRunner};
-
-/// Random inputs per harness (M2 step 11 contract).
-const RANDOM_CASES: u32 = 10_000;
-/// Mutated-seed inputs per harness.
-const MUTATED_CASES: u32 = 10_000;
-/// Longest random input.
-const MAX_RANDOM_LEN: usize = 1024;
 
 fn fuzz_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz")
@@ -116,7 +108,12 @@ fn every_harness_has_a_fuzz_target_and_both_kinds_of_seed() {
         .expect("fuzz_targets dir")
         .flatten()
         .count();
-    assert_eq!(targets, HARNESSES.len(), "a fuzz target without a harness");
+    // `codec` and `patch` are the codec crate's harnesses (its own replay test covers them).
+    assert_eq!(
+        targets,
+        HARNESSES.len() + 2,
+        "a fuzz target without a harness"
+    );
 }
 
 #[test]
@@ -149,77 +146,31 @@ fn committed_seeds_run_as_expected() {
 fn seed_neighbourhoods_do_not_panic() {
     for (harness, _) in HARNESSES {
         for seed in seeds_of(harness) {
-            let bytes = &seed.bytes;
-            let stride = (bytes.len() / 250).max(1);
-            for i in (0..=bytes.len()).step_by(stride) {
-                run(harness, &bytes[..i]);
-                if i < bytes.len() {
-                    for flip in [0x01u8, 0xff] {
-                        let mut m = bytes.clone();
-                        m[i] ^= flip;
-                        run(harness, &m);
-                    }
-                    let mut dropped = bytes.clone();
-                    dropped.remove(i);
-                    run(harness, &dropped);
-                }
-                let mut inserted = bytes.clone();
-                inserted.insert(i, b'"');
-                run(harness, &inserted);
-            }
+            seed_neighbourhood(&seed.bytes, |data| {
+                run(harness, data);
+            });
         }
     }
 }
 
-fn runner(cases: u32) -> TestRunner {
-    TestRunner::new(Config {
-        cases,
-        failure_persistence: None,
-        ..Config::default()
-    })
-}
-
-fn random_inputs(harness: &str) {
-    let strategy = prop::collection::vec(any::<u8>(), 0..MAX_RANDOM_LEN);
-    runner(RANDOM_CASES)
-        .run(&strategy, |data| {
-            run(harness, &data);
-            Ok(())
-        })
-        .unwrap_or_else(|e| panic!("{harness}: random input: {e}"));
-}
-
-fn mutated_seeds(harness: &str) {
-    let seeds: Vec<Vec<u8>> = seeds_of(harness).into_iter().map(|s| s.bytes).collect();
-    let strategy = (
-        prop::sample::select(seeds),
-        prop::collection::vec((any::<u16>(), any::<u8>(), 0u8..3), 1..8),
+fn replay_harness(harness: &str) {
+    random_inputs(harness, |data| {
+        run(harness, data);
+    });
+    mutated_seeds(
+        harness,
+        seeds_of(harness).into_iter().map(|s| s.bytes).collect(),
+        |data| {
+            run(harness, data);
+        },
     );
-    runner(MUTATED_CASES)
-        .run(&strategy, |(mut data, edits)| {
-            for (at, byte, op) in edits {
-                let at = usize::from(at) % (data.len() + 1);
-                match op {
-                    0 if at < data.len() => data[at] ^= byte | 1,
-                    1 => data.insert(at, byte),
-                    _ if at < data.len() => {
-                        data.remove(at);
-                    }
-                    _ => {}
-                }
-            }
-            run(harness, &data);
-            Ok(())
-        })
-        .unwrap_or_else(|e| panic!("{harness}: mutated seed: {e}"));
 }
 
 macro_rules! replay {
     ($($name:ident),* $(,)?) => {$(
         #[test]
         fn $name() {
-            random_inputs(stringify!($name));
-            mutated_seeds(stringify!($name));
+            replay_harness(stringify!($name));
         }
     )*};
 }
@@ -230,6 +181,7 @@ replay!(
     keys,
     feed,
     manifest,
+    deltas,
     path,
     tree,
     rules,
@@ -240,7 +192,8 @@ replay!(
     update_config,
     setup,
     service,
-    ui
+    ui,
+    prebuilt
 );
 
 #[test]
@@ -251,6 +204,7 @@ fn the_replay_list_covers_every_harness() {
         "keys",
         "feed",
         "manifest",
+        "deltas",
         "path",
         "tree",
         "rules",
@@ -262,9 +216,95 @@ fn the_replay_list_covers_every_harness() {
         "setup",
         "service",
         "ui",
+        "prebuilt",
     ]
     .into_iter()
     .collect();
     let all: BTreeSet<&str> = HARNESSES.iter().map(|(n, _)| *n).collect();
     assert_eq!(named, all);
+}
+
+/// A `deltas` seed is refused for the reason its name gives, not for another one (the fixture is
+/// valid, so the input is the only thing that can be wrong).
+#[test]
+fn deltas_seeds_are_refused_for_their_reason() {
+    let seeds = seeds_of("deltas");
+    let ok = seeds.iter().filter(|s| s.accepted).count();
+    assert!(ok >= 3, "deltas: {ok} accepted seeds, at least 3");
+    for seed in &seeds {
+        let verdict = deltas_verdict(&seed.bytes);
+        if seed.accepted {
+            assert_eq!(verdict, Ok(()), "deltas/{}", seed.name);
+            assert_eq!(seed.reason, None, "deltas/{}", seed.name);
+        } else {
+            let reason = seed
+                .reason
+                .unwrap_or_else(|| panic!("deltas/{} names no reason", seed.name));
+            let err = verdict.expect_err(&seed.name);
+            assert!(
+                err.contains(reason),
+                "deltas/{}: refused with {err:?}, expected a reason containing {reason:?}",
+                seed.name
+            );
+        }
+    }
+}
+
+/// A `prebuilt` seed is refused for the reason its name gives (the fixture's root and signature are
+/// valid, so the payload is the only thing that can be wrong), and the accepted ones are the three
+/// the format needs: one row, the most rows a list can hold, and a rehearsal list.
+#[test]
+fn prebuilt_seeds_are_refused_for_their_reason() {
+    let seeds = seeds_of("prebuilt");
+    for name in ["ok-one-row", "ok-every-kind-every-target", "ok-rehearsal"] {
+        assert!(
+            seeds.iter().any(|s| s.name == name && s.accepted),
+            "prebuilt: no accepted seed {name}"
+        );
+    }
+    for seed in &seeds {
+        let verdict = prebuilt_verdict(&seed.bytes);
+        if seed.accepted {
+            assert_eq!(verdict, Ok(()), "prebuilt/{}", seed.name);
+            assert_eq!(seed.reason, None, "prebuilt/{}", seed.name);
+        } else {
+            let reason = seed
+                .reason
+                .unwrap_or_else(|| panic!("prebuilt/{} names no reason", seed.name));
+            let err = verdict.expect_err(&seed.name);
+            assert!(
+                err.contains(reason),
+                "prebuilt/{}: refused with {err:?}, expected a reason containing {reason:?}",
+                seed.name
+            );
+        }
+    }
+}
+
+/// More than 200,000 patches in one delta (FORMAT.md 9.3): built here and not committed, since it
+/// is some 45 MB of JSON.
+#[test]
+fn deltas_with_too_many_patches_are_refused_for_it() {
+    let seeds = seeds_of("deltas");
+    let one = seeds
+        .iter()
+        .find(|s| s.name == "ok-one-delta")
+        .expect("the one-delta seed");
+    let text = std::str::from_utf8(&one.bytes).expect("utf-8");
+    // `[{"from":..,"patches":[ P ]}]` with P the writer's one patch object repeated.
+    let start = text.find("\"patches\":[").expect("patches") + "\"patches\":[".len();
+    let end = text.rfind("]}]").expect("patches end");
+    let patch = &text[start..end];
+    assert!(patch.starts_with('{') && patch.ends_with('}'), "{patch}");
+    let many = format!(
+        "{}{}{}",
+        &text[..start],
+        vec![patch; 200_001].join(","),
+        &text[end..]
+    );
+    let err = deltas_verdict(many.as_bytes()).expect_err("too many patches");
+    assert!(
+        err.contains("200001 patches, at most 200000"),
+        "refused with {err:?}"
+    );
 }

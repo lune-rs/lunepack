@@ -7,6 +7,7 @@
 mod cmd_feed;
 mod cmd_keys;
 mod cmd_pack;
+mod cmd_prebuilt;
 mod cmd_setup;
 mod cmd_verify;
 mod codesign;
@@ -16,6 +17,8 @@ mod pipeline;
 mod pkg;
 mod place;
 mod plist;
+mod prebuilt;
+mod project_key;
 mod release_dir;
 mod stamp;
 mod state;
@@ -66,6 +69,25 @@ enum Command {
     /// Build a Linux setup file: the release's runtime with one version's key set, manifest and
     /// pack, installable offline (`<app_id>-<version>-<target>-setup`).
     Setup(cmd_setup::SetupArgs),
+    /// lunepack's own prebuilt binaries: what this CLI pins, and the project's signed list of them.
+    Prebuilt {
+        #[command(subcommand)]
+        command: PrebuiltCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PrebuiltCommand {
+    /// Show the project's key sets compiled into this CLI and the binaries it pins.
+    List(cmd_prebuilt::ListArgs),
+    /// Parse a list with this CLI's own parser and print what it read (no key, no network).
+    Check(cmd_prebuilt::CheckArgs),
+    /// Sign a list: write its envelope after checking it under the project's key set.
+    Sign(cmd_prebuilt::SignArgs),
+    /// Check a list's envelope under a key set, and optionally the downloaded files.
+    Verify(cmd_prebuilt::VerifyArgs),
+    /// Download this CLI's pinned binaries of one target and check them against the pins.
+    Fetch(cmd_prebuilt::FetchArgs),
 }
 
 #[derive(Subcommand)]
@@ -114,6 +136,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Verify(args) => cmd_verify::verify(&cli.config, &args),
         Command::Inspect(args) => cmd_verify::inspect(&cli.config, &args),
         Command::Setup(args) => cmd_setup::setup(&cli.config, &args),
+        Command::Prebuilt { command } => match command {
+            PrebuiltCommand::List(args) => cmd_prebuilt::list(&args),
+            PrebuiltCommand::Check(args) => cmd_prebuilt::check(&args),
+            PrebuiltCommand::Sign(args) => cmd_prebuilt::sign(&cli.config, &args),
+            PrebuiltCommand::Verify(args) => cmd_prebuilt::verify(&args),
+            PrebuiltCommand::Fetch(args) => cmd_prebuilt::fetch(&args),
+        },
     }
 }
 

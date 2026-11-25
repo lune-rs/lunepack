@@ -46,6 +46,7 @@ mod denylist {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            let line = line.split("::skip-file::").next().unwrap_or_default();
             for t in line.split("&&") {
                 let t = t.trim().to_lowercase();
                 if !t.is_empty() {
@@ -229,7 +230,8 @@ mod denylist {
         assert_eq!(out.code, 1, "{}", out.stderr);
         assert_eq!(lines(&out.stdout), ["denylist: src/a.txt:2: rule 2"]);
         assert!(
-            out.stderr.contains("denylist: 1 rules, 1 hits"),
+            out.stderr
+                .contains("denylist: 1 rules, 0 skip-files, 1 hits"),
             "{}",
             out.stderr
         );
@@ -837,9 +839,235 @@ mod denylist {
         assert_eq!(out.code, 0, "{}", out.stderr);
         assert_eq!(out.stdout, "");
         assert!(
-            out.stderr.contains("denylist: 1 rules, 0 hits"),
+            out.stderr
+                .contains("denylist: 1 rules, 0 skip-files, 0 hits"),
             "{}",
             out.stderr
         );
+    }
+
+    // The file exception: a rule line of the denylist declares `::skip-file:: <path>`. The tests
+    // use made-up terms and a throwaway denylist whose second line is rule 2.
+    const EXCEPTED: &str = "crates/lunepack-cli/THIRD-PARTY-NOTICES.txt";
+
+    /// A denylist with a made-up rule 2 that skips `path`.
+    fn deny_skipping(fx: &Fx, path: &str) {
+        fx.deny(&format!("zqxone\nzqxexc ::skip-file:: {path}\n"));
+    }
+
+    #[test]
+    fn t17_file_exception_skips_only_the_named_rule_in_the_exact_path() {
+        let fx = Fx::new();
+        fx.write(
+            EXCEPTED,
+            "has zqxexc only\nhas zqxthree only\nhas zqxexc and zqxone\n",
+        );
+        fx.commit("init");
+        fx.deny(&format!(
+            "zqxone\nzqxexc ::skip-file:: {EXCEPTED}\nzqxthree\n"
+        ));
+        for args in [&[][..], &["--range", "HEAD"][..]] {
+            let out = fx.scan(args);
+            assert_eq!(out.code, 1, "{args:?}: {}", out.stderr);
+            let l = lines(&out.stdout);
+            // Line 1 (rule 2 only) is skipped; rule 3 and rule 1 still hit.
+            let want_tree = [
+                format!("denylist: {EXCEPTED}:2: rule 3"),
+                format!("denylist: {EXCEPTED}:3: rule 1"),
+            ];
+            if args.is_empty() {
+                assert_eq!(l, want_tree.iter().map(String::as_str).collect::<Vec<_>>());
+            } else {
+                let sha = &fx.git(&["rev-parse", "HEAD"])[..12];
+                assert!(l.contains(&want_tree[0].as_str()), "{l:?}");
+                assert!(l.contains(&want_tree[1].as_str()), "{l:?}");
+                assert!(
+                    l.contains(&format!("denylist: commit {sha} {EXCEPTED}:2: rule 3").as_str()),
+                    "{l:?}"
+                );
+                assert!(
+                    l.contains(&format!("denylist: commit {sha} {EXCEPTED}:3: rule 1").as_str()),
+                    "{l:?}"
+                );
+                assert!(
+                    !l.iter().any(|x| x.contains(":1: rule 2")),
+                    "an excepted line hit: {l:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t18_file_exception_alone_passes_in_tree_and_range() {
+        let fx = Fx::new();
+        fx.write(EXCEPTED, "has zqxexc only\n");
+        fx.write("other.txt", "clean\n");
+        fx.commit("init");
+        deny_skipping(&fx, EXCEPTED);
+        for args in [&[][..], &["--range", "HEAD"][..]] {
+            let out = fx.scan(args);
+            assert_eq!(out.code, 0, "{args:?}: {}{}", out.stdout, out.stderr);
+            assert_eq!(out.stdout, "");
+            assert!(
+                out.stderr.contains("2 rules, 1 skip-files, 0 hits"),
+                "{}",
+                out.stderr
+            );
+            assert!(!out.stderr.contains("warning"), "{}", out.stderr);
+        }
+    }
+
+    #[test]
+    fn t19_the_excepted_rule_still_hits_in_every_other_path() {
+        let fx = Fx::new();
+        for p in [
+            "other/THIRD-PARTY-NOTICES.txt",
+            "THIRD-PARTY-NOTICES.txt",
+            "x/crates/lunepack-cli/THIRD-PARTY-NOTICES.txt",
+            "crates/lunepack-cli/THIRD-PARTY-NOTICES.txt.bak",
+            "crates/lunepack-cli/THIRD-PARTY-NOTICES.txt2",
+            "crates/lunepack-cli/third-party-notices.txt",
+            "crates/lunepack-cli/THIRD-PARTY-NOTICES.tx",
+            "crates/lunepack-cli/src/THIRD-PARTY-NOTICES.txt",
+            "notes.txt",
+        ] {
+            fx.write(p, "has zqxexc here\n");
+        }
+        fx.commit("init");
+        deny_skipping(&fx, EXCEPTED);
+        for args in [&[][..], &["--range", "HEAD"][..]] {
+            let out = fx.scan(args);
+            assert_eq!(out.code, 1, "{args:?}: {}", out.stderr);
+            let l = lines(&out.stdout);
+            let tree: Vec<&&str> = l.iter().filter(|x| !x.contains("commit ")).collect();
+            assert_eq!(tree.len(), 9, "{l:?}");
+            for x in &tree {
+                assert!(x.ends_with(":1: rule 2"), "{l:?}");
+            }
+            if !args.is_empty() {
+                assert_eq!(l.len(), 18, "{l:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn t20_file_exception_does_not_cover_the_path_or_the_commit_message() {
+        let fx = Fx::new();
+        fx.write(EXCEPTED, "clean line\n");
+        fx.commit("mentions zqxexc in the message");
+        deny_skipping(&fx, EXCEPTED);
+        let out = fx.scan(&["--range", "HEAD"]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stdout.contains(" object line "), "{}", out.stdout);
+        assert!(out.stdout.contains(": rule 2"), "{}", out.stdout);
+
+        // A path hit on the excepted file itself is never excepted.
+        let fx = Fx::new();
+        fx.write(
+            "crates/lunepack-cli/THIRD-PARTY-NOTICES.txt",
+            "clean line\n",
+        );
+        fx.commit("init");
+        fx.deny(&format!(
+            "zqxone\nthird-party-notices ::skip-file:: {EXCEPTED}\n"
+        ));
+        let out = fx.scan(&["--range", "HEAD"]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stdout.contains("path "), "{}", out.stdout);
+        assert!(out.stdout.contains("commit "), "{}", out.stdout);
+    }
+
+    #[test]
+    fn t21_malformed_skip_file_markers_exit_2_naming_only_the_line() {
+        let fx = Fx::new();
+        fx.write("a.txt", "x\n");
+        fx.commit("init");
+        for (text, line) in [
+            ("zqxa ::skip-file::\n", "line 1"),
+            ("zqxok\nzqxa ::skip-file::   \n", "line 2"),
+            ("zqxok\nzqxa ::skip-file:: /abs/p.txt\n", "line 2"),
+            ("zqxa ::skip-file:: dir/\n", "line 1"),
+            ("zqxa ::skip-file:: a//b\n", "line 1"),
+            ("zqxa ::skip-file:: a/../b\n", "line 1"),
+            ("zqxa ::skip-file:: ./b\n", "line 1"),
+            ("zqxa ::skip-file:: a\\b\n", "line 1"),
+            ("zqxa ::skip-file:: ok.txt ::skip-file::\n", "line 1"),
+            ("::skip-file:: ok.txt\n", "line 1"),
+            ("zqxa && ::skip-file:: ok.txt\n", "line 1"),
+            // Near misses of the marker: each would leave the rule matching nothing.
+            ("zqxok\nzqxa ::skip-file: ok.txt\n", "line 2"),
+            ("zqxa ::Skip-File:: ok.txt\n", "line 1"),
+            ("zqxa :: skip-file :: ok.txt\n", "line 1"),
+            ("zqxa ::skip_file:: ok.txt\n", "line 1"),
+            ("zqxa :skip-file:: ok.txt\n", "line 1"),
+            ("zqxa ::skip-file:: ok.txt ::skip-file: b.txt\n", "line 1"),
+            (
+                "zqxa ::skip-file:: ok.txt :: SKIP-FILE :: b.txt\n",
+                "line 1",
+            ),
+        ] {
+            fx.deny(text);
+            let out = fx.scan(&[]);
+            assert_eq!(out.code, 2, "{text:?}: {}", out.stderr);
+            assert!(out.stderr.contains(line), "{text:?}: {}", out.stderr);
+            assert!(!out.stderr.contains("ok.txt"), "{}", out.stderr);
+            assert!(!out.stderr.contains("abs"), "{}", out.stderr);
+        }
+    }
+
+    #[test]
+    fn t22_a_skip_file_that_is_not_tracked_warns_and_does_not_fail() {
+        let fx = Fx::new();
+        fx.write("a.txt", "clean\n");
+        fx.commit("init");
+        deny_skipping(&fx, "gone/not-tracked.txt");
+        let out = fx.scan(&[]);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(
+            out.stderr
+                .contains("warning: rule 2 names a skip-file that is not a tracked file"),
+            "{}",
+            out.stderr
+        );
+        assert!(!out.stderr.contains("not-tracked"), "{}", out.stderr);
+        // An untracked (never added) file of that path is not tracked either, and a real hit
+        // elsewhere still fails the scan next to the warning.
+        fx.write("b.txt", "has zqxone\n");
+        fx.commit("more");
+        let out = fx.scan(&[]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert_eq!(lines(&out.stdout), ["denylist: b.txt:1: rule 1"]);
+        assert!(out.stderr.contains("warning: rule 2"), "{}", out.stderr);
+    }
+
+    #[test]
+    fn t23_several_paths_one_rule_and_paths_are_exact() {
+        let fx = Fx::new();
+        fx.write("a/one.txt", "has zqxexc\n");
+        fx.write("b/two.txt", "has zqxexc\n");
+        fx.write("a/one.txt.bak", "has zqxexc\n");
+        fx.write("c/three.txt", "has zqxexc\n");
+        fx.commit("init");
+        fx.deny("zqxone\nzqxexc ::skip-file:: a/one.txt ::skip-file:: b/two.txt\n");
+        for args in [&[][..], &["--range", "HEAD"][..]] {
+            let out = fx.scan(args);
+            assert_eq!(out.code, 1, "{args:?}: {}", out.stderr);
+            let l = lines(&out.stdout);
+            let tree: Vec<&&str> = l.iter().filter(|x| !x.contains("commit ")).collect();
+            assert_eq!(
+                tree,
+                [
+                    &"denylist: a/one.txt.bak:1: rule 2",
+                    &"denylist: c/three.txt:1: rule 2"
+                ],
+                "{l:?}"
+            );
+            assert!(!out.stderr.contains("warning"), "{}", out.stderr);
+            assert!(
+                out.stderr.contains("2 rules, 2 skip-files, "),
+                "{}",
+                out.stderr
+            );
+        }
     }
 }

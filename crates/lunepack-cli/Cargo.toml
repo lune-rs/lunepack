@@ -1,11 +1,16 @@
 [package]
 name = "lunepack-cli"
+description = "The lunepack command: package releases, build installers and signed feeds, and manage signing keys for lunepack-updated applications."
+readme = "README.md"
+# The tests (their fixtures, goldens and the fuzz replay) are a checkout's, not a package's.
+exclude = ["/tests"]
+keywords = ["packager", "installer", "updater", "release", "signing"]
+categories = ["command-line-utilities", "development-tools"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [lints]
 workspace = true
@@ -20,9 +25,13 @@ lunepack-core.workspace = true
 lunepack-crypto.workspace = true
 lunepack-codec-lzma.workspace = true
 lunepack.workspace = true
+# `prebuilt fetch` (M13-D4): the CLI is a composition root, so it wires the transport adapters itself.
+lunepack-http.workspace = true
 clap = { workspace = true }
 anyhow = { workspace = true }
 toml = { workspace = true }
+# The path of a `file:` base URL for `prebuilt fetch`; already in the lock through the facade.
+url = { workspace = true }
 serde = { workspace = true }
 # The publisher state file (M3-R2-D1).
 serde_json = { workspace = true }

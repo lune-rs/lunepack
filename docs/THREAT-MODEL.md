@@ -1,10 +1,11 @@
 # Threat model
 
-Status: **draft**, awaiting approval together with `docs/FORMAT.md`.
+Status: approved together with `docs/FORMAT.md` (format v1) and kept up to date with each milestone.
 
 What lunepack's update and install path defends against, and what it does not. The format rules
-referred to here are in `docs/FORMAT.md`; the decisions in `docs/DECISIONS.md` (D7, D17, D21, D24,
-D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12, M7-D1 to M7-D22, M8-D1 to M8-D20, M10-D1 to M10-D20, M11-D1 to M11-D16, M12-D1 to M12-D11).
+referred to here are in `docs/FORMAT.md`. Identifiers such as `D17` or `M8-D10` refer to the project's
+internal decision log, which is not part of this repository; each one is explained where it is used (D7, D17, D21, D24,
+D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12, M7-D1 to M7-D22, M8-D1 to M8-D20, M10-D1 to M10-D20, M11-D1 to M11-D16, M12-D1 to M12-D11, M13-D1 to M13-D39).
 
 ## Assets
 
@@ -28,6 +29,10 @@ D33, D34, D35, D36 to D41, M3-D1 to M3-D13, M4-D1 to M4-D23, M6-D1 to M6-D12, M7
 - The first download of an installer is outside the format: it is protected by OS code signing and
   the user's choice of source, not by lunepack. After that, the installer verifies its own payload
   against its compiled-in root like any update.
+- The prebuilt binaries of lunepack itself (the runtime, the window program, the update service and the
+  Windows stubs that a packager places into an app) have their own anchor: the project key set compiled into
+  the `lunepack` command line, and the list of those binaries that the command line carries. It is a separate
+  chain from the one above and is described in "lunepack's own supply chain (M13)" below.
 
 ## Attacker classes
 
@@ -88,7 +93,8 @@ Not stopped:
   bounded only by the key set's `expires` and the key's `not_after`. Short windows and an `expires`
   on the key set limit this.
 - A leaked key can raise the feed `seq` floor to a huge value, so the publisher's next feeds must
-  exceed it.
+  exceed it. At the largest value the channel can never be written again; the workaround is a new channel
+  name ("The `seq` limit", below).
 
 ### 3. Leaked root key
 
@@ -745,8 +751,9 @@ rather than deletes, and fails toward keeping the app.
   of eight hops took 0.36 s in a release build, measured. A test materialises 10,000 seeded trees and requires,
   for every accepted tree, that each link resolves inside the root or ends in `ENOENT` or `ENOTDIR`, never
   `ELOOP`, with two instruments checked by local mutations (no hops followed, and exact-spelling lookup)
-  that each find an escaping tree. The 10-minute libFuzzer runs of the `tree` and `manifest` targets have
-  not been run (`cargo-fuzz` was not installed); the committed seeds replay in the gate. Final links are now
+  that each find an escaping tree. The 10-minute libFuzzer runs of the `tree` and `manifest` targets were not
+  run in that milestone (`cargo-fuzz` was not installed); they ran later, see "Fuzz coverage (M13)". The
+  committed seeds replay in the gate. Final links are now
   followed too, which refuses a loop or a chain of more than eight that earlier releases of the rule
   accepted: neither resolves, so no working app depends on one. A `windows-*` manifest still refuses every
   link before any of this. Cases a reviewer should attack: `d/s` to `..` with `l` to `d/s/x` is accepted where the old rule
@@ -766,8 +773,12 @@ rather than deletes, and fails toward keeping the app.
   from it, with working directory `/` and its frameworks only mapped, is judged not in use, so the resumed
   removal goes on; before M8-D19 it failed closed. Q103 accepted that. A read that fails on a process that
   is starting or ending is re-read up to three times, ten milliseconds apart, and a process that has
-  meanwhile ended is not in use; one still unreadable is in use. A process that forks while the scanning
-  process holds a descriptor open under the tree inherits it until its exec and is counted, rightly.
+  meanwhile ended is not in use; one still unreadable is in use. A working directory or open file whose
+  vnode is dead (its volume was force-unmounted, or a FUSE mount was torn down) reads as `ENOENT` for as
+  long as the process holds it; it lies on no mounted file system, so in no tree, and is not counted as a
+  failed read (otherwise one such process would hold every tree of its user in use until it ended). A
+  process that forks while the scanning process holds a descriptor open under the tree inherits it until
+  its exec and is counted, rightly.
 - **The installer's reversed channel (M8-D7, M6-D1, M6-D5).** In the installer app the UI is the main
   executable and the runtime is its child over the UI's own streams, the reverse of every other flow. The
   runtime treats every message from its parent as untrusted exactly as it does a child UI's (the flow
@@ -1179,12 +1190,243 @@ new message to the privileged engine.
   its manifest, a base that fails is skipped with a report line, and every patch is round-tripped through the
   client's decoder before it is placed. The delta set depends on `--memory-budget-mib` (a candidate over the whole
   budget is not run), which changes bandwidth, never correctness.
-- **Fuzz surfaces for M13.** Three new inputs belong to the libFuzzer run: the manifest's `deltas` parser (the
-  `manifest` target; seeds `ok-two-deltas`, `ok-delta-from-build-metadata`, `bad-delta-patch-stored`,
-  `bad-delta-window-over-128-mib` replay in the gate), the patch decoder through `Codec::decode_patch` and
-  `decode_patch_verified` (a target with a base and a patch as inputs; not yet written), and protocol version 2's
+- **Fuzz surfaces for M13.** Three new inputs were handed to the libFuzzer run: the manifest's `deltas` parser (the
+  `deltas` target, and the `manifest` target; seeds `ok-two-deltas`, `ok-delta-from-build-metadata`,
+  `bad-delta-patch-stored`, `bad-delta-window-over-128-mib` replay in the gate), the patch decoder through
+  `Codec::decode_patch` (the `patch` target, with a base and a patch as inputs), and protocol version 2's
   `put` (the `service` target; seeds `ok-client-v2-hello`, `ok-server-v2-put-patch`, `bad-server-v1-put-patch`).
-  libFuzzer itself has not run for any of them.
+  They ran in M13: see "Fuzz coverage (M13)".
+
+## lunepack's own supply chain (M13)
+
+An app that packs with lunepack places lunepack's own binaries into its tree: the runtime, the window
+program (`lunepack-ui`), the update service and, on Windows, the two launcher stubs. They are built from this
+repository by a release workflow, published as the assets of a GitHub release, and fetched by
+`lunepack prebuilt fetch`. This section is about what a person who downloads or packs them can rely on. The
+runbook that produces a release is [`docs/RELEASING.md`](RELEASING.md); how to check a download is in
+[`SECURITY.md`](../SECURITY.md).
+
+**What is proved, by two mechanisms that each show one thing.**
+
+- **The pins** bind exact bytes to one version of the CLI. The `lunepack` command line of a version carries,
+  compiled into its source, the list of the prebuilt binaries of that same version (size and SHA-256 of
+  each, per kind and target) and the envelope that signs it. `pack` and `prebuilt fetch` call a binary
+  pinned only when it is in that list, the list is the very bytes the envelope signs, the envelope verifies
+  under the CLI's own built-in key set, the list is of the CLI's version and it is not a rehearsal list. It
+  is checked at every use, not once at build time. What a pin shows: these bytes, for this CLI.
+- **The signature** is the project key's signature over that list (FORMAT.md section 21). What it shows: a
+  run of the release workflow on `main`, that the maintainer approved, held the key and signed this list. It
+  says nothing about how the files were built, and there is no build attestation of any kind: the release
+  workflow has no `id-token` or `attestations` permission and nothing checks one.
+
+What is not proved: that the source at that commit is free of flaws, that the build was not tampered with
+(anything that can run in the release workflow before the list is assembled can change what is built), or
+anything about the files after they were placed into an app.
+
+**The `lunepack` CLI download carries no proof.** It is built at the release tag, after the one signing,
+and nothing signs it. A user who wants more than the page gives can install it with `cargo install
+lunepack-cli --locked` (the package contains the same source, key constants and list) or build it from the
+tag, and should check a download with a CLI obtained before that release. The prebuilt runtime, service and
+UI of macOS carry only the linker's ad-hoc signature and those of Windows none; the project holds neither a
+Developer ID nor an Authenticode certificate, so the downloaded files are not notarized, a browser download
+of a CLI is stopped by Gatekeeper and SmartScreen shows a warning. An app's own signer signs the files in the
+sign stage of `pack` ([`docs/CLI.md`](CLI.md), "Code signing").
+
+**Where the key lives and who can use it.** The private key is a GitHub environment secret,
+`LUNEPACK_PROJECT_KEY` of the environment `release-signing`, so GitHub can read it. The approver can use it:
+the environment needs the maintainer's approval, which hands the key to one job, `sign`. Whoever takes over
+an administrator's account can use it too, by approving or by changing the environment's rules. Any code that
+runs in the signing job can use it: the three pinned first-party actions, `scripts/release/sign-list.sh`, and
+the `lunepack` CLI that an unprivileged job of the same run built at the same commit (the job `sign`
+compiles and installs nothing, so a build script or procedural macro of the dependency tree never runs next
+to the key; the CLI and everything linked into it is trusted with the key all the same). Every job of a run
+can upload an artifact under any name, and an upload under a name that exists replaces it, so a download by
+name would make every job of the run (the `build` job's UI stack and the `preflight` job's tools included)
+trusted with the key. The same holds one step earlier for what the key signs: the list pins the hashes of
+the files `assemble` downloads, so a download by name or pattern there would let any job of the run choose
+the runtime, service, UI or stub that the signed list pins. The workflow therefore downloads by artifact id:
+`build`, `build-cli`, `assemble` and `sign` publish the id of each artifact they upload as a job output, and
+`assemble`, `draft`, `sign`, `attach` and `finalize` download only those ids (a replaced artifact has a new
+id, the old one no longer exists, and the download fails), so only the `build` leg that made a binary, with
+its own dependency tree, is trusted with what gets pinned, and only `assemble` with what goes into the
+draft. The workflow lint fails on a download by name or pattern in those five jobs. A signed list says
+nothing about a file it does not name, so a check of the binaries alone would let a file added to the draft
+(an installer script, a package) or a replaced `SHA256SUMS` be published beside the signed assets unchecked.
+`attach` and `finalize` (`scripts/release/verify-pins.sh`) therefore also refuse a draft that holds any file
+outside the release's set (the twenty binaries, the list, the envelope, `THIRD-PARTY-NOTICES.txt` and
+`SHA256SUMS`; the CLI files are added only after the check), and check the two files the list does not
+cover by content: the notices against the committed file, `SHA256SUMS` against the SHA-256 of the other
+files. What stands in the
+way of everyone else: the secret belongs to one environment and to nothing else (never a repository or
+organization secret, which the runbook has the maintainer check); the environment admits only the branch
+`main` and needs the approval; the job's token is read-only (`contents: read`); the key is in the
+environment of the single step that runs the signing script, never of the job or the workflow, and no key
+file is written; and the workflow lint (`scripts/tests/test-workflows.sh`, run by the `preflight` job at the
+commit being released) holds the file's content: one `secrets` reference, one `environment`, the three
+allowed write permissions on the three other jobs and none on the signing job. A script guard
+(`scripts/release/check-signing-env.sh`) reads the environment's settings before the key is asked for and
+refuses a missing reviewer rule, administrator bypass or any branch rule but `main`; it is a guard against a
+setting left off, not against someone who administers the repository.
+
+**The long-lived key.** The key has no expiry and there is no revocation channel: a signature never expires
+and a client has no document that withdraws a key. What the theft of the key allows: signing a list for any
+version, which then verifies under every CLI that has the key built in, when someone checks a download by
+hand. What it does not allow: changing what any published CLI pins (each CLI carries its own list, compiled
+in), and publishing on the project's release page, which needs write access to the repository as well. The
+answer to a theft is a rotation, a security advisory and a release ([`docs/RELEASING.md`](RELEASING.md)).
+
+**A taken-over account.** Someone who controls the maintainer's account, or an administrator's, can sign and
+publish a release that passes every check, and nothing in the repository detects it. The copies that do not
+move with the account are the key constants in the CLIs already installed and in the crates.io packages
+already published: a later release signed by a key those do not carry fails their check.
+
+**The approval is the only human gate.** Exactly one job waits for it, and the jobs that create, complete and
+publish a release (`draft`, `attach`, `finalize`) do not: anyone who can push a tag matching `v*`, or start
+the workflow on `main`, runs them without a click. The tag rule of the repository, protected by the
+maintainer, decides who can publish. The approval covers the key's use, not what the other jobs write.
+
+**No signed chain between key sets.** A rotation is a code change: the new key set is appended to
+`crates/lunepack-cli/src/project_key.rs` in the commit that also replaces the secret, and the earlier sets
+stay so an older release can still be checked under the set that signed it. There is no document that links
+the old key to the new one. A CLI built before a rotation learns of the new key only from SECURITY.md or from
+a newer CLI, and checks a newer release with `--trusted-key`.
+
+**Rehearsal lists are signed by the real key.** A release rehearsal runs the whole privileged path against a
+draft that is never published, so its list is signed by the project key and says `"rehearsal": true` inside
+the signed bytes. Every consumer refuses such a list as a release (`pack`, `prebuilt fetch`, `prebuilt
+verify` without `--allow-rehearsal`), and that is all that makes it harmless.
+
+**Two signed lists for one version.** The release workflow cannot make two: the job that creates the draft
+runs before the signing job and fails when a release, a draft or a tag of that version exists, so a second
+`binaries` run stops before anything is signed. What does not prevent it: a draft that is deleted by hand
+makes the next run possible, and a second signed list for the same version, different from the first, would
+verify under the same key. The runbook's rule is that a draft is deleted only before `sign` has succeeded,
+and that after a signed list has been pushed the next attempt takes a new version.
+
+**The CLI's download path.** `prebuilt fetch` is the only command that uses the network for these files.
+It requests anything only in the state `pinned`, takes its rows from the compiled-in list and nowhere else
+(never from a file or the network), accepts a base URL only by the rule of an update feed (`https:`,
+`file:///`, or `http:` to a loopback address), reads at most the pinned size plus one byte, checks size and
+SHA-256 before placing, places by a rename from a temporary file, and never runs, parses or unpacks what it
+downloaded ([`docs/CLI.md`](CLI.md), "`lunepack prebuilt fetch`"). Redirects are followed up to the
+transport's limit; a redirect cannot change what is accepted, only where the bytes come from.
+
+**What stays trusted.** GitHub (Actions, the release storage and the secret store) and the maintainer's
+account. The example application's toolchain (the .NET SDK) never runs in the release workflow: it belongs to
+CI and to the local suites.
+
+## Fuzz coverage (M13)
+
+The harnesses of `lunepack_core::fuzz` and `lunepack_codec_lzma::fuzz` cover every parser and decoder that
+reads bytes before or without a signature, and the real LZMA decoders. libFuzzer runs them from
+`scripts/fuzz.sh` in a pinned Docker image; the committed seeds also replay in the gate on stable. A crash is
+kept, minimised, committed as a seed and fixed; no target is skipped and no sanitizer is switched off
+([`fuzz/README.md`](../fuzz/README.md)). The run recorded here was the first libFuzzer run of the project
+(`cargo-fuzz` was not installed in earlier milestones): 60 seconds per target in the pinned image, every target; `envelope` and `prebuilt` were run again at 600 seconds after the
+`prebuilt` kind was added. A hosted-runner run at 600 seconds per target, and the weekly run at 300, are the
+workflow's, and had not been observed when this was written.
+
+| Target | What the bytes are | Seeds | libFuzzer run (runs, crashes) |
+| --- | --- | --- | --- |
+| `envelope` | an envelope, tried as each of the five kinds | 8 | 5,996,141 in 600 s, 0 |
+| `root`, `keys`, `feed`, `manifest` | a payload, signed with a fake key and verified by the real function | 6, 6, 8, 12 | 274,772; 608,377; 261,152; 134,402 in 60 s each, 0 |
+| `prebuilt` | a payload of the list of prebuilt binaries (both readers must agree) | 29 | 3,476,061 in 600 s, 0 |
+| `deltas` | the `deltas` member of a manifest, spliced into a valid one | 24 | 88,339 in 60 s, 0 |
+| `path`, `tree`, `rules`, `json` | an entry path; a tree; the version, target, id and other rules; the strict JSON pre-pass | 12, 14, 13, 11 | 1,360,937; 509,320; 2,027,107; 1,595,135 in 60 s each, 0 |
+| `frame` | a frame descriptor and its bytes through the identity codec | 12 | 2,263,235 in 60 s, 0 |
+| `http` | response headers, `Content-Range` and `Content-Length` checks | 22 | 1,774,688 in 60 s, 0 |
+| `state` | an install-state record, as a file and as a payload | 21 | 783,553 in 60 s, 0 |
+| `update_config` | an update configuration, which must round-trip through the writer | 21 | 1,469,270 in 60 s, 0 |
+| `setup` | a whole executable: the PE reader, the setup locator and the trailer | 8 | 2,701,463 in 60 s, 0 |
+| `service` | one side of a service-protocol connection, versions 1 and 2 | 43 | 1,582,430 in 60 s, 0 |
+| `ui` | the UI protocol, either direction | 19 | 2,073,895 in 60 s, 0 |
+| `codec` | one frame handed to the real LZMA decoders (the five codec ids) | 9 | 554,689 in 60 s, 0 |
+| `patch` | one delta patch handed to the real patch decoder | 8 | 826,065 in 60 s, 0 |
+
+Not covered by a harness: the code that acts on a verified document (staging, the applier, the integration
+adapters), the operating-system adapters, and the packager's encoder (it reads the publisher's own files).
+A run of 60 seconds is a smoke test, not a proof of absence; the first run found nothing. The coverage of
+the real decoders is the point of `codec` and `patch`: they are the code that has unsafe blocks and
+assembly in a dependency (next section), and the gate never ran them under libFuzzer before.
+
+## The LZMA decoder dependency (M13)
+
+`lunepack-codec-lzma` decodes and encodes with `lzma-rust2`, pinned to exactly `=0.25.0`
+(`crates/lunepack-codec-lzma/Cargo.toml:20`; the boundary check holds the pin and confines the crate to this
+one adapter). Every statement below was read from the sources named; what could not be read is stated as
+unknown.
+
+- **The crate.** The crates.io API (read 2026-11-25, `https://crates.io/api/v1/crates/lzma-rust2`) reports
+  one owner, the user `hasenbanck`, 53 published versions since the crate's creation on 2025-02-24, the
+  version 0.25.0 created on 2026-11-01 and not yanked, and about 36.6 million downloads. Its repository is
+  `https://github.com/hasenbanck/lzma-rust2`; the package's `README.md` says it is a fork of the unmaintained
+  `lzma-rust` crate. Its licence is Apache-2.0 (`Cargo.toml` of the package).
+- **Release cadence.** `CHANGELOG.md` of 0.25.0 lists 0.25.0 on 2026-11-01, 0.24.0 on 2026-10-25 and 0.23.0
+  on 2026-10-18: a release a week, in the weeks before this was written, each with bug fixes in the stream
+  and padding handling. That is active maintenance by one person; it also means a pin goes stale.
+- **Unsafe code.** The package's `src/lib.rs:52` is `#![cfg_attr(not(feature = "optimization"),
+  forbid(unsafe_code))]`: with the feature off, unsafe code is forbidden. `lunepack-codec-lzma` depends on
+  the crate without `default-features = false`, and `optimization` is in the package's default features
+  (`Cargo.toml` of the package, `[features]`), so it is on. With it on, the registry copy of 0.25.0 has unsafe
+  blocks in `src/range_dec.rs` (:256 and :339, with `core::arch::asm!` at :264 and :347, the range
+  decoder's hot paths), `src/lz/mod.rs` (:26 and :101) and `src/lz/lz_encoder.rs` (:207, :211, :219, :414
+  and the three `unsafe fn` of the vectorised position normalisation, AVX2, SSE4.1 and NEON, at :500, :532
+  and :564). On the decoder's path the unsafe code is the range decoder's, in
+  `range_dec.rs`: the window code of the decoder (`lz/lz_decoder.rs`) has none. `lz/mod.rs` holds
+  `extend_match`, which a search of the sources finds used by the match finders (`lz/hc4.rs`, `lz/bt4.rs`,
+  `lz/lz_encoder.rs`) and the encoders, so it belongs to the encoder; so does `lz/lz_encoder.rs`. (The
+  callers were found by searching the package's sources, not traced further.) The package's `README.md` ("Safety") says these optimizations are "properly guarded and ... sound", and
+  "generally consider safe to use, even with untrusted input". That is the author's statement; lunepack has
+  not audited the unsafe blocks.
+- **Review history.** No third-party audit, no unsafe-code review and no fuzzing report of the crate were
+  found in its repository's package, README or changelog, which are what was read. The RustSec database page
+  for the crate (`https://rustsec.org/packages/lzma-rust2.html`) answered 404 when read, which means no
+  advisory page; it does not mean the crate was reviewed. Whether the upstream project fuzzes its decoders is
+  unknown.
+- **What bounds the exposure.** The decoder sees only frames whose SHA-256 matched the manifest the release
+  key signed, after the descriptor passed the pure-core checks; its output is capped at the signed size and
+  its memory is charged against a budget before it is allocated (see "Decoder exposure"). Feeding it crafted
+  input therefore needs a release key (class 2) or the publisher (class 6). The two real decoders are
+  fuzzed (`codec`, `patch`, above), with zero crashes in the first run, and the weekly workflow runs them
+  again and runs `cargo deny` over the advisory database. The encoder runs only in the packager, over the
+  publisher's own files.
+- **What remains.** An unsafe-code flaw in the decoder that lunepack's fuzzing does not reach, triggered by a
+  frame signed with a leaked release key. The exposure stays as small as the format makes it, and a bump of
+  the pin is a deliberate change.
+
+## Residuals recorded in M13
+
+**The `seq` limit.** A feed carries a `seq` that a client keeps as its floor per channel (FORMAT.md section
+11.2), and the writer rule is that `seq` strictly increases. A leaked release key that meets the threshold
+can sign a feed with `seq` = 2^53-1 (the largest integer the format allows). Clients then keep that floor, no
+feed of that channel is newer, and `feed refresh` on that channel stops. The class-2 mitigations do not undo
+it: a new `keys.json` revokes the key, but the floor is the client's. The workaround is a new channel
+name, which has its own `seq`, with a new pack's `[update] channel` or `--channel` on `check` and `download`
+telling clients about it ([`docs/KEY-CEREMONY.md`](KEY-CEREMONY.md), "A leaked key and the `seq` of a
+channel"). Clients that are not told the new name stay on the poisoned channel. A format revision that resets
+the floor on a key-set change was rejected: it could not be taken back once clients shipped.
+
+**`Process::tree_in_use` on Windows.** The per-user in-use scan skips a process that it cannot open, where the
+trait's rule is that a process that cannot be inspected counts as in use, and it compares only a process's
+image with the tree, not its working directory or the DLLs it loaded. Counting what cannot be opened would stop
+collection on every Windows machine, since the system's own processes cannot be opened by an ordinary user.
+That is safe for the deletion it guards, because Windows refuses to delete a running image whoever runs it,
+and `tree_in_use_strict`, which every removal under a machine install asks, adds a probe of the tree's own
+files for what the scan does not see. So on Windows the scan's answer is what a per-user collection and
+uninstall ask, and never the guard of a machine install's removal. The residual is that a per-user
+collection can remove an old version's files that a process the user cannot inspect still has open as data
+(its working directory, a DLL); the files are the user's own, and the removal of a file that a process holds
+without delete sharing fails and leaves the folder.
+
+**The macOS extended-attribute rule.** A pack carries no extended attributes (FORMAT.md 8.1), and
+`codesign` keeps the signature of a file that is not Mach-O in an extended attribute of that file. A
+bundle that is, or will be, signed and has a non-Mach-O file in `Contents/MacOS` (other than its main
+executable) would therefore be installed from the pack without those signatures and fail `codesign --verify
+--deep --strict`. `pack` refuses such a bundle and names the files and the fix (move them under
+`Contents/Resources`). This is a rule that keeps a signature from depending on something the pack does not
+carry, not a defence against an attacker: it makes the failure appear at the publisher's `pack` and not on a
+user's machine. An unsigned bundle with no `[codesign.macos]` section is packed as before
+([`docs/CLI.md`](CLI.md), "macOS targets").
 
 ## Denial-of-service bounds
 

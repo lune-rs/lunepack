@@ -1,11 +1,16 @@
 [package]
 name = "lunepack-core"
+description = "Pure logic and traits of the lunepack update framework: the signed formats, the trust chain, the update engine, with no I/O of its own."
+readme = "README.md"
+# The tests (their fixtures, goldens and the fuzz replay) are a checkout's, not a package's.
+exclude = ["/tests"]
+keywords = ["updater", "auto-update", "signature", "delta", "installer"]
+categories = ["development-tools", "cryptography"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [dependencies]
 serde = { workspace = true }

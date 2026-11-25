@@ -13,9 +13,9 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 use lunepack_core::{
-    AppId, ClockReading, FeedTargetEntry, Hasher, Limits, RollbackFloor, Target, TrustedRoot,
-    VerifiedEntry, VerifiedKeySet, VerifiedManifest, Verifier, Version, advance_root, verify_feed,
-    verify_key_set, verify_manifest, verify_payload_manifest,
+    AppId, Channel, ClockReading, FeedTargetEntry, Floors, Hasher, KeysChain, Limits, RootWalk,
+    Target, TrustedRoot, VerifiedEntry, VerifiedFeed, VerifiedKeySet, VerifiedManifest, Verifier,
+    Version, verify_manifest, verify_payload_manifest,
 };
 
 use crate::cmd_verify::{channel_of, feed_file_names};
@@ -28,8 +28,53 @@ pub struct Opened {
     pub root: TrustedRoot,
     /// The version of `root` (the `k` of the last `root-<k>.json`, or the config's version).
     pub root_doc_k: u64,
+    /// The walk's second stage, when `keys.json` exists: the key set under `root`, and the feeds
+    /// under it (see [`verify_feed_of`]).
+    pub chain: Option<KeysChain>,
+}
+
+impl Opened {
     /// The key set under `root`, when `keys.json` exists.
-    pub keys: Option<VerifiedKeySet>,
+    pub fn keys(&self) -> Option<&VerifiedKeySet> {
+        self.chain.as_ref().map(KeysChain::keys)
+    }
+}
+
+/// The feed `bytes` of `channel` under the key set of `chain`, by the core's chain walk
+/// ([`KeysChain::verify_feed`], the call a client makes), at `reading`.
+pub fn verify_feed_of(
+    chain: &KeysChain,
+    app_id: &AppId,
+    channel: &Channel,
+    bytes: &[u8],
+    reading: &ClockReading,
+    verifier: &dyn Verifier,
+) -> lunepack_core::Result<VerifiedFeed> {
+    chain
+        .clone()
+        .verify_feed(app_id, channel, bytes, reading, verifier)
+        .map(|documents| documents.feed)
+}
+
+/// The key set `bytes` verified under `root`, with the floors at zero, by the core's chain walk
+/// ([`RootWalk::verify_keys`], the call a first-install client makes). For the writers: what they
+/// built is checked through the same walk a reader takes before it is placed.
+pub fn verify_keys_under(
+    root: &TrustedRoot,
+    app_id: &AppId,
+    bytes: &[u8],
+    reading: &ClockReading,
+    hasher: &dyn Hasher,
+    verifier: &dyn Verifier,
+) -> lunepack_core::Result<KeysChain> {
+    RootWalk::new(root.clone()).verify_keys(
+        app_id,
+        &Floors::default(),
+        bytes,
+        reading,
+        hasher,
+        verifier,
+    )
 }
 
 /// The path of `root-<k>.json`.
@@ -65,9 +110,11 @@ pub fn read_capped(path: &Path, cap: u64) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-/// Opens `dir`: builds the trusted root from `cfg`, walks `root-<k>.json` for `k = version + 1,
-/// +2, ...` while the file exists (a gap ends the walk; a file that does not verify fails it), then
-/// verifies `keys.json` when present, with the floors at zero.
+/// Opens `dir` the way a first-install client reads a feed's documents (FORMAT.md 11.1), through
+/// the core's [`RootWalk`]: builds the trusted root from `cfg`, walks `root-<k>.json` for `k =
+/// version + 1, +2, ...` while the file exists (a gap ends the walk; a file that does not verify
+/// fails it; the walk takes at most [`lunepack_core::MAX_ROOT_STEPS`] rotations), checks the final
+/// root's app id, then verifies `keys.json` when present, with the floors at zero.
 pub fn open(
     dir: &Path,
     cfg: &Config,
@@ -78,24 +125,26 @@ pub fn open(
     if !dir.is_dir() {
         bail!("{} is not a directory", dir.display());
     }
-    let mut root = cfg.trusted_root(hasher, verifier)?;
-    loop {
-        let k = root.version() + 1;
+    let mut walk = RootWalk::new(cfg.trusted_root(hasher, verifier)?);
+    while let Some(k) = walk.next_version() {
         let path = root_path(dir, k);
         let Some(bytes) = read_capped(&path, Limits::V1.root_doc_bytes)? else {
             break;
         };
-        root = advance_root(&root, &bytes, hasher, verifier)
+        walk.advance(&bytes, hasher, verifier)
             .with_context(|| format!("{} does not verify", path.display()))?;
     }
+    walk.check_app_id(&cfg.app_id)
+        .context("the root the walk ended on is another app's")?;
+    let root = walk.root().clone();
     let path = keys_path(dir);
-    let keys = match read_capped(&path, Limits::V1.keys_doc_bytes)? {
+    let chain = match read_capped(&path, Limits::V1.keys_doc_bytes)? {
         None => None,
         Some(bytes) => Some(
-            verify_key_set(
-                &root,
+            walk.verify_keys(
+                &cfg.app_id,
+                &Floors::default(),
                 &bytes,
-                &RollbackFloor::default(),
                 reading,
                 hasher,
                 verifier,
@@ -107,7 +156,7 @@ pub fn open(
     Ok(Opened {
         root,
         root_doc_k,
-        keys,
+        chain,
     })
 }
 
@@ -118,8 +167,8 @@ pub const MAX_BASES: usize = 16;
 pub struct BaseQuery<'a> {
     /// The release directory.
     pub dir: &'a Path,
-    /// Its verified key set.
-    pub keys: &'a VerifiedKeySet,
+    /// The chain of its verified key set.
+    pub chain: &'a KeysChain,
     /// The app id.
     pub app_id: &'a AppId,
     /// The new release's version: only versions of lower precedence are bases.
@@ -186,14 +235,8 @@ pub fn select_bases(
             let channel = channel_of(&file)?;
             let bytes = read_capped(&q.dir.join(&file), Limits::V1.feed_doc_bytes)?
                 .with_context(|| format!("{file} does not exist"))?;
-            Ok(verify_feed(
-                q.keys,
-                &bytes,
-                q.app_id,
-                &channel,
-                &RollbackFloor::default(),
-                q.skip,
-                verifier,
+            Ok(verify_feed_of(
+                q.chain, q.app_id, &channel, &bytes, q.skip, verifier,
             )?)
         })();
         let feed = match feed {
@@ -260,15 +303,22 @@ fn open_base(
             let reference = entry.reference();
             let bytes = read_capped(&q.dir.join(reference.path()), reference.size())?
                 .with_context(|| format!("{} does not exist", reference.path()))?;
-            verify_manifest(q.keys, entry, &bytes, hasher, verifier)
+            verify_manifest(q.chain.keys(), entry, &bytes, hasher, verifier)
                 .with_context(|| format!("{} does not verify", reference.path()))?
         }
         Via::NoFeed(version) => {
             let rel = format!("{text}/{manifest_name}");
             let bytes = read_capped(&q.dir.join(&rel), Limits::V1.manifest_doc_bytes)?
                 .with_context(|| format!("{rel} does not exist"))?;
-            verify_payload_manifest(q.keys, (version, q.target), &bytes, q.now, hasher, verifier)
-                .with_context(|| format!("{rel} does not verify"))?
+            verify_payload_manifest(
+                q.chain.keys(),
+                (version, q.target),
+                &bytes,
+                q.now,
+                hasher,
+                verifier,
+            )
+            .with_context(|| format!("{rel} does not verify"))?
         }
     };
     let pack_ref = manifest.pack();

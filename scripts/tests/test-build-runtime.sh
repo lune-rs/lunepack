@@ -88,13 +88,15 @@ stub uname 'case "$1" in
 esac'
 stub musl-gcc 'exit 0'
 stub cargo 'echo "MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-unset} $@" >>"$STUB_LOG"
+p=lunepack-runtime
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --target ]; then t=$2; fi
+  if [ "$1" = -p ]; then p=$2; fi
   shift
 done
 d=${CARGO_TARGET_DIR:-target}/$t/release
 mkdir -p "$d"
-printf "0123456789" >"$d/lunepack-runtime"'
+printf "0123456789" >"$d/$p"'
 stub readelf 'case "$1" in
   -hW) echo "  Machine:                           ${STUB_MACHINE:-Advanced Micro Devices X86-64}" ;;
   -lW)
@@ -191,6 +193,13 @@ t_check "the refusal says which variable" out_has "CC_x86_64_unknown_linux_musl"
 sbuild STUB_UNAME=arm64 STUB_MACHINE=AArch64 -- linux-aarch64
 t_check "an arm64 host builds aarch64 with musl-gcc" rc_is 0
 
+# --package builds another shipped binary by the same rules (M13 step 14).
+rm -rf "$repo/target"
+build linux-x86_64 --package lunepack-service
+t_check "--package lunepack-service builds static for musl" rc_is 0
+t_check "cargo built the service" grep -q -- "-p lunepack-service --target x86_64-unknown-linux-musl" "$T_TMP/cargo.args"
+t_check "the check names the service" out_has "x86_64-unknown-linux-musl/release/lunepack-service"
+
 rm -f "$stubs/readelf"
 sbuild -- linux-x86_64
 t_check "a missing readelf is refused before the build" rc_nonzero
@@ -226,6 +235,21 @@ stub otool 'case "$1" in
     echo "    minos $m"
     ;;
 esac'
+# codesign: --verify of a slice says "not signed at all" under STUB_UNSIGNED until `-s` marks it,
+# fails otherwise under STUB_BADSIG; --verify --strict answers STUB_STRICT_RC. Calls are logged.
+stub codesign 'echo "codesign $*" >>"$CODESIGN_LOG"
+for a in "$@"; do f=$a; done
+case "$1" in
+  -s) : >"$f.signed" ;;
+  --verify)
+    if [ "$2" = --strict ]; then exit "${STUB_STRICT_RC:-0}"; fi
+    if [ -n "${STUB_BADSIG:-}" ]; then echo "$f: invalid signature (code or signature have been modified)" >&2; exit 1; fi
+    if [ -n "${STUB_UNSIGNED:-}" ] && [ ! -e "$f.signed" ]; then echo "$f: code object is not signed at all" >&2; exit 1; fi
+    ;;
+esac
+exit 0'
+CODESIGN_LOG=$T_TMP/codesign.log
+export CODESIGN_LOG
 tab=$(printf '\t')
 
 rm -rf "$repo/target"
@@ -239,9 +263,27 @@ t_check "with the deployment target set" grep -q -- "^MACOSX_DEPLOYMENT_TARGET=1
 t_check "and the strip config" grep -q -- "--config profile.release.strip=true" "$T_TMP/cargo.args"
 
 rm -rf "$repo/target"
+: >"$CODESIGN_LOG"
 sbuild STUB_OS=Darwin STUB_ARCHS=x86_64 -- macos-x86_64
 t_check "a macos-x86_64 build succeeds" rc_is 0
 t_check "its minimum is the deployment target" out_has "minos: x86_64=10.15"
+t_check "it reports the ad-hoc signature" out_has "signature: ad hoc on every slice"
+t_check "a slice the linker signed is not signed again" test "$(grep -c -- '^codesign -s' "$CODESIGN_LOG" || true)" -eq 0
+t_check "the result was verified strictly on every slice" grep -q -- "^codesign --verify --strict --all-architectures" "$CODESIGN_LOG"
+
+rm -rf "$repo/target"
+: >"$CODESIGN_LOG"
+sbuild STUB_OS=Darwin STUB_ARCHS=x86_64 STUB_UNSIGNED=1 -- macos-x86_64
+t_check "an unsigned x86_64 slice is signed ad hoc and the build succeeds" rc_is 0
+t_check "with the linker's kind of signature and no identity" grep -q -- "^codesign -s - -o linker-signed target/x86_64-apple-darwin/release/lunepack-runtime" "$CODESIGN_LOG"
+
+sbuild STUB_OS=Darwin STUB_ARCHS=x86_64 STUB_BADSIG=1 -- macos-x86_64
+t_check "a slice whose signature does not verify is refused" rc_nonzero
+t_check "the refusal says codesign --verify failed" out_has "codesign --verify failed"
+
+sbuild STUB_OS=Darwin STUB_ARCHS=x86_64 STUB_STRICT_RC=1 -- macos-x86_64
+t_check "a result that fails codesign --verify --strict is refused" rc_nonzero
+t_check "the refusal names the strict check" out_has "does not pass codesign --verify --strict"
 
 sbuild STUB_OS=Darwin STUB_ARCHS=x86_64 STUB_MINOS_X86=10.12 -- macos-x86_64
 t_check "an x86_64 slice with a lower minimum is refused" rc_nonzero
@@ -285,6 +327,27 @@ sbuild -- macos-aarch64
 t_check "a macOS target on another host is refused" rc_nonzero
 t_check "the refusal names the host" out_has "macOS host only"
 t_check "and cargo did not run" test ! -e "$T_TMP/cargo.args"
+
+mv "$stubs/codesign" "$stubs/codesign.off"
+sbuild STUB_OS=Darwin -- macos-aarch64
+t_check "a missing codesign is refused before the build" rc_nonzero
+t_check "the refusal names codesign" out_has "codesign is not on PATH"
+mv "$stubs/codesign.off" "$stubs/codesign"
+
+# --package builds another shipped binary by the same rules.
+rm -rf "$repo/target"
+sbuild STUB_OS=Darwin 'STUB_ARCHS=x86_64 arm64' -- macos-universal --package lunepack-ui
+t_check "--package lunepack-ui builds a universal UI on macOS" rc_is 0
+t_check "lipo joined the UI" test -f "$repo/target/universal-apple-darwin/release/lunepack-ui"
+build linux-x86_64 --package lunepack-ui
+t_check "--package lunepack-ui on Linux is a usage error" rc_is 2
+t_check "it says the UI is macOS only here" out_has "macOS targets only"
+build linux-x86_64 --package lunepack-cli
+t_check "an unknown --package is a usage error" rc_is 2
+build linux-x86_64 --package lunepack-service --package lunepack-runtime
+t_check "--package twice is a usage error" rc_is 2
+run_cmd bash "$SCRIPT" --print-command macos-universal --package lunepack-ui
+t_check "--print-command follows --package" out_has "lipo -create -output target/universal-apple-darwin/release/lunepack-ui"
 
 rm -f "$stubs/lipo"
 sbuild STUB_OS=Darwin -- macos-aarch64

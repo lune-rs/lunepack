@@ -1314,6 +1314,37 @@ fn put_of_a_patch_follows_the_current_version_and_its_size() {
     assert!(matches!(end, Err(ServiceError::Malformed(_))));
 }
 
+/// A `put` of a patch (protocol version 2) before any `stage_begin` ends the session `malformed`
+/// ("put without a stage session", engine.rs) and writes nothing.
+#[test]
+fn a_patch_put_before_stage_begin_is_malformed() {
+    let m = Machine::new();
+    let mut engine = m.engine();
+    let before = m.record();
+    let (_, patches) = release_with_delta(&fx(), "1.1.0", 2, "1.0.0");
+    let (_, sha, bytes) = &patches[0];
+    let (r, end) = connect_versions(&m, &mut engine, (1, 2), (1, 2), |c| {
+        c.put(ObjectKind::Patch, *sha, bytes.len() as u64, &mut &bytes[..])
+    });
+    assert!(matches!(
+        r,
+        Err(ServiceError::Answered {
+            code: ErrorCode::Malformed,
+            ..
+        }) | Err(ServiceError::Io(_))
+    ));
+    match end {
+        Err(ServiceError::Malformed(why)) => assert_eq!(why, "put without a stage session"),
+        other => panic!("expected malformed, got {other:?}"),
+    }
+    let after = m.record();
+    assert_eq!(
+        (after.current, after.staged, after.pending, after.bad),
+        (before.current, before.staged, before.pending, before.bad)
+    );
+    assert_eq!(m.uploads(), 0);
+}
+
 /// A current-tree file changed under the engine (another base than the patch's): `need_fetch`
 /// for that path alone, then its frame stages the version.
 #[test]

@@ -15,6 +15,8 @@
 #   B  the e2e app behind the console stub: row 3's stub replaced while it runs
 #   C  the e2e app at an entry path over 260 characters: row 7
 #   D  a small console program (scripts/ci/e2e-ctl-app.cs): row 6 and the console-event proof
+#   E  the .NET example (examples/dotnet, M13 step 9), a folder of about 190 files behind the console
+#      stub: row E, install rows only (below)
 #
 # Rows without -Install: the packaging half of every row (releases pack, setup files build, the
 # images carry the hardening and the stamps), row 9 (planted DLLs), row 10's static half.
@@ -32,9 +34,19 @@
 # unsigned DLL with `candidate_unsigned`. Without -Install a dry-run row packs a signed release
 # with a certificate nothing trusts and checks that the templates ran.
 #
+# Row E (M13 step 9, with -Install only): the .NET example as app E, driven only through the runtime's
+# command line by the app itself, with the same outcome lines as the other apps: install, an update
+# by check, download and apply-and-restart, an update by delta (the changed file arrives as a patch,
+# and none of the app's own files is fetched again), a version that crashes on start (rolled back,
+# marked bad), the fixed version and the uninstall. The app is the published folder given with
+# -DotnetApp <folder> (scripts/build-example-dotnet.sh windows-x86_64 makes one anywhere, `dotnet
+# publish` makes one here) or, without it, published here when `dotnet` is on the machine. An
+# install row run with no .NET app available fails; LUNEPACK_E2E_DOTNET=0 is the one opt-out and
+# prints SKIPPED.
+#
 # The harness never prints environment or registry dumps; a failure names a differing field, and
 # prints only versions, outcome words and exit codes.
-param([switch]$Install)
+param([switch]$Install, [string]$DotnetApp = '')
 $ErrorActionPreference = 'Stop'
 if ($env:CI -eq 'true' -or $env:LUNEPACK_E2E_INSTALL -eq '1') { $Install = $true }
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -137,7 +149,12 @@ function New-Out([string]$tag) {
 }
 
 function Expect-Lines([string]$file, [string[]]$want, [switch]$Unordered, [int]$seconds = 120) {
-    Wait-Until { @(Read-Lines $file).Count -ge $want.Count } $seconds "$($want.Count) outcome lines"
+    try {
+        Wait-Until { @(Read-Lines $file).Count -ge $want.Count } $seconds "$($want.Count) outcome lines"
+    } catch {
+        # Say what did arrive, so a timeout can be told from a wrong or a missing line.
+        throw "$($_.Exception.Message); got [$(@(Read-Lines $file) -join '; ')]"
+    }
     Start-Sleep -Milliseconds 800
     $got = @(Read-Lines $file)
     if ($Unordered) {
@@ -342,7 +359,7 @@ function New-App([string]$tag, [string]$idSuffix, [string]$nameSuffix, [string]$
         Tag = $tag; Id = "org.example.lpe2e$hex$idSuffix"; BaseName = "Lunepack E2E $([char]0xC4) $hex$nameSuffix"
         EntryRel = $entryRel; EntryFile = ($entryRel -split '/')[-1]; EntrySource = $entrySource
         Terminal = $terminal; Ui = $ui; Dir = $dir; Cfg = $cfg; Rel = (Join-Path $dir 'rel'); RelKey = (Join-Path $dir 'rel0.key')
-        Root = $null; Declare = $false; Ext = ''
+        Root = $null; Declare = $false; Ext = ''; Folder = $null
     }
     $app.Name = $app.BaseName
     $app.Feed = FileFeed $app.Rel
@@ -380,6 +397,10 @@ function Publish-Version($app, [string]$version, [hashtable]$options = @{}) {
     $in = Join-Path $app.Dir "in-$version"
     $dest = Join-Path $in ($app.EntryRel -replace '/', '\')
     [void][IO.Directory]::CreateDirectory((Long (Split-Path $dest -Parent)))
+    if ($app.Folder) {
+        # A folder app (the .NET example): every file of the folder goes beside the entry.
+        Copy-Item -Path (Join-Path $app.Folder '*') -Destination (Split-Path $dest -Parent) -Recurse -Force
+    }
     $entrySource = $app.EntrySource
     if ($options.ContainsKey('Entry')) { $entrySource = $options.Entry }
     [IO.File]::Copy($entrySource, (Long $dest), $true)
@@ -424,8 +445,8 @@ function Build-Setup($app, [string]$version) {
 
 # ---- install and uninstall -------------------------------------------------------------------------------
 
-function Install-Silent($app, [string]$setupExe) {
-    $r = Run-Tool $setupExe @('/S')
+function Install-Silent($app, [string]$setupExe, [int]$seconds = 180) {
+    $r = Run-Tool $setupExe @('/S') $seconds
     SameV 'setup exit code' $r.Code 0
     $app.Root = Join-Path $programs $app.BaseName
     return $r
@@ -698,6 +719,46 @@ function Wait-Updated($app, [string]$to) {
     Wait-Runtimes-Gone $app.Root
 }
 
+# Every `(path, source)` of the `stage` progress lines of a runtime's `--json` output.
+function Stage-Files([object[]]$lines) {
+    $files = @()
+    foreach ($l in $lines) {
+        if ("$l" -like '*"phase":"stage"*' -and "$l" -like '*"file":{"path":"*') {
+            $f = ("$l" | ConvertFrom-Json).file
+            if ($f) { $files += [pscustomobject]@{ Path = $f.path; Source = $f.source } }
+        }
+    }
+    return $files
+}
+
+# The .NET example's published folder (M13 step 9): the one given with -DotnetApp, else published
+# here with `dotnet` (the SDK of examples/dotnet/global.json, self-contained for win-x64, the output
+# named as PublishDir with a slash: `-o` fails for a folder named `dotnet`). $null, once said
+# SKIPPED, with LUNEPACK_E2E_DOTNET=0. No app available is an error: the rows are required.
+function Get-DotnetApp {
+    if ($env:LUNEPACK_E2E_DOTNET -eq '0') {
+        Write-Host 'SKIPPED: the .NET row (LUNEPACK_E2E_DOTNET=0)'
+        return $null
+    }
+    $folder = $DotnetApp
+    if (-not $folder) {
+        if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+            throw 'no .NET app: pass -DotnetApp <the published folder> or install the SDK of examples/dotnet/global.json (LUNEPACK_E2E_DOTNET=0 skips the .NET row)'
+        }
+        $folder = Join-Path $work 'dotnet-app'
+        Write-Host 'e2e-windows: publishing the .NET example for win-x64'
+        # `dotnet` reads global.json from the working directory.
+        Push-Location (Join-Path $repo 'examples\dotnet')
+        try {
+            & dotnet publish Example.csproj -c Release -r win-x64 --self-contained "-p:PublishDir=$folder/" --nologo | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed' }
+        } finally { Pop-Location }
+    }
+    Require (Test-Path -LiteralPath (Join-Path $folder 'Example.exe')) 'the .NET app folder holds Example.exe'
+    Require (-not (Test-Path -LiteralPath (Join-Path $folder 'lunepack-runtime.exe'))) 'the .NET app folder holds no runtime of its own'
+    return (Resolve-Path -LiteralPath $folder).Path
+}
+
 # ---- the work -----------------------------------------------------------------------------------------------
 
 try {
@@ -819,6 +880,8 @@ try {
         Require (-not (Test-Path -LiteralPath (Join-Path $programs $A.BaseName))) 'no earlier install of this unique name'
         $state = @{}
         $holdOut = $null
+        # The .NET example is required by the install rows: no app is a failure before any row runs.
+        $dotnetFolder = Get-DotnetApp
 
         Row '1 (install, state)' {
             $o = New-Out 'row1'
@@ -1150,6 +1213,85 @@ try {
             }
             Invoke-Uninstall $C
         } -Undo { Reset-App $C }
+
+        # ---- app E: the .NET example (M13 step 9) --------------------------------------------------------------------------
+        if ($dotnetFolder) {
+            Row 'E (the .NET example behind the console stub: install, update, delta, crash and rollback, the fixed version, uninstall)' {
+                $E = New-App 'e' '-e' ' Net' 'Example.exe' (Join-Path $dotnetFolder 'Example.exe') $true $null
+                $E.Folder = $dotnetFolder
+                # The app's own files, by their path in the tree: none of them is fetched again by the delta update.
+                $appFiles = @{}
+                $prefix = $dotnetFolder.TrimEnd('\') + '\'
+                foreach ($f in Get-ChildItem -LiteralPath $dotnetFolder -Recurse -File) { $appFiles[$f.FullName.Substring($prefix.Length).Replace('\', '/')] = $true }
+                Require ($appFiles.Count -ge 150) "the .NET folder holds its files ($($appFiles.Count))"
+                Publish-Version $E '1.0.0'
+                $setupE = Build-Setup $E '1.0.0'
+                $deltaFiles = New-DeltaFiles
+
+                # Install: the stub at R, the tree beside it; the app finds the runtime beside its own executable.
+                $null = Install-Silent $E $setupE 600
+                Assert-Installed $E '1.0.0'
+                Require (Test-Path -LiteralPath (Join-Path $E.Root 'app\1.0.0\lunepack-runtime.exe')) 'the runtime is beside the entry in the tree'
+                $o = New-Out 'rowE1'
+                $null = Start-Proc (Stub-Path $E)
+                Expect-Lines $o @('1.0.0 start', '1.0.0 event installed', '1.0.0 event first_run', '1.0.0 nothing-pending') -Seconds 180
+                Assert-Record $E '1.0.0' $null @()
+
+                # An update by the app itself: check, download, apply-and-restart.
+                Publish-Version $E '1.1.0' @{ Files = @{ 'share/delta.bin' = $deltaFiles.One } }
+                $o = New-Out 'rowE2'
+                $null = Start-Proc (Stub-Path $E) @('--update', '--no-ui')
+                Expect-Lines $o (Confirmed-Lines '1.0.0' '1.1.0') -Seconds 240
+                Wait-Updated $E '1.1.0'
+                Assert-Record $E '1.1.0' '1.0.0' @()
+
+                # An update by delta: 16 bytes of one file change.
+                Publish-Version $E '1.2.0' @{ Files = @{ 'share/delta.bin' = $deltaFiles.Two } }
+                Require (Test-Path -LiteralPath (Join-Path $E.Rel '1.2.0\windows-x86_64.from-1.1.0.delta')) 'the packer wrote the delta from 1.1.0'
+                $o = New-Out 'rowE3'
+                $dl = Update-ViaRuntime $E '1.1.0' '1.2.0' -NoUi -PassThru -restartArgs @('--after-update')
+                $fetched = Download-Bytes $dl.Out
+                Require ($fetched -ge 0 -and $fetched -lt 65536) "the download fetched a patch, not the file's frame, and none of the app's files ($fetched bytes)"
+                Require (@(Stage-Sources $dl.Out 'share/delta.bin' | Where-Object { $_ -ne 'patch' }).Count -eq 0) 'every stage line of share/delta.bin names the patch'
+                $seen = 0
+                foreach ($f in @(Stage-Files $dl.Out)) {
+                    if ($appFiles.ContainsKey($f.Path)) {
+                        SameV "source of the app's own file $($f.Path)" $f.Source 'unchanged'
+                        $seen++
+                    }
+                }
+                Write-Output "     note: $seen stage lines of the app's own files, all unchanged"
+                Expect-Lines $o @('1.2.0 start', '1.2.0 arg after-update', '1.2.0 event updated 1.1.0', '1.2.0 event first_run', '1.2.0 confirmed') -Seconds 240
+                Wait-Updated $E '1.2.0'
+                Same 'the updated delta.bin' (Get-FileHash -LiteralPath (Join-Path $E.Root 'app\1.2.0\share\delta.bin') -Algorithm SHA256).Hash (Get-FileHash -LiteralPath $deltaFiles.Two -Algorithm SHA256).Hash
+                Assert-Record $E '1.2.0' '1.1.0' @()
+
+                # A version that crashes on start: rolled back, marked bad, not offered again.
+                Publish-Version $E '1.3.0' @{ Flags = @('crash-on-start'); Files = @{ 'share/delta.bin' = $deltaFiles.Two } }
+                $o = New-Out 'rowE4'
+                $null = Start-Proc (Stub-Path $E) @('--update', '--no-ui')
+                Expect-Lines $o @('1.2.0 start', '1.2.0 nothing-pending', '1.2.0 check 1.3.0', '1.2.0 staged 1.3.0', '1.2.0 apply-scheduled',
+                    '1.3.0 start', '1.3.0 arg after-update', '1.3.0 event updated 1.2.0', '1.3.0 event first_run', '1.3.0 crash',
+                    '1.2.0 start', '1.2.0 arg after-update', '1.2.0 nothing-pending') -Seconds 240
+                Wait-Runtimes-Gone $E.Root
+                Assert-Record $E '1.2.0' $null @('1.3.0')
+                $o = New-Out 'rowE5'
+                $null = Start-Proc (Stub-Path $E) @('--update', '--no-ui')
+                Expect-Lines $o @('1.2.0 start', '1.2.0 nothing-pending', '1.2.0 check none')
+
+                # The fixed version.
+                Publish-Version $E '1.4.0' @{ Files = @{ 'share/delta.bin' = $deltaFiles.Two } }
+                $o = New-Out 'rowE6'
+                $null = Start-Proc (Stub-Path $E) @('--update', '--no-ui')
+                Expect-Lines $o (Confirmed-Lines '1.2.0' '1.4.0') -Seconds 240
+                Wait-Updated $E '1.4.0'
+                Assert-Record $E '1.4.0' '1.2.0' @('1.3.0')
+
+                # The uninstall leaves nothing: the install folder, the Start-menu shortcut and the
+                # Uninstall key go (Invoke-Uninstall), and the end-of-run leftover check covers the rest.
+                Invoke-Uninstall $E
+            } -Undo { foreach ($e in @($apps | Where-Object { $_.Tag -eq 'e' })) { Reset-App $e } }
+        }
 
         # The certificates are trusted machine-wide, so only a CI runner (a throwaway machine) runs
         # this. The packager signs through [codesign.windows] (signtool is called by lunepack, with

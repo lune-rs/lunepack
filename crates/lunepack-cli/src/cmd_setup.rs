@@ -279,7 +279,8 @@ fn load(
 
     let opened = release_dir::open(dir, config, &hasher, &verifier, &reading)?;
     let keys = opened
-        .keys
+        .keys()
+        .cloned()
         .context("the release directory has no keys.json")?;
     let keys_path = release_dir::keys_path(dir);
     let keys_bytes =

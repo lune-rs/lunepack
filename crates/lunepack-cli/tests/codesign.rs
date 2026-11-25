@@ -841,6 +841,153 @@ mod fake {
         assert!(tools.log().is_empty());
     }
 
+    /// M13-D12: a bundle that the config will sign, with files under `Contents/MacOS` that are not
+    /// Mach-O executables, is refused before anything is signed: such a file's signature lives in an
+    /// extended attribute, which a pack does not carry. The error names up to ten paths, the cause
+    /// and the fix; nothing is signed and nothing is left behind.
+    #[test]
+    fn a_bundle_to_be_signed_with_non_macho_files_in_contents_macos_is_refused() {
+        let (w, tools, dir, input) = mac_world(false);
+        let bins = mac_bins(&w);
+        for n in 0..12 {
+            write(
+                input.path(),
+                &format!("Contents/MacOS/lib{n:02}.dll"),
+                b"managed code",
+            );
+        }
+        let out = pack_mac(&w, input.path(), &dir, &bins);
+        let err = assert_fails(&out, 1, "non-Mach-O files in Contents/MacOS");
+        assert!(err.contains("12 file(s)"), "{err:?}");
+        for n in 0..10 {
+            assert!(
+                err.contains(&format!("Contents/MacOS/lib{n:02}.dll")),
+                "{n}: {err:?}"
+            );
+        }
+        for n in 10..12 {
+            assert!(!err.contains(&format!("lib{n:02}.dll")), "{n}: {err:?}");
+        }
+        assert!(err.contains("and 2 more"), "{err:?}");
+        assert!(err.contains("extended attribute"), "{err:?}");
+        assert!(err.contains("Contents/Resources"), "{err:?}");
+        assert!(
+            tools.log().is_empty(),
+            "nothing was signed: {:?}",
+            tools.log()
+        );
+        assert_eq!(w.work_dirs(), 0);
+        assert!(
+            !dir.join("1.0.0").exists(),
+            "no release was written for a refused pack"
+        );
+    }
+
+    /// The same input with no `[codesign.macos]` and no signature packs as before; the main
+    /// executable may be a script, signed or not (the shell app of the end-to-end suite); a Mach-O
+    /// file other than the main executable stays allowed.
+    #[test]
+    fn the_rule_for_contents_macos_applies_only_to_a_signed_or_signing_bundle() {
+        let w = World::new();
+        w.set_config(&mac_toml(""));
+        let dir = w.release_dir("rel");
+        let input = tempfile::tempdir().unwrap();
+        mac_app(input.path());
+        write(input.path(), "Contents/MacOS/data.txt", b"text");
+        let bins = mac_bins(&w);
+        assert_ok(
+            &pack_mac(&w, input.path(), &dir, &bins),
+            "an unsigned bundle with no [codesign.macos]",
+        );
+
+        // With the fake signers, a script as the main executable and a second Mach-O file pass.
+        let (w, tools, dir, input) = mac_world(false);
+        let bins = mac_bins(&w);
+        write(input.path(), "Contents/MacOS/Hello", b"#!/bin/sh\nexit 0\n");
+        set_mode(&input.path().join("Contents/MacOS/Hello"), 0o755);
+        write(input.path(), "Contents/MacOS/Other", &unsigned_macho(3_000));
+        set_mode(&input.path().join("Contents/MacOS/Other"), 0o755);
+        assert_ok(
+            &pack_mac(&w, input.path(), &dir, &bins),
+            "a script as the main executable",
+        );
+        assert!(
+            tools
+                .log()
+                .iter()
+                .any(|(k, p)| k == "sign" && p == "Contents/MacOS/Other"),
+            "{:?}",
+            tools.log()
+        );
+    }
+
+    /// The rule reaches a file in a subdirectory of `Contents/MacOS`, and a nested bundle's own
+    /// `Contents/MacOS` (its main executable included: only the outer bundle's is excepted).
+    #[test]
+    fn the_rule_for_contents_macos_reaches_subdirectories_and_nested_bundles() {
+        for (rel, what) in [
+            ("Contents/MacOS/sub/data.bin", "a subdirectory"),
+            (
+                "Contents/Helpers/Tool.app/Contents/MacOS/run.sh",
+                "a nested bundle",
+            ),
+        ] {
+            let (w, tools, dir, input) = mac_world(false);
+            let bins = mac_bins(&w);
+            write(input.path(), rel, b"#!/bin/sh\n");
+            let out = pack_mac(&w, input.path(), &dir, &bins);
+            let err = assert_fails(&out, 1, what);
+            assert!(err.contains(rel), "{what}: {err:?}");
+            assert!(tools.log().is_empty(), "{what}");
+        }
+    }
+
+    /// A bundle that is already signed (`_CodeSignature`) is held to the rule without any
+    /// `[codesign.macos]`: the seal cannot hold once the file's signature has lost its attribute.
+    #[test]
+    fn a_signed_input_bundle_with_non_macho_files_in_contents_macos_is_refused() {
+        let w = World::new();
+        w.set_config(&mac_toml(""));
+        let dir = w.release_dir("rel");
+        let input = tempfile::tempdir().unwrap();
+        mac_app(input.path());
+        let bins = mac_bins(&w);
+        let assembled = w.dir.path().join("assembled");
+        let out = w.run(
+            &[
+                "pack",
+                "--input",
+                s(input.path()),
+                "--version",
+                "1.0.0",
+                "--target",
+                "macos-aarch64",
+                "--runtime",
+                s(&bins.0),
+                "--ui",
+                s(&bins.1),
+                "--assemble",
+                s(&assembled),
+            ],
+            &[("SOURCE_DATE_EPOCH", &T0.to_string())],
+        );
+        assert_ok(&out, "assemble");
+        write(&assembled, "Contents/_CodeSignature/CodeResources", b"seal");
+        assert_ok(
+            &pack_mac(&w, &assembled, &dir, &bins),
+            "the signed bundle packs without the stray file",
+        );
+        write(&assembled, "Contents/MacOS/data.txt", b"text");
+        let again = w.release_dir("again");
+        let out = pack_mac(&w, &assembled, &again, &bins);
+        let err = assert_fails(
+            &out,
+            1,
+            "a signed bundle with a text file in Contents/MacOS",
+        );
+        assert!(err.contains("Contents/MacOS/data.txt"), "{err:?}");
+    }
+
     /// M9-D3: a failing tool's output reaches the user only through the runner: no argv, and the
     /// call's `{env:}` values replaced by their names. A variable that is unset stops the pack
     /// before any tool runs.
@@ -1129,6 +1276,136 @@ mod real_macos {
             .arg(bundle)
             .output()
             .expect("start codesign")
+    }
+
+    /// The premise of M13-D12, on the real tools: a bundle with a text file in `Contents/MacOS`,
+    /// signed with `codesign --deep`, verifies where it was signed; copied without extended
+    /// attributes (which is what a pack gives) it fails `codesign --verify --deep --strict`. The
+    /// same bundle without the file verifies after the same copy (the instrument can tell), and
+    /// `pack` refuses the text file's bundle, signed or still to be signed. If the copy still
+    /// verified, the rule would be wrong: the test says so.
+    #[test]
+    fn a_non_macho_file_in_contents_macos_cannot_survive_a_pack() {
+        let (target_id, target, _) = target();
+        let _ = target;
+        let scratch = tempfile::tempdir().unwrap();
+        let bin = unsigned_real(scratch.path(), "hello");
+        let build = |name: &str, with_text: bool| -> PathBuf {
+            let root = scratch.path().join(name).join("Hello.app");
+            write(
+                &root,
+                "Contents/Info.plist",
+                plist("Hello", "org.example.hello", "APPL").as_bytes(),
+            );
+            exec_write(&root, "Contents/MacOS/Hello", &bin);
+            if with_text {
+                write(&root, "Contents/MacOS/data.txt", b"not a Mach-O file\n");
+            }
+            let st = Command::new(CODESIGN)
+                .args(["--force", "--deep", "--sign", "-"])
+                .arg(&root)
+                .status()
+                .expect("start codesign");
+            assert!(st.success(), "codesign --deep failed ({st})");
+            root
+        };
+        // A copy that carries bytes, modes and links but no extended attribute.
+        let bytes_only = |from: &Path, to: &Path| {
+            fn walk(from: &Path, to: &Path) {
+                fs::create_dir_all(to).unwrap();
+                for entry in fs::read_dir(from).unwrap() {
+                    let entry = entry.unwrap();
+                    let (src, dst) = (entry.path(), to.join(entry.file_name()));
+                    let kind = entry.file_type().unwrap();
+                    if kind.is_dir() {
+                        walk(&src, &dst);
+                    } else if kind.is_symlink() {
+                        std::os::unix::fs::symlink(fs::read_link(&src).unwrap(), &dst).unwrap();
+                    } else {
+                        fs::write(&dst, fs::read(&src).unwrap()).unwrap();
+                        fs::set_permissions(&dst, fs::metadata(&src).unwrap().permissions())
+                            .unwrap();
+                    }
+                }
+            }
+            walk(from, to);
+        };
+        let with_text = build("with", true);
+        assert!(
+            codesign_verify(&with_text).status.success(),
+            "the bundle does not verify where it was signed"
+        );
+        let copy = scratch.path().join("with-copy").join("Hello.app");
+        bytes_only(&with_text, &copy);
+        let out = codesign_verify(&copy);
+        assert!(
+            !out.status.success(),
+            "PREMISE FAILED: a bundle with a text file in Contents/MacOS verifies without \
+             extended attributes; the rule of M13-D12 would be wrong"
+        );
+        let clean = build("without", false);
+        let clean_copy = scratch.path().join("without-copy").join("Hello.app");
+        bytes_only(&clean, &clean_copy);
+        assert!(
+            codesign_verify(&clean_copy).status.success(),
+            "the instrument: the same bundle without the file must verify after the same copy: {}",
+            stderr(&codesign_verify(&clean_copy))
+        );
+
+        // `pack` refuses both forms of the input: signed, and still to be signed.
+        let runtime = scratch.path().join("runtime-bin");
+        fs::write(&runtime, unsigned_real(scratch.path(), "rt")).unwrap();
+        let extra = ["--runtime", s(&runtime)];
+        let w = World::new();
+        w.set_config(&mac_toml(""));
+        let dir = w.release_dir("signed");
+        let out = w.pack(
+            &copy_of_signed(&with_text, scratch.path()),
+            &dir,
+            target_id,
+            &extra,
+            &[],
+        );
+        let err = assert_fails(&out, 1, "the signed bundle");
+        assert!(err.contains("Contents/MacOS/data.txt"), "{err:?}");
+
+        let unsigned = scratch.path().join("unsigned").join("Hello.app");
+        write(
+            &unsigned,
+            "Contents/Info.plist",
+            plist("Hello", "org.example.hello", "APPL").as_bytes(),
+        );
+        exec_write(&unsigned, "Contents/MacOS/Hello", &bin);
+        write(&unsigned, "Contents/MacOS/data.txt", b"not a Mach-O file\n");
+        let sign = tpl(&[CODESIGN, "--force", "--sign", "-", "{path}"]);
+        w.set_config(&format!(
+            "{}\n[codesign.macos]\nsign = {sign}\n",
+            mac_toml("")
+        ));
+        let dir = w.release_dir("to-sign");
+        let out = w.pack(&unsigned, &dir, target_id, &extra, &[]);
+        let err = assert_fails(&out, 1, "the bundle to be signed");
+        assert!(err.contains("Contents/MacOS/data.txt"), "{err:?}");
+    }
+
+    /// The signed bundle as a pack's input: its bytes and modes, no extended attribute.
+    fn copy_of_signed(bundle: &Path, scratch: &Path) -> PathBuf {
+        let to = scratch.join("signed-input").join("Hello.app");
+        fn walk(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let (src, dst) = (entry.path(), to.join(entry.file_name()));
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&src, &dst);
+                } else {
+                    fs::write(&dst, fs::read(&src).unwrap()).unwrap();
+                    fs::set_permissions(&dst, fs::metadata(&src).unwrap().permissions()).unwrap();
+                }
+            }
+        }
+        walk(bundle, &to);
+        to
     }
 
     /// Real `/usr/bin/codesign`, ad hoc: an unsigned app with the runtime, the helper app and a

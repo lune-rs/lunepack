@@ -434,9 +434,11 @@ impl Process for MacProcess {
     }
 
     fn tree_in_use(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
-        // The tree as the kernel names it, so the comparison with the kernel's paths is exact.
+        // The tree as the kernel names it, so the comparison with the kernel's paths is exact;
+        // named without opening it, so no child forked meanwhile holds it (`kernel_path_unopened`).
         let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
-        let tree = libproc::kernel_path(&tree).map_err(|e| ProcessError::from_io("in use", e))?;
+        let tree =
+            libproc::kernel_path_unopened(&tree).map_err(|e| ProcessError::from_io("in use", e))?;
         scan(&RealPids, &tree, exclude, Some(effective_uid())).map_err(|e| unreadable("in use", e))
     }
 
@@ -447,7 +449,8 @@ impl Process for MacProcess {
     /// anything (Q128: fail closed; the engine's removal guard runs as root).
     fn tree_in_use_strict(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
         let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
-        let tree = libproc::kernel_path(&tree).map_err(|e| ProcessError::from_io("in use", e))?;
+        let tree =
+            libproc::kernel_path_unopened(&tree).map_err(|e| ProcessError::from_io("in use", e))?;
         scan(&RealPids, &tree, exclude, None).map_err(|e| unreadable("in use", e))
     }
 }
@@ -501,6 +504,10 @@ const REREAD_PAUSE: Duration = Duration::from_millis(10);
 /// - a deleted executable (M8-D19 (a)): `proc_pidpath` fails with `ENOENT`, so it cannot lie in
 ///   the tree, and the process is judged by its working directory and open files; it counts as in
 ///   use when its working directory is refused too, since then nothing about it can be told.
+///
+/// A working directory or an open file whose vnode is dead (`ENOENT`: a force-unmounted volume, a
+/// torn-down FUSE mount) is not a failed read: that file is on no mounted file system and so in no
+/// tree, and the source reads as having no such path (`libproc::cwd_path`, `libproc::fd_paths`).
 ///
 /// Any other failed read (the listing's identity, the executable, the working directory, the open
 /// files) is re-read up to [`REREADS`] times, [`REREAD_PAUSE`] apart, each time reading the

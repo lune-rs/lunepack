@@ -16,14 +16,14 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use lunepack_codec_lzma::LzmaCodec;
 use lunepack_core::{
-    Channel, Clock, ClockReading, FeedTargetEntry, Hasher, Limits, RelPath, RollbackFloor, Target,
+    Channel, Clock, ClockReading, FeedTargetEntry, Hasher, KeysChain, Limits, RelPath, Target,
     VerifiedDelta, VerifiedEntry, VerifiedFeed, VerifiedKeySet, VerifiedManifest,
-    decode_patch_verified, decode_verified, verify_feed, verify_manifest,
+    decode_patch_verified, decode_verified, verify_manifest,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
 use crate::config::{Config, FixedClock};
-use crate::release_dir::{self, read_capped};
+use crate::release_dir::{self, read_capped, verify_feed_of};
 
 /// A sink for the one-line reports.
 pub type Say<'a> = &'a mut dyn FnMut(&str) -> Result<()>;
@@ -323,13 +323,13 @@ impl Rejected {
 }
 
 /// Every `feed-*.json` of `dir`, and every manifest it references, that does not verify under
-/// `keys` at `reading` (no pack is read). A feed whose own signatures fail is reported once; for a
+/// the key set of `chain` at `reading` (no pack is read). A feed whose own signatures fail is reported once; for a
 /// feed that verifies, each failing `<version>/<target>` is reported. Used before a key set is
 /// placed (Revision 1: no command leaves a feed that `verify` would reject unless asked).
 pub fn unverifiable_feeds(
     dir: &Path,
     app_id: &lunepack_core::AppId,
-    keys: &VerifiedKeySet,
+    chain: &KeysChain,
     reading: &ClockReading,
 ) -> Result<Vec<Rejected>> {
     let verifier = Ed25519Verifier;
@@ -339,16 +339,7 @@ pub fn unverifiable_feeds(
             let channel = channel_of(&file)?;
             let bytes = read_capped(&dir.join(&file), Limits::V1.feed_doc_bytes)?
                 .with_context(|| format!("{file} does not exist"))?;
-            verify_feed(
-                keys,
-                &bytes,
-                app_id,
-                &channel,
-                &RollbackFloor::default(),
-                reading,
-                &verifier,
-            )
-            .map_err(Into::into)
+            verify_feed_of(chain, app_id, &channel, &bytes, reading, &verifier).map_err(Into::into)
         })();
         let feed = match checked {
             Ok(feed) => feed,
@@ -372,7 +363,7 @@ pub fn unverifiable_feeds(
                     });
                     continue;
                 };
-                if let Err(e) = load_manifest(dir, keys, &entry) {
+                if let Err(e) = load_manifest(dir, chain.keys(), &entry) {
                     out.push(Rejected {
                         feed: file.clone(),
                         item: Some(item),
@@ -423,9 +414,10 @@ pub fn check_release_dir(
     let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
     let opened = release_dir::open(dir, config, &hasher, &verifier, reading)?;
     say(&format!("root: version {} ok", opened.root_doc_k))?;
-    let Some(keys) = opened.keys else {
+    let Some(chain) = opened.chain else {
         bail!("{} has no keys.json", dir.display());
     };
+    let keys = chain.keys().clone();
     say(&format!(
         "keys.json: version {}, {} key(s), threshold {} ok",
         keys.version(),
@@ -438,16 +430,8 @@ pub fn check_release_dir(
     for (file, channel) in feed_files(dir)? {
         let bytes = read_capped(&dir.join(&file), Limits::V1.feed_doc_bytes)?
             .with_context(|| format!("{file} does not exist"))?;
-        let feed = verify_feed(
-            &keys,
-            &bytes,
-            &config.app_id,
-            &channel,
-            &RollbackFloor::default(),
-            reading,
-            &verifier,
-        )
-        .with_context(|| format!("{file} does not verify"))?;
+        let feed = verify_feed_of(&chain, &config.app_id, &channel, &bytes, reading, &verifier)
+            .with_context(|| format!("{file} does not verify"))?;
         say(&format!(
             "{file}: seq {}, {} release(s) ok",
             feed.seq(),

@@ -376,7 +376,9 @@ impl Lab {
         for (k, v) in vars {
             cmd.env(k, v);
         }
-        Run::of(finish(cmd.spawn().expect("spawn")))
+        Run::of(finish(
+            lunepack_testkit::exec::spawn(&mut cmd).expect("spawn"),
+        ))
     }
 
     /// An app-facing command of the installed 1.0.0.

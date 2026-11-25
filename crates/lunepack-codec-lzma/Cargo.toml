@@ -1,11 +1,16 @@
 [package]
 name = "lunepack-codec-lzma"
+description = "LZMA2 codec adapter for lunepack: decodes and encodes the codec ids of the lunepack format in pure Rust."
+readme = "README.md"
+# The tests (their fixtures, goldens and the fuzz replay) are a checkout's, not a package's.
+exclude = ["/tests"]
+keywords = ["lzma", "lzma2", "compression", "updater", "delta"]
+categories = ["compression"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [lints]
 workspace = true
