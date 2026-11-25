@@ -21,7 +21,11 @@
 //! is skipped: the path itself, the history-path check, commit messages and every other file are
 //! scanned as before, and every other rule still applies to that file. An empty or malformed
 //! path (empty, absolute, with a backslash, a control character, an empty, `.` or `..`
-//! component, or a trailing slash) is a parse error naming the line number only. A named path
+//! component, or a trailing slash) is a parse error naming the line number only, and so is a
+//! near miss of the marker left anywhere on the line (any text whose ASCII letters and digits,
+//! lowercased, contain `skipfile`, such as `::skip-file:` or `:: Skip_File ::`): a near miss kept
+//! in a term would make the rule match nothing. The summary line counts the parsed skip-file
+//! paths (`denylist: N rules, M skip-files, K hits`). A named path
 //! that is not a tracked file is a stale marker: it gets a warning naming the rule number only,
 //! and does not fail the scan.
 
@@ -86,6 +90,19 @@ struct Rule {
 /// Separator that starts a file exception on a rule line (see the module doc).
 const SKIP_FILE_MARKER: &str = "::skip-file::";
 
+/// True when `text` still holds a near miss of the marker after the exact markers were split
+/// off (`::skip-file:`, `::Skip-File::`, `:: skip_file ::`, ...): its ASCII letters and digits,
+/// lowercased, contain `skipfile`. Such a line is refused, since a near miss left in a term would
+/// make the rule match nothing and so disable it silently.
+fn has_near_miss_marker(text: &str) -> bool {
+    let folded: String = text
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    folded.contains("skipfile")
+}
+
 /// True for a plain repo-relative path with `/` separators and no `.`/`..`/empty component.
 fn valid_skip_path(path: &str) -> bool {
     !path.is_empty()
@@ -125,9 +142,15 @@ impl Rules {
             let mut segments = line.split(SKIP_FILE_MARKER);
             let term_part = segments.next().unwrap_or_default();
             let mut skip_files = Vec::new();
+            if has_near_miss_marker(term_part) {
+                bail!(
+                    "denylist line {}: malformed {SKIP_FILE_MARKER} marker",
+                    idx + 1
+                );
+            }
             for path in segments {
                 let path = path.trim();
-                if !valid_skip_path(path) {
+                if !valid_skip_path(path) || has_near_miss_marker(path) {
                     bail!(
                         "denylist line {}: malformed {SKIP_FILE_MARKER} marker",
                         idx + 1
@@ -155,6 +178,12 @@ impl Rules {
     /// Number of rules.
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// Number of `::skip-file::` paths over all rules (shown in the summary line, so the user can
+    /// see that a marker parsed without anyone reading the list).
+    pub fn skip_file_count(&self) -> usize {
+        self.0.iter().map(|r| r.skip_files.len()).sum()
     }
 
     /// True when there are no rules.
@@ -832,7 +861,12 @@ pub fn run(args: &Args, get_env: impl Fn(&str) -> Option<OsString>) -> Result<u8
     for (idx, hit) in scan.hits.iter().enumerate() {
         println!("{}", render(&rules, hit, idx + 1));
     }
-    eprintln!("denylist: {} rules, {} hits", rules.len(), scan.hits.len());
+    eprintln!(
+        "denylist: {} rules, {} skip-files, {} hits",
+        rules.len(),
+        rules.skip_file_count(),
+        scan.hits.len()
+    );
     Ok(u8::from(!scan.hits.is_empty()))
 }
 

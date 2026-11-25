@@ -230,7 +230,8 @@ mod denylist {
         assert_eq!(out.code, 1, "{}", out.stderr);
         assert_eq!(lines(&out.stdout), ["denylist: src/a.txt:2: rule 2"]);
         assert!(
-            out.stderr.contains("denylist: 1 rules, 1 hits"),
+            out.stderr
+                .contains("denylist: 1 rules, 0 skip-files, 1 hits"),
             "{}",
             out.stderr
         );
@@ -838,7 +839,8 @@ mod denylist {
         assert_eq!(out.code, 0, "{}", out.stderr);
         assert_eq!(out.stdout, "");
         assert!(
-            out.stderr.contains("denylist: 1 rules, 0 hits"),
+            out.stderr
+                .contains("denylist: 1 rules, 0 skip-files, 0 hits"),
             "{}",
             out.stderr
         );
@@ -906,7 +908,11 @@ mod denylist {
             let out = fx.scan(args);
             assert_eq!(out.code, 0, "{args:?}: {}{}", out.stdout, out.stderr);
             assert_eq!(out.stdout, "");
-            assert!(out.stderr.contains("2 rules, 0 hits"), "{}", out.stderr);
+            assert!(
+                out.stderr.contains("2 rules, 1 skip-files, 0 hits"),
+                "{}",
+                out.stderr
+            );
             assert!(!out.stderr.contains("warning"), "{}", out.stderr);
         }
     }
@@ -988,6 +994,17 @@ mod denylist {
             ("zqxa ::skip-file:: ok.txt ::skip-file::\n", "line 1"),
             ("::skip-file:: ok.txt\n", "line 1"),
             ("zqxa && ::skip-file:: ok.txt\n", "line 1"),
+            // Near misses of the marker: each would leave the rule matching nothing.
+            ("zqxok\nzqxa ::skip-file: ok.txt\n", "line 2"),
+            ("zqxa ::Skip-File:: ok.txt\n", "line 1"),
+            ("zqxa :: skip-file :: ok.txt\n", "line 1"),
+            ("zqxa ::skip_file:: ok.txt\n", "line 1"),
+            ("zqxa :skip-file:: ok.txt\n", "line 1"),
+            ("zqxa ::skip-file:: ok.txt ::skip-file: b.txt\n", "line 1"),
+            (
+                "zqxa ::skip-file:: ok.txt :: SKIP-FILE :: b.txt\n",
+                "line 1",
+            ),
         ] {
             fx.deny(text);
             let out = fx.scan(&[]);
@@ -1046,6 +1063,11 @@ mod denylist {
                 "{l:?}"
             );
             assert!(!out.stderr.contains("warning"), "{}", out.stderr);
+            assert!(
+                out.stderr.contains("2 rules, 2 skip-files, "),
+                "{}",
+                out.stderr
+            );
         }
     }
 }

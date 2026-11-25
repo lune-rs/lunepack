@@ -194,8 +194,10 @@ Section 4.
   maintainer appends `::skip-file:: <repo-relative path>` to the rule's line (for example
   `some-term ::skip-file:: crates/lunepack-cli/THIRD-PARTY-NOTICES.txt`; several markers, several paths). The
   scan then skips that rule's hits on content lines of exactly that tracked path, and nothing else (not the path,
-  not commit messages, not other files). A malformed marker is an error naming the line number; a marker naming
-  a path that is not tracked prints a warning naming the rule number. Never write a denylist term anywhere in
+  not commit messages, not other files). A malformed marker, or a near miss of one anywhere on the line (such as
+  `::skip-file:` or `:: Skip-File ::`), is an error naming the line number; a marker naming a path that is not
+  tracked prints a warning naming the rule number. The summary line counts the parsed paths
+  (`denylist: N rules, M skip-files, K hits`), so a marker that parsed shows there. Never write a denylist term anywhere in
   the repository.
 - `main` is frozen from the commit A that phase 1 builds until the tag: the tag run fails when A..B changes
   any file but the two of the pin commit, so a changelog date added late is enough to fail it.
