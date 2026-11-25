@@ -434,9 +434,11 @@ impl Process for MacProcess {
     }
 
     fn tree_in_use(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
-        // The tree as the kernel names it, so the comparison with the kernel's paths is exact.
+        // The tree as the kernel names it, so the comparison with the kernel's paths is exact;
+        // named without opening it, so no child forked meanwhile holds it (`kernel_path_unopened`).
         let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
-        let tree = libproc::kernel_path(&tree).map_err(|e| ProcessError::from_io("in use", e))?;
+        let tree =
+            libproc::kernel_path_unopened(&tree).map_err(|e| ProcessError::from_io("in use", e))?;
         scan(&RealPids, &tree, exclude, Some(effective_uid())).map_err(|e| unreadable("in use", e))
     }
 
@@ -447,7 +449,8 @@ impl Process for MacProcess {
     /// anything (Q128: fail closed; the engine's removal guard runs as root).
     fn tree_in_use_strict(&self, tree: &Path, exclude: &[ProcessId]) -> Result<bool, Error> {
         let tree = std::fs::canonicalize(tree).map_err(|e| ProcessError::from_io("in use", e))?;
-        let tree = libproc::kernel_path(&tree).map_err(|e| ProcessError::from_io("in use", e))?;
+        let tree =
+            libproc::kernel_path_unopened(&tree).map_err(|e| ProcessError::from_io("in use", e))?;
         scan(&RealPids, &tree, exclude, None).map_err(|e| unreadable("in use", e))
     }
 }

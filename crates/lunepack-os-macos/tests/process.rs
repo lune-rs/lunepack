@@ -77,6 +77,10 @@ mod macos {
             in_use_kernel_name,
         ),
         (
+            "the_scan_names_its_tree_without_opening_it",
+            tree_named_unopened,
+        ),
+        (
             "terminate_kills_a_child_that_ignores_sigterm",
             terminate_stubborn,
         ),
@@ -594,6 +598,52 @@ mod macos {
         } else {
             println!("note: the volume is case sensitive; the case spelling was not tested");
         }
+    }
+
+    /// The scan names its tree without a descriptor on it (M13 step 5): one it opened, even for an
+    /// instant, is copied into a child another thread forks meanwhile and held there until the
+    /// child's exec, and a scan that reaches the child first counts an unused tree in use. A tree
+    /// this user may not open (mode 000) shows it: `kernel_path`, which opens, is refused, while
+    /// the scan's name for it is the same path and the scan answers.
+    fn tree_named_unopened(scratch: &Path) {
+        let tree = scratch.join("Tree");
+        std::fs::create_dir(&tree).unwrap();
+        let opened = libproc::kernel_path(&tree).unwrap();
+        assert_eq!(libproc::kernel_path_unopened(&tree).unwrap(), opened);
+        let upper = scratch.join("TREE");
+        if upper.exists() {
+            assert_eq!(
+                libproc::kernel_path_unopened(&upper).unwrap(),
+                opened,
+                "the same directory spelled in another case"
+            );
+        }
+        let file = tree.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            libproc::kernel_path_unopened(&file).unwrap(),
+            libproc::kernel_path(&file).unwrap()
+        );
+        assert_eq!(
+            libproc::kernel_path_unopened(&scratch.join("missing"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let open = libproc::kernel_path(&tree).map(|_| ());
+        let unopened = libproc::kernel_path_unopened(&tree);
+        let in_use = os().tree_in_use(&tree, &[]);
+        // Restored before any assertion, so the scratch can be removed.
+        std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            open.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the control: opening the tree is refused"
+        );
+        assert_eq!(unopened.unwrap(), opened);
+        assert!(!in_use.unwrap(), "a tree nobody uses");
     }
 
     /// A copy of the helper at `<scratch>/exe/helper`, started with `args` in `cwd`, then deleted

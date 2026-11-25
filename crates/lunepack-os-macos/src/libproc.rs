@@ -1,9 +1,9 @@
 //! The libproc calls behind [`crate::MacProcess`]: process ids, identity, and the three places a
 //! process can hold a directory tree: its executable path, its working directory and its open
-//! vnode files (M5-D9's in-use scan, M8 step 3). Every `unsafe` block is one libproc call on a
-//! buffer this module owns and sizes, with the returned length checked, or the one view of a
-//! kernel path buffer's `c_char`s as bytes (`vip_bytes`); nothing here allocates from a count
-//! the kernel reports without a cap.
+//! vnode files (M5-D9's in-use scan, M8 step 3). Every `unsafe` block is one libproc call (or one
+//! `fcntl` or `getattrlist` naming a path) on a buffer this module owns and sizes, with the
+//! returned length checked, or the one view of a kernel path buffer's `c_char`s as bytes
+//! (`vip_bytes`); nothing here allocates from a count the kernel reports without a cap.
 //!
 //! Hidden from the documentation: the crate's own tests read each source on its own (the premise
 //! that a tree moved by a swap is reported under its new path is measured with these calls, not
@@ -306,6 +306,64 @@ pub fn fd_paths(pid: u32) -> io::Result<Vec<PathBuf>> {
         }
     }
     Ok(paths)
+}
+
+/// The path of the existing directory or file `path` as the kernel names it, like [`kernel_path`],
+/// but without opening it: `getattrlist` with `ATTR_CMN_FULLPATH`, which reports from the same
+/// source (`vn_getpath`). The in-use scan names its tree this way. A descriptor it opened on the
+/// tree, even for an instant and close-on-exec, is copied into any child another thread of the
+/// caller forks meanwhile, and that child holds it until its exec: a scan that reaches the child
+/// first sees an open file in the tree, a tree in use that nobody uses (M13 step 5).
+pub fn kernel_path_unopened(path: &std::path::Path) -> io::Result<PathBuf> {
+    /// The reply: its length, the reference to the path, then the path (at most `PATH_MAX`
+    /// bytes, NUL included).
+    const REPLY: usize = 4 + 8 + libc::PATH_MAX as usize;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_FULLPATH,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buf = vec![0u8; REPLY];
+    // SAFETY: `c_path` is a NUL-terminated string and `request` a valid `attrlist`, both alive for
+    // the call; `buf` is writable memory of exactly `buf.len()` bytes, the size passed, and the
+    // call writes at most that many.
+    let rc = unsafe {
+        libc::getattrlist(
+            c_path.as_ptr(),
+            (&raw mut request).cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+        )
+    };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "bad ATTR_CMN_FULLPATH reply");
+    let word = |at: usize| -> io::Result<[u8; 4]> {
+        buf.get(at..at + 4)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(invalid)
+    };
+    let total = u32::from_ne_bytes(word(0)?) as usize;
+    // The reference's offset counts from the reference itself (at byte 4).
+    let offset = i32::from_ne_bytes(word(4)?);
+    let length = u32::from_ne_bytes(word(8)?) as usize;
+    let start = usize::try_from(offset)
+        .ok()
+        .and_then(|o| o.checked_add(4))
+        .ok_or_else(invalid)?;
+    let end = start.checked_add(length).ok_or_else(invalid)?;
+    if total > buf.len() || end > total {
+        return Err(invalid());
+    }
+    path_of(&buf[start..end]).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
 }
 
 /// The path of the existing directory or file `path` as the kernel names it (`F_GETPATH`): the
