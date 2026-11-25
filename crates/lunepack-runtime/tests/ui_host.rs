@@ -1195,7 +1195,9 @@ mod native {
             notes(&lab.out)
         );
         assert_eq!(got, ChoiceValue::Cancel);
-        assert!(took < FAST.pong_wait + Duration::from_secs(1), "{took:?}");
+        // The UI's answer is delayed 60 s; the bound only has to tell "gave up after the ping wait"
+        // from that, with room for a loaded machine (3.02 s seen under the full gate).
+        assert!(took < FAST.pong_wait + Duration::from_secs(10), "{took:?}");
         ui.close(&events);
     }
 
