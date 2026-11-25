@@ -121,8 +121,16 @@ jobs:
           fi
 
   build:
+    # Its outputs are the ids of the four artifacts it uploads (one per leg, each leg sets its own):
+    # assemble downloads by id, so the list pins only what each leg built, and an artifact that another
+    # job of the run uploads under the same name (it gets a new id) is never the one it hashes.
     needs: plan
     if: needs.plan.outputs.mode == 'dry-run' || needs.plan.outputs.mode == 'binaries' || needs.plan.outputs.mode == 'rehearsal'
+    outputs:
+      bin_linux_x86_64: ${{ steps.ids.outputs.bin_linux_x86_64 }}
+      bin_linux_aarch64: ${{ steps.ids.outputs.bin_linux_aarch64 }}
+      bin_windows_x86_64: ${{ steps.ids.outputs.bin_windows_x86_64 }}
+      bin_macos_universal: ${{ steps.ids.outputs.bin_macos_universal }}
     strategy:
       fail-fast: false
       matrix:
@@ -156,11 +164,22 @@ jobs:
         shell: pwsh
         run: ./scripts/release/build.ps1 -OutDir "$env:RUNNER_TEMP/release-bin"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
         with:
           name: release-bin-${{ matrix.target }}
           path: ${{ runner.temp }}/release-bin
           if-no-files-found: error
           retention-days: 7
+      - name: Name the artifact id
+        id: ids
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          set -euo pipefail
+          [ -n "$ARTIFACT_ID" ]
+          echo "bin_${RELEASE_TARGET//-/_}=$ARTIFACT_ID" >>"$GITHUB_OUTPUT"
 
   build-cli:
     # The lunepack CLI at this commit for the four hosts, in every mode. Its linux-x86_64 file is the
@@ -248,7 +267,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: release-bin-*
+          artifact-ids: ${{ needs.build.outputs.bin_linux_x86_64 }},${{ needs.build.outputs.bin_linux_aarch64 }},${{ needs.build.outputs.bin_windows_x86_64 }},${{ needs.build.outputs.bin_macos_universal }}
           merge-multiple: true
           path: ${{ runner.temp }}/release-bin
       - name: The list, the notices and SHA256SUMS

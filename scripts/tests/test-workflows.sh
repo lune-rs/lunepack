@@ -261,10 +261,11 @@ release_ok() {
       if printf '%s\n' "$step" | grep -q '^        uses: actions/checkout@' && ! printf '%s\n' "$step" | grep -Fxq '          persist-credentials: false'; then
         problem "$job: a checkout without persist-credentials: false"
       fi
-      # The jobs that run a handed-over file, or hold a write token, download by artifact id: a
-      # download by name or pattern takes whatever any job of the run uploaded last under that name.
+      # The jobs that run a handed-over file, hash what the key signs, or hold a write token, download
+      # by artifact id: a download by name or pattern takes whatever any job of the run uploaded last
+      # under that name.
       case $job in
-        sign | attach | finalize)
+        assemble | sign | attach | finalize)
           if printf '%s\n' "$step" | grep -q '^        uses: actions/download-artifact@'; then
             if printf '%s\n' "$step" | grep -Eq '^          (name|pattern):' ||
               ! printf '%s\n' "$step" | grep -Eq '^          artifact-ids: \$\{\{ needs\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_]+ \}\}(,\$\{\{ needs\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_]+ \}\})*$'; then
@@ -549,6 +550,10 @@ else
   rseed finalize-download-by-pattern "finalize: a download-artifact step that is not by artifact-ids"
   r in_job_sub attach '^          artifact-ids: .*outputs.id_linux_x86_64' '          artifact-ids: 123' "$real_release"
   rseed attach-literal-id "attach: a download-artifact step that is not by artifact-ids"
+  r in_job_sub assemble '^          artifact-ids: ' '          pattern: release-bin-*' "$real_release"
+  rseed assemble-download-by-pattern "assemble: a download-artifact step that is not by artifact-ids"
+  r in_job_sub assemble '^          artifact-ids: ' '          name: release-bin-linux-x86_64' "$real_release"
+  rseed assemble-download-by-name "assemble: a download-artifact step that is not by artifact-ids"
   r in_job_sub assemble '^        run: scripts/release/assemble.sh' '        run: scripts/release/assemble.sh "${{ inputs.mode }}" a b' "$real_release"
   rseed run-expression "an expression inside run:"
   r in_job_ins sign '^          persist-credentials: false' "        env:\n$KEY_LINE" "$T_TMP/r1.yml"
