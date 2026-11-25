@@ -7,7 +7,7 @@
 # <bin-dir> must hold exactly the 20 files of the release matrix (M13-D19 as revised), named
 # lunepack-<kind>-<version>-<target>[.exe]; a missing file, any other file or an empty one fails.
 # <out-dir> (created, must be empty) receives a copy of each binary, the list, THIRD-PARTY-NOTICES.txt
-# (crates/lunepack-cli/THIRD-PARTY-NOTICES.txt) and SHA256SUMS over all of them.
+# (crates/lunepack-cli/THIRD-PARTY-NOTICES.txt) and SHA256SUMS over all of them (C order, LF).
 #
 # The list: version = the workspace version; source_commit = HEAD of this checkout; rehearsal = false
 # in mode `binaries` only (true in `rehearsal` and `dry-run`); rows sorted by target, then kind.
@@ -87,9 +87,11 @@ jq -S -s --arg version "$version" --arg commit "$commit" --argjson rehearsal "$r
   "$rows" >"$outdir/$list"
 cp "$notices" "$outdir/THIRD-PARTY-NOTICES.txt"
 
+# In C order, whatever the locale: rel_check_release_files (attach, verify-pins.sh) rebuilds this file
+# from the release's files and compares it byte for byte.
 (
   cd "$outdir"
-  for f in *; do
+  printf '%s\n' * | LC_ALL=C sort | while IFS= read -r f; do
     sha=$(rel_sha256 "$f")
     printf '%s  %s\n' "$sha" "$f"
   done

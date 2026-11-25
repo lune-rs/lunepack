@@ -261,6 +261,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       list_id: ${{ steps.list.outputs.artifact-id }}
+      assets_id: ${{ steps.assets.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -282,6 +283,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: assets
         with:
           name: release-assets
           path: ${{ runner.temp }}/release-assets
@@ -299,11 +301,11 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: release-assets
+          artifact-ids: ${{ needs.assemble.outputs.assets_id }}
           path: release-assets
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: release-cli-linux-x86_64
+          artifact-ids: ${{ needs.build-cli.outputs.id_linux_x86_64 }}
           path: release-tool
       - name: Sign with a throwaway key and verify
         env:
@@ -332,7 +334,8 @@ jobs:
     # Creates the draft v<version> (rehearsal: v<version>-rehearsal) with the binaries, the list,
     # SHA256SUMS and the notices. Mode binaries fails when a release, a draft or a tag of that name
     # exists, so a second run for one version stops before anything is signed; the concurrency group
-    # keeps two runs from passing that check together.
+    # keeps two runs from passing that check together. It downloads assemble's artifact by id, so a
+    # job of the run that uploads its own release-assets (it gets a new id) never feeds the draft.
     needs: [plan, assemble, preflight]
     if: needs.plan.outputs.mode == 'binaries' || needs.plan.outputs.mode == 'rehearsal'
     runs-on: ubuntu-22.04
@@ -345,7 +348,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: release-assets
+          artifact-ids: ${{ needs.assemble.outputs.assets_id }}
           path: release-assets
       - name: Create the draft
         env:
@@ -418,8 +421,10 @@ jobs:
           retention-days: 7
 
   attach:
-    # Downloads the draft's files as stored, verifies the envelope and every file under the built-in
-    # key of the CLI that signed, and only then adds the envelope to the draft.
+    # Downloads the draft's files as stored, refuses any file outside the release's expected set
+    # (rel_check_release_files: the notices against the committed file, SHA256SUMS against the files),
+    # verifies the envelope and every binary under the built-in key of the CLI that signed, and only
+    # then adds the envelope to the draft.
     needs: [plan, sign, build-cli]
     if: needs.plan.outputs.mode == 'binaries' || needs.plan.outputs.mode == 'rehearsal'
     runs-on: ubuntu-22.04
@@ -427,6 +432,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.sign.outputs.envelope_id }}
@@ -444,15 +452,18 @@ jobs:
         run: |
           set -euo pipefail
           chmod u+x release-tool/lunepack
+          . scripts/release/lib.sh
+          # A rehearsal draft started again still holds the envelope of the run before; this run's replaces it.
           case $LUNEPACK_RELEASE_MODE in
-            binaries) tag="v$LUNEPACK_RELEASE_VERSION"; extra=() ;;
-            rehearsal) tag="v$LUNEPACK_RELEASE_VERSION-rehearsal"; extra=(--allow-rehearsal) ;;
+            binaries) tag="v$LUNEPACK_RELEASE_VERSION"; extra=(); envelope=absent ;;
+            rehearsal) tag="v$LUNEPACK_RELEASE_VERSION-rehearsal"; extra=(--allow-rehearsal); envelope=either ;;
             *) echo "unexpected mode" >&2; exit 1 ;;
           esac
           sig="release-envelope/prebuilt-$LUNEPACK_RELEASE_VERSION.sig.json"
           mkdir draft-files
           gh release download "$tag" --dir draft-files
           release-tool/lunepack prebuilt verify --list "draft-files/prebuilt-$LUNEPACK_RELEASE_VERSION.json" --sig "$sig" --dir draft-files --all "${extra[@]}"
+          rel_check_release_files draft-files "$LUNEPACK_RELEASE_VERSION" "$envelope" crates/lunepack-cli/THIRD-PARTY-NOTICES.txt
           if [ "$LUNEPACK_RELEASE_MODE" = rehearsal ]; then
             gh release upload "$tag" --clobber "$sig"
           else
@@ -460,8 +471,9 @@ jobs:
           fi
 
   finalize:
-    # Phase 2: proves the pins at this commit (verify-pins.sh), adds the CLI files and, in mode tag
-    # only, publishes the draft. It never replaces a file of the draft.
+    # Phase 2: proves the pins at this commit (verify-pins.sh, which also refuses any draft file
+    # outside the release's expected set), adds the CLI files and, in mode tag only, publishes the
+    # draft. It never replaces a file of the draft.
     needs: [plan, preflight, build-cli]
     if: needs.plan.outputs.mode == 'tag' || needs.plan.outputs.mode == 'rehearsal-finalize'
     runs-on: ubuntu-22.04

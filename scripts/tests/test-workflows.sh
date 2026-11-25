@@ -230,6 +230,7 @@ release_ok() {
   [ "$(grep -Eic '(^|[^a-z0-9_])write([^a-z0-9_]|$)' "$f")" -eq 3 ] || problem "release.yml must have exactly three contents: write lines (draft, attach, finalize)"
   grep -Eiq 'id-token|attestations' "$f" && problem "id-token or attestations is not allowed in release.yml"
   grep -q 'actions/cache' "$f" && problem "actions/cache is not allowed in release.yml (no cache feeds a release build)"
+  grep -Eq 'run[[:space:]]+download|/actions/artifacts' "$f" && problem "gh run download or the artifacts API is not allowed in release.yml (artifacts come by artifact-ids: only)"
   grep -Eq 'runs-on:.*latest|os:.*latest' "$f" && problem "runner images must be named by version, not latest"
   [ "$(grep -c 'LUNEPACK_PROJECT_KEY' "$f")" -eq 1 ] || problem "the project key is not named on exactly one line"
   [ "$(grep -Eic '(^|[^a-z0-9_])secrets([^a-z0-9_]|$)' "$f")" -eq 1 ] || problem "secrets is not on exactly one line"
@@ -261,19 +262,15 @@ release_ok() {
       if printf '%s\n' "$step" | grep -q '^        uses: actions/checkout@' && ! printf '%s\n' "$step" | grep -Fxq '          persist-credentials: false'; then
         problem "$job: a checkout without persist-credentials: false"
       fi
-      # The jobs that run a handed-over file, hash what the key signs, or hold a write token, download
-      # by artifact id: a download by name or pattern takes whatever any job of the run uploaded last
-      # under that name.
-      case $job in
-        assemble | sign | attach | finalize)
-          if printf '%s\n' "$step" | grep -q '^        uses: actions/download-artifact@'; then
-            if printf '%s\n' "$step" | grep -Eq '^          (name|pattern):' ||
-              ! printf '%s\n' "$step" | grep -Eq '^          artifact-ids: \$\{\{ needs\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_]+ \}\}(,\$\{\{ needs\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_]+ \}\})*$'; then
-              problem "$job: a download-artifact step that is not by artifact-ids: from a job output (a download by name or pattern can be replaced by any job of the run)"
-            fi
-          fi
-          ;;
-      esac
+      # Every job of release.yml downloads by artifact id: a download by name or pattern takes whatever
+      # any job of the run uploaded last under that name (what assemble hashes, what draft publishes,
+      # what sign, attach and finalize run, what selftest proves).
+      if printf '%s\n' "$step" | grep -q '^        uses: actions/download-artifact@'; then
+        if printf '%s\n' "$step" | grep -Eq '^          (name|pattern):' ||
+          ! printf '%s\n' "$step" | grep -Eq '^          artifact-ids: \$\{\{ needs\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_]+ \}\}(,\$\{\{ needs\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_]+ \}\})*$'; then
+          problem "$job: a download-artifact step that is not by artifact-ids: from a job output (a download by name or pattern can be replaced by any job of the run)"
+        fi
+      fi
       i=$((i + 1))
     done
   done < <(awk '/^jobs:/ { on = 1; next } on && /^[^ #]/ { exit } on && /^  [A-Za-z0-9_-]+:/ { j = $0; sub(/^  /, "", j); sub(/:.*/, "", j); print j }' "$f")
@@ -289,6 +286,13 @@ release_ok() {
       cancel-in-progress: false" ] || problem "draft has no concurrency: block (group release-draft, cancel-in-progress false)"
   # attach comes after sign.
   job_block "$f" attach | grep -Eq '^    needs: \[([^]]*, )?sign(, [^]]*)?\]$' || problem "attach does not need sign"
+  # attach refuses a draft file outside the release's expected set before it uploads anything (the
+  # check runs on the downloaded draft, before the first gh release upload of the job).
+  printf '%s\n' "$(job_block "$f" attach)" | awk '
+    /^          rel_check_release_files draft-files / && !up { ok = 1 }
+    /gh release upload/ { up = 1 }
+    END { exit !ok }
+  ' || problem "attach does not run rel_check_release_files on the draft before its upload"
   # The job sign (M13-D35).
   block=$(job_block "$f" sign)
   printf '%s\n' "$block" | grep -Fxq '    environment: release-signing' || problem "sign has no environment release-signing"
@@ -554,6 +558,19 @@ else
   rseed assemble-download-by-pattern "assemble: a download-artifact step that is not by artifact-ids"
   r in_job_sub assemble '^          artifact-ids: ' '          name: release-bin-linux-x86_64' "$real_release"
   rseed assemble-download-by-name "assemble: a download-artifact step that is not by artifact-ids"
+  r in_job_sub draft '^          artifact-ids: ' '          name: release-assets' "$real_release"
+  rseed draft-download-by-name "draft: a download-artifact step that is not by artifact-ids"
+  r in_job_sub draft '^          artifact-ids: ' '          pattern: release-*' "$real_release"
+  rseed draft-download-by-pattern "draft: a download-artifact step that is not by artifact-ids"
+  r in_job_sub selftest '^          artifact-ids: .*outputs.assets_id' '          name: release-assets' "$real_release"
+  rseed selftest-download-by-name "selftest: a download-artifact step that is not by artifact-ids"
+  r in_job_ins attach '^          gh release download ' '          gh run download "$GITHUB_RUN_ID" -n release-envelope -D release-envelope' "$real_release"
+  rseed gh-run-download "gh run download or the artifacts API is not allowed in release.yml"
+  r in_job_del attach '^          rel_check_release_files draft-files ' "$real_release"
+  rseed attach-no-files-check "attach does not run rel_check_release_files on the draft before its upload"
+  in_job_del attach '^          rel_check_release_files draft-files ' "$real_release" >"$T_TMP/r1.yml" || t_fail "seed edit: attach files check"
+  r in_job_ins attach '^            gh release upload .*--clobber' '          rel_check_release_files draft-files "$LUNEPACK_RELEASE_VERSION" "$envelope" crates/lunepack-cli/THIRD-PARTY-NOTICES.txt' "$T_TMP/r1.yml"
+  rseed attach-files-check-after-upload "attach does not run rel_check_release_files on the draft before its upload"
   r in_job_sub assemble '^        run: scripts/release/assemble.sh' '        run: scripts/release/assemble.sh "${{ inputs.mode }}" a b' "$real_release"
   rseed run-expression "an expression inside run:"
   r in_job_ins sign '^          persist-credentials: false' "        env:\n$KEY_LINE" "$T_TMP/r1.yml"

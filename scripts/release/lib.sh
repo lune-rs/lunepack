@@ -93,6 +93,63 @@ rel_asset() {
   esac
 }
 
+# rel_check_release_files <dir> <version> <envelope> <notices>: fails unless <dir> holds exactly the
+# files that assemble.sh wrote and the envelope, as regular files, and nothing else: the 20 binaries
+# of the matrix, prebuilt-<version>.json, THIRD-PARTY-NOTICES.txt, SHA256SUMS, and
+# prebuilt-<version>.sig.json as <envelope> says (absent, present or either). Checked by content
+# here: THIRD-PARTY-NOTICES.txt equals <notices> (the committed file) byte for byte, and SHA256SUMS
+# is the SHA-256 of the other 22 files in assemble.sh's form (C order, LF) byte for byte. The
+# binaries and the list are left to `prebuilt verify --all` under the signed envelope, and the
+# envelope to its signature: run it beside this, never instead.
+rel_check_release_files() {
+  [ "$#" -eq 4 ] || rel_die "rel_check_release_files takes 4 arguments"
+  local dir=$1 version=$2 envelope=$3 notices=$4 list sig names allowed f n a ok h missing='' extra='' sums=''
+  rel_need cmp
+  case $envelope in
+    absent | present | either) ;;
+    *) rel_die "rel_check_release_files: envelope '$envelope' is not absent, present or either" ;;
+  esac
+  [ -d "$dir" ] && [ ! -L "$dir" ] || rel_die "the release directory does not exist"
+  [ -f "$notices" ] || rel_die "no committed notices file to compare with"
+  list=prebuilt-$version.json
+  sig=prebuilt-$version.sig.json
+  names=$(rel_matrix | while read -r k t; do rel_asset "$k" "$version" "$t"; done)
+  names=$(printf '%s\n%s\n%s' "$names" "$list" THIRD-PARTY-NOTICES.txt)
+  allowed=$(printf '%s\nSHA256SUMS' "$names")
+  [ "$envelope" = absent ] || allowed=$(printf '%s\n%s' "$allowed" "$sig")
+  # Every entry is one of the allowed names (compared whole, so a name with a newline in it never
+  # matches one of its lines) and a regular file.
+  for f in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    n=${f##*/}
+    ok=
+    while IFS= read -r a; do
+      if [ "$a" = "$n" ]; then
+        ok=1
+        break
+      fi
+    done <<<"$allowed"
+    if [ -z "$ok" ]; then
+      extra="$extra $n"
+    elif [ ! -f "$f" ] || [ -L "$f" ]; then
+      rel_die "$n is not a regular file"
+    fi
+  done
+  [ -z "$extra" ] || rel_die "files outside the release's expected set:$extra"
+  while IFS= read -r n; do
+    [ -f "$dir/$n" ] || missing="$missing $n"
+  done <<<"$(printf '%s\nSHA256SUMS' "$names")"
+  if [ "$envelope" = present ] && [ ! -f "$dir/$sig" ]; then missing="$missing $sig"; fi
+  [ -z "$missing" ] || rel_die "missing from the release:$missing"
+  cmp -s "$notices" "$dir/THIRD-PARTY-NOTICES.txt" || rel_die "THIRD-PARTY-NOTICES.txt is not the committed notices file"
+  while IFS= read -r n; do
+    h=$(rel_sha256 "$dir/$n")
+    sums="$sums$h  $n
+"
+  done <<<"$(printf '%s\n' "$names" | LC_ALL=C sort)"
+  printf '%s' "$sums" | cmp -s - "$dir/SHA256SUMS" || rel_die "SHA256SUMS is not the SHA-256 of the release's files"
+}
+
 # rel_mode_ok <mode> <allowed>...: fails unless the mode is one of the allowed names.
 rel_mode_ok() {
   local m=$1 a

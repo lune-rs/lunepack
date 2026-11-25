@@ -1246,12 +1246,17 @@ trusted with the key. The same holds one step earlier for what the key signs: th
 the files `assemble` downloads, so a download by name or pattern there would let any job of the run choose
 the runtime, service, UI or stub that the signed list pins. The workflow therefore downloads by artifact id:
 `build`, `build-cli`, `assemble` and `sign` publish the id of each artifact they upload as a job output, and
-`assemble`, `sign`, `attach` and `finalize` download only those ids (a replaced artifact has a new id, the
-old one no longer exists, and the download fails), so only the `build` leg that made a binary, with its own
-dependency tree, is trusted with what gets pinned. The workflow lint fails on a download by name or pattern
-in those four jobs. A job that swaps the draft's binaries (`release-assets`, which `draft` downloads by
-name) after `assemble` gains nothing: `attach` verifies every file of the draft against the signed list,
-which `sign` took by id. What stands in the
+`assemble`, `draft`, `sign`, `attach` and `finalize` download only those ids (a replaced artifact has a new
+id, the old one no longer exists, and the download fails), so only the `build` leg that made a binary, with
+its own dependency tree, is trusted with what gets pinned, and only `assemble` with what goes into the
+draft. The workflow lint fails on a download by name or pattern in those five jobs. A signed list says
+nothing about a file it does not name, so a check of the binaries alone would let a file added to the draft
+(an installer script, a package) or a replaced `SHA256SUMS` be published beside the signed assets unchecked.
+`attach` and `finalize` (`scripts/release/verify-pins.sh`) therefore also refuse a draft that holds any file
+outside the release's set (the twenty binaries, the list, the envelope, `THIRD-PARTY-NOTICES.txt` and
+`SHA256SUMS`; the CLI files are added only after the check), and check the two files the list does not
+cover by content: the notices against the committed file, `SHA256SUMS` against the SHA-256 of the other
+files. What stands in the
 way of everyone else: the secret belongs to one environment and to nothing else (never a repository or
 organization secret, which the runbook has the maintainer check); the environment admits only the branch
 `main` and needs the approval; the job's token is read-only (`contents: read`); the key is in the

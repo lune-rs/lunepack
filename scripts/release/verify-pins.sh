@@ -5,6 +5,9 @@
 #   scripts/release/verify-pins.sh <assets-dir> <tag|rehearsal-finalize>
 #
 # <assets-dir> holds the draft's files as stored (downloaded from the release). It fails unless:
+#   - the draft holds exactly the release's files and nothing else (rel_check_release_files: the 20
+#     binaries, the list, the envelope, THIRD-PARTY-NOTICES.txt equal to the committed file, and
+#     SHA256SUMS equal to the SHA-256 of the others), so no file that nothing checks is published;
 #   - the committed table crates/lunepack-cli/prebuilt.json equals the draft's prebuilt-<version>.json
 #     and the committed envelope crates/lunepack-cli/prebuilt.sig.json equals the draft's
 #     prebuilt-<version>.sig.json, byte for byte;
@@ -60,6 +63,7 @@ allow=()
 if [ "$mode" = rehearsal-finalize ]; then allow=(--allow-rehearsal); fi
 v=$("$cli" prebuilt verify --list "$table" --sig "$envelope" --dir "$assets" --all --json ${allow[@]+"${allow[@]}"}) ||
   rel_die "prebuilt verify failed: the committed list, its envelope or the draft's files"
+rel_check_release_files "$assets" "$version" present "$top/crates/lunepack-cli/THIRD-PARTY-NOTICES.txt"
 lv=$(rel_json_str "$v" version)
 a=$(rel_json_str "$v" source_commit)
 lr=$(rel_json_bool "$v" rehearsal)

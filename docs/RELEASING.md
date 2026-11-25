@@ -241,7 +241,8 @@ gh workflow run release.yml --ref main -f mode=rehearsal
 
 Approve the `sign` job (section 3). The run ends with the draft `v<version>-rehearsal` holding the binaries,
 the list, the envelope, the notices and `SHA256SUMS`. A rehearsal may be started again at any point; its
-draft's files are replaced.
+draft's files are replaced. After leg two the draft also holds the CLI files, which `attach` refuses: delete
+the draft before starting the rehearsal again.
 
 Leg two, phase 2 (not run: the user's): at a clean checkout of the commit that leg one built, run
 
@@ -271,7 +272,8 @@ signing environment's settings, and a project key built into the CLI), `build` (
 matrix: six target ids from four build jobs) and `build-cli` (the CLI for four hosts), `assemble` (the list, the notices and
 `SHA256SUMS`), `draft` (creates the draft `v<version>` with those files), `sign` (waits for your approval,
 then signs the list) and `attach` (downloads the draft as stored, verifies the envelope and every file
-under the CLI's built-in key, and only then adds the envelope).
+under the CLI's built-in key, refuses any file outside the release's set and a `SHA256SUMS` or notices
+file that does not match, and only then adds the envelope).
 
 `draft` fails when a release, a draft or a tag of that version exists, so starting `binaries` again while a
 draft exists fails on purpose, before anything is signed. Two signed lists for one version cannot come out of
@@ -317,7 +319,8 @@ It holds and reads no key, and commits, pushes and tags nothing. By hand, in thi
    be withdrawn)**. A tag on a local commit that never landed fails the tag run.
 
 Phase 2 **[automatic]**, no approval: `finalize` proves the pins (`scripts/release/verify-pins.sh`: the
-committed files are the draft's, byte for byte; A..B changes exactly the two files; every file matches; the
+committed files are the draft's, byte for byte; A..B changes exactly the two files; every file matches and
+the draft holds no other file, `SHA256SUMS` and the notices included; the
 envelope verifies under the key built into the CLI at B; the CLI's own state is `pinned`), builds the CLI for
 four hosts, adds the four files to the draft and publishes it.
 

@@ -214,6 +214,7 @@ phase1() {
   local allow=()
   if [ "$mode" = rehearsal ]; then allow=(--allow-rehearsal); fi
   "$WRAP" prebuilt verify --list "$out/prebuilt-$V.json" --sig "$sig/prebuilt-$V.sig.json" --dir "$out" --all ${allow[@]+"${allow[@]}"} >>"$ALL" 2>&1 || return 1
+  (cd "$w" && rel_check_release_files "$out" "$V" absent crates/lunepack-cli/THIRD-PARTY-NOTICES.txt) >>"$ALL" 2>&1 || return 1
   mkdir -p "$GH_RELEASES/$tag"
   cp "$out"/* "$sig/prebuilt-$V.sig.json" "$GH_RELEASES/$tag/"
 }
@@ -270,6 +271,8 @@ t_check "SHA256SUMS lists 22 files (20 binaries, the list, the notices; not itse
 run_cmd sh -c "cd '$T_TMP/asm-binaries' && if command -v sha256sum >/dev/null; then sha256sum -c SHA256SUMS; else shasum -a 256 -c SHA256SUMS; fi"
 t_check "SHA256SUMS checks" rc_is 0
 t_check "the notices are a release file" test -f "$T_TMP/asm-binaries/THIRD-PARTY-NOTICES.txt"
+t_check "SHA256SUMS is in C order (the form rel_check_release_files rebuilds)" test "$(cut -c 67- "$T_TMP/asm-binaries/SHA256SUMS")" = "$(cut -c 67- "$T_TMP/asm-binaries/SHA256SUMS" | LC_ALL=C sort)"
+t_check "SHA256SUMS starts with THIRD-PARTY-NOTICES.txt (C order, the order check is armed)" test "$(head -n 1 "$T_TMP/asm-binaries/SHA256SUMS" | cut -c 67-)" = THIRD-PARTY-NOTICES.txt
 cp -R "$T_TMP/bins" "$T_TMP/bins-missing"
 rm "$T_TMP/bins-missing/$(rel_asset ui "$V" macos-x86_64)"
 run_in "$W" scripts/release/assemble.sh binaries "$T_TMP/bins-missing" "$T_TMP/asm-missing"
@@ -439,6 +442,64 @@ W=$(make_work rel)
 A=$(g -C "$W" rev-parse HEAD)
 phase1 "$W" binaries "v$V" || t_fail "phase 1 (release) failed"
 t_check "phase 1 put the list and the envelope into the draft" test -f "$GH_RELEASES/v$V/prebuilt-$V.sig.json"
+
+# attach's check of the draft's files (rel_check_release_files, as release.yml runs it), on copies
+# of what assemble.sh wrote for this release.
+rcf_case() { # label, dir, envelope (absent|present|either), expected rc, expected text
+  run_in "$W" bash -c '. scripts/release/lib.sh && rel_check_release_files "$@"' rcf "$2" "$V" "$3" crates/lunepack-cli/THIRD-PARTY-NOTICES.txt
+  t_check "rel_check_release_files: $1 (exit $4)" rc_is "$4"
+  t_check "rel_check_release_files: $1 says $5" out_has "$5"
+}
+copy_assets() { # name -> a copy of assemble.sh's output of this release
+  rm -rf "${T_TMP:?}/$1"
+  cp -R "$T_TMP/binaries-assets" "$T_TMP/$1"
+  printf '%s\n' "$T_TMP/$1"
+}
+R=$(copy_assets rcf-good)
+run_in "$W" bash -c '. scripts/release/lib.sh && rel_check_release_files "$@" && echo files-ok' rcf "$R" "$V" absent crates/lunepack-cli/THIRD-PARTY-NOTICES.txt
+t_check "rel_check_release_files: assemble.sh's output passes (absent)" rc_is 0
+t_check "rel_check_release_files: assemble.sh's output passes (absent) and says so" out_has files-ok
+cp "$GH_RELEASES/v$V/prebuilt-$V.sig.json" "$R/"
+run_in "$W" bash -c '. scripts/release/lib.sh && rel_check_release_files "$@" && echo files-ok' rcf "$R" "$V" either crates/lunepack-cli/THIRD-PARTY-NOTICES.txt
+t_check "rel_check_release_files: with the envelope passes (either)" rc_is 0
+rcf_case "the envelope where none may be yet" "$R" absent 1 "files outside the release's expected set: prebuilt-$V.sig.json"
+R=$(copy_assets rcf-extra)
+printf '#!/bin/sh\necho installer\n' >"$R/install.sh"
+rcf_case "an extra file" "$R" absent 1 "files outside the release's expected set: install.sh"
+R=$(copy_assets rcf-extra-either)
+printf 'pkg\n' >"$R/lunepack-$V.pkg"
+rcf_case "an extra file beside the allowed envelope" "$R" either 1 "files outside the release's expected set: lunepack-$V.pkg"
+R=$(copy_assets rcf-dot)
+printf 'x\n' >"$R/.hidden"
+rcf_case "an extra dot file" "$R" absent 1 "files outside the release's expected set: .hidden"
+R=$(copy_assets rcf-nl)
+printf 'x\n' >"$R/install.sh
+SHA256SUMS"
+rcf_case "an extra file whose name holds a newline and an allowed name" "$R" absent 1 "files outside the release's expected set"
+R=$(copy_assets rcf-dir)
+mkdir "$R/docs"
+rcf_case "an extra directory" "$R" absent 1 "files outside the release's expected set: docs"
+R=$(copy_assets rcf-sums)
+sed '1s/^./0/; 1s/^0\(.*\)/f\1/' "$R/SHA256SUMS" >"$T_TMP/rcf-sums.txt"
+cp "$T_TMP/rcf-sums.txt" "$R/SHA256SUMS"
+t_check "the modified SHA256SUMS differs (seed applied)" sh -c '! cmp -s "$1" "$2"' sums "$R/SHA256SUMS" "$T_TMP/binaries-assets/SHA256SUMS"
+rcf_case "a modified SHA256SUMS (one hash)" "$R" absent 1 "SHA256SUMS is not the SHA-256 of the release's files"
+R=$(copy_assets rcf-sums-line)
+printf '%064d  install.sh\n' 0 >>"$R/SHA256SUMS"
+rcf_case "a SHA256SUMS with a line for a file that is not there" "$R" absent 1 "SHA256SUMS is not the SHA-256 of the release's files"
+R=$(copy_assets rcf-sums-gone)
+rm "$R/SHA256SUMS"
+rcf_case "no SHA256SUMS" "$R" absent 1 "missing from the release: SHA256SUMS"
+R=$(copy_assets rcf-notices)
+printf 'other terms\n' >"$R/THIRD-PARTY-NOTICES.txt"
+rcf_case "notices that are not the committed file" "$R" absent 1 "THIRD-PARTY-NOTICES.txt is not the committed notices file"
+R=$(copy_assets rcf-link)
+n=$(rel_asset ui "$V" linux-x86_64)
+mv "$R/$n" "$T_TMP/rcf-link-target"
+ln -s "$T_TMP/rcf-link-target" "$R/$n"
+rcf_case "a binary that is a symbolic link" "$R" absent 1 "$n is not a regular file"
+R=$(copy_assets rcf-noenv)
+rcf_case "no envelope where it must be" "$R" present 1 "missing from the release: prebuilt-$V.sig.json"
 : >"$GH_LOG"
 run_in "$W" env LUNEPACK_CLI="$WRAP" scripts/release/pin.sh
 t_check "pin.sh at A passes" rc_is 0
@@ -478,6 +539,18 @@ vp_case "a draft file that differs from its row" "$W" "$D" tag "prebuilt verify 
 D=$(copy_draft d-missing)
 rm "$D/$(rel_asset stub "$V" windows-x86_64)"
 vp_case "a draft file missing (--all)" "$W" "$D" tag "prebuilt verify failed"
+D=$(copy_draft d-extra)
+printf '#!/bin/sh\necho installer\n' >"$D/install.sh"
+vp_case "an extra file in the draft" "$W" "$D" tag "files outside the release's expected set: install.sh"
+D=$(copy_draft d-cli-early)
+printf 'cli\n' >"$D/lunepack-cli-$V-linux-x86_64"
+vp_case "a CLI file in the draft before finalize adds it" "$W" "$D" tag "files outside the release's expected set: lunepack-cli-$V-linux-x86_64"
+D=$(copy_draft d-sums)
+printf '%064d  install.sh\n' 0 >>"$D/SHA256SUMS"
+vp_case "a modified SHA256SUMS in the draft" "$W" "$D" tag "SHA256SUMS is not the SHA-256 of the release's files"
+D=$(copy_draft d-notices)
+printf 'other terms\n' >"$D/THIRD-PARTY-NOTICES.txt"
+vp_case "notices in the draft that are not the committed file" "$W" "$D" tag "THIRD-PARTY-NOTICES.txt is not the committed notices file"
 vp_case "a release list in rehearsal-finalize" "$W" "$GH_RELEASES/v$V" rehearsal-finalize "rehearsal flag is false, mode rehearsal-finalize needs true" GITHUB_REF=refs/heads/release-rehearsal
 # A list edited after signing: the committed table and the draft's list both changed, so cmp passes
 # and the signature check fails.
