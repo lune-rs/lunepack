@@ -1,7 +1,8 @@
 # lunepack format v1
 
-Status: **draft**, awaiting approval. Nothing in this document is frozen until it is approved; after
-approval, a change to any MUST or MUST NOT below is a format revision (a new DECISIONS row).
+Status: **approved (format v1); frozen from the first published release.** Until a release is published
+a rule may still be corrected; from then on, a change to any MUST or MUST NOT below is a format revision,
+which the project records in its internal decision log.
 
 This document is normative. The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 "Writer" means the lunepack packager (the only producer of these documents). "Reader" means any
@@ -11,7 +12,8 @@ All readers run the same core code, so every rule below holds for all of them al
 A reader that meets anything this document does not allow MUST reject the whole document (fail
 closed). There is no "best effort" mode and no warning-only path.
 
-Decisions behind the format: `docs/DECISIONS.md` D6, D7, D8, D21, D24, D25 and D33. The threat model
+Decisions behind the format: D6, D7, D8, D21, D24, D25 and D33 of the project's internal decision log, which
+is not part of this repository (each rule they settled is stated in this document). The threat model
 is `docs/THREAT-MODEL.md`.
 
 ## 1. Artifacts and names

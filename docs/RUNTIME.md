@@ -8,7 +8,7 @@ confirm that it works and hand a staged update over to be applied. Each command 
 the library calls a Rust app makes (`Updater::check`, `download` and `stage`, `startup`,
 `confirm_healthy`, `apply_and_restart`), so both get the same behaviour and the same errors (D42).
 `docs/INTEGRATION.md` walks through the command line with a .NET app and real output; a Rust app starts
-from `docs/GETTING-STARTED.md`. The decisions are M5-D11 and M5-D12 in `docs/DECISIONS.md`;
+from `docs/GETTING-STARTED.md`. The decisions are M5-D11 and M5-D12 of the project's internal decision log (not part of this repository);
 what the output must never hold is in `docs/THREAT-MODEL.md` ("The Linux runtime").
 
 ## Locating the runtime

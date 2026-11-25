@@ -59,8 +59,19 @@ test (the testkit does not depend on the codec crate); rewrite them with:
 
 and replay them on stable with `cargo test -p lunepack-codec-lzma --locked --test fuzz_replay`.
 
+The `ui` seeds embed the workspace version in their build id, so a version bump makes
+`committed_seeds_match_the_writer` fail until they are written again with the first command above
+(`docs/RELEASING.md` lists it among the files a bump changes).
+
 A crash found by libFuzzer: minimise it, keep the input as a seed, add it to the replay test as a
 regression case and fix the parser.
+
+## What has run
+
+`docs/THREAT-MODEL.md` ("Fuzz coverage (M13)") has the table of the twenty targets, their seeds and the
+runs recorded so far: the first libFuzzer run of the project was 60 seconds per target over the then
+nineteen targets, then 600 seconds for `envelope` and `prebuilt`, with no crash. The weekly workflow's
+runs are its own to report.
 
 ## Inputs
 

@@ -134,9 +134,10 @@ on the target:
 - **macOS.** A self-contained .NET app is built for one architecture, so it is packed for
   `macos-aarch64` or `macos-x86_64`. The runtime must match the pack's target: a Mach-O file of that
   architecture, and a fat file with both slices only for `macos-universal`
-  ([`CLI.md`](CLI.md), "Self-updating apps"). `prebuilt fetch` offers the universal runtime
-  (`macos-universal`), so a thin app needs a thin one: build it on a Mac with
-  `scripts/build-runtime.sh macos-aarch64` (below).
+  ([`CLI.md`](CLI.md), "Self-updating apps"). A lunepack release carries the universal runtime
+  (`macos-universal`) and one thin runtime for each architecture, so
+  `lunepack prebuilt fetch --target macos-aarch64 --out <dir>` gives a thin app its runtime; from a checkout
+  on a Mac, `scripts/build-runtime.sh macos-aarch64` builds it (below).
 
 ## 4. Pack, publish and install
 

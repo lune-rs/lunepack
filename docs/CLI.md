@@ -3,7 +3,8 @@
 `lunepack` packages an app's build output into a signed release directory that any static host can
 serve, and checks such a directory the way a client does. The directory layout, the documents and
 the signatures are defined in [`docs/FORMAT.md`](FORMAT.md); the decisions behind the tool are
-M3-D1 to M3-D13 and M3-R1-D1 in [`docs/DECISIONS.md`](DECISIONS.md); what it defends against is in
+M3-D1 to M3-D13 and M3-R1-D1 of the project's internal decision log (not part of this repository; the
+rules are stated here); what it defends against is in
 the packager section of [`docs/THREAT-MODEL.md`](THREAT-MODEL.md).
 
 Walk-throughs with real output: [`docs/GETTING-STARTED.md`](GETTING-STARTED.md) (a Rust app),
@@ -391,7 +392,7 @@ earlier releases and the feeds in the directory; given those, the output is byte
 for any `--jobs`. A large changed file costs about 20 s per candidate at a 64 MiB window (up to
 about a minute at the cap), with up to two candidates per base and three bases by default; lower
 `--deltas` to pack faster. Measured on real 30 to 32 MB executables with one base and the defaults, the whole
-`pack` took 41 to 68 s and peaked at about 1.8 GB of process memory (DECISIONS.md D8).
+`pack` took 41 to 68 s and peaked at about 1.8 GB of process memory (D8 of the project's internal decision log).
 
 Upload order: the pack and the delta files first, then the manifest, then the feed (`feed add`), so a
 client never sees a manifest whose files are missing.
@@ -1085,7 +1086,7 @@ lunepack prebuilt fetch --target <TARGET> --out <DIR> [--kind <KIND>]... [--base
 ```
 
 Downloads the prebuilt binaries this CLI pins for one target (`linux-x86_64`, `linux-aarch64`,
-`windows-x86_64` or `macos-universal`), checks each against its pinned row and places it in `<DIR>`.
+`windows-x86_64`, `macos-universal`, `macos-aarch64` or `macos-x86_64`), checks each against its pinned row and places it in `<DIR>`.
 This is the only command that uses the network for them: `pack` never downloads anything, and
 `pack --require-pinned` names this command when a binary is a local build.
 
