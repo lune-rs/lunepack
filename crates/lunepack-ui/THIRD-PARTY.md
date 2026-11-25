@@ -12,8 +12,9 @@ their own licenses (`cargo metadata` lists them); this file names what is bundle
   Reserved Font Name `RznSans`, is `crates/lunepack-ui-luneui/assets/fonts/OFL.txt`, which stays
   beside the fonts.
 - The fonts are bundled, unmodified, with the software and are not sold by themselves. A
-  distribution of the `lunepack-ui` binary must carry this notice and the license text with it;
-  `pack --ui` places only the binary, so shipping them with a release belongs to the release
-  workflow (M13).
+  distribution of the `lunepack-ui` binary must carry this notice and the license text with it.
+  `cargo run -p xtask -- notices` copies the license text into
+  `crates/lunepack-cli/THIRD-PARTY-NOTICES.txt`, which `pack` places as `lunepack-NOTICES.txt`
+  beside the runtime (M13-D11), and the release assets carry it too.
 - The OFL covers the font binaries only, not lunepack's source, which is under the repository's own
   licenses (`LICENSE-MIT`, `LICENSE-APACHE`).

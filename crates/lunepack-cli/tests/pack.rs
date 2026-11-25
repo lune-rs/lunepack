@@ -351,6 +351,17 @@ fn exec_of(m: &VerifiedManifest, path: &str) -> bool {
     }
 }
 
+/// The third-party notices the CLI places beside the runtime (M13-D11): the generated file itself.
+const NOTICES: &[u8] = include_bytes!("../THIRD-PARTY-NOTICES.txt");
+
+/// The notices are placed at `path` as the generated file, hashed into the manifest and not
+/// executable.
+fn assert_notices(m: &VerifiedManifest, files: &BTreeMap<String, Vec<u8>>, path: &str) {
+    assert_eq!(files[path], NOTICES, "{path}");
+    assert!(!exec_of(m, path), "{path} is not exec");
+    assert_eq!(sha_of(m, path), Sha256Hasher.sha256(NOTICES), "{path}");
+}
+
 /// Deterministic noise (xorshift64), incompressible.
 fn noise(seed: u64, len: usize) -> Vec<u8> {
     let mut x = seed | 1;
@@ -1161,6 +1172,8 @@ fn update_pack_refusals() {
         ("bin/lunepack-ui", false),
         ("bin/lunepack-ui.exe", false),
         ("bin/LUNEPACK-UI", false),
+        ("bin/lunepack-NOTICES.txt", false),
+        ("bin/Lunepack-Notices.TXT", false),
     ] {
         let input = tempfile::tempdir().unwrap();
         app_tree(input.path(), "bin/app");
@@ -1175,6 +1188,7 @@ fn update_pack_refusals() {
     let input = tempfile::tempdir().unwrap();
     app_tree(input.path(), "bin/app");
     write(input.path(), "tools/lunepack-runtime", b"x");
+    write(input.path(), "tools/lunepack-NOTICES.txt", b"x");
     assert_ok(
         &pack_update(
             &w,
@@ -1309,6 +1323,8 @@ fn ui_pack_places_ui_beside_runtime() {
         assert!(exec_of(&m, ui_at), "{entry}: the UI is exec");
         assert_eq!(sha_of(&m, ui_at), Sha256Hasher.sha256(&ui_bytes));
         assert!(files.contains_key("lunepack-update.json"));
+        let notices_at = ui_at.replace("lunepack-ui", "lunepack-NOTICES.txt");
+        assert_notices(&m, &files, &notices_at);
     }
 }
 
@@ -1459,6 +1475,10 @@ fn update_config_tables() {
     let (_, files) = w.verify(&dir, "1.0.0", Target::LinuxX86_64);
     assert!(!files.contains_key("lunepack-update.json"));
     assert!(!files.contains_key("bin/lunepack-runtime"));
+    assert!(
+        !files.keys().any(|k| k.ends_with("lunepack-NOTICES.txt")),
+        "a pack without a runtime has no notices file"
+    );
 
     let broken = |toml: &str, needle: &str| {
         let w = World::new(1, 1);
@@ -1534,10 +1554,11 @@ fn update_pack_other_targets() {
         ),
         "windows-x86_64",
     );
-    let (_, files) = w.verify(&dir, "1.0.0", Target::WindowsX86_64);
+    let (m, files) = w.verify(&dir, "1.0.0", Target::WindowsX86_64);
     assert!(files.contains_key("bin/lunepack-runtime.exe"));
     assert!(files.contains_key("bin/lunepack-stub.exe"));
     assert!(files.contains_key("lunepack-update.json"));
+    assert_notices(&m, &files, "bin/lunepack-NOTICES.txt");
 
     // A Linux runtime for a Windows target, and an arm64 PE for x86-64, are refused.
     let elf = w.dir.path().join("runtime.elf");
@@ -1618,9 +1639,12 @@ fn update_pack_other_targets() {
         ),
         "macos-aarch64",
     );
-    let (_, files) = w.verify(&dir, "1.0.0", Target::MacosAarch64);
+    let (m, files) = w.verify(&dir, "1.0.0", Target::MacosAarch64);
     assert!(files.contains_key("Contents/MacOS/lunepack-runtime"));
     assert!(files.contains_key("Contents/Resources/lunepack-update.json"));
+    // The notices go beside the configuration, not into Contents/MacOS, which holds code only.
+    assert_notices(&m, &files, "Contents/Resources/lunepack-NOTICES.txt");
+    assert!(!files.contains_key("Contents/MacOS/lunepack-NOTICES.txt"));
 }
 
 // ---- `--stub` and stamping for Windows targets (M7 step 12) -------------------------------------
@@ -3144,6 +3168,8 @@ fn macos_pack_refusals() {
         ("Contents/Resources/deep/lunepack-update.json", false),
         ("Contents/MacOS/lunepack-runtime", false),
         ("Contents/MacOS/lunepack-ui", false),
+        ("Contents/Resources/lunepack-NOTICES.txt", false),
+        ("Contents/Resources/Lunepack-Notices.TXT", false),
     ] {
         let input = tempfile::tempdir().unwrap();
         mac_app(input.path());

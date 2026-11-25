@@ -425,6 +425,8 @@ Reserved names, each an error before anything is written:
 - a file named `lunepack-runtime` or `lunepack-runtime.exe` (any case) in the entry's directory, or a
   file named `lunepack-ui` or `lunepack-ui.exe` there, with or without `--ui`: the runtime starts a
   UI from its own directory, so the name is never left to an app file.
+- a file named `lunepack-NOTICES.txt` (any case) in the entry's directory (`Contents/Resources` for
+  `macos-*`), where `pack` places the third-party notices (below).
 
 The feed (`[update] feed`) must pass the feed rule of FORMAT.md 13.3, which `pack` checks with the same
 function a client runs before its first request: `https://` with a lowercase DNS name or an IPv4
@@ -432,6 +434,17 @@ address, `file:///`, or `http://` to a loopback IP literal (`127.x.y.z` or `[::1
 information, query, fragment, percent-encoding, uppercase or non-canonical form; a trailing `/` is
 added when missing. `http://` to any other host, `localhost` included, is refused: the error names
 `[update] feed` and the rule that failed and never prints the feed.
+
+Third-party notices (M13-D11): wherever `pack` places the runtime it also places `lunepack-NOTICES.txt`, a
+text file (not executable) beside the runtime, in the entry's directory, or in `Contents/Resources` for
+`macos-*`. It names every Rust package linked into the release binaries (`lunepack-runtime`,
+`lunepack-service`, `lunepack-stub`, `lunepack-ui` and `lunepack`) with its licence and licence texts, and
+holds the bundled font's licence and LuneUI's own notices; an app that ships the runtime thereby ships the
+notices the binaries' licences ask for. The CLI carries the file, `crates/lunepack-cli/THIRD-PARTY-NOTICES.txt`,
+which `cargo run -p xtask -- notices` generates from `cargo metadata` and the gate checks (`notices --check`
+fails when it is stale, or when a package has no licence expression, a licence outside the allowlist or no
+licence text). The notices are bytes of the CLI itself, so the same CLI gives the same pack (C2). A pack
+without a runtime has no notices file, and the app's own licence notices stay the app's to ship.
 
 Determinism (C2) covers the runtime too: the same inputs, runtime bytes, keys and `SOURCE_DATE_EPOCH`
 give a byte-identical configuration, pack and manifest. `verify` accepts the result; `inspect` lists
@@ -517,7 +530,8 @@ each written before hashing so the signed manifest covers them (FORMAT.md 13, 17
   `Contents/MacOS/<file>` (an executable regular file). The error names `Contents/Info.plist` or
   `[install] entry`, never the value.
 - The runtime is placed beside the entry, `Contents/MacOS/lunepack-runtime` (marked executable), and the
-  update configuration at `Contents/Resources/lunepack-update.json`.
+  update configuration at `Contents/Resources/lunepack-update.json`, with the third-party notices
+  (`lunepack-NOTICES.txt`, not executable) beside it.
 - With `--ui`, the update window is a helper app (M8-D6): the UI binary at
   `Contents/Helpers/lunepack-update.app/Contents/MacOS/lunepack-ui` (executable) with a generated
   `Contents/Info.plist` (`CFBundleExecutable` `lunepack-ui`; `CFBundleIdentifier` the app id with `_` written
@@ -531,8 +545,8 @@ each written before hashing so the signed manifest covers them (FORMAT.md 13, 17
   is refused naming `[macos] icon`, never its content.
 - Reserved, each an error before anything is written: `Contents/Helpers/lunepack-update.app` and
   everything under it, `Contents/Resources/lunepack-setup.payload` (the installer app's payload file), the
-  names `lunepack-update.json` (at any depth), and `lunepack-runtime` and `lunepack-ui` in
-  `Contents/MacOS`. Comparison ignores ASCII case.
+  names `lunepack-update.json` (at any depth), `lunepack-runtime` and `lunepack-ui` in
+  `Contents/MacOS`, and `Contents/Resources/lunepack-NOTICES.txt`. Comparison ignores ASCII case.
 - Symlinks are packed as links, unchanged, and must satisfy FORMAT 10.2: a target stays inside the
   bundle, may pass through other links inside it (a framework's `Versions/Current` → `A` and `Foo` →
   `Versions/Current/Foo` pack as they are), and follows at most 8 of them. Exec bits come from the

@@ -37,6 +37,9 @@ cargo test --workspace --locked
 stage "./scripts/check-boundaries.sh"
 ./scripts/check-boundaries.sh
 
+stage "cargo run -p xtask -- notices --check"
+cargo run --quiet --locked -p xtask -- notices --check
+
 stage "./scripts/check-secrets.sh"
 ./scripts/check-secrets.sh
 
