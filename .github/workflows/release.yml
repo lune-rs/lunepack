@@ -1,0 +1,461 @@
+name: release
+
+# The release of lunepack's prebuilt binaries (M13-D3, D27, D35 to D38), one workflow in five modes,
+# decided by scripts/release/mode.sh (the only reader of the event, the ref and the input):
+#   dry-run             a push to main or orch/** touching the release files, or a dispatch: build,
+#                       assemble and a self-test with a throwaway key; nothing is published or signed
+#   binaries            phase 1, dispatched on main: build, assemble, the draft v<version>, the signing
+#                       job (it waits for the maintainer's approval), the envelope attached to the draft
+#   rehearsal           binaries into the draft v<version>-rehearsal; the list says rehearsal: true
+#   tag                 phase 2, the push of the tag v<version> on the pin commit: prove the pins
+#                       (scripts/release/verify-pins.sh), add the CLI files, publish the draft
+#   rehearsal-finalize  tag against the rehearsal draft on the branch release-rehearsal; publishes nothing
+# The project key is an environment value of `release-signing` and reaches one step of one job, `sign`,
+# which has a read-only token. scripts/tests/test-workflows.sh holds this file to its rules.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: dry-run, binaries, rehearsal or rehearsal-finalize
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - binaries
+          - rehearsal
+          - rehearsal-finalize
+  push:
+    branches:
+      - main
+      - 'orch/**'
+    tags:
+      - 'v*'
+    # Path filters apply to the branch pushes only; GitHub does not evaluate them for a tag push.
+    paths:
+      - .github/workflows/release.yml
+      - scripts/release/**
+      - scripts/build-runtime.sh
+      - scripts/tests/test-release-scripts.sh
+      - scripts/tests/test-workflows.sh
+      - crates/lunepack-cli/prebuilt.json
+      - crates/lunepack-cli/prebuilt.sig.json
+      - crates/lunepack-cli/src/project_key.rs
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      version: ${{ steps.mode.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mode and version
+        id: mode
+        env:
+          LUNEPACK_INPUT_MODE: ${{ inputs.mode }}
+        run: scripts/release/mode.sh >>"$GITHUB_OUTPUT"
+
+  preflight:
+    # The checks that must hold at this commit before anything is built for release or the key is
+    # asked for: the boundary check, the notices, the publish dry run, the workflow lint and the
+    # release-script fixtures (they hold the key path down), the signing environment's settings,
+    # and, in every mode but dry-run, a project key built into the CLI.
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install gitleaks 8.30.1 (sha256 pinned)
+        run: |
+          set -euo pipefail
+          version=8.30.1
+          sha256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz"
+          echo "${sha256}  ${archive}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+      - name: Publish dry run (a clean tree, before anything is built here)
+        run: ./scripts/publish-dry-run.sh
+      - name: Boundary check
+        run: ./scripts/check-boundaries.sh
+      - name: Third-party notices
+        run: cargo run --quiet --locked -p xtask -- notices --check
+      - name: Workflow lint
+        run: bash scripts/tests/test-workflows.sh
+      - name: Release-script fixtures
+        run: bash scripts/tests/test-release-scripts.sh
+      - name: The signing environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LUNEPACK_RELEASE_MODE: ${{ needs.plan.outputs.mode }}
+        run: scripts/release/check-signing-env.sh "$LUNEPACK_RELEASE_MODE"
+      - name: A project key is built in (every mode but dry-run)
+        env:
+          LUNEPACK_RELEASE_MODE: ${{ needs.plan.outputs.mode }}
+        run: |
+          set -euo pipefail
+          cargo build --quiet --locked -p lunepack-cli
+          state=$(target/debug/lunepack prebuilt list --json | jq -er '.state')
+          echo "prebuilt list: state $state"
+          if [ "$LUNEPACK_RELEASE_MODE" != dry-run ] && [ "$state" = no-key ]; then
+            echo "no project key is built in: hold the key ceremony first" >&2
+            exit 1
+          fi
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.mode == 'dry-run' || needs.plan.outputs.mode == 'binaries' || needs.plan.outputs.mode == 'rehearsal'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x86_64, os: ubuntu-22.04, musl: x86_64-unknown-linux-musl }
+          - { target: linux-aarch64, os: ubuntu-22.04-arm, musl: aarch64-unknown-linux-musl }
+          - { target: windows-x86_64, os: windows-2022, musl: '' }
+          - { target: macos-universal, os: macos-14, musl: '' }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: musl-tools and the musl target (Linux)
+        if: runner.os == 'Linux'
+        env:
+          MUSL_TRIPLE: ${{ matrix.musl }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add "$MUSL_TRIPLE"
+      - name: Build (Linux, macOS)
+        if: runner.os != 'Windows'
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: scripts/release/build.sh "$RELEASE_TARGET" "$RUNNER_TEMP/release-bin"
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/release/build.ps1 -OutDir "$env:RUNNER_TEMP/release-bin"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-bin-${{ matrix.target }}
+          path: ${{ runner.temp }}/release-bin
+          if-no-files-found: error
+          retention-days: 7
+
+  build-cli:
+    # The lunepack CLI at this commit for the four hosts, in every mode. Its linux-x86_64 file is the
+    # tool of selftest, sign, attach and finalize; in mode tag the four files are added to the release.
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x86_64, os: ubuntu-22.04 }
+          - { target: linux-aarch64, os: ubuntu-22.04-arm }
+          - { target: windows-x86_64, os: windows-2022 }
+          - { target: macos-universal, os: macos-14 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the CLI
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release-cli"
+          mkdir -p "$out"
+          case $RELEASE_TARGET in
+            macos-universal)
+              for t in aarch64-apple-darwin x86_64-apple-darwin; do
+                MACOSX_DEPLOYMENT_TARGET=10.15 cargo build --locked --release -p lunepack-cli --target "$t" --config profile.release.strip=true
+              done
+              lipo -create -output "$out/lunepack" target/aarch64-apple-darwin/release/lunepack target/x86_64-apple-darwin/release/lunepack
+              ;;
+            windows-x86_64)
+              cargo build --locked --release -p lunepack-cli --target x86_64-pc-windows-msvc --config profile.release.strip=true
+              cp target/x86_64-pc-windows-msvc/release/lunepack.exe "$out/lunepack.exe"
+              ;;
+            linux-x86_64 | linux-aarch64)
+              cargo build --locked --release -p lunepack-cli --config profile.release.strip=true
+              cp target/release/lunepack "$out/lunepack"
+              ;;
+            *)
+              echo "unknown target" >&2
+              exit 1
+              ;;
+          esac
+          ls -l "$out"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-cli-${{ matrix.target }}
+          path: ${{ runner.temp }}/release-cli
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    needs: [plan, build]
+    if: needs.plan.outputs.mode == 'dry-run' || needs.plan.outputs.mode == 'binaries' || needs.plan.outputs.mode == 'rehearsal'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-bin-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-bin
+      - name: The list, the notices and SHA256SUMS
+        env:
+          LUNEPACK_RELEASE_MODE: ${{ needs.plan.outputs.mode }}
+        run: scripts/release/assemble.sh "$LUNEPACK_RELEASE_MODE" "$RUNNER_TEMP/release-bin" "$RUNNER_TEMP/release-assets"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-list
+          path: ${{ runner.temp }}/release-assets/prebuilt-${{ needs.plan.outputs.version }}.json
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+          retention-days: 7
+
+  selftest:
+    # Dry run only: a throwaway key made in this job signs the assembled list, and the list and the
+    # Linux x86-64 files are verified under it. Proves that the CLI's parser accepts what assemble.sh
+    # wrote and that the commands work; uploads nothing but its verdict.
+    needs: [plan, assemble, build-cli]
+    if: needs.plan.outputs.mode == 'dry-run'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: release-assets
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-cli-linux-x86_64
+          path: release-tool
+      - name: Sign with a throwaway key and verify
+        env:
+          LUNEPACK_RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          chmod u+x release-tool/lunepack
+          cli=$PWD/release-tool/lunepack
+          work="$RUNNER_TEMP/selftest"
+          mkdir -p "$work/files"
+          list="release-assets/prebuilt-$LUNEPACK_RELEASE_VERSION.json"
+          public=$("$cli" keys gen "$work/throwaway.lpk" | sed -n 's/^public: //p')
+          [ -n "$public" ]
+          cp release-assets/lunepack-*-"$LUNEPACK_RELEASE_VERSION"-linux-x86_64 "$work/files/"
+          "$cli" prebuilt sign --list "$list" --out "$work/selftest.sig.json" --sign "file:$work/throwaway.lpk" --trusted-key "$public"
+          rm -f "$work/throwaway.lpk"
+          "$cli" prebuilt verify --list "$list" --sig "$work/selftest.sig.json" --trusted-key "$public" --allow-rehearsal --dir "$work/files" | tee "$work/verdict.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-selftest-verdict
+          path: ${{ runner.temp }}/selftest/verdict.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  draft:
+    # Creates the draft v<version> (rehearsal: v<version>-rehearsal) with the binaries, the list,
+    # SHA256SUMS and the notices. Mode binaries fails when a release, a draft or a tag of that name
+    # exists, so a second run for one version stops before anything is signed; the concurrency group
+    # keeps two runs from passing that check together.
+    needs: [plan, assemble, preflight]
+    if: needs.plan.outputs.mode == 'binaries' || needs.plan.outputs.mode == 'rehearsal'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: release-draft
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: release-assets
+      - name: Create the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LUNEPACK_RELEASE_MODE: ${{ needs.plan.outputs.mode }}
+          LUNEPACK_RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          LUNEPACK_SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case $LUNEPACK_RELEASE_MODE in
+            binaries) tag="v$LUNEPACK_RELEASE_VERSION"; title="lunepack $LUNEPACK_RELEASE_VERSION" ;;
+            rehearsal) tag="v$LUNEPACK_RELEASE_VERSION-rehearsal"; title="lunepack $LUNEPACK_RELEASE_VERSION (rehearsal, never published)" ;;
+            *) echo "unexpected mode" >&2; exit 1 ;;
+          esac
+          releases=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | [.tag_name, (.draft | tostring)] | @tsv')
+          existing=$(printf '%s\n' "$releases" | awk -F '\t' -v t="$tag" '$1 == t { print $2 }')
+          refs=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$tag" --jq '.[].ref')
+          if [ "$LUNEPACK_RELEASE_MODE" = binaries ]; then
+            if [ -n "$existing" ]; then echo "a release or a draft named $tag exists" >&2; exit 1; fi
+            if printf '%s\n' "$refs" | grep -Fxq "refs/tags/$tag"; then echo "a tag $tag exists" >&2; exit 1; fi
+            gh release create "$tag" --draft --target "$LUNEPACK_SOURCE_COMMIT" --title "$title" --notes "Draft of phase 1." release-assets/*
+          else
+            case $existing in
+              "") gh release create "$tag" --draft --target "$LUNEPACK_SOURCE_COMMIT" --title "$title" --notes "A release rehearsal: never published." release-assets/* ;;
+              true) gh release upload "$tag" --clobber release-assets/* ;;
+              *) echo "$tag exists and is not a draft" >&2; exit 1 ;;
+            esac
+          fi
+
+  sign:
+    # The one job that can read the project key: it waits for the maintainer's approval in the
+    # environment release-signing (main only), has a read-only token, compiles and installs nothing,
+    # and runs only the three pinned actions, the CLI built by build-cli in this run and sign-list.sh.
+    needs: [plan, draft, preflight, build-cli]
+    if: needs.plan.outputs.mode == 'binaries' || needs.plan.outputs.mode == 'rehearsal'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: release-signing
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-list
+          path: release-list
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-cli-linux-x86_64
+          path: release-tool
+      - run: scripts/release/sign-list.sh "$LUNEPACK_SIGN_LIST" "$LUNEPACK_SIGN_OUT" "$LUNEPACK_RELEASE_MODE"
+        env:
+          LUNEPACK_PROJECT_KEY: ${{ secrets.LUNEPACK_PROJECT_KEY }}
+          LUNEPACK_CLI: release-tool/lunepack
+          LUNEPACK_SIGN_LIST: release-list/prebuilt-${{ needs.plan.outputs.version }}.json
+          LUNEPACK_SIGN_OUT: release-out/prebuilt-${{ needs.plan.outputs.version }}.sig.json
+          LUNEPACK_RELEASE_MODE: ${{ needs.plan.outputs.mode }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-envelope
+          path: release-out/prebuilt-${{ needs.plan.outputs.version }}.sig.json
+          if-no-files-found: error
+          retention-days: 7
+
+  attach:
+    # Downloads the draft's files as stored, verifies the envelope and every file under the built-in
+    # key of the CLI that signed, and only then adds the envelope to the draft.
+    needs: [plan, sign, build-cli]
+    if: needs.plan.outputs.mode == 'binaries' || needs.plan.outputs.mode == 'rehearsal'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-envelope
+          path: release-envelope
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-cli-linux-x86_64
+          path: release-tool
+      - name: Verify the draft as stored, then attach the envelope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LUNEPACK_RELEASE_MODE: ${{ needs.plan.outputs.mode }}
+          LUNEPACK_RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          chmod u+x release-tool/lunepack
+          case $LUNEPACK_RELEASE_MODE in
+            binaries) tag="v$LUNEPACK_RELEASE_VERSION"; extra=() ;;
+            rehearsal) tag="v$LUNEPACK_RELEASE_VERSION-rehearsal"; extra=(--allow-rehearsal) ;;
+            *) echo "unexpected mode" >&2; exit 1 ;;
+          esac
+          sig="release-envelope/prebuilt-$LUNEPACK_RELEASE_VERSION.sig.json"
+          mkdir draft-files
+          gh release download "$tag" --dir draft-files
+          release-tool/lunepack prebuilt verify --list "draft-files/prebuilt-$LUNEPACK_RELEASE_VERSION.json" --sig "$sig" --dir draft-files --all "${extra[@]}"
+          if [ "$LUNEPACK_RELEASE_MODE" = rehearsal ]; then
+            gh release upload "$tag" --clobber "$sig"
+          else
+            gh release upload "$tag" "$sig"
+          fi
+
+  finalize:
+    # Phase 2: proves the pins at this commit (verify-pins.sh), adds the CLI files and, in mode tag
+    # only, publishes the draft. It never replaces a file of the draft.
+    needs: [plan, preflight, build-cli]
+    if: needs.plan.outputs.mode == 'tag' || needs.plan.outputs.mode == 'rehearsal-finalize'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-cli-*
+          path: ${{ runner.temp }}/release-cli
+      - name: Prove the pins, add the CLI, publish (mode tag only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LUNEPACK_RELEASE_MODE: ${{ needs.plan.outputs.mode }}
+          LUNEPACK_RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          case $LUNEPACK_RELEASE_MODE in
+            tag) tag="v$LUNEPACK_RELEASE_VERSION" ;;
+            rehearsal-finalize) tag="v$LUNEPACK_RELEASE_VERSION-rehearsal" ;;
+            *) echo "unexpected mode" >&2; exit 1 ;;
+          esac
+          cli_dir="$RUNNER_TEMP/release-cli"
+          chmod u+x "$cli_dir/release-cli-linux-x86_64/lunepack"
+          mkdir "$RUNNER_TEMP/draft-files"
+          gh release download "$tag" --dir "$RUNNER_TEMP/draft-files"
+          LUNEPACK_CLI="$cli_dir/release-cli-linux-x86_64/lunepack" scripts/release/verify-pins.sh "$RUNNER_TEMP/draft-files" "$LUNEPACK_RELEASE_MODE"
+          mkdir "$RUNNER_TEMP/cli-assets"
+          for t in linux-x86_64 linux-aarch64 macos-universal; do
+            cp "$cli_dir/release-cli-$t/lunepack" "$RUNNER_TEMP/cli-assets/lunepack-cli-$LUNEPACK_RELEASE_VERSION-$t"
+          done
+          cp "$cli_dir/release-cli-windows-x86_64/lunepack.exe" "$RUNNER_TEMP/cli-assets/lunepack-cli-$LUNEPACK_RELEASE_VERSION-windows-x86_64.exe"
+          gh release upload "$tag" "$RUNNER_TEMP"/cli-assets/*
+          if [ "$LUNEPACK_RELEASE_MODE" = tag ]; then
+            gh release edit "$tag" --draft=false
+          fi

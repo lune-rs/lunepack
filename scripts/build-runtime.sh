@@ -2,8 +2,13 @@
 # Builds the lunepack runtime for a Linux or macOS target (M5-D7, M8-D14). `lunepack pack --runtime
 # <path>` places the result beside the app's entry. Run from anywhere; builds from the repo top level.
 #
-#   scripts/build-runtime.sh <target> [--out <path>]
-#   scripts/build-runtime.sh --print-command <target>   # print the build command(s), run nothing
+#   scripts/build-runtime.sh <target> [--package <name>] [--out <path>]
+#   scripts/build-runtime.sh --print-command <target> [--package <name>]   # print the build command(s), run nothing
+#
+# --package builds another shipped binary by the same rules and checks (M13 step 14, the release
+# build): lunepack-runtime (the default), lunepack-service (static musl on Linux, like the runtime),
+# or lunepack-ui on a macOS target only (the UI is not a static binary: on Linux the release build
+# makes it with the host's C library, scripts/release/build.sh).
 #
 # Targets: linux-x86_64, linux-aarch64 (a static musl build), macos-aarch64, macos-x86_64 and
 # macos-universal (both slices, joined by `lipo -create`; macOS hosts only).
@@ -19,7 +24,10 @@
 # the x86_64 slice only: the aarch64 slice keeps Rust's own minimum, macOS 11.0, the first release
 # for Apple silicon. The binary is stripped, then checked: `lipo -archs` names exactly the target's
 # architecture(s), `otool -L` lists system libraries only (/usr/lib, /System/Library), and the
-# x86_64 slice's minimum macOS is 10.15.
+# x86_64 slice's minimum macOS is 10.15. The Apple linker signs an arm64 binary ad hoc
+# ("linker-signed") and leaves an x86_64 one unsigned; a slice it left unsigned gets the same kind
+# of signature (`codesign -s - -o linker-signed`, no identity), so every slice of the result passes
+# `codesign --verify --strict` and an app's own signer replaces it as it replaces the linker's.
 #
 # CARGO_TARGET_DIR is honoured (default: target/ at the repo root). The script prints the binary's
 # size (the first measured build is the D37 baseline, docs/STATE.md). bash 3.2 compatible (D30).
@@ -31,7 +39,7 @@ self=${0##*/}
 deployment_target=10.15
 
 usage() {
-  echo "usage: $self [--print-command] <linux-x86_64|linux-aarch64|macos-aarch64|macos-x86_64|macos-universal> [--out <path>]" >&2
+  echo "usage: $self [--print-command] <linux-x86_64|linux-aarch64|macos-aarch64|macos-x86_64|macos-universal> [--package <lunepack-runtime|lunepack-service|lunepack-ui>] [--out <path>]" >&2
   echo "  macOS builds set MACOSX_DEPLOYMENT_TARGET=$deployment_target, which binds the x86_64 slice only;" >&2
   echo "  the aarch64 slice keeps Rust's 11.0 minimum." >&2
 }
@@ -45,6 +53,7 @@ print_only=0
 out=
 have_out=0
 target=
+package=
 while [ "$#" -gt 0 ]; do
   case $1 in
     -h | --help)
@@ -68,6 +77,14 @@ while [ "$#" -gt 0 ]; do
       out=$2
       shift 2
       ;;
+    --package)
+      if [ -n "$package" ] || [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        usage
+        exit 2
+      fi
+      package=$2
+      shift 2
+      ;;
     *)
       if [ -n "$target" ]; then
         usage
@@ -82,6 +99,14 @@ if [ -z "$target" ]; then
   usage
   exit 2
 fi
+case ${package:=lunepack-runtime} in
+  lunepack-runtime | lunepack-service | lunepack-ui) ;;
+  *)
+    echo "$self: unknown package (only lunepack-runtime, lunepack-service and lunepack-ui are built here)" >&2
+    usage
+    exit 2
+    ;;
+esac
 
 kind=linux
 triples=()
@@ -118,22 +143,28 @@ case $target in
     ;;
 esac
 
+if [ "$package" = lunepack-ui ] && [ "$kind" != macos ]; then
+  echo "$self: lunepack-ui is built for macOS targets only here (on Linux it is not a static binary; scripts/release/build.sh builds it)" >&2
+  usage
+  exit 2
+fi
+
 target_dir=${CARGO_TARGET_DIR:-target}
-build_args=(build --locked --release -p lunepack-runtime --config profile.release.strip=true)
+build_args=(build --locked --release -p "$package" --config profile.release.strip=true)
 
 if [ "$kind" = macos ]; then
-  universal_bin=$target_dir/universal-apple-darwin/release/lunepack-runtime
+  universal_bin=$target_dir/universal-apple-darwin/release/$package
   if [ "$print_only" -eq 1 ]; then
     for t in "${triples[@]}"; do
-      echo "MACOSX_DEPLOYMENT_TARGET=$deployment_target cargo build --locked --release -p lunepack-runtime --target $t --config profile.release.strip=true"
+      echo "MACOSX_DEPLOYMENT_TARGET=$deployment_target cargo build --locked --release -p $package --target $t --config profile.release.strip=true"
     done
     if [ "$target" = macos-universal ]; then
-      echo "lipo -create -output $universal_bin $target_dir/aarch64-apple-darwin/release/lunepack-runtime $target_dir/x86_64-apple-darwin/release/lunepack-runtime"
+      echo "lipo -create -output $universal_bin $target_dir/aarch64-apple-darwin/release/$package $target_dir/x86_64-apple-darwin/release/$package"
     fi
     exit 0
   fi
 else
-  cmd=(cargo build --locked --release -p lunepack-runtime --target "$triple" --config profile.release.strip=true)
+  cmd=(cargo build --locked --release -p "$package" --target "$triple" --config profile.release.strip=true)
   if [ "$print_only" -eq 1 ]; then
     echo "${cmd[*]}"
     exit 0
@@ -161,22 +192,31 @@ esac
 
 if [ "$kind" = macos ]; then
   [ "$(uname -s)" = Darwin ] || die "macOS targets are built on a macOS host only (the Apple linker, lipo and otool are needed)"
-  for tool in lipo otool; do
+  for tool in lipo otool codesign; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is not on PATH (the Xcode command line tools); the check cannot run"
   done
   cd "$here/.."
   for t in "${triples[@]}"; do
     MACOSX_DEPLOYMENT_TARGET=$deployment_target cargo "${build_args[@]}" --target "$t"
-    [ -f "$target_dir/$t/release/lunepack-runtime" ] || die "the build left no $target_dir/$t/release/lunepack-runtime"
+    slice=$target_dir/$t/release/$package
+    [ -f "$slice" ] || die "the build left no $slice"
+    # A slice the linker left unsigned (x86_64) gets the linker's kind of ad-hoc signature; any
+    # other verification failure is an error.
+    if ! verify_out=$(LC_ALL=C codesign --verify "$slice" 2>&1); then
+      case $verify_out in
+        *"not signed at all"*) LC_ALL=C codesign -s - -o linker-signed "$slice" || die "codesign could not sign $slice ad hoc" ;;
+        *) die "codesign --verify failed on $slice: $verify_out" ;;
+      esac
+    fi
   done
   if [ "$target" = macos-universal ]; then
     mkdir -p "${universal_bin%/*}"
     lipo -create -output "$universal_bin" \
-      "$target_dir/aarch64-apple-darwin/release/lunepack-runtime" \
-      "$target_dir/x86_64-apple-darwin/release/lunepack-runtime"
+      "$target_dir/aarch64-apple-darwin/release/$package" \
+      "$target_dir/x86_64-apple-darwin/release/$package"
     bin=$universal_bin
   else
-    bin=$target_dir/${triples[0]}/release/lunepack-runtime
+    bin=$target_dir/${triples[0]}/release/$package
   fi
   [ -f "$bin" ] || die "the build left no $bin"
 
@@ -213,6 +253,7 @@ if [ "$kind" = macos ]; then
     fi
     minos_report="$minos_report $a=$minos"
   done
+  LC_ALL=C codesign --verify --strict --all-architectures "$bin" >/dev/null 2>&1 || die "$bin does not pass codesign --verify --strict on every slice"
 
   if [ "$have_out" -eq 1 ]; then
     cp "$bin" "$out"
@@ -222,6 +263,7 @@ if [ "$kind" = macos ]; then
   echo "built: $bin"
   echo "macho: yes (${archs}; system libraries only)"
   echo "minos:${minos_report}"
+  echo "signature: ad hoc on every slice (codesign --verify --strict passes)"
   echo "size: ${size//[[:space:]]/} bytes"
   exit 0
 fi
@@ -244,7 +286,7 @@ command -v readelf >/dev/null 2>&1 || die "readelf is not on PATH (apt: binutils
 
 cd "$here/.."
 "${cmd[@]}"
-bin=$target_dir/$triple/release/lunepack-runtime
+bin=$target_dir/$triple/release/$package
 [ -f "$bin" ] || die "the build left no $bin"
 
 # The static check fails closed: a readelf that prints nothing recognisable is a failure.
