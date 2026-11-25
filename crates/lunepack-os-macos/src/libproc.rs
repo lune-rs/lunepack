@@ -178,8 +178,18 @@ pub fn exe_path(pid: u32) -> io::Result<Option<PathBuf>> {
     Ok(path_of(&buf[..(got as usize).min(buf.len())]))
 }
 
+/// `ENOENT` from a read of one vnode of a live process: the kernel could not take a reference on
+/// the vnode, because it is dead or being reclaimed (its volume was force-unmounted, a FUSE mount
+/// under it was torn down, or it was revoked), or the file system says the file no longer exists.
+/// Either way the file is on no mounted file system, so it lies in no tree, and the answer does not
+/// change on a re-read while the process holds it (M13 step 5: a test process of another program
+/// held one, and every scan of this user failed closed until it ended).
+fn dead_vnode(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ENOENT)
+}
+
 /// Source two: the process's working directory (`PROC_PIDVNODEPATHINFO`). `None` when the process
-/// is gone or has none.
+/// is gone or has none, or when its working directory is a dead vnode ([`dead_vnode`]).
 pub fn cwd_path(pid: u32) -> io::Result<Option<PathBuf>> {
     let Some(pid) = pid_arg(pid) else {
         return Ok(None);
@@ -199,7 +209,11 @@ pub fn cwd_path(pid: u32) -> io::Result<Option<PathBuf>> {
     };
     if got <= 0 {
         let err = io::Error::last_os_error();
-        return if gone(&err) { Ok(None) } else { Err(err) };
+        return if gone(&err) || dead_vnode(&err) {
+            Ok(None)
+        } else {
+            Err(err)
+        };
     }
     if got != size {
         return Err(io::Error::new(
@@ -258,8 +272,9 @@ fn list_fds(pid: libc::c_int) -> io::Result<Option<Vec<libc::proc_fdinfo>>> {
 }
 
 /// Source three: the paths of the process's open vnode files (`PROC_PIDLISTFDS`, then
-/// `PROC_PIDFDVNODEPATHINFO` for each vnode descriptor). A descriptor closed between the two calls
-/// is skipped; a process that is gone gives an empty list.
+/// `PROC_PIDFDVNODEPATHINFO` for each vnode descriptor). A descriptor closed between the two calls,
+/// or one whose vnode is dead ([`dead_vnode`]), is skipped; a process that is gone gives an empty
+/// list.
 pub fn fd_paths(pid: u32) -> io::Result<Vec<PathBuf>> {
     let Some(pid) = pid_arg(pid) else {
         return Ok(Vec::new());
@@ -287,8 +302,9 @@ pub fn fd_paths(pid: u32) -> io::Result<Vec<PathBuf>> {
         };
         if got <= 0 {
             let err = io::Error::last_os_error();
-            // The process ended or this descriptor was closed since the list was read.
-            if gone(&err) || err.raw_os_error() == Some(libc::EBADF) {
+            // The process ended or this descriptor was closed since the list was read, or the
+            // descriptor's file is on no mounted file system.
+            if gone(&err) || err.raw_os_error() == Some(libc::EBADF) || dead_vnode(&err) {
                 continue;
             }
             return Err(err);

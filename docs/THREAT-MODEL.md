@@ -773,8 +773,12 @@ rather than deletes, and fails toward keeping the app.
   from it, with working directory `/` and its frameworks only mapped, is judged not in use, so the resumed
   removal goes on; before M8-D19 it failed closed. Q103 accepted that. A read that fails on a process that
   is starting or ending is re-read up to three times, ten milliseconds apart, and a process that has
-  meanwhile ended is not in use; one still unreadable is in use. A process that forks while the scanning
-  process holds a descriptor open under the tree inherits it until its exec and is counted, rightly.
+  meanwhile ended is not in use; one still unreadable is in use. A working directory or open file whose
+  vnode is dead (its volume was force-unmounted, or a FUSE mount was torn down) reads as `ENOENT` for as
+  long as the process holds it; it lies on no mounted file system, so in no tree, and is not counted as a
+  failed read (otherwise one such process would hold every tree of its user in use until it ended). A
+  process that forks while the scanning process holds a descriptor open under the tree inherits it until
+  its exec and is counted, rightly.
 - **The installer's reversed channel (M8-D7, M6-D1, M6-D5).** In the installer app the UI is the main
   executable and the runtime is its child over the UI's own streams, the reverse of every other flow. The
   runtime treats every message from its parent as untrusted exactly as it does a child UI's (the flow

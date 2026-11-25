@@ -505,6 +505,10 @@ const REREAD_PAUSE: Duration = Duration::from_millis(10);
 ///   the tree, and the process is judged by its working directory and open files; it counts as in
 ///   use when its working directory is refused too, since then nothing about it can be told.
 ///
+/// A working directory or an open file whose vnode is dead (`ENOENT`: a force-unmounted volume, a
+/// torn-down FUSE mount) is not a failed read: that file is on no mounted file system and so in no
+/// tree, and the source reads as having no such path (`libproc::cwd_path`, `libproc::fd_paths`).
+///
 /// Any other failed read (the listing's identity, the executable, the working directory, the open
 /// files) is re-read up to [`REREADS`] times, [`REREAD_PAUSE`] apart, each time reading the
 /// identity first (M8-D19 (b)): a process that is gone, a zombie, or whose pid now names a process

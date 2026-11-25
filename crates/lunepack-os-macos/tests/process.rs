@@ -81,6 +81,10 @@ mod macos {
             tree_named_unopened,
         ),
         (
+            "a_process_holding_a_force_unmounted_volume_uses_no_tree",
+            dead_volume_in_no_tree,
+        ),
+        (
             "terminate_kills_a_child_that_ignores_sigterm",
             terminate_stubborn,
         ),
@@ -644,6 +648,124 @@ mod macos {
         );
         assert_eq!(unopened.unwrap(), opened);
         assert!(!in_use.unwrap(), "a tree nobody uses");
+    }
+
+    /// A disk image attached at a mount point of its own; force-detached on drop if still attached.
+    struct Attached(PathBuf);
+
+    impl Attached {
+        fn new(scratch: &Path) -> Attached {
+            let image = scratch.join("volume.dmg");
+            let mount = scratch.join("volume");
+            std::fs::create_dir(&mount).unwrap();
+            hdiutil(&[
+                "create",
+                "-size",
+                "4m",
+                "-fs",
+                "APFS",
+                "-volname",
+                "lunepack-test",
+            ])
+            .args(["-layout", "NONE", "-quiet"])
+            .arg(&image)
+            .status()
+            .map(|s| assert!(s.success(), "hdiutil create: {s}"))
+            .expect("start hdiutil");
+            hdiutil(&[
+                "attach",
+                "-nobrowse",
+                "-noautoopen",
+                "-quiet",
+                "-mountpoint",
+            ])
+            .arg(&mount)
+            .arg(&image)
+            .status()
+            .map(|s| assert!(s.success(), "hdiutil attach: {s}"))
+            .expect("start hdiutil");
+            Attached(mount)
+        }
+
+        /// `hdiutil detach -force`: the volume goes while files on it are still open.
+        fn force_detach(&self) -> bool {
+            hdiutil(&["detach", "-force", "-quiet"])
+                .arg(&self.0)
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+    }
+
+    impl Drop for Attached {
+        fn drop(&mut self) {
+            let mounted = |p: &Path| {
+                use std::os::unix::fs::MetadataExt;
+                let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
+                p.parent().is_some_and(|parent| dev(p) != dev(parent))
+            };
+            if mounted(&self.0) {
+                let _ = self.force_detach();
+            }
+        }
+    }
+
+    fn hdiutil(args: &[&str]) -> Command {
+        let mut cmd = Command::new("/usr/bin/hdiutil");
+        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null());
+        cmd
+    }
+
+    /// A process whose working directory and open file were on a volume that was then
+    /// force-unmounted holds two dead vnodes: the kernel answers `ENOENT` for each, as long as the
+    /// process lives. They lie in no tree, so they make no tree in use; read as failed reads, they
+    /// made every scan of this user answer in use until that process ended (M13 step 5: a FUSE test
+    /// of another program, during the gate).
+    fn dead_volume_in_no_tree(scratch: &Path) {
+        let tree = scratch.join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let volume = Attached::new(scratch);
+        let file = volume.0.join("data");
+        std::fs::write(&file, b"x").unwrap();
+        let ready = scratch.join("ready");
+        let mut child = Reap(
+            Command::new(helper())
+                .arg("hold")
+                .arg(&file)
+                .arg(&ready)
+                .arg("600")
+                .current_dir(&volume.0)
+                .spawn()
+                .unwrap(),
+        );
+        wait_for_file(&ready);
+        assert!(
+            os().tree_in_use(&volume.0, &[]).unwrap(),
+            "the control: the mounted volume is in use"
+        );
+        assert!(!os().tree_in_use(&tree, &[]).unwrap(), "before the unmount");
+        assert!(volume.force_detach(), "hdiutil detach -force");
+        assert!(
+            !os().tree_in_use(&tree, &[]).unwrap(),
+            "a tree nobody uses, beside a process on a dead volume"
+        );
+        assert!(
+            !os().tree_in_use(&volume.0, &[]).unwrap(),
+            "the empty mount point left behind"
+        );
+        // Each source on its own: no path, and no error.
+        let pid = child.0.id();
+        assert_eq!(
+            libproc::cwd_path(pid).unwrap(),
+            None,
+            "a dead working directory"
+        );
+        let files = libproc::fd_paths(pid).unwrap();
+        assert!(
+            !files.iter().any(|p| p.starts_with(&volume.0)),
+            "a dead open file: {files:?}"
+        );
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
     }
 
     /// A copy of the helper at `<scratch>/exe/helper`, started with `args` in `cwd`, then deleted
