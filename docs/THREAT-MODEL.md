@@ -1239,7 +1239,15 @@ an administrator's account can use it too, by approving or by changing the envir
 runs in the signing job can use it: the three pinned first-party actions, `scripts/release/sign-list.sh`, and
 the `lunepack` CLI that an unprivileged job of the same run built at the same commit (the job `sign`
 compiles and installs nothing, so a build script or procedural macro of the dependency tree never runs next
-to the key; the CLI and everything linked into it is trusted with the key all the same). What stands in the
+to the key; the CLI and everything linked into it is trusted with the key all the same). Every job of a run
+can upload an artifact under any name, and an upload under a name that exists replaces it, so a download by
+name would make every job of the run (the `build` job's UI stack and the `preflight` job's tools included)
+trusted with the key. The workflow therefore downloads by artifact id: `build-cli`, `assemble` and `sign`
+publish the id of each artifact they upload as a job output, and `sign`, `attach` and `finalize` download
+only those ids (a replaced artifact has a new id, the old one no longer exists, and the download fails). The
+workflow lint fails on a download by name or pattern in those three jobs. A job that swaps the draft's
+binaries (`release-assets`) gains nothing either: `attach` verifies every file of the draft against the
+signed list, which `sign` took by id. What stands in the
 way of everyone else: the secret belongs to one environment and to nothing else (never a repository or
 organization secret, which the runbook has the maintainer check); the environment admits only the branch
 `main` and needs the approval; the job's token is read-only (`contents: read`); the key is in the

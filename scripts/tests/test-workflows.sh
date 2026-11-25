@@ -261,6 +261,18 @@ release_ok() {
       if printf '%s\n' "$step" | grep -q '^        uses: actions/checkout@' && ! printf '%s\n' "$step" | grep -Fxq '          persist-credentials: false'; then
         problem "$job: a checkout without persist-credentials: false"
       fi
+      # The jobs that run a handed-over file, or hold a write token, download by artifact id: a
+      # download by name or pattern takes whatever any job of the run uploaded last under that name.
+      case $job in
+        sign | attach | finalize)
+          if printf '%s\n' "$step" | grep -q '^        uses: actions/download-artifact@'; then
+            if printf '%s\n' "$step" | grep -Eq '^          (name|pattern):' ||
+              ! printf '%s\n' "$step" | grep -Eq '^          artifact-ids: \$\{\{ needs\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_]+ \}\}(,\$\{\{ needs\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_]+ \}\})*$'; then
+              problem "$job: a download-artifact step that is not by artifact-ids: from a job output (a download by name or pattern can be replaced by any job of the run)"
+            fi
+          fi
+          ;;
+      esac
       i=$((i + 1))
     done
   done < <(awk '/^jobs:/ { on = 1; next } on && /^[^ #]/ { exit } on && /^  [A-Za-z0-9_-]+:/ { j = $0; sub(/^  /, "", j); sub(/:.*/, "", j); print j }' "$f")
@@ -529,6 +541,14 @@ else
   rseed cache "actions/cache is not allowed in release.yml"
   r awk '{ print } /^on:/ { print "  pull_request:" }' "$real_release"
   rseed pull-request "a pull_request trigger is not allowed in release.yml"
+  r in_job_sub sign '^          artifact-ids: .*outputs.id_linux_x86_64' '          name: release-cli-linux-x86_64' "$real_release"
+  rseed sign-download-by-name "sign: a download-artifact step that is not by artifact-ids"
+  r in_job_sub attach '^          artifact-ids: .*outputs.envelope_id' '          name: release-envelope' "$real_release"
+  rseed attach-download-by-name "attach: a download-artifact step that is not by artifact-ids"
+  r in_job_sub finalize '^          artifact-ids: ' '          pattern: release-cli-*' "$real_release"
+  rseed finalize-download-by-pattern "finalize: a download-artifact step that is not by artifact-ids"
+  r in_job_sub attach '^          artifact-ids: .*outputs.id_linux_x86_64' '          artifact-ids: 123' "$real_release"
+  rseed attach-literal-id "attach: a download-artifact step that is not by artifact-ids"
   r in_job_sub assemble '^        run: scripts/release/assemble.sh' '        run: scripts/release/assemble.sh "${{ inputs.mode }}" a b' "$real_release"
   rseed run-expression "an expression inside run:"
   r in_job_ins sign '^          persist-credentials: false' "        env:\n$KEY_LINE" "$T_TMP/r1.yml"
