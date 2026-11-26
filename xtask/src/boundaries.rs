@@ -23,6 +23,9 @@ pub enum Role {
     Adapter,
     Facade,
     Binary,
+    /// A language binding (M14-D1): wraps the facade and adds no logic, so its normal dependencies
+    /// are the core and the facade only. It constructs no adapter; the facade's default wiring does.
+    Binding,
     Tool,
 }
 
@@ -44,6 +47,7 @@ pub const ROLES: &[(&str, Role)] = &[
     ("lunepack-ui", Role::Binary),
     ("lunepack-stub", Role::Binary),
     ("lunepack-service", Role::Binary),
+    ("lunepack-ffi", Role::Binding),
     ("xtask", Role::Tool),
 ];
 
@@ -66,12 +70,13 @@ pub const PUBLISH_SET: &[&str] = &[
     "lunepack-os-windows",
 ];
 
-/// Crates that may lift `unsafe_code` (M1-D3); `lunepack-ffi` joins here later.
+/// Crates that may lift `unsafe_code` (M1-D3); `lunepack-ffi` joined with M14-D1.
 pub const UNSAFE_ALLOWLIST: &[&str] = &[
     "lunepack-fs",
     "lunepack-os-windows",
     "lunepack-os-macos",
     "lunepack-os-linux",
+    "lunepack-ffi",
 ];
 
 /// External (non-workspace) dependencies `lunepack-core` may have (M2-D1): the pure parsing,
@@ -240,6 +245,7 @@ fn allowed_normal(role: Role) -> Vec<&'static str> {
         Role::Testkit | Role::Adapter => &[Role::Core],
         Role::Facade => &[Role::Core, Role::Adapter],
         Role::Binary => &[Role::Core, Role::Adapter, Role::Facade],
+        Role::Binding => &[Role::Core, Role::Facade],
     };
     roles.iter().flat_map(|r| names_with_role(*r)).collect()
 }

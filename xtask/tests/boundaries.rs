@@ -315,6 +315,76 @@ undocumented_unsafe_blocks = "deny"
         assert_has(&fx.run().1, "mystery", "unknown-member");
     }
 
+    /// The clean fixture plus the binding crate (M14-D1): the facade as its one dependency and the
+    /// copied lints an allowlisted crate carries.
+    fn with_ffi() -> Fx {
+        let mut fx = Fx::clean();
+        fx.crates.insert(
+            "lunepack-ffi".into(),
+            manifest(
+                "lunepack-ffi",
+                OVERRIDE_LINTS,
+                r#"lunepack = { path = "../lunepack" }"#,
+            ),
+        );
+        fx
+    }
+
+    #[test]
+    fn ffi_binding_on_the_facade_and_with_lifted_unsafe_is_clean() {
+        let (n, vs) = with_ffi().run();
+        assert_eq!(n, 7);
+        assert_clean(&vs);
+    }
+
+    #[test]
+    fn ffi_binding_on_the_core_is_clean() {
+        let mut fx = with_ffi();
+        fx.add_dep(
+            "lunepack-ffi",
+            r#"lunepack-core = { path = "../lunepack-core" }"#,
+        );
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn ffi_binding_on_an_adapter_is_rejected_by_every_edge_kind() {
+        for (table, line) in [
+            (
+                "[dependencies]",
+                r#"lunepack-http = { path = "../lunepack-http" }"#,
+            ),
+            (
+                "[build-dependencies]",
+                r#"lunepack-fs = { path = "../lunepack-fs" }"#,
+            ),
+        ] {
+            let mut fx = with_ffi();
+            if table == "[dependencies]" {
+                fx.add_dep("lunepack-ffi", line);
+            } else {
+                fx.append("lunepack-ffi", &format!("{table}\n{line}"));
+            }
+            assert_has(&fx.run().1, "lunepack-ffi", "edge");
+        }
+    }
+
+    #[test]
+    fn ffi_binding_with_workspace_lints_is_clean_and_other_crates_may_not_lift_unsafe() {
+        // The binding is allowlisted, so another member that copies its lints is still refused.
+        let mut fx = with_ffi();
+        fx.edit("lunepack-http", |m| *m = m.replace(INHERIT, OVERRIDE_LINTS));
+        let vs = fx.run().1;
+        assert_has(&vs, "lunepack-http", "lints");
+        assert!(!has(&vs, "lunepack-ffi", "lints"), "{}", render(&vs));
+        // And the binding itself must still keep the copied lints in full.
+        let mut fx = with_ffi();
+        fx.edit("lunepack-ffi", |m| {
+            *m = m.replace("undocumented_unsafe_blocks = \"deny\"\n", "")
+        });
+        assert_has(&fx.run().1, "lunepack-ffi", "lints");
+    }
+
     #[test]
     fn h_git_and_outside_path_deps_are_rejected() {
         let mut fx = Fx::clean();
@@ -1500,7 +1570,7 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         );
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            "boundaries: ok (17 packages)"
+            "boundaries: ok (18 packages)"
         );
     }
 

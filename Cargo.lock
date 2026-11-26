@@ -2198,6 +2198,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lunepack-ffi"
+version = "0.1.0"
+dependencies = [
+ "lunepack",
+]
+
+[[package]]
 name = "lunepack-fs"
 version = "0.1.0"
 dependencies = [
