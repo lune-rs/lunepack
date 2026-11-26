@@ -189,6 +189,8 @@ jobs:
     # `e2e-windows-defender` is the same with Defender on. A skip is not a pass: the script exits
     # non-zero on a failed row. The .NET example (M13 step 9) is app E of the suite: the script
     # publishes it with the SDK installed below, and nothing here sets the LUNEPACK_E2E_DOTNET=0 opt-out.
+    # The C example (M14 step 8) is app F: the script builds it with the Visual Studio build tools
+    # the runner image has (the `cc` crate finds them), and nothing here sets the LUNEPACK_E2E_C=0 opt-out.
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
