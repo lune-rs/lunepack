@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use crate::transport::{FakeOrigin, Reply};
 
 /// How long a blocked socket call waits before the thread looks at the stop flag again.
-const TICK: Duration = Duration::from_millis(50);
+pub(crate) const TICK: Duration = Duration::from_millis(50);
 /// A connection that sends no complete request head within this long is dropped.
 const HEAD_DEADLINE: Duration = Duration::from_secs(10);
 /// Longest request head accepted.
@@ -126,7 +126,7 @@ fn accept_loop(
     }
 }
 
-fn is_retry(kind: io::ErrorKind) -> bool {
+pub(crate) fn is_retry(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
@@ -161,7 +161,7 @@ fn read_head(stream: &mut TcpStream, stop: &AtomicBool) -> Option<Vec<u8>> {
 }
 
 /// Writes all of `buf`; `false` when the peer is gone or the server is stopping.
-fn write_all(stream: &mut TcpStream, mut buf: &[u8], stop: &AtomicBool) -> bool {
+pub(crate) fn write_all(stream: &mut TcpStream, mut buf: &[u8], stop: &AtomicBool) -> bool {
     while !buf.is_empty() {
         if stop.load(Ordering::SeqCst) {
             return false;

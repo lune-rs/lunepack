@@ -224,7 +224,7 @@ fn is_tls_failure(e: &io::Error) -> bool {
     false
 }
 
-fn io_kind(e: &io::Error) -> TransportErrorKind {
+pub(crate) fn io_kind(e: &io::Error) -> TransportErrorKind {
     if is_tls_failure(e) {
         return TransportErrorKind::Tls;
     }
@@ -237,7 +237,7 @@ fn io_kind(e: &io::Error) -> TransportErrorKind {
     }
 }
 
-fn kind_of(e: &ureq::Error) -> TransportErrorKind {
+pub(crate) fn kind_of(e: &ureq::Error) -> TransportErrorKind {
     use ureq::Error as E;
     match e {
         E::Timeout(_) => TransportErrorKind::Timeout,
