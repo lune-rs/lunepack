@@ -25,6 +25,12 @@
 # `dotnet` missing is a failure; LUNEPACK_E2E_DOTNET=0 is the one opt-out, and the suite then prints
 # SKIPPED once.
 #
+# The C example (examples/c, M14 step 6) runs a fourth table the same way: the app and the C library
+# beside it, built inside the container by `cargo run -p xtask -- build-example-c` for the suite's own
+# Linux target (the image has the C compiler), and its outcome log must equal the shell app's, cut to
+# the same rows. A missing C compiler is a failure; LUNEPACK_E2E_C=0 is the one opt-out (the Docker
+# mode hands it to the container), and the suite then prints SKIPPED once.
+#
 # The Docker mode builds the image `lunepack-rs-e2e:<hash>` from scripts/e2e.Dockerfile (once per
 # Dockerfile change), runs `docker run --rm --init` (a reaping PID 1, as on a desktop) with the
 # worktree read-only, as the image's unprivileged user `e2e` (a setup run as root without
@@ -118,8 +124,12 @@ if [ "$inside" -eq 0 ]; then
     ./scripts/build-example-dotnet.sh "$dotnet_target" "$host_work/app"
     dotnet_args=(-v "$host_work/app":/dotnet-app:ro -e LUNEPACK_E2E_DOTNET_APP=/dotnet-app)
   fi
+  # The C example is built inside the container: only its opt-out crosses (0 or 1, never the host's
+  # own text).
+  c_args=(-e LUNEPACK_E2E_C=1)
+  if [ "${LUNEPACK_E2E_C:-1}" = 0 ]; then c_args=(-e LUNEPACK_E2E_C=0); fi
   # RUSTUP_TOOLCHAIN makes rustup use the image's own 1.99.1 instead of installing what
-  # rust-toolchain.toml lists. No host env is passed (but the one opt-out above), no capabilities,
+  # rust-toolchain.toml lists. No host env is passed (but the two opt-outs above), no capabilities,
   # no new privileges; the suite runs as the image's user `e2e`, uid 1000, never as root.
   rc=0
   docker run --rm --init \
@@ -134,6 +144,7 @@ if [ "$inside" -eq 0 ]; then
     -e CARGO_HOME=/cargo-home \
     -e RUSTUP_TOOLCHAIN=1.99.1 \
     "${dotnet_args[@]}" \
+    "${c_args[@]}" \
     -w /src \
     "$image" \
     ./scripts/e2e.sh --inside || rc=$?
@@ -187,6 +198,19 @@ else
   echo "e2e: publishing the .NET example for $target"
   ./scripts/build-example-dotnet.sh "$target" "$work/dotnet-app"
   export LUNEPACK_E2E_DOTNET_APP=$work/dotnet-app
+fi
+
+# The C example: a folder handed in, the opt-out, or built here (the app and the C library beside
+# it, for the suite's own target).
+if [ "${LUNEPACK_E2E_C:-1}" = 0 ]; then
+  unset LUNEPACK_E2E_C_APP
+elif [ -n "${LUNEPACK_E2E_C_APP:-}" ]; then
+  [ -f "$LUNEPACK_E2E_C_APP/example" ] || die "LUNEPACK_E2E_C_APP does not name a built folder of the C example"
+else
+  command -v cc >/dev/null 2>&1 || die "no C compiler (cc): the C rows need one (LUNEPACK_E2E_C=0 skips them)"
+  echo "e2e: building the C example for $target"
+  cargo run --quiet --locked -p xtask -- build-example-c --out "$work/c-app" --target "$target"
+  export LUNEPACK_E2E_C_APP=$work/c-app
 fi
 
 shell_app=$top/crates/lunepack-runtime/tests/e2e/shell-app/app.sh

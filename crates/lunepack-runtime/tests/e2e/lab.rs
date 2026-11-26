@@ -84,9 +84,9 @@ pub struct App {
     pub binary: PathBuf,
     /// The entry's file name in a tree (`e2e_app`).
     pub name: String,
-    /// A folder app (M13 step 7, the .NET example): `binary` is a folder that holds the entry
-    /// `name` and every file the app needs, all of them packed beside the entry. A single-file
-    /// app is just the entry.
+    /// A folder app (the .NET example, M13 step 7; the C example, M14 step 6): `binary` is a
+    /// folder that holds the entry `name` and every file the app needs, all of them packed beside
+    /// the entry. A single-file app is just the entry.
     pub folder: bool,
 }
 

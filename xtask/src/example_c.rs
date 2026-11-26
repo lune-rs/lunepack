@@ -1,7 +1,7 @@
 //! `build-example-c --out <dir> [--target <lunepack target id>]`: builds the C library
 //! (`lunepack-ffi`, release) and the C example app (`examples/c/example.c`), and places the
 //! executable `example` (`example.exe` on Windows) and the library beside it in `<dir>`, for the
-//! end-to-end suites to pack as an app (M14). Nothing is written outside `<dir>` and `target/`.
+//! end-to-end suites to pack as an app (M14). Nothing is written outside `<dir>` and cargo's target directory.
 //!
 //! The C compiler is the one the `cc` crate finds for the target (`CC`, `CFLAGS` and the usual
 //! variables apply); no compiler is an error, never a skip.
@@ -122,7 +122,12 @@ fn run(out: &Path, target_id: Option<&str>) -> Result<()> {
     if !status.success() {
         bail!("cargo build of lunepack-ffi failed ({status})");
     }
-    let mut lib_dir = root.join("target");
+    // Cargo's target directory: `CARGO_TARGET_DIR` when set (the end-to-end container keeps it in a
+    // volume), else `target/` of the workspace.
+    let mut lib_dir = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) if !dir.is_empty() => root.join(dir),
+        _ => root.join("target"),
+    };
     if cross {
         lib_dir.push(&triple);
     }
