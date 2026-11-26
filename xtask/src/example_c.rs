@@ -106,7 +106,9 @@ fn run(out: &Path, target_id: Option<&str>) -> Result<()> {
     } else {
         fs::create_dir_all(out).with_context(|| format!("cannot create {}", out.display()))?;
     }
-    let out = fs::canonicalize(out)?;
+    // Absolute, but not canonical: on Windows a canonical path carries the `\\?\` prefix, which the
+    // MSVC compiler and linker do not take on their command line.
+    let out = std::path::absolute(out)?;
 
     // The library, release.
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
