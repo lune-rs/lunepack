@@ -96,9 +96,10 @@ typedef struct {
 } LunepackProgress;
 
 // A progress callback. It runs on the thread that made the call, only during the call. It must
-// not unwind or `longjmp` out, and any lunepack call it makes except
-// `lunepack_cancel_token_cancel` and `lunepack_cancel_token_is_cancelled` returns
-// `LUNEPACK_STATUS_USAGE`. NULL means no callback.
+// not unwind or `longjmp` out. Every function that returns a status
+// gives `LUNEPACK_STATUS_USAGE` when called from it; accessors, name lookups, `_free` functions
+// and `lunepack_cancel_token_cancel` and `lunepack_cancel_token_is_cancelled` are allowed. NULL
+// means no callback.
 typedef void (*LunepackProgressFn)(void *user_data, const LunepackProgress *progress);
 
 // Fetching and verifying the signed documents.

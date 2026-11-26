@@ -130,6 +130,10 @@ distributed yet, so until then it may still change.
   `lunepack_source_name`, `lunepack_library_version`) and `lunepack_last_error_reason` return static
   strings that are valid for the life of the process.
 - An input string is NUL-terminated UTF-8, read only during the call. Text that is not UTF-8 is `usage`.
+  On Windows, `main`'s `argv` is in the ANSI code page, not UTF-8, so do not pass it as is: give
+  `lunepack_startup` and `lunepack_apply_and_restart` strings you converted to UTF-8 (from
+  `CommandLineToArgvW` with `WideCharToMultiByte(CP_UTF8, ...)`), or for `lunepack_startup` pass
+  `(NULL, 0)` and let the library read the process's own arguments, as the example does.
 - `lunepack_updater_stage` consumes its `LunepackDownloaded` whenever it is not NULL, whatever the status:
   do not free or reuse it afterwards. A downloaded handle that is never staged is released with
   `lunepack_downloaded_free`.

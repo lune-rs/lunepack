@@ -337,8 +337,15 @@ static int run(int argc, char **argv)
     size_t e;
     uint32_t outcome = 0;
 
+#ifdef _WIN32
+    /* main's argv on Windows is in the ANSI code page, not UTF-8, which lunepack_startup requires
+     * of an explicit list (a non-ASCII argument would be `usage`). (NULL, 0) makes the library
+     * read the process's own arguments from the wide command line instead. */
+    status = lunepack_startup(NULL, 0, &startup);
+#else
     status = lunepack_startup(argc > 1 ? (const char *const *)(argv + 1) : NULL,
                               argc > 1 ? (size_t)(argc - 1) : 0, &startup);
+#endif
     if (status != LUNEPACK_STATUS_OK) {
         return failed("startup");
     }
