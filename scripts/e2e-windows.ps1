@@ -17,6 +17,8 @@
 #   D  a small console program (scripts/ci/e2e-ctl-app.cs): row 6 and the console-event proof
 #   E  the .NET example (examples/dotnet, M13 step 9), a folder of about 190 files behind the console
 #      stub: row E, install rows only (below)
+#   F  the C example (examples/c, M14 step 8), example.exe and lunepack_ffi.dll behind the console
+#      stub: row F, install rows only (below)
 #
 # Rows without -Install: the packaging half of every row (releases pack, setup files build, the
 # images carry the hardening and the stamps), row 9 (planted DLLs), row 10's static half.
@@ -44,9 +46,18 @@
 # install row run with no .NET app available fails; LUNEPACK_E2E_DOTNET=0 is the one opt-out and
 # prints SKIPPED.
 #
+# Row F (M14 step 8, with -Install only): the C example as app F, which calls the runtime through the C
+# library (lunepack_ffi.dll beside example.exe in the version tree) and writes the same outcome lines
+# as the other apps: install, an update by check, download, stage and apply-and-restart, a version
+# that crashes on start (rolled back, marked bad), the fixed version and the uninstall. The app is
+# the folder `cargo run -p xtask -- build-example-c` makes (the MSVC compiler `cc` finds; a Visual
+# Studio build tools install is on every machine that links Rust here), given with -CApp <folder> or,
+# without it, built here. A build that fails is an error; LUNEPACK_E2E_C=0 is the one opt-out and
+# prints SKIPPED.
+#
 # The harness never prints environment or registry dumps; a failure names a differing field, and
 # prints only versions, outcome words and exit codes.
-param([switch]$Install, [string]$DotnetApp = '')
+param([switch]$Install, [string]$DotnetApp = '', [string]$CApp = '')
 $ErrorActionPreference = 'Stop'
 if ($env:CI -eq 'true' -or $env:LUNEPACK_E2E_INSTALL -eq '1') { $Install = $true }
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -759,6 +770,30 @@ function Get-DotnetApp {
     return (Resolve-Path -LiteralPath $folder).Path
 }
 
+# The C example's folder (M14 step 8): the one given with -CApp, else built here by xtask's
+# build-example-c (example.exe and lunepack_ffi.dll for this machine's own target). $null, once said
+# SKIPPED, with LUNEPACK_E2E_C=0. A build that fails is an error: the rows are required.
+function Get-CApp {
+    if ($env:LUNEPACK_E2E_C -eq '0') {
+        Write-Host 'SKIPPED: the C row (LUNEPACK_E2E_C=0)'
+        return $null
+    }
+    $folder = $CApp
+    if (-not $folder) {
+        $folder = Join-Path $work 'c-app'
+        Write-Host 'e2e-windows: building the C example for windows-x86_64'
+        Push-Location $repo
+        try {
+            & cargo run --quiet --locked -p xtask -- build-example-c --out $folder --target windows-x86_64 | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw 'build-example-c failed' }
+        } finally { Pop-Location }
+    }
+    Require (Test-Path -LiteralPath (Join-Path $folder 'example.exe')) 'the C app folder holds example.exe'
+    Require (Test-Path -LiteralPath (Join-Path $folder 'lunepack_ffi.dll')) 'the C app folder holds lunepack_ffi.dll'
+    Require (-not (Test-Path -LiteralPath (Join-Path $folder 'lunepack-runtime.exe'))) 'the C app folder holds no runtime of its own'
+    return (Resolve-Path -LiteralPath $folder).Path
+}
+
 # ---- the work -----------------------------------------------------------------------------------------------
 
 try {
@@ -882,6 +917,8 @@ try {
         $holdOut = $null
         # The .NET example is required by the install rows: no app is a failure before any row runs.
         $dotnetFolder = Get-DotnetApp
+        # So is the C example (row F): built here unless a folder was given.
+        $cFolder = Get-CApp
 
         Row '1 (install, state)' {
             $o = New-Out 'row1'
@@ -1291,6 +1328,58 @@ try {
                 # Uninstall key go (Invoke-Uninstall), and the end-of-run leftover check covers the rest.
                 Invoke-Uninstall $E
             } -Undo { foreach ($e in @($apps | Where-Object { $_.Tag -eq 'e' })) { Reset-App $e } }
+        }
+
+        # ---- app F: the C example (M14 step 8) -------------------------------------------------------------------------------
+        if ($cFolder) {
+            Row 'F (the C example behind the console stub: install, update, crash and rollback, the fixed version, uninstall)' {
+                $F = New-App 'f' '-f' ' C' 'example.exe' (Join-Path $cFolder 'example.exe') $true $null
+                $F.Folder = $cFolder
+                Publish-Version $F '1.0.0'
+                $setupF = Build-Setup $F '1.0.0'
+
+                # Install: the stub at R, the tree beside it; the app and its library sit with the runtime in the tree.
+                $null = Install-Silent $F $setupF 600
+                Assert-Installed $F '1.0.0'
+                Require (Test-Path -LiteralPath (Join-Path $F.Root 'app\1.0.0\lunepack-runtime.exe')) 'the runtime is beside the entry in the tree'
+                Require (Test-Path -LiteralPath (Join-Path $F.Root 'app\1.0.0\lunepack_ffi.dll')) 'the C library is beside the entry in the tree'
+                $o = New-Out 'rowF1'
+                $null = Start-Proc (Stub-Path $F)
+                Expect-Lines $o @('1.0.0 start', '1.0.0 event installed', '1.0.0 event first_run', '1.0.0 nothing-pending') -Seconds 120
+                Assert-Record $F '1.0.0' $null @()
+
+                # An update by the app itself, through the library: check, download, stage, apply-and-restart.
+                Publish-Version $F '1.1.0'
+                $o = New-Out 'rowF2'
+                $null = Start-Proc (Stub-Path $F) @('--update', '--no-ui')
+                Expect-Lines $o (Confirmed-Lines '1.0.0' '1.1.0') -Seconds 180
+                Wait-Updated $F '1.1.0'
+                Assert-Record $F '1.1.0' '1.0.0' @()
+
+                # A version that crashes on start: rolled back, marked bad, not offered again.
+                Publish-Version $F '1.2.0' @{ Flags = @('crash-on-start') }
+                $o = New-Out 'rowF3'
+                $null = Start-Proc (Stub-Path $F) @('--update', '--no-ui')
+                Expect-Lines $o @('1.1.0 start', '1.1.0 nothing-pending', '1.1.0 check 1.2.0', '1.1.0 staged 1.2.0', '1.1.0 apply-scheduled',
+                    '1.2.0 start', '1.2.0 arg after-update', '1.2.0 event updated 1.1.0', '1.2.0 event first_run', '1.2.0 crash',
+                    '1.1.0 start', '1.1.0 arg after-update', '1.1.0 nothing-pending') -Seconds 180
+                Wait-Runtimes-Gone $F.Root
+                Assert-Record $F '1.1.0' $null @('1.2.0')
+                $o = New-Out 'rowF4'
+                $null = Start-Proc (Stub-Path $F) @('--update', '--no-ui')
+                Expect-Lines $o @('1.1.0 start', '1.1.0 nothing-pending', '1.1.0 check none')
+
+                # The fixed version.
+                Publish-Version $F '1.3.0'
+                $o = New-Out 'rowF5'
+                $null = Start-Proc (Stub-Path $F) @('--update', '--no-ui')
+                Expect-Lines $o (Confirmed-Lines '1.1.0' '1.3.0') -Seconds 180
+                Wait-Updated $F '1.3.0'
+                Assert-Record $F '1.3.0' '1.1.0' @('1.2.0')
+
+                # The uninstall leaves nothing (Invoke-Uninstall; the end-of-run leftover check covers the rest).
+                Invoke-Uninstall $F
+            } -Undo { foreach ($f in @($apps | Where-Object { $_.Tag -eq 'f' })) { Reset-App $f } }
         }
 
         # The certificates are trusted machine-wide, so only a CI runner (a throwaway machine) runs

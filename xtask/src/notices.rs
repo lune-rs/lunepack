@@ -21,13 +21,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, Package, PackageId};
 
 /// The packages whose dependencies are linked into what a release ships: the runtime, the update
-/// service, the Windows stub, the UI and the CLI (M13-D11).
+/// service, the Windows stub, the UI and the CLI (M13-D11), and the C library (M14-D13), which is
+/// not released but whose dependencies the shipped notices must provably cover.
 pub const ROOTS: &[&str] = &[
     "lunepack-runtime",
     "lunepack-service",
     "lunepack-stub",
     "lunepack-ui",
     "lunepack-cli",
+    "lunepack-ffi",
 ];
 
 /// Where the generated file lives, relative to the workspace root. It sits in the CLI's crate so

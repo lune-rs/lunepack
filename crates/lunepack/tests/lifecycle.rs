@@ -646,6 +646,40 @@ fn unsupervised_starts_count_attempts_and_the_fourth_rolls_back() {
     assert_eq!(previous.name, "App 1.1.0");
 }
 
+/// `startup_in` (what `startup_with_args` runs once it has found its installation) hands the
+/// arguments it is given, not the process's own, to the relaunch of a rollback.
+#[test]
+fn startup_in_passes_its_arguments_to_a_rollback_relaunch() {
+    use lunepack::unstable_internals::startup_in;
+    for args in [
+        vec![OsString::from("--open"), OsString::from("a file.txt")],
+        vec![
+            OsString::from("--second"),
+            OsString::from(""),
+            OsString::from("--last=1"),
+        ],
+        Vec::new(),
+    ] {
+        let lab = Lab::new();
+        lab.version_tree(V100, "app");
+        lab.version_tree(V110, "app2");
+        commit(&lab.fs, &root_dir(), |_| pending_110());
+        for n in 1..=3u64 {
+            let got = startup_in(&lab.open(V110, None), args.clone()).expect("startup");
+            assert_eq!(got.action, StartupAction::Continue, "start {n}");
+            assert!(got.pending);
+        }
+        assert!(lab.process.spawns().is_empty());
+        let got = startup_in(&lab.open(V110, None), args.clone()).expect("startup");
+        assert_eq!(got.action, StartupAction::Exit);
+        let spawns = lab.process.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].program, root_dir().join("versions/1.0.0/bin/app"));
+        // Exactly the given arguments, in order, and none of the test process's own.
+        assert_eq!(spawns[0].args, args);
+    }
+}
+
 /// Three unsupervised starts of 1.1.0, so the next one rolls back.
 fn three_attempts(lab: &Lab) {
     for _ in 1..=3u64 {

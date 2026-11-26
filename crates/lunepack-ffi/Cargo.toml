@@ -1,0 +1,45 @@
+[package]
+name = "lunepack-ffi"
+description = "C ABI over the lunepack facade: a C-callable library for an app that updates itself, with a generated header."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# M14-D10 (a): not distributed. A C app builds the library from a checkout.
+publish = false
+build = "build.rs"
+
+# A binding crate (M14-D1): the one member of the `Binding` role, so it may lift `unsafe_code` like
+# the other allowlisted crates (hard rule 2): a full copy of the workspace lints in which
+# `unsafe_code` is `deny` instead of `forbid`, so the modules that need it opt in with
+# `#![allow(unsafe_code)]`, and every unsafe block carries a `// SAFETY:` comment.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[lib]
+name = "lunepack_ffi"
+# The cdylib is the C library; the rlib is for this crate's Rust tests (M14-D9).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The facade is the only dependency: the binding adds no logic and constructs no adapter
+# (the facade's `Platform::native()` does).
+lunepack.workspace = true
+
+[dev-dependencies]
+# The updaters under test run over the testkit's fakes (M14 step 3): a fake origin and transport,
+# an in-memory filesystem and keys made at test time. No adapter crate by any edge.
+lunepack-testkit.workspace = true
+# The document and state types the fixtures name (`PayloadKind`, `CodecId`, the install record);
+# the facade re-exports only what its API takes. The core is allowed to the binding by role.
+lunepack-core.workspace = true
+# Compiles examples/c/example.c for the target the library was built for (tests/c_example.rs); the
+# version already in the lock (the HTTP stack's build scripts use it). Not a workspace crate.
+cc = "1"

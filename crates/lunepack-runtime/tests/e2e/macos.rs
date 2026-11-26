@@ -30,6 +30,8 @@ const APP_NAME: &str = "Lunepack E2E";
 const ENTRY: &str = "lunepack-e2e";
 /// The .NET example's host in its bundle (the assembly name of `examples/dotnet`).
 const DOTNET_ENTRY: &str = "Example";
+/// The C example's executable in its bundle (`Contents/MacOS/example`, the library beside it).
+const C_ENTRY: &str = "example";
 const OUT_VAR: &str = "LUNEPACK_E2E_OUT";
 const DETAIL_VAR: &str = "LUNEPACK_E2E_DETAIL";
 const WAIT: Duration = Duration::from_secs(90);
@@ -56,6 +58,10 @@ pub struct Bins {
     /// host alone in `Contents/MacOS`, the rest under `Contents/Resources/app` (M13 step 8). `None`
     /// when its row is skipped by name (`LUNEPACK_E2E_DOTNET=0`).
     pub dotnet_bundle: Option<PathBuf>,
+    /// The C example's folder (`cargo run -p xtask -- build-example-c`: `example` and
+    /// `liblunepack_ffi.dylib`), which the row makes into a bundle (M14 step 7). `None` when its
+    /// row is skipped by name (`LUNEPACK_E2E_C=0`).
+    pub c_app: Option<PathBuf>,
 }
 
 /// Who signs a release through the packager's `[codesign.macos]` templates (M9-D2).
@@ -258,6 +264,12 @@ pub const ROWS: &[Row] = &[
         id: "15",
         name: "the .NET example bundle (ad hoc signed by the packager): install, delta update, crash and rollback, the fixed version, uninstall; codesign-clean throughout",
         run: row_dotnet,
+        ci_only: false,
+    },
+    Row {
+        id: "16",
+        name: "the C example bundle (the app and the C library beside it, ad hoc signed by the packager): install, confirmed update, crash and rollback, uninstall; codesign-clean throughout",
+        run: row_c_app,
         ci_only: false,
     },
     Row {
@@ -490,6 +502,8 @@ pub struct World {
     home_env: Option<PathBuf>,
     /// The releases of this world are the .NET example's bundle, not the Rust or shell app's.
     dotnet: bool,
+    /// The releases of this world are the C example's bundle (M14 step 7).
+    c_app: bool,
 }
 
 /// The suite's root, checked: absolute, canonical, and `HOME` of this process inside it.
@@ -561,6 +575,7 @@ impl World {
             cli_vars: Vec::new(),
             home_env: None,
             dotnet: false,
+            c_app: false,
         };
         w.setup_publisher();
         w
@@ -573,9 +588,22 @@ impl World {
         w
     }
 
+    /// A world whose releases are the C example's bundle (M14 step 7).
+    pub fn c_app(bins: &Bins) -> World {
+        let mut w = World::build(bins, false);
+        w.c_app = true;
+        w
+    }
+
     /// The file name of the entry in `Contents/MacOS`.
     fn entry_name(&self) -> &'static str {
-        if self.dotnet { DOTNET_ENTRY } else { ENTRY }
+        if self.dotnet {
+            DOTNET_ENTRY
+        } else if self.c_app {
+            C_ENTRY
+        } else {
+            ENTRY
+        }
     }
 
     /// The live bundle `B`.
@@ -704,6 +732,9 @@ impl World {
         if self.dotnet {
             return self.dotnet_input(release, input);
         }
+        if self.c_app {
+            return self.c_input(release, input);
+        }
         let app = if release.shell {
             &self.bins.shell_app
         } else {
@@ -792,6 +823,55 @@ impl World {
         input
     }
 
+    /// The bundle input of `release` for the C example (M14 step 7): an `Info.plist`, the
+    /// executable `Contents/MacOS/example` and the C library beside it (a `.dylib` is Mach-O, so
+    /// the signed bundle may hold it there), and the files the rows read in `Contents/Resources`.
+    fn c_input(&self, release: &Release, input: PathBuf) -> PathBuf {
+        let folder = self
+            .bins
+            .c_app
+            .as_ref()
+            .expect("the C example's folder is named by the environment");
+        let plist = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\"><dict>\
+             <key>CFBundleExecutable</key><string>{C_ENTRY}</string>\
+             <key>CFBundleIdentifier</key><string>org.lunepack.e2e.app</string>\
+             <key>CFBundlePackageType</key><string>APPL</string>\
+             <key>CFBundleName</key><string>{APP_NAME}</string>\
+             <key>CFBundleShortVersionString</key><string>{}</string>\
+             </dict></plist>\n",
+            release.version
+        );
+        write_file(&input.join("Contents/Info.plist"), plist.as_bytes(), false);
+        write_file(
+            &input.join("Contents/MacOS").join(C_ENTRY),
+            &std::fs::read(folder.join(C_ENTRY)).expect("read the C example"),
+            true,
+        );
+        let library = "liblunepack_ffi.dylib";
+        write_file(
+            &input.join("Contents/MacOS").join(library),
+            &std::fs::read(folder.join(library)).expect("read the C library"),
+            true,
+        );
+        write_file(
+            &input.join("Contents/Resources/version.txt"),
+            format!("{}\n", release.version).as_bytes(),
+            false,
+        );
+        if !release.flags.is_empty() {
+            write_file(
+                &input.join("Contents/Resources/e2e-flags"),
+                format!("{}\n", release.flags.join("\n")).as_bytes(),
+                false,
+            );
+        }
+        input
+    }
+
     /// Packs `release` with the real command line (the stand-in UI as the helper), adds it to the
     /// feed and serves it.
     pub fn publish(&self, release: &Release) {
@@ -813,7 +893,7 @@ impl World {
     /// signed manifest lists what the server does not have, the fallback of M12-D5).
     fn publish_opts(&self, release: &Release, signer: Option<Signer>, drop_deltas: bool) {
         let input = self.bundle_input(release);
-        if signer.is_some() && !self.dotnet {
+        if signer.is_some() && !self.dotnet && !self.c_app {
             // Only code `codesign` can seal: no text framework, no script.
             std::fs::remove_dir_all(input.join("Contents/Frameworks")).expect("no framework");
             std::fs::remove_dir_all(input.join("Contents/Helpers")).expect("no helper tool");
@@ -2827,6 +2907,104 @@ fn row_dotnet(bins: &Bins) -> Vec<String> {
     assert_no_quarantine(&w.bundle());
 
     // The uninstall.
+    let (code, _) = w.runtime(&["uninstall", "--silent"]);
+    assert_eq!(code, 0, "uninstall");
+    assert!(!w.bundle().exists(), "B is gone");
+    assert!(!w.root.exists(), "R is gone");
+    lines
+}
+
+/// Row 16 (M14 step 7): the C example as an app bundle (the executable and `liblunepack_ffi.dylib`
+/// side by side in `Contents/MacOS`), signed ad hoc by the packager's own `[codesign.macos]`
+/// templates, driving the runtime through the C API only. Installed from the `.dmg`; updated and
+/// confirmed; a version that crashes on start is rolled back and marked bad; the fixed version is
+/// taken; the app is uninstalled. The bundle verifies strictly after every step and carries no
+/// signature in an extended attribute; the outcome lines are the shell app's for the same steps.
+fn row_c_app(bins: &Bins) -> Vec<String> {
+    if bins.c_app.is_none() {
+        // Skipped by name (`LUNEPACK_E2E_C=0`): the suite said SKIPPED once.
+        return Vec::new();
+    }
+    const CRASH: Release = Release {
+        version: "1.2.0",
+        flags: &["crash-on-start"],
+        ..V2
+    };
+    const FIXED: Release = Release {
+        version: "1.3.0",
+        ..V2
+    };
+    let w = World::c_app(bins);
+    w.publish_codesigned(&V1, Signer::AdHoc);
+    let dmg = w.build_dmg_signed("1.0.0");
+    assert_eq!(w.install_from_dmg(&dmg), 0, "the installer's exit code");
+    w.assert_installed("1.0.0");
+    assert_sealed(&w, "after the install");
+    assert_eq!(w.run_app(&w.entry(), &[]), 0, "the entry run directly");
+    let mut lines = w.expect_lines(&first_install_lines(), false);
+
+    // The update, confirmed by the new version.
+    w.publish_codesigned(&V2, Signer::AdHoc);
+    w.run_app(&w.entry(), &["--update", "--no-ui"]);
+    lines.extend(w.expect_lines(&confirmed_update_lines("1.0.0", "1.1.0"), false));
+    w.wait_runtime_gone();
+    assert_eq!(
+        w.bundle_version().as_deref(),
+        Some("1.1.0"),
+        "B holds 1.1.0"
+    );
+    assert_sealed(&w, "after the update");
+
+    // 1.2.0 crashes on start: the applier swaps 1.1.0 back and marks 1.2.0 bad.
+    w.publish_codesigned(&CRASH, Signer::AdHoc);
+    w.run_app(&w.entry(), &["--update", "--no-ui"]);
+    let want: Vec<String> = [
+        "1.1.0 start",
+        "1.1.0 nothing-pending",
+        "1.1.0 check 1.2.0",
+        "1.1.0 staged 1.2.0",
+        "1.1.0 apply-scheduled",
+        "1.2.0 start",
+        "1.2.0 arg after-update",
+        "1.2.0 event updated 1.1.0",
+        "1.2.0 event first_run",
+        "1.2.0 crash",
+        "1.1.0 start",
+        "1.1.0 arg after-update",
+        "1.1.0 nothing-pending",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    lines.extend(w.expect_lines(&want, false));
+    w.wait_runtime_gone();
+    assert_eq!(
+        w.bundle_version().as_deref(),
+        Some("1.1.0"),
+        "B holds 1.1.0 again"
+    );
+    let r = w.record().expect("a record");
+    assert_eq!(r.current.as_deref(), Some("1.1.0"));
+    assert_eq!(r.bad, ["1.2.0"]);
+    assert_sealed(&w, "after the rollback");
+
+    // The fixed version.
+    w.publish_codesigned(&FIXED, Signer::AdHoc);
+    w.run_app(&w.entry(), &["--update", "--no-ui"]);
+    lines.extend(w.expect_lines(&confirmed_update_lines("1.1.0", "1.3.0"), false));
+    w.wait_runtime_gone();
+    assert_eq!(
+        w.bundle_version().as_deref(),
+        Some("1.3.0"),
+        "B holds 1.3.0"
+    );
+    let r = w.record().expect("a record");
+    assert_eq!(r.current.as_deref(), Some("1.3.0"));
+    assert_eq!(r.bad, ["1.2.0"], "the bad version stays marked");
+    assert_sealed(&w, "after the fixed version");
+    assert_no_quarantine(&w.bundle());
+
+    // The uninstall: nothing is left.
     let (code, _) = w.runtime(&["uninstall", "--silent"]);
     assert_eq!(code, 0, "uninstall");
     assert!(!w.bundle().exists(), "B is gone");

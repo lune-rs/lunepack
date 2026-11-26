@@ -17,15 +17,21 @@
 //! scenarios (M6 step 11: a setup file, a UI that is absent, killed or cannot start) are in [`ui`]:
 //! a table run with both apps like the first, then extras run once. A third app, the .NET
 //! example (M13 step 7), is a folder of about 190 files; it runs the rows of
-//! [`scenarios::FOLDER_APP_ROWS`] and its log must equal the shell app's log cut to those rows.
+//! [`scenarios::FOLDER_APP_ROWS`] and its log must equal the shell app's log cut to those rows. So
+//! does a fourth, the C example (M14 step 6): the folder `build-example-c` makes, the app and the
+//! C library beside it.
 //!
 //! Environment: `LUNEPACK_E2E_RUNTIME` (the static runtime), `LUNEPACK_E2E_CLI` (`lunepack`),
 //! `LUNEPACK_E2E_APP` (the Rust example app), `LUNEPACK_E2E_SHELL_APP` (the shell app),
 //! `LUNEPACK_E2E_FAKE_UI` (the stand-in UI, `tests/e2e/fake-ui`) and `LUNEPACK_E2E_UI` (the real
-//! `lunepack-ui`). On macOS `LUNEPACK_E2E_DOTNET_BUNDLE` names the example's app bundle instead.
+//! `lunepack-ui`). On macOS `LUNEPACK_E2E_DOTNET_BUNDLE` names the example's app bundle instead, and
+//! `LUNEPACK_E2E_C_APP` the folder of the C example (opt-out `LUNEPACK_E2E_C=0`).
 //! `LUNEPACK_E2E_DOTNET_APP` names the published folder of the .NET example (its
 //! entry is `Example`; `scripts/build-example-dotnet.sh` makes it); with `LUNEPACK_E2E_REQUIRE=1`
 //! it must be set, and `LUNEPACK_E2E_DOTNET=0` is the one opt-out (the suite prints `SKIPPED`).
+//! `LUNEPACK_E2E_C_APP` names the folder of the C example (its entry is `example`; `cargo run -p
+//! xtask -- build-example-c` makes it), required the same way, with `LUNEPACK_E2E_C=0` as its
+//! opt-out.
 
 #[cfg(target_os = "linux")]
 mod cli_extra;
@@ -55,6 +61,13 @@ const DOTNET_VAR: &str = "LUNEPACK_E2E_DOTNET";
 /// The .NET example's entry in its folder (the assembly name of `examples/dotnet`).
 #[cfg(target_os = "linux")]
 const DOTNET_ENTRY: &str = "Example";
+#[cfg(target_os = "linux")]
+const C_APP_VAR: &str = "LUNEPACK_E2E_C_APP";
+#[cfg(target_os = "linux")]
+const C_VAR: &str = "LUNEPACK_E2E_C";
+/// The C example's entry in its folder (`build-example-c` names it so).
+#[cfg(target_os = "linux")]
+const C_ENTRY: &str = "example";
 
 fn main() -> ExitCode {
     let paths: Vec<Option<PathBuf>> = [
@@ -149,6 +162,37 @@ fn dotnet_bundle() -> Result<Option<PathBuf>, String> {
     Ok(Some(bundle))
 }
 
+/// The C example's folder of the macOS suite (M14 step 7): `LUNEPACK_E2E_C_APP` names the folder
+/// `cargo run -p xtask -- build-example-c` made (`example` and `liblunepack_ffi.dylib`). `Ok(None)`
+/// when its row is skipped: by name (`LUNEPACK_E2E_C=0`) or, without `LUNEPACK_E2E_REQUIRE=1`,
+/// because no folder was given; either way the suite says `SKIPPED` once. An error when the row is
+/// required and the folder is not usable.
+#[cfg(target_os = "macos")]
+fn c_app_folder() -> Result<Option<PathBuf>, String> {
+    const FOLDER_VAR: &str = "LUNEPACK_E2E_C_APP";
+    const C_VAR: &str = "LUNEPACK_E2E_C";
+    if std::env::var(C_VAR).is_ok_and(|v| v == "0") {
+        eprintln!("e2e: SKIPPED: the C row ({C_VAR}=0)");
+        return Ok(None);
+    }
+    let required = std::env::var(REQUIRE_VAR).is_ok_and(|v| v == "1");
+    let Some(folder) = std::env::var_os(FOLDER_VAR).map(PathBuf::from) else {
+        if required {
+            return Err(format!(
+                "{REQUIRE_VAR}=1, but {FOLDER_VAR} is not set ({C_VAR}=0 skips the C row)"
+            ));
+        }
+        eprintln!("e2e: SKIPPED: the C row ({FOLDER_VAR} is not set)");
+        return Ok(None);
+    };
+    if !folder.join("example").is_file() || !folder.join("liblunepack_ffi.dylib").is_file() {
+        return Err(format!(
+            "{FOLDER_VAR} does not name the C example's folder (example, liblunepack_ffi.dylib)"
+        ));
+    }
+    Ok(Some(folder))
+}
+
 /// The macOS suite (M8 step 10): `scripts/e2e-macos.sh` makes the temporary root and sets `HOME`
 /// and `LUNEPACK_E2E_ROOT`; the rows are in [`macos`].
 #[cfg(target_os = "macos")]
@@ -177,6 +221,13 @@ fn run(paths: &Paths<'_>) -> ExitCode {
         fake_ui: paths.fake_ui.clone(),
         dotnet_bundle: match dotnet_bundle() {
             Ok(bundle) => bundle,
+            Err(why) => {
+                eprintln!("e2e: FAIL: {why}");
+                return ExitCode::FAILURE;
+            }
+        },
+        c_app: match c_app_folder() {
+            Ok(folder) => folder,
             Err(why) => {
                 eprintln!("e2e: FAIL: {why}");
                 return ExitCode::FAILURE;
@@ -245,6 +296,13 @@ fn run(paths: &Paths<'_>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let c_app = match c_app() {
+        Ok(app) => app,
+        Err(why) => {
+            eprintln!("e2e: FAIL: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
     eprintln!("e2e: {}", scenarios::validator_note());
 
     eprintln!("e2e: table 1 of 2: the Rust app ({})", rust_app.name);
@@ -288,26 +346,29 @@ fn run(paths: &Paths<'_>) -> ExitCode {
     }
     let rust_log: Vec<String> = rust_log.into_iter().chain(rust_ui_log).collect();
 
-    if let Some(dotnet_app) = &dotnet {
+    for (label, app) in [(".NET", &dotnet), ("C", &c_app)] {
+        let Some(folder_app) = app else {
+            continue;
+        };
         eprintln!(
-            "e2e: folder table: the .NET app ({}), rows {:?}",
-            dotnet_app.name,
+            "e2e: folder table: the {label} app ({}), rows {:?}",
+            folder_app.name,
             scenarios::FOLDER_APP_ROWS
         );
         let started = std::time::Instant::now();
-        let dotnet_log = match scenarios::run_folder_table(&bins, dotnet_app) {
+        let folder_log = match scenarios::run_folder_table(&bins, folder_app) {
             Ok(log) => log,
             Err(why) => {
-                eprintln!("e2e: FAIL: the .NET app: {why}");
+                eprintln!("e2e: FAIL: the {label} app: {why}");
                 return ExitCode::FAILURE;
             }
         };
         eprintln!(
-            "e2e: the .NET rows took {:.0}s",
+            "e2e: the {label} rows took {:.0}s",
             started.elapsed().as_secs_f32()
         );
         let shell_rows = scenarios::filter_log(&shell_log, scenarios::FOLDER_APP_ROWS);
-        if !same_logs(".NET", &dotnet_log, "shell", &shell_rows) {
+        if !same_logs(label, &folder_log, "shell", &shell_rows) {
             return ExitCode::FAILURE;
         }
     }
@@ -324,10 +385,11 @@ fn run(paths: &Paths<'_>) -> ExitCode {
     println!(
         "e2e: outcome log ({} lines, equal for both apps{})",
         rust_log.len(),
-        if dotnet.is_some() {
-            "; the .NET app's rows equal the shell app's"
-        } else {
-            ""
+        match (dotnet.is_some(), c_app.is_some()) {
+            (true, true) => "; the .NET and C apps' rows equal the shell app's",
+            (true, false) => "; the .NET app's rows equal the shell app's",
+            (false, true) => "; the C app's rows equal the shell app's",
+            (false, false) => "",
         }
     );
     for line in &rust_log {
@@ -363,28 +425,47 @@ fn same_logs(a_name: &str, a: &[String], b_name: &str, b: &[String]) -> bool {
 /// and the folder is not usable.
 #[cfg(target_os = "linux")]
 fn dotnet_app() -> Result<Option<lab::App>, String> {
-    if std::env::var(DOTNET_VAR).is_ok_and(|v| v == "0") {
-        eprintln!("e2e: SKIPPED: the .NET rows ({DOTNET_VAR}=0)");
+    folder_app(".NET", DOTNET_APP_VAR, DOTNET_VAR, DOTNET_ENTRY)
+}
+
+/// The C example as an app of the lab, from the environment: the folder of `build-example-c`, with
+/// the same skip rules as the .NET app (`LUNEPACK_E2E_C=0` is the one opt-out).
+#[cfg(target_os = "linux")]
+fn c_app() -> Result<Option<lab::App>, String> {
+    folder_app("C", C_APP_VAR, C_VAR, C_ENTRY)
+}
+
+/// A folder app of the lab from the environment: `folder_var` names its folder, which holds the
+/// entry `entry`; `opt_out_var=0` skips its rows (and the suite says `SKIPPED` once).
+#[cfg(target_os = "linux")]
+fn folder_app(
+    label: &str,
+    folder_var: &str,
+    opt_out_var: &str,
+    entry: &str,
+) -> Result<Option<lab::App>, String> {
+    if std::env::var(opt_out_var).is_ok_and(|v| v == "0") {
+        eprintln!("e2e: SKIPPED: the {label} rows ({opt_out_var}=0)");
         return Ok(None);
     }
     let required = std::env::var(REQUIRE_VAR).is_ok_and(|v| v == "1");
-    let Some(folder) = std::env::var_os(DOTNET_APP_VAR).map(PathBuf::from) else {
+    let Some(folder) = std::env::var_os(folder_var).map(PathBuf::from) else {
         if required {
             return Err(format!(
-                "{REQUIRE_VAR}=1, but {DOTNET_APP_VAR} is not set ({DOTNET_VAR}=0 skips the .NET rows)"
+                "{REQUIRE_VAR}=1, but {folder_var} is not set ({opt_out_var}=0 skips the {label} rows)"
             ));
         }
-        eprintln!("e2e: SKIPPED: the .NET rows ({DOTNET_APP_VAR} is not set)");
+        eprintln!("e2e: SKIPPED: the {label} rows ({folder_var} is not set)");
         return Ok(None);
     };
-    if !folder.join(DOTNET_ENTRY).is_file() {
+    if !folder.join(entry).is_file() {
         return Err(format!(
-            "{DOTNET_APP_VAR} does not name a folder with the entry {DOTNET_ENTRY}"
+            "{folder_var} does not name a folder with the entry {entry}"
         ));
     }
     Ok(Some(lab::App {
         binary: folder,
-        name: DOTNET_ENTRY.to_owned(),
+        name: entry.to_owned(),
         folder: true,
     }))
 }

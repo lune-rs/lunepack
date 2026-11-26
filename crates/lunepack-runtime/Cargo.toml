@@ -31,6 +31,9 @@ lunepack-os-windows.workspace = true
 
 [dev-dependencies]
 lunepack-testkit.workspace = true
+# Its status table is a copy of `modes::Kind`'s; the unit test in `modes.rs` holds the two equal
+# (M14-D3). The one dev edge the boundary check allows to the binding (`DEV_EDGE_ONLY`).
+lunepack-ffi.workspace = true
 tempfile = { workspace = true }
 
 # The `file:` feed URL of a Windows path (cli tests).

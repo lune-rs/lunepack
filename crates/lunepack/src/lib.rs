@@ -126,6 +126,7 @@ pub use installation::{HEALTH_TOKEN_VAR, Installation, Platform};
 pub use lifecycle::{
     ApplyOptions, ApplyScheduled, Startup, StartupAction, UiChoice, apply_and_restart,
     apply_and_restart_for, confirm_for, confirm_healthy, follow_move, startup, startup_for,
+    startup_with_args,
 };
 pub use updater::{
     CheckOptions, CheckOutcome, DownloadOptions, Downloaded, InstalledVersion, Layout,
@@ -170,6 +171,7 @@ pub mod unstable_internals {
         acquire_op_lock, download, fetch_artifact_doc, fetch_document, fetch_pack, fetch_root_doc,
         fetch_run,
     };
+    pub use crate::lifecycle::startup_in;
     pub use crate::machine::{connect_error, hello_error, service_error};
     pub use crate::pipe::{
         AsyncReceiver, AsyncSender, BLOCKING_RECHECK, BlockingReceiver, BlockingSender, Closed,

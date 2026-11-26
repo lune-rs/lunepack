@@ -23,6 +23,9 @@ pub enum Role {
     Adapter,
     Facade,
     Binary,
+    /// A language binding (M14-D1): wraps the facade and adds no logic, so its normal dependencies
+    /// are the core and the facade only. It constructs no adapter; the facade's default wiring does.
+    Binding,
     Tool,
 }
 
@@ -44,6 +47,7 @@ pub const ROLES: &[(&str, Role)] = &[
     ("lunepack-ui", Role::Binary),
     ("lunepack-stub", Role::Binary),
     ("lunepack-service", Role::Binary),
+    ("lunepack-ffi", Role::Binding),
     ("xtask", Role::Tool),
 ];
 
@@ -66,12 +70,13 @@ pub const PUBLISH_SET: &[&str] = &[
     "lunepack-os-windows",
 ];
 
-/// Crates that may lift `unsafe_code` (M1-D3); `lunepack-ffi` joins here later.
+/// Crates that may lift `unsafe_code` (M1-D3); `lunepack-ffi` joined with M14-D1.
 pub const UNSAFE_ALLOWLIST: &[&str] = &[
     "lunepack-fs",
     "lunepack-os-windows",
     "lunepack-os-macos",
     "lunepack-os-linux",
+    "lunepack-ffi",
 ];
 
 /// External (non-workspace) dependencies `lunepack-core` may have (M2-D1): the pure parsing,
@@ -106,7 +111,16 @@ pub const CONFINED: &[(&str, &[&str])] = &[
 pub const ONLY_DEPENDED_ON_BY: &[(&str, &[&str])] = &[
     ("lunepack-ui-luneui", &["lunepack-ui"]),
     ("lunepack-ui", &[]),
+    // The C binding (M14-D1): nothing links it. The runtime's test holds its status table equal to
+    // its own (`DEV_EDGE_ONLY`).
+    ("lunepack-ffi", &["lunepack-runtime"]),
 ];
+
+/// Workspace crates whose listed dependents may reach them by a dev-dependency only (M14-D3):
+/// `(crate, dependents)`. A listed dependent is exempt from its role's edge table for this crate in
+/// its dev-dependencies and refused in its normal and build ones; every other package is refused by
+/// `ONLY_DEPENDED_ON_BY`.
+pub const DEV_EDGE_ONLY: &[(&str, &[&str])] = &[("lunepack-ffi", &["lunepack-runtime"])];
 
 /// Closed dependency lists (M7-D7, M7-D20, M10-D7): `(package, the only crates it may depend on)`. Every
 /// normal and build dependency of the package, workspace member or external, must be named here;
@@ -240,6 +254,7 @@ fn allowed_normal(role: Role) -> Vec<&'static str> {
         Role::Testkit | Role::Adapter => &[Role::Core],
         Role::Facade => &[Role::Core, Role::Adapter],
         Role::Binary => &[Role::Core, Role::Adapter, Role::Facade],
+        Role::Binding => &[Role::Core, Role::Facade],
     };
     roles.iter().flat_map(|r| names_with_role(*r)).collect()
 }
@@ -1259,10 +1274,23 @@ fn check_dependency(
                 ),
             ));
         }
+        let dev_only = DEV_EDGE_ONLY
+            .iter()
+            .find(|(c, dependents)| *c == dname && dependents.contains(&package));
+        if dev_only.is_some() && dep.kind != DependencyKind::Development {
+            out.push(v(
+                package,
+                "confined",
+                format!("{kind} dependency on `{dname}`: only a dev-dependency may reach it"),
+            ));
+        }
         if let Some(role) = role {
             let mut allowed = allowed_normal(role);
             if dep.kind == DependencyKind::Development {
                 allowed.extend(testkit.iter().copied());
+                if dev_only.is_some() {
+                    allowed.push(dname);
+                }
             }
             if !allowed.contains(&dname) {
                 out.push(v(

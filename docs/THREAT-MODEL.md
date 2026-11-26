@@ -1428,6 +1428,43 @@ carry, not a defence against an attacker: it makes the failure appear at the pub
 user's machine. An unsigned bundle with no `[codesign.macos]` section is packed as before
 ([`docs/CLI.md`](CLI.md), "macOS targets").
 
+## The C binding adds no trust input (M14)
+
+`lunepack-ffi`, the C library over the facade ([`docs/C-API.md`](C-API.md)), is a second way to reach calls
+that the runtime's command line already makes. It adds no input that decides what an update is allowed to
+be, so no attacker class gains anything from it that it had against the runtime:
+
+- **No trust comes from the caller.** No function takes a root key, a feed URL, a channel's key set or an
+  install root. The library finds the app's own tree from the app's own executable, and the root key, the
+  feed and the channel come from the `lunepack-update.json` in that signed tree, exactly as for the runtime
+  ([`docs/RUNTIME.md`](RUNTIME.md), "Locating the runtime"). An `install`, an adoption flag and a constructor
+  with a layout are left out of the first ABI for this reason. What a caller does pass is the app's own
+  business: a cancel token, a progress callback, the arguments a new version starts with, an expected version
+  (which only narrows what `apply_and_restart` accepts), and a channel name of the same feed, checked as a
+  channel id.
+- **Verification is the facade's.** Every document, hash and signature is checked by the code the runtime
+  uses; the binding converts types and statuses and runs no decoder of its own.
+- **Nothing sensitive crosses back.** Statuses are numbers, names and reason names from closed sets; there
+  is no message text, because a facade error's text may carry a path or the words of an operating-system
+  error, and no output of lunepack shows those. Strings the library returns come from signed documents
+  (versions) or are static. The binding calls the facade's free functions for `startup`, `confirm_healthy`
+  and `apply_and_restart`, which keep the health token that a per-machine install issues to the process,
+  and not the `_for` forms that skip that hand-off.
+- **The process is the app's.** The library runs in the app's own process with the app's own rights, the
+  class-4 position (a process of the same user): code that can call it can already call the runtime or edit
+  what the user owns, and the binding opens no new door for it. The update itself is applied by the
+  runtime in its own process, as before.
+- **Memory safety at the boundary.** The unsafe code of the crate is confined to the entry points, each block
+  says what the caller promised (a live handle, a NUL-terminated string, a writable slot), a panic is caught
+  at every entry point and becomes `internal`, and a result handle is immutable. A caller that breaks a
+  promise (frees a handle twice, passes a string that is not NUL-terminated, unwinds out of a callback) is
+  undefined behaviour in the caller's own process; the library cannot defend against it, and
+  `docs/C-API.md` states each rule.
+- **One residual.** Rust's default panic hook writes the message of a caught panic to standard error: the
+  binding installs no global hook, which would change the host app. The text is that of the panic itself (an
+  assertion or an `expect` in lunepack or a dependency) and is not under the binding's control; the binding
+  adds nothing to it, the call returns `internal`, and no panic is expected in normal use.
+
 ## Denial-of-service bounds
 
 | Resource | Bound |

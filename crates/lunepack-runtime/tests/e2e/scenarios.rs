@@ -139,14 +139,15 @@ const V6: Release = Release {
     ..Release::plain("6.0.0")
 };
 
-/// The rows a folder app (the .NET example, about 190 files) runs, by id. Together they cover each
+/// The rows a folder app (the .NET example, about 190 files; the C example, the app and its
+/// library) runs, by id. Together they cover each
 /// stage of an app's life: the install (1); the update by `check`, `download` and
 /// `apply-and-restart` with the new version's confirm (2); a version that crashes on start, rolled
 /// back and marked bad (3); the fixed version (4); the uninstall (7, which runs from the tree row 4
 /// left); and an update that arrives as a delta (10). Rows 5, 6, 8, 9, 11 and 12 test the runtime
 /// (timeouts, the attempt counter, a file feed, a policy, the delta fallbacks), not the app, and the
 /// two single-file apps already run them. The shell app's log, cut to these rows by [`filter_log`],
-/// is what the folder app's log must equal.
+/// is what each folder app's log must equal.
 pub const FOLDER_APP_ROWS: &[u8] = &[1, 2, 3, 4, 7, 10];
 
 /// Runs the whole table on a fresh lab per feed kind, stopping at the first failing row.

@@ -2,9 +2,10 @@
 
 An app in any language, native or managed, installs and updates itself through one thing: a program
 called `lunepack-runtime` that sits beside the app's own executable. The app runs it as a child process,
-reads its output and acts on the result. There is no library to link and no binding. The command line is
-the interface ([`RUNTIME.md`](RUNTIME.md) is its reference); this guide walks through it with a real
-app, the .NET example in [`examples/dotnet`](../examples/dotnet/README.md).
+reads its output and acts on the result. There is no library to link. The command line is the interface
+([`RUNTIME.md`](RUNTIME.md) is its reference); this guide walks through it with a real app, the .NET example
+in [`examples/dotnet`](../examples/dotnet/README.md). An app in C or C++ can instead link a small C library
+that makes the same calls itself: "An app in C" below and [`C-API.md`](C-API.md).
 
 A Rust app uses the facade crate instead and follows [`GETTING-STARTED.md`](GETTING-STARTED.md); both
 guides produce the same packs, feeds and installs. The signing keys and how to keep them are in
@@ -452,6 +453,38 @@ reading cancels the download too; a reader that never reads cannot stall it
 ([`RUNTIME.md`, "Cancel"](RUNTIME.md#cancel)).
 
 (not run: a delta download is 20 bytes and ends before a signal could arrive.)
+
+## An app in C
+
+A C or C++ app does not have to start a child process: it can link `lunepack_ffi` and call the same
+operations as functions ([`C-API.md`](C-API.md) is the reference, [`examples/c`](../examples/c/README.md)
+the working app). The library is built from a checkout and is not distributed yet. It is the same code the
+runtime's command line runs, so everything above holds: the app's own signed tree is the only source of the
+root key, the feed and the channel, the packing and the feed are the ones of sections 2 to 4, and the
+library finds its tree and the runtime from the app's own executable as section 5 describes. The runtime
+still sits beside the app: `apply_and_restart` starts it to apply the update.
+
+| Command of the runtime | Calls of the library |
+|---|---|
+| `startup` | `lunepack_startup`, then `lunepack_startup_should_exit` (`action` is `"exit"`) and the `lunepack_startup_event_*` accessors (`events`) |
+| `confirm` | `lunepack_confirm_healthy` |
+| `check` | `lunepack_updater_open`, `lunepack_updater_check` (no update: an `out` handle of NULL) |
+| `download` | `lunepack_updater_download`, then `lunepack_updater_stage` (the command stages, too); `lunepack_updater_staged` reads what is staged |
+| `apply-and-restart` | `lunepack_apply_and_restart`, with `--expect-version` as its `expect_version`; the app exits right after |
+
+The runtime's progress lines are the calls' progress callback, its exit codes are the calls' statuses (the
+same numbers and names, [`RUNTIME.md`, "Exit codes"](RUNTIME.md#exit-codes)), and cancelling is a cancel
+token instead of ending a child process. The checklist below applies as it is: `startup` first and end when
+told to, `confirm` once the app works, and exit right after `apply_and_restart`.
+
+To build and try it: `cargo run -p xtask -- build-example-c --out <dir>` places the example and the library
+side by side for the host (or for `--target <id>`), and `pack` takes that folder with `example`
+(`example.exe` on Windows) as the entry, like the .NET folder of section 1. On macOS the executable and
+`liblunepack_ffi.dylib` go into `Contents/MacOS` of the bundle. The example speaks the same test protocol as
+the .NET and shell apps, so the repository's three end-to-end suites run it through the same rows.
+
+(not run in this guide's session: it needs a C compiler and the Rust toolchain on the machine that builds
+the example; the end-to-end suites build and run it.)
 
 ## macOS: the bundle layout
 

@@ -31,6 +31,12 @@
 # with the real HOME (as cargo does: the SDK's package cache is there, and the runtime pack
 # is downloaded once); its output goes under the root. After the suite, a crash report named after
 # lunepack, the e2e apps or the example in the real user's DiagnosticReports is a failure.
+#
+# Row 16 runs the C example (examples/c, M14 step 7): `cargo run -p xtask -- build-example-c` builds
+# the app and the C library for this Mac's own target (the system's C compiler; no SDK to install),
+# the row makes them into a bundle (the executable and `liblunepack_ffi.dylib` side by side in
+# Contents/MacOS) that the packager signs ad hoc. A missing C compiler is a failure;
+# LUNEPACK_E2E_C=0 is the one opt-out, and the suite then prints SKIPPED once.
 # bash 3.2 compatible.
 set -euo pipefail
 
@@ -184,6 +190,15 @@ if [ "${LUNEPACK_E2E_DOTNET:-1}" != 0 ]; then
   dotnet_bundle=$root/build/Example.app
 fi
 
+# The C example, for this Mac's own target: the app and the C library in one folder under the root.
+c_app=
+if [ "${LUNEPACK_E2E_C:-1}" != 0 ]; then
+  command -v cc >/dev/null 2>&1 || die "no C compiler (cc): row 16 needs one (LUNEPACK_E2E_C=0 skips it)"
+  echo "e2e-macos: building the C example for $target"
+  cargo run --quiet --locked -p xtask -- build-example-c --out "$root/build/c-app" --target "$target"
+  c_app=$root/build/c-app
+fi
+
 shell_app=$top/crates/lunepack-runtime/tests/e2e/shell-app/app.sh
 [ -f "$shell_app" ] || die "the shell app is missing"
 if command -v shellcheck >/dev/null 2>&1; then
@@ -255,6 +270,7 @@ LUNEPACK_E2E_ROOT=$root/rows \
   LUNEPACK_E2E_FAKE_UI=$root/build/e2e_fake_ui \
   LUNEPACK_E2E_UI=$root/build/e2e_fake_ui \
   LUNEPACK_E2E_DOTNET_BUNDLE=$dotnet_bundle \
+  LUNEPACK_E2E_C_APP=$c_app \
   LUNEPACK_E2E_CI=$ci \
   LUNEPACK_E2E_REQUIRE=1 \
   cargo test --locked -p lunepack-runtime --test e2e
