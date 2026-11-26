@@ -23,10 +23,10 @@ use crate::status::{Fail, LunepackStatus, publisher_name};
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// Counts one live handle for as long as it exists.
-struct Live;
+pub(crate) struct Live;
 
 impl Live {
-    fn new() -> Live {
+    pub(crate) fn new() -> Live {
         LIVE.fetch_add(1, Ordering::SeqCst);
         Live
     }
@@ -38,7 +38,7 @@ impl Drop for Live {
     }
 }
 
-/// How many updater, update-info, downloaded and staged handles are alive: every `_free` and every
+/// How many updater, update-info, downloaded, staged and startup handles are alive: every `_free` and every
 /// consuming call lowers it. For the tests; not part of the C ABI.
 pub fn live_handles() -> usize {
     LIVE.load(Ordering::SeqCst)

@@ -15,6 +15,28 @@
 // Removing or re-meaning anything bumps it.
 #define LUNEPACK_ABI_VERSION 1
 
+// The app was installed at this version (`lunepack_startup_event_kind`).
+#define LUNEPACK_EVENT_INSTALLED 1
+
+// The app was updated; `event_version` is the new version and `event_from` the old one.
+#define LUNEPACK_EVENT_UPDATED 2
+
+// This version runs for the first time.
+#define LUNEPACK_EVENT_FIRST_RUN 3
+
+// The version was confirmed healthy (`lunepack_confirm_healthy`).
+#define LUNEPACK_CONFIRM_CONFIRMED 1
+
+// Nothing to confirm: nothing is pending, or another version is, or the tree is not installed.
+#define LUNEPACK_CONFIRM_NOTHING_PENDING 2
+
+// `lunepack_apply_and_restart` flag: the applier shows no update window.
+#define LUNEPACK_APPLY_NO_UI 1
+
+// `lunepack_apply_and_restart` flag: start the new version without bringing it to the front
+// (macOS; elsewhere it changes nothing).
+#define LUNEPACK_APPLY_BACKGROUND 2
+
 // A cancel token: an opaque handle made by `lunepack_cancel_token_new` and released by
 // `lunepack_cancel_token_free`. Safe to use from several threads at once; cancelling is
 // permanent. A function that takes a token accepts NULL for "no token".
@@ -27,6 +49,10 @@ typedef struct LunepackDownloaded LunepackDownloaded;
 // A staged version tree, immutable until `lunepack_staged_free`. Safe to read from several
 // threads at once.
 typedef struct LunepackStaged LunepackStaged;
+
+// What `lunepack_startup` found and did: plain data, immutable until `lunepack_startup_free`.
+// Safe to read from several threads at once.
+typedef struct LunepackStartup LunepackStartup;
 
 // An update `lunepack_updater_check` found, immutable until `lunepack_update_info_free`. Safe to
 // read from several threads at once.
@@ -259,6 +285,102 @@ bool lunepack_cancel_token_is_cancelled(const LunepackCancelToken *token);
 // # Safety
 // `token` is NULL or a handle from `lunepack_cancel_token_new` not yet freed.
 void lunepack_cancel_token_free(LunepackCancelToken *token);
+
+// The start of the running app: call it at every start, before anything else. It reconciles the
+// install, counts this start when this version is pending its health check (the fourth
+// unconfirmed start rolls back, starts the previous version and sets `should_exit`), and
+// delivers the lifecycle events queued for this version, each once.
+//
+// `args` and `nargs` are the process's own arguments after the program name, for the relaunch of
+// a rollback: `(NULL, 0)` takes them from the process; otherwise `nargs` UTF-8 strings. `out`
+// receives the handle (NULL on failure). A process with no update configuration above its
+// executable (a development run) gets `update_config`. Release the handle with
+// `lunepack_startup_free`.
+//
+// # Safety
+// `args` is NULL or points to `nargs` NUL-terminated strings valid for the call; `out` is a
+// writable slot.
+LunepackStatus lunepack_startup(const char *const *args, size_t nargs, LunepackStartup **out);
+
+// Whether the app must exit now: this version was rolled back and the previous one has been
+// started in its place. false for NULL.
+//
+// # Safety
+// `startup` is NULL or a live handle.
+bool lunepack_startup_should_exit(const LunepackStartup *startup);
+
+// Whether this version still waits for `lunepack_confirm_healthy`. false for NULL.
+//
+// # Safety
+// `startup` is NULL or a live handle.
+bool lunepack_startup_pending(const LunepackStartup *startup);
+
+// The running tree's own version, as canonical SemVer text. Valid, unchanged, until the handle
+// is freed. NULL for NULL.
+//
+// # Safety
+// `startup` is NULL or a live handle.
+const char *lunepack_startup_tree_version(const LunepackStartup *startup);
+
+// How many lifecycle events were delivered, oldest first. 0 for NULL.
+//
+// # Safety
+// `startup` is NULL or a live handle.
+size_t lunepack_startup_event_count(const LunepackStartup *startup);
+
+// The kind of event `i`: `LUNEPACK_EVENT_INSTALLED`, `_UPDATED` or `_FIRST_RUN`; a kind a later
+// version adds is a new number. 0 for an index out of range or NULL.
+//
+// # Safety
+// `startup` is NULL or a live handle.
+uint32_t lunepack_startup_event_kind(const LunepackStartup *startup, size_t i);
+
+// The version event `i` is for: the installed or first-run version, or the new version of an
+// update. Valid, unchanged, until the handle is freed. NULL for an index out of range or NULL.
+//
+// # Safety
+// `startup` is NULL or a live handle.
+const char *lunepack_startup_event_version(const LunepackStartup *startup, size_t i);
+
+// The version an update came from, for an `LUNEPACK_EVENT_UPDATED` event; NULL for any other
+// event, an index out of range or NULL. Valid until the handle is freed.
+//
+// # Safety
+// `startup` is NULL or a live handle.
+const char *lunepack_startup_event_from(const LunepackStartup *startup, size_t i);
+
+// Releases a startup handle. NULL does nothing.
+//
+// # Safety
+// `startup` is NULL or a handle not yet freed.
+void lunepack_startup_free(LunepackStartup *startup);
+
+// The running version confirms its health, once it works. `out_outcome` receives
+// `LUNEPACK_CONFIRM_CONFIRMED` or `LUNEPACK_CONFIRM_NOTHING_PENDING` (0 on failure); a NULL
+// `out_outcome` is `usage`. A health token the process holds that is malformed or does not
+// match is `token_mismatch`; a process with no update configuration gets `update_config`.
+//
+// # Safety
+// `out_outcome` is a writable `uint32_t`.
+LunepackStatus lunepack_confirm_healthy(uint32_t *out_outcome);
+
+// Hands the staged version to the runtime: it starts the runtime detached to wait for this
+// process, apply the staged version and start it with `args`. The call returns; THE APP MUST EXIT
+// NEXT (the library never exits the process). Nothing is started when nothing usable is staged
+// (`nothing_staged`) or the staged version is not `expect_version` (`unexpected_version`).
+//
+// `expect_version` is NULL or the canonical version the app expects to be staged (`1.0`, `v1.0.0`
+// and other non-canonical text is `usage`). `flags` is `LUNEPACK_APPLY_NO_UI` and
+// `LUNEPACK_APPLY_BACKGROUND` or'd (any other bit is `usage`). `args`, `nargs`: the arguments the
+// new version is started with, `nargs` UTF-8 strings; `(NULL, 0)` is none.
+//
+// # Safety
+// `expect_version` is NULL or a NUL-terminated string valid for the call; `args` is NULL or
+// points to `nargs` such strings.
+LunepackStatus lunepack_apply_and_restart(const char *expect_version,
+                                          uint32_t flags,
+                                          const char *const *args,
+                                          size_t nargs);
 
 // The name of a status number: `"ok"` for 0, the runtime's `kind` name for the others, NULL for
 // a number this library does not know. The string is static.

@@ -13,6 +13,7 @@
 
 mod cancel;
 mod guard;
+mod lifecycle;
 mod progress;
 mod status;
 mod updater;
@@ -20,6 +21,14 @@ mod updater;
 pub use cancel::{
     LunepackCancelToken, lunepack_cancel_token_cancel, lunepack_cancel_token_free,
     lunepack_cancel_token_is_cancelled, lunepack_cancel_token_new,
+};
+pub use lifecycle::{
+    LUNEPACK_APPLY_BACKGROUND, LUNEPACK_APPLY_NO_UI, LUNEPACK_CONFIRM_CONFIRMED,
+    LUNEPACK_CONFIRM_NOTHING_PENDING, LUNEPACK_EVENT_FIRST_RUN, LUNEPACK_EVENT_INSTALLED,
+    LUNEPACK_EVENT_UPDATED, LunepackStartup, lunepack_apply_and_restart, lunepack_confirm_healthy,
+    lunepack_startup, lunepack_startup_event_count, lunepack_startup_event_from,
+    lunepack_startup_event_kind, lunepack_startup_event_version, lunepack_startup_free,
+    lunepack_startup_pending, lunepack_startup_should_exit, lunepack_startup_tree_version,
 };
 pub use progress::{LunepackProgress, LunepackProgressFn};
 pub use status::{LunepackStatus, lunepack_last_error_reason, lunepack_status_name};
@@ -180,6 +189,7 @@ pub extern "C" fn lunepack_source_name(source: LunepackSource) -> *const c_char 
 /// Plumbing the runtime's drift test uses; not part of the C ABI and free to change.
 #[doc(hidden)]
 pub mod unstable_internals {
+    pub use crate::lifecycle::startup_handle;
     pub use crate::status::*;
     pub use crate::updater::{live_handles, updater_handle};
 }

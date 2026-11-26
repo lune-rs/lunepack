@@ -277,11 +277,24 @@ fn is_pending(record: &InstallState, own: &Version) -> bool {
 
 /// The start of the running app: [`startup_for`] its own installation with its own arguments.
 pub fn startup() -> Result<Startup, Error> {
+    startup_with_args(std::env::args_os().skip(1).collect())
+}
+
+/// [`startup`] for an app that holds its arguments itself (a binding, a host that parses them
+/// first): the same start of the running app's own installation, with `args` in place of the
+/// process's own. A rollback's relaunch of the previous version carries `args`.
+pub fn startup_with_args(args: Vec<OsString>) -> Result<Startup, Error> {
     let inst = Installation::from_current_exe()?;
-    let started = startup_for(&inst, std::env::args_os().skip(1).collect());
+    startup_in(&inst, args)
+}
+
+/// [`startup_for`] followed by the hand-off of the health token a per-machine install may have
+/// issued this process: what [`startup`] does once it has found its installation.
+pub fn startup_in(inst: &Installation, args: Vec<OsString>) -> Result<Startup, Error> {
+    let started = startup_for(inst, args);
     // A per-machine install's `attempt` may have issued this process a token (M10-D3): the
     // `confirm_healthy` that follows builds an installation of its own.
-    crate::machine::export_kept(&inst);
+    crate::machine::export_kept(inst);
     started
 }
 

@@ -462,6 +462,21 @@ fn a_callback_that_calls_lunepack_is_refused_and_one_that_cancels_ends_the_opera
         // SAFETY: a live updater and a writable slot.
         let s = unsafe { lunepack_updater_staged(uaddr as *const LunepackUpdater, &mut o) };
         notes.push(format!("staged {s} {}", o.is_null()));
+        // The lifecycle calls are refused too, with `usage` and not `update_config`.
+        let (s, out) = {
+            let mut o = 0x10 as *mut LunepackStartup;
+            // SAFETY: a writable slot; NULL arguments.
+            let s = unsafe { lunepack_startup(ptr::null(), 0, &mut o) };
+            (s, o.is_null())
+        };
+        notes.push(format!("startup {s} {out}"));
+        let mut outcome = 9u32;
+        // SAFETY: a writable `uint32_t`.
+        let s = unsafe { lunepack_confirm_healthy(&mut outcome) };
+        notes.push(format!("confirm {s} {outcome}"));
+        // SAFETY: NULL arguments are valid.
+        let s = unsafe { lunepack_apply_and_restart(ptr::null(), 0, ptr::null(), 0) };
+        notes.push(format!("apply {s}"));
         // The token's own functions work from inside a callback.
         let t = taddr as *const LunepackCancelToken;
         // SAFETY: `t` is a live token.
@@ -485,6 +500,9 @@ fn a_callback_that_calls_lunepack_is_refused_and_one_that_cancels_ends_the_opera
             format!("check {USAGE} true"),
             format!("stage {USAGE} true"),
             format!("staged {USAGE} true"),
+            format!("startup {USAGE} true"),
+            format!("confirm {USAGE} 0"),
+            format!("apply {USAGE}"),
             "cancelled false".to_owned(),
             "cancelled true".to_owned(),
         ]
