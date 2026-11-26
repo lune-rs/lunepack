@@ -26,11 +26,16 @@ mod state;
 mod tool;
 mod zip;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use lunepack_core::{CodeSign, Error, SignItem};
+use lunepack_http::{Credentials, DirStore, S3Store};
+
+use crate::config::{PublishSettings, StoreKind};
 
 #[derive(Parser)]
 #[command(
@@ -70,7 +75,7 @@ enum Command {
     /// Build a Linux setup file: the release's runtime with one version's key set, manifest and
     /// pack, installable offline (`<app_id>-<version>-<target>-setup`).
     Setup(cmd_setup::SetupArgs),
-    /// The standard publish flow: fetch the published state, then (later) push a release.
+    /// The standard publish flow: fetch the published state, then push a release.
     Publish {
         #[command(subcommand)]
         command: cmd_publish::PublishCommand,
@@ -125,6 +130,73 @@ impl CodeSign for NoCodeSign {
     }
 }
 
+/// The value of the variable `name`, which `[publish] <field>` names. The error names the variable,
+/// never a value.
+fn publish_env(name: &str, field: &str) -> anyhow::Result<String> {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) | Err(std::env::VarError::NotPresent) => {
+            bail!("the environment variable {name} ([publish] {field}) is not set")
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("the environment variable {name} ([publish] {field}) is not valid text")
+        }
+    }
+}
+
+/// The store credentials, from the variables `[publish]` names; read once per store, so no copy
+/// outlives the `Credentials` that zeroize it.
+fn store_credentials(publish: &PublishSettings) -> anyhow::Result<Credentials> {
+    Ok(Credentials::new(
+        publish_env(&publish.access_key_env, "access_key_env")?,
+        publish_env(&publish.secret_key_env, "secret_key_env")?,
+    ))
+}
+
+/// The stores of `publish` (the composition root wires the adapters): `S3Store` for `r2` and `s3`,
+/// signing at the system clock (never `SOURCE_DATE_EPOCH`'s), or two `DirStore`s under
+/// `--store-dir`, which reads no variable.
+fn open_stores(
+    publish: &PublishSettings,
+    store_dir: Option<&Path>,
+) -> anyhow::Result<cmd_publish::Stores> {
+    if let Some(dir) = store_dir {
+        return Ok(cmd_publish::Stores {
+            public: Box::new(DirStore::new(dir.join("public"))),
+            private: Box::new(DirStore::new(dir.join("private"))),
+        });
+    }
+    let clock: Arc<dyn lunepack_core::Clock> = Arc::new(lunepack::SystemClock);
+    let open = |bucket: &str| -> anyhow::Result<Box<dyn lunepack_core::ObjectStore>> {
+        let credentials = store_credentials(publish)?;
+        let store = match &publish.store {
+            StoreKind::R2 { account_id_env } => S3Store::r2(
+                &publish_env(account_id_env, "account_id_env")?,
+                bucket,
+                credentials,
+                clock.clone(),
+            ),
+            StoreKind::S3 {
+                endpoint_env,
+                region,
+            } => S3Store::new(
+                &publish_env(endpoint_env, "endpoint_env")?,
+                bucket,
+                region,
+                credentials,
+                clock.clone(),
+            ),
+        };
+        Ok(Box::new(
+            store.context("[publish] does not describe a usable store")?,
+        ))
+    };
+    Ok(cmd_publish::Stores {
+        public: open(&publish.public_bucket)?,
+        private: open(&publish.private_bucket)?,
+    })
+}
+
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Init(args) => cmd_keys::init(&cli.config, &args),
@@ -142,7 +214,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Verify(args) => cmd_verify::verify(&cli.config, &args),
         Command::Inspect(args) => cmd_verify::inspect(&cli.config, &args),
         Command::Setup(args) => cmd_setup::setup(&cli.config, &args),
-        Command::Publish { command } => cmd_publish::run(&cli.config, &command),
+        Command::Publish { command } => cmd_publish::run(&cli.config, &command, &open_stores),
         Command::Prebuilt { command } => match command {
             PrebuiltCommand::List(args) => cmd_prebuilt::list(&args),
             PrebuiltCommand::Check(args) => cmd_prebuilt::check(&args),

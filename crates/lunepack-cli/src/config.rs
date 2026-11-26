@@ -284,8 +284,6 @@ pub enum StoreKind {
 
 /// `[publish]`, parsed and checked (P-D4). It holds the names of the variables that carry the
 /// credentials, never a value.
-// Read by `lunepack publish` (the next steps of the publish work); only `channels` is read today.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PublishSettings {
     /// The app's prefix in both buckets: one key segment.

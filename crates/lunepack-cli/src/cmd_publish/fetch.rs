@@ -187,7 +187,7 @@ fn check_release_dir(dir: &Path) -> Result<()> {
 }
 
 /// A path a signed document names, joined under `base`: relative, with no `.` or `..` segment.
-fn under(base: &Path, rel: &str) -> Result<PathBuf> {
+pub(super) fn under(base: &Path, rel: &str) -> Result<PathBuf> {
     if rel.is_empty()
         || rel.starts_with('/')
         || rel.contains(['\\', ':'])
@@ -200,7 +200,7 @@ fn under(base: &Path, rel: &str) -> Result<PathBuf> {
     Ok(base.join(rel))
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
