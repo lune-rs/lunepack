@@ -111,7 +111,16 @@ pub const CONFINED: &[(&str, &[&str])] = &[
 pub const ONLY_DEPENDED_ON_BY: &[(&str, &[&str])] = &[
     ("lunepack-ui-luneui", &["lunepack-ui"]),
     ("lunepack-ui", &[]),
+    // The C binding (M14-D1): nothing links it. The runtime's test holds its status table equal to
+    // its own (`DEV_EDGE_ONLY`).
+    ("lunepack-ffi", &["lunepack-runtime"]),
 ];
+
+/// Workspace crates whose listed dependents may reach them by a dev-dependency only (M14-D3):
+/// `(crate, dependents)`. A listed dependent is exempt from its role's edge table for this crate in
+/// its dev-dependencies and refused in its normal and build ones; every other package is refused by
+/// `ONLY_DEPENDED_ON_BY`.
+pub const DEV_EDGE_ONLY: &[(&str, &[&str])] = &[("lunepack-ffi", &["lunepack-runtime"])];
 
 /// Closed dependency lists (M7-D7, M7-D20, M10-D7): `(package, the only crates it may depend on)`. Every
 /// normal and build dependency of the package, workspace member or external, must be named here;
@@ -1265,10 +1274,23 @@ fn check_dependency(
                 ),
             ));
         }
+        let dev_only = DEV_EDGE_ONLY
+            .iter()
+            .find(|(c, dependents)| *c == dname && dependents.contains(&package));
+        if dev_only.is_some() && dep.kind != DependencyKind::Development {
+            out.push(v(
+                package,
+                "confined",
+                format!("{kind} dependency on `{dname}`: only a dev-dependency may reach it"),
+            ));
+        }
         if let Some(role) = role {
             let mut allowed = allowed_normal(role);
             if dep.kind == DependencyKind::Development {
                 allowed.extend(testkit.iter().copied());
+                if dev_only.is_some() {
+                    allowed.push(dname);
+                }
             }
             if !allowed.contains(&dname) {
                 out.push(v(

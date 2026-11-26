@@ -385,6 +385,77 @@ undocumented_unsafe_blocks = "deny"
         assert_has(&fx.run().1, "lunepack-ffi", "lints");
     }
 
+    /// The binding fixture plus the runtime, a binary that depends on the core.
+    fn with_ffi_and_runtime() -> Fx {
+        let mut fx = with_ffi();
+        fx.crates.insert(
+            "lunepack-runtime".into(),
+            manifest(
+                "lunepack-runtime",
+                INHERIT,
+                r#"lunepack-core = { path = "../lunepack-core" }"#,
+            ),
+        );
+        fx
+    }
+
+    const FFI_DEP: &str = r#"lunepack-ffi = { path = "../lunepack-ffi" }"#;
+
+    #[test]
+    fn ffi_the_runtimes_dev_edge_is_allowed() {
+        let mut fx = with_ffi_and_runtime();
+        fx.append(
+            "lunepack-runtime",
+            &format!("[dev-dependencies]\n{FFI_DEP}"),
+        );
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn ffi_the_runtimes_normal_and_build_edges_are_refused() {
+        let mut fx = with_ffi_and_runtime();
+        fx.add_dep("lunepack-runtime", FFI_DEP);
+        let vs = fx.run().1;
+        assert_has(&vs, "lunepack-runtime", "confined");
+        assert_has(&vs, "lunepack-runtime", "edge");
+        let mut fx = with_ffi_and_runtime();
+        fx.append(
+            "lunepack-runtime",
+            &format!("[build-dependencies]\n{FFI_DEP}"),
+        );
+        let vs = fx.run().1;
+        assert_has(&vs, "lunepack-runtime", "confined");
+    }
+
+    #[test]
+    fn ffi_a_dev_edge_from_any_other_member_is_refused() {
+        for member in [
+            "lunepack-cli",
+            "lunepack-testkit",
+            "lunepack-http",
+            "lunepack",
+            "lunepack-fs",
+        ] {
+            let mut fx = with_ffi_and_runtime();
+            fx.append(member, &format!("[dev-dependencies]\n{FFI_DEP}"));
+            assert_has(&fx.run().1, member, "confined");
+        }
+        // The binding may not depend on itself through a runtime-shaped exemption either.
+        let mut fx = with_ffi_and_runtime();
+        fx.append("lunepack-ffi", &format!("[dev-dependencies]\n{FFI_DEP}"));
+        assert!(!fx.run().1.is_empty());
+    }
+
+    #[test]
+    fn ffi_a_binding_dev_dependency_on_an_adapter_is_refused() {
+        let mut fx = with_ffi_and_runtime();
+        fx.append(
+            "lunepack-ffi",
+            "[dev-dependencies]\nlunepack-http = { path = \"../lunepack-http\" }",
+        );
+        assert_has(&fx.run().1, "lunepack-ffi", "edge");
+    }
+
     #[test]
     fn h_git_and_outside_path_deps_are_rejected() {
         let mut fx = Fx::clean();

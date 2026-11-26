@@ -2,6 +2,7 @@
 
 pub mod boundaries;
 pub mod denylist;
+pub mod ffi_header;
 pub mod keyfiles;
 pub mod notices;
 pub mod paths;

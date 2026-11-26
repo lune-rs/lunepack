@@ -40,6 +40,9 @@ stage "./scripts/check-boundaries.sh"
 stage "cargo run -p xtask -- notices --check"
 cargo run --quiet --locked -p xtask -- notices --check
 
+stage "cargo run -p xtask -- ffi-header --check"
+cargo run --quiet --locked -p xtask -- ffi-header --check
+
 stage "./scripts/check-secrets.sh"
 ./scripts/check-secrets.sh
 

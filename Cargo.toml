@@ -32,6 +32,8 @@ lunepack = { path = "crates/lunepack", version = "=0.1.0" }
 lunepack-runtime = { path = "crates/lunepack-runtime" }
 lunepack-cli = { path = "crates/lunepack-cli", version = "=0.1.0" }
 lunepack-ui-luneui = { path = "crates/lunepack-ui-luneui" }
+# The C binding (M14): publish = false, no version pin; only the runtime's drift test links it.
+lunepack-ffi = { path = "crates/lunepack-ffi" }
 
 # Core's pure external crates (M2-D1); the boundary check allowlists exactly these for lunepack-core.
 serde = { version = "1", features = ["derive"] }

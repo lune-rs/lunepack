@@ -1989,4 +1989,177 @@ mod tests {
             );
         }
     }
+
+    /// One value of every variant of `lunepack::Error` (every reason of the three that have one,
+    /// every service-refusal code), so the C binding's copy of `Kind::of` is compared on all of them.
+    fn every_error() -> Vec<lunepack::Error> {
+        use lunepack::{
+            Error as E, FsError, FsErrorKind, IntegrationError, ProcessError, ProcessErrorKind,
+            PublisherOutcome as P, ServiceReason as R, StateError, TransportError,
+            TransportErrorKind, UpdateConfigError,
+        };
+        use lunepack_core::LocationReason as L;
+        use lunepack_core::service::ErrorCode;
+        let mut all = vec![
+            E::NotInstalled,
+            E::Busy,
+            E::Cancelled,
+            E::Stale,
+            E::MachineScope,
+            E::VersionDirCollision,
+            E::StateTooNew,
+            E::Verify(lunepack_core::Error::Cancelled),
+            E::Transport(TransportError::new(
+                TransportErrorKind::Io,
+                "https://example.test",
+                None,
+            )),
+            E::Fs(FsError::new(
+                FsErrorKind::Other,
+                std::path::Path::new("x"),
+                None,
+            )),
+            E::State(StateError::SeqExhausted),
+            E::Incomplete,
+            E::NeedFetchExhausted(Vec::new()),
+            E::WorkerPanicked,
+            E::Config("x"),
+            E::Unsupported,
+            E::NoUpdateConfig,
+            E::UpdateConfig(UpdateConfigError::NewerFormat),
+            E::NothingStaged,
+            E::UnexpectedVersion,
+            E::AlreadyInstalled,
+            E::ForeignInstallRoot,
+            E::NoRelease,
+            E::TokenMismatch,
+            E::Process(ProcessError::new(ProcessErrorKind::Other, "spawn")),
+            E::Integration(IntegrationError::Home),
+            E::RollbackUnavailable,
+            E::DisabledByPolicy,
+            E::ServiceUnsupported,
+        ];
+        for reason in [
+            L::Translocated,
+            L::ReadOnly,
+            L::OtherVolume,
+            L::NotOwned,
+            L::NotWritable,
+        ] {
+            all.push(E::UnsupportedLocation { reason });
+        }
+        for reason in [
+            P::Different,
+            P::InstalledUnsigned,
+            P::InstalledInvalid,
+            P::CandidateUnsigned,
+            P::CandidateInvalid,
+            P::Os,
+        ] {
+            all.push(E::PublisherMismatch { reason });
+        }
+        for reason in [
+            R::NotInstalled,
+            R::Disabled,
+            R::StartFailed,
+            R::Untrusted,
+            R::Timeout,
+            R::Protocol,
+        ] {
+            all.push(E::ServiceUnavailable { reason });
+        }
+        for code in ErrorCode::ALL {
+            all.push(E::ServiceRefused {
+                code: *code,
+                class: None,
+            });
+        }
+        all
+    }
+
+    /// The C binding (`lunepack-ffi`) repeats `Kind::of` over the facade's error, because `Kind`
+    /// lives in this binary (M14-D3). Its number, name and reason must be this table's for every
+    /// error, and its status table must hold exactly the classes `Kind::of` returns plus `usage`
+    /// and `internal`.
+    #[test]
+    fn the_c_binding_maps_every_facade_error_as_the_runtime_does() {
+        use lunepack_ffi::unstable_internals::{Fail, reason_table, status_table};
+        let named: std::collections::BTreeMap<i32, &str> = status_table().collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for e in every_error() {
+            let kind = Kind::of(&e);
+            let fail = Fail::of(&e);
+            assert_eq!(
+                fail.status(),
+                i32::from(kind.code()),
+                "{kind:?}: status of {e:?}"
+            );
+            assert_eq!(
+                fail.reason().map(|r| r.to_str().expect("UTF-8")),
+                kind.reason(),
+                "{kind:?}: reason of {e:?}"
+            );
+            assert_eq!(
+                named.get(&fail.status()).copied(),
+                Some(kind.name()),
+                "{kind:?}: name"
+            );
+            seen.insert(fail.status());
+        }
+        // The table: success, `usage` and `internal`, and exactly the classes the facade's errors
+        // reach. A number no error reaches (or an error class missing here) fails this.
+        let mut want = seen.clone();
+        want.extend([0, 2, 70]);
+        assert_eq!(named.keys().copied().collect::<Vec<_>>(), {
+            let mut v: Vec<i32> = want.into_iter().collect();
+            v.sort_unstable();
+            v
+        });
+        assert_eq!(named[&0], "ok");
+        assert_eq!(named[&2], Kind::Usage.name());
+        assert_eq!(named[&70], Kind::Internal.name());
+        assert_eq!(i32::from(Kind::Usage.code()), 2);
+        assert_eq!(i32::from(Kind::Internal.code()), 70);
+        // Every number is a code of the table under the same name.
+        for (n, name) in &named {
+            if *n == 0 {
+                continue;
+            }
+            assert!(
+                Kind::ALL
+                    .iter()
+                    .any(|k| i32::from(k.code()) == *n && k.name() == *name),
+                "{n} {name} is not in the code table"
+            );
+        }
+        // The closed reason sets are the runtime's.
+        let names = |table: &[&std::ffi::CStr]| -> Vec<String> {
+            let mut v: Vec<String> = table
+                .iter()
+                .map(|c| c.to_str().expect("UTF-8").to_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        let sorted = |mut v: Vec<&str>| -> Vec<String> {
+            v.sort_unstable();
+            v.into_iter().map(str::to_owned).collect()
+        };
+        assert_eq!(
+            names(reason_table(28)),
+            sorted(Place::ALL.iter().map(|p| p.name()).collect())
+        );
+        // The runtime lists the refusals a policy can make; the binding also names the one outcome
+        // that only ever warns, because `Kind::PublisherMismatch` carries any outcome's code.
+        let mut publisher: Vec<&str> = PUBLISHER_REASONS.iter().map(|r| r.code()).collect();
+        publisher.push(PublisherOutcome::InstalledUnsigned.code());
+        assert_eq!(names(reason_table(29)), sorted(publisher));
+        assert_eq!(
+            names(reason_table(32)),
+            sorted(ServiceWhy::ALL.iter().map(|w| w.name()).collect())
+        );
+        for n in named.keys().filter(|n| ![28, 29, 32].contains(*n)) {
+            assert!(reason_table(*n).is_empty(), "{n}");
+        }
+    }
 }
