@@ -35,6 +35,7 @@ pub mod service;
 pub mod setup;
 pub mod stage;
 pub mod state;
+pub mod store;
 pub mod stub;
 pub mod target;
 pub mod traits;
@@ -126,6 +127,10 @@ pub use state::{
     CurrentRef, Floors, Health, InstallCounters, InstallState, Lifecycle, LifecycleEvent, Loaded,
     MachineScope, MachineStore, PendingRef, PreviousRef, Record, RootParts, Scope, StagedIssued,
     StagedRef, UserScope,
+};
+pub use store::{
+    MAX_KEY_BYTES, ObjectStore, StoreError, StoreKey, StoreKeyError, StoreMethod,
+    StoreTransportKind,
 };
 pub use stub::{LaunchTarget, STUB_CONTRACT_VERSION, STUB_FILE, StubError, launch_target};
 pub use target::Target;
