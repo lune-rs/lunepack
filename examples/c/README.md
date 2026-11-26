@@ -28,7 +28,9 @@ library beside it in `<dir>`: `liblunepack_ffi.so` (rpath `$ORIGIN`), `liblunepa
 `linux-aarch64`, `windows-x86_64`, `macos-aarch64`, `macos-x86_64`; with none, the host's.
 
 To use the library in an app of your own, build it from a checkout (`cargo build --release -p
-lunepack-ffi`; it is not distributed yet), include `lunepack.h` and link `lunepack_ffi`. Pack the folder
+lunepack-ffi`; it is not distributed yet), include `lunepack.h` and link `lunepack_ffi`
+([the C API reference](../../docs/C-API.md): linking per system, ownership, threads, errors and every
+function). Pack the folder
 with `example` (`example.exe` on Windows) as the entry; `lunepack-runtime` sits beside it once packed.
 
 `crates/lunepack-ffi/tests/c_example.rs` compiles the example with `-std=c99 -Wall -Wextra -Werror`

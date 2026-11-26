@@ -18,7 +18,9 @@ first published release ([`docs/FORMAT.md`](docs/FORMAT.md)).
 | `lunepack` (the facade crate) | the Rust API an app uses to check for, download, verify and stage an update, and to apply it and restart |
 | `lunepack-runtime` | a small static program that sits beside an app and does the same through a command line, so an app in any language can update itself |
 | installers and an update window | per-user and per-machine installs on Windows, macOS and Linux; a privileged update service for installs for all users |
+| `lunepack-ffi` | a C library and its header (`lunepack.h`), so a C or C++ app can check for, download and apply an update with function calls; built from a checkout, not distributed yet |
 | `examples/dotnet` | a .NET app that installs and updates itself through the runtime's command line only |
+| `examples/c` | a C app that does the same through the C library |
 
 Signing is done with the publisher's own keys; an update is accepted only when the chain from the root key
 compiled into the app to the files on disk verifies. What that does and does not defend against is in the
@@ -28,11 +30,12 @@ compiled into the app to the files on disk verifies. What that does and does not
 
 - [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md): from nothing to an installed Rust app that updates
   itself.
-- [`docs/INTEGRATION.md`](docs/INTEGRATION.md): the same for an app in any language, with the .NET example.
+- [`docs/INTEGRATION.md`](docs/INTEGRATION.md): the same for an app in any language, with the .NET example
+  (and, for C and C++, the library below).
 - [`docs/KEY-CEREMONY.md`](docs/KEY-CEREMONY.md): making and keeping the signing keys, rotating and revoking
   them, and what a leak costs.
 - Reference: [`docs/CLI.md`](docs/CLI.md) (the packager), [`docs/RUNTIME.md`](docs/RUNTIME.md) (the runtime's
-  command line, output and exit codes), [`docs/FORMAT.md`](docs/FORMAT.md) (the documents and how a client
+  command line, output and exit codes), [`docs/C-API.md`](docs/C-API.md) (the C library), [`docs/FORMAT.md`](docs/FORMAT.md) (the documents and how a client
   checks them), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the crates and the rules between them).
 - [`SECURITY.md`](SECURITY.md): how to report a vulnerability, and how to check the prebuilt binaries you
   download. [`docs/RELEASING.md`](docs/RELEASING.md) is the maintainer's runbook for a release.
