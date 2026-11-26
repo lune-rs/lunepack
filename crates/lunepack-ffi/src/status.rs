@@ -275,6 +275,15 @@ impl Fail {
     }
 }
 
+/// The name of a publisher finding (`different`, `candidate_unsigned`, ...), the same text the
+/// runtime's `publisher` member and the `publisher_mismatch` reason carry.
+pub(crate) fn publisher_name(finding: lunepack::PublisherOutcome) -> Option<&'static CStr> {
+    PUBLISHER_REASONS
+        .iter()
+        .copied()
+        .find(|r| r.to_bytes() == finding.code().as_bytes())
+}
+
 /// Every status number and name this library defines, for the runtime's drift test.
 pub fn status_table() -> impl Iterator<Item = (LunepackStatus, &'static str)> {
     STATUS_NAMES

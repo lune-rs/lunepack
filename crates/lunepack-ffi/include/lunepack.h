@@ -20,71 +20,114 @@
 // permanent. A function that takes a token accepts NULL for "no token".
 typedef struct LunepackCancelToken LunepackCancelToken;
 
+// A completed download, the input of `lunepack_updater_stage`, which consumes it. One owner at a
+// time: it may be moved to another thread, never used from two at once.
+typedef struct LunepackDownloaded LunepackDownloaded;
+
+// A staged version tree, immutable until `lunepack_staged_free`. Safe to read from several
+// threads at once.
+typedef struct LunepackStaged LunepackStaged;
+
+// An update `lunepack_updater_check` found, immutable until `lunepack_update_info_free`. Safe to
+// read from several threads at once.
+typedef struct LunepackUpdateInfo LunepackUpdateInfo;
+
+// The running app's updater, made by `lunepack_updater_open` from its own tree's configuration
+// and released by `lunepack_updater_free`. Safe to use from several threads at once; two
+// operations at the same time give one `busy`.
+typedef struct LunepackUpdater LunepackUpdater;
+
 // The phase of an operation, as a progress event reports it. A number this library does not
 // know (a phase a later version adds) is `LUNEPACK_PHASE_UNKNOWN`.
-typedef int32_t LunepackPhase;
+typedef uint32_t LunepackPhase;
 
 // Where the bytes of one file come from. A number this library does not know is
 // `LUNEPACK_SOURCE_UNKNOWN`.
-typedef int32_t LunepackSource;
+typedef uint32_t LunepackSource;
 
 // The result of a function: `LUNEPACK_STATUS_OK` or a status number. Callers tolerate numbers
 // they do not know; `lunepack_status_name` names the ones this library does.
 typedef int32_t LunepackStatus;
 
+// One progress event. It lives on the stack of the library for the duration of the callback only:
+// copy what is needed, keep no pointer from it.
+typedef struct {
+  // `LUNEPACK_PHASE_*`, or `LUNEPACK_PHASE_UNKNOWN` for a phase this version does not know.
+  LunepackPhase phase;
+  // Bytes done in the phase.
+  uint64_t done;
+  // Bytes the phase needs (0 while unknown).
+  uint64_t total;
+  // The signed relative path of the file this event is about, UTF-8, or NULL when it is not
+  // about one file. Valid during the callback only.
+  const char *file_path;
+  // Bytes done for that file (0 without a file).
+  uint64_t file_done;
+  // Bytes that file needs (0 without a file).
+  uint64_t file_total;
+  // `LUNEPACK_SOURCE_*` of that file's bytes (`LUNEPACK_SOURCE_UNKNOWN` without a file).
+  LunepackSource file_source;
+} LunepackProgress;
+
+// A progress callback. It runs on the thread that made the call, only during the call. It must
+// not unwind or `longjmp` out, and any lunepack call it makes except
+// `lunepack_cancel_token_cancel` and `lunepack_cancel_token_is_cancelled` returns
+// `LUNEPACK_STATUS_USAGE`. NULL means no callback.
+typedef void (*LunepackProgressFn)(void *user_data, const LunepackProgress *progress);
+
 // Fetching and verifying the signed documents.
-#define LUNEPACK_PHASE_CHECK 0
+#define LUNEPACK_PHASE_CHECK 1
 
 // Finding files of the current tree that the new version keeps unchanged.
-#define LUNEPACK_PHASE_SCAN 1
+#define LUNEPACK_PHASE_SCAN 2
 
 // Fetching pack bytes into the cache.
-#define LUNEPACK_PHASE_DOWNLOAD 2
+#define LUNEPACK_PHASE_DOWNLOAD 3
 
 // Building and verifying the new version tree.
-#define LUNEPACK_PHASE_STAGE 3
+#define LUNEPACK_PHASE_STAGE 4
 
 // Installing the first version.
-#define LUNEPACK_PHASE_INSTALL 4
+#define LUNEPACK_PHASE_INSTALL 5
 
 // Waiting for the app to exit before an apply.
-#define LUNEPACK_PHASE_WAIT 5
+#define LUNEPACK_PHASE_WAIT 6
 
 // Committing the staged version and switching `current` to it.
-#define LUNEPACK_PHASE_APPLY 6
+#define LUNEPACK_PHASE_APPLY 7
 
 // Launching the new version.
-#define LUNEPACK_PHASE_LAUNCH 7
+#define LUNEPACK_PHASE_LAUNCH 8
 
 // Waiting for the new version to confirm its health.
-#define LUNEPACK_PHASE_CONFIRM 8
+#define LUNEPACK_PHASE_CONFIRM 9
 
 // Rolling a version that failed its health check back to the previous one.
-#define LUNEPACK_PHASE_ROLLBACK 9
+#define LUNEPACK_PHASE_ROLLBACK 10
 
 // Removing the install.
-#define LUNEPACK_PHASE_UNINSTALL 10
+#define LUNEPACK_PHASE_UNINSTALL 11
 
 // Proving a bundle the user placed equal to its signed release before adopting it.
-#define LUNEPACK_PHASE_ADOPT 11
+#define LUNEPACK_PHASE_ADOPT 12
 
 // A phase this library version does not know.
-#define LUNEPACK_PHASE_UNKNOWN -1
+#define LUNEPACK_PHASE_UNKNOWN 0
 
 // Copied from the current tree, hash-checked against the manifest.
-#define LUNEPACK_SOURCE_UNCHANGED 0
+#define LUNEPACK_SOURCE_UNCHANGED 1
 
 // A single frame fetched with an HTTP Range request.
-#define LUNEPACK_SOURCE_RANGE 1
+#define LUNEPACK_SOURCE_RANGE 2
 
 // Taken from the full pack.
-#define LUNEPACK_SOURCE_FULL_PACK 2
+#define LUNEPACK_SOURCE_FULL_PACK 3
 
 // A delta patch against the current file (reserved).
-#define LUNEPACK_SOURCE_PATCH 3
+#define LUNEPACK_SOURCE_PATCH 4
 
-// A source this library version does not know.
-#define LUNEPACK_SOURCE_UNKNOWN -1
+// No file, or a source this library version does not know.
+#define LUNEPACK_SOURCE_UNKNOWN 0
 
 // Success.
 #define LUNEPACK_STATUS_OK 0
@@ -192,9 +235,9 @@ const char *lunepack_phase_name(LunepackPhase phase);
 // number this library does not know.
 const char *lunepack_source_name(LunepackSource source);
 
-// Makes a token that is not cancelled. `out` receives the handle (NULL on failure); release it
-// with `lunepack_cancel_token_free`.
-LunepackStatus lunepack_cancel_token_new(LunepackCancelToken **out);
+// Makes a token that is not cancelled; release it with `lunepack_cancel_token_free`. NULL only if
+// the library could not allocate it.
+LunepackCancelToken *lunepack_cancel_token_new(void);
 
 // Cancels the token and wakes whatever waits on it. Callable from any thread and from inside a
 // progress callback. NULL does nothing.
@@ -225,6 +268,124 @@ const char *lunepack_status_name(LunepackStatus status);
 // `publisher_mismatch` and `service_unavailable`; NULL when the last call had none, or succeeded.
 // Every status-returning function clears it on entry. The string is static.
 const char *lunepack_last_error_reason(void);
+
+// Opens the updater of the running app, from the update configuration its own tree carries: the
+// root key, the feed and the channel come from there and nowhere else (D44); no argument names
+// them. `channel` (NULL: the configured one) picks another channel of the same feed; text that is
+// not a channel id is `usage`. `out` receives the handle (NULL on failure). A process with no
+// update configuration above its executable (a development run) gets `update_config`; a tree
+// that is not installed gets `not_installed`. Release the handle with `lunepack_updater_free`.
+//
+// # Safety
+// `channel` is NULL or a NUL-terminated string valid for the call; `out` is a writable slot.
+LunepackStatus lunepack_updater_open(const char *channel, LunepackUpdater **out);
+
+// Releases an updater. NULL does nothing. No operation may still run on it.
+//
+// # Safety
+// `updater` is NULL or a handle from `lunepack_updater_open` not yet freed.
+void lunepack_updater_free(LunepackUpdater *updater);
+
+// Checks the feed for an update. `out` receives a handle when there is one and NULL when there is
+// none (status ok either way). `cancel` is NULL or a token that ends the call with `cancelled`;
+// `progress` is NULL or a callback (a check reports progress only when it adopts a macOS bundle).
+//
+// # Safety
+// `updater` is a live handle, `cancel` NULL or a live token, `progress` NULL or a valid
+// callback, `user_data` whatever the callback expects, `out` a writable slot.
+LunepackStatus lunepack_updater_check(const LunepackUpdater *updater,
+                                      const LunepackCancelToken *cancel,
+                                      LunepackProgressFn progress,
+                                      void *user_data,
+                                      LunepackUpdateInfo **out);
+
+// The new version as canonical SemVer text. Valid, unchanged, until the handle is freed. NULL
+// for a NULL handle.
+//
+// # Safety
+// `info` is NULL or a live handle.
+const char *lunepack_update_info_version(const LunepackUpdateInfo *info);
+
+// The most bytes a download of this update fetches: the pack's signed size. 0 for NULL.
+//
+// # Safety
+// `info` is NULL or a live handle.
+uint64_t lunepack_update_info_download_size_max(const LunepackUpdateInfo *info);
+
+// Whether expiry and key windows were checked; false when the clock was implausible and they
+// were skipped. false for NULL.
+//
+// # Safety
+// `info` is NULL or a live handle.
+bool lunepack_update_info_time_checked(const LunepackUpdateInfo *info);
+
+// Releases an update-info handle. NULL does nothing.
+//
+// # Safety
+// `info` is NULL or a handle not yet freed.
+void lunepack_update_info_free(LunepackUpdateInfo *info);
+
+// Downloads the update `info` describes into the cache, resumably: a download that was cancelled
+// or ended early keeps its part, and the next call continues it. `out` receives the handle for
+// `lunepack_updater_stage`, or NULL on failure. A `progress` callback runs during this call only.
+//
+// # Safety
+// As `lunepack_updater_check`, and `info` is a live handle.
+LunepackStatus lunepack_updater_download(const LunepackUpdater *updater,
+                                         const LunepackUpdateInfo *info,
+                                         const LunepackCancelToken *cancel,
+                                         LunepackProgressFn progress,
+                                         void *user_data,
+                                         LunepackDownloaded **out);
+
+// Releases a downloaded handle that was not staged. NULL does nothing.
+//
+// # Safety
+// `downloaded` is NULL or a handle not yet freed or staged.
+void lunepack_downloaded_free(LunepackDownloaded *downloaded);
+
+// Builds the new version's tree from the download and verifies it. CONSUMES `downloaded`
+// whenever it is not NULL, whatever the status: do not free or reuse it afterwards. `out`
+// receives the staged handle, or NULL on failure. The runtime's `download` command stages the
+// same way. A `progress` callback runs during this call only.
+//
+// # Safety
+// As `lunepack_updater_check`, and `downloaded` is NULL or a handle not yet freed.
+LunepackStatus lunepack_updater_stage(const LunepackUpdater *updater,
+                                      LunepackDownloaded *downloaded,
+                                      const LunepackCancelToken *cancel,
+                                      LunepackProgressFn progress,
+                                      void *user_data,
+                                      LunepackStaged **out);
+
+// The version staged in this install, if any: `out` receives a handle, or NULL when nothing is
+// staged (status ok either way).
+//
+// # Safety
+// `updater` is a live handle and `out` a writable slot.
+LunepackStatus lunepack_updater_staged(const LunepackUpdater *updater, LunepackStaged **out);
+
+// The staged version as canonical SemVer text. Valid, unchanged, until the handle is freed. NULL
+// for a NULL handle.
+//
+// # Safety
+// `staged` is NULL or a live handle.
+const char *lunepack_staged_version(const LunepackStaged *staged);
+
+// What the publisher check reported when it let this version through, as the runtime names it
+// (`different`, `installed_unsigned`, `installed_invalid`, `candidate_unsigned`,
+// `candidate_invalid`, `os`), or NULL: no finding, or a handle from `lunepack_updater_staged`
+// (the finding is not recorded). Static string. NULL for a NULL handle.
+//
+// # Safety
+// `staged` is NULL or a live handle.
+const char *lunepack_staged_publisher(const LunepackStaged *staged);
+
+// Releases a staged handle. NULL does nothing.
+//
+// # Safety
+// `staged` is NULL or a handle not yet freed.
+void lunepack_staged_free(LunepackStaged *staged);
 
 #ifdef __cplusplus
 }  // extern "C"

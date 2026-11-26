@@ -2220,6 +2220,8 @@ name = "lunepack-ffi"
 version = "0.1.0"
 dependencies = [
  "lunepack",
+ "lunepack-core",
+ "lunepack-testkit",
 ]
 
 [[package]]

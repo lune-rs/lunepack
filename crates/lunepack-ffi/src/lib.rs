@@ -13,13 +13,24 @@
 
 mod cancel;
 mod guard;
+mod progress;
 mod status;
+mod updater;
 
 pub use cancel::{
     LunepackCancelToken, lunepack_cancel_token_cancel, lunepack_cancel_token_free,
     lunepack_cancel_token_is_cancelled, lunepack_cancel_token_new,
 };
+pub use progress::{LunepackProgress, LunepackProgressFn};
 pub use status::{LunepackStatus, lunepack_last_error_reason, lunepack_status_name};
+pub use updater::{
+    LunepackDownloaded, LunepackStaged, LunepackUpdateInfo, LunepackUpdater,
+    lunepack_downloaded_free, lunepack_staged_free, lunepack_staged_publisher,
+    lunepack_staged_version, lunepack_update_info_download_size_max, lunepack_update_info_free,
+    lunepack_update_info_time_checked, lunepack_update_info_version, lunepack_updater_check,
+    lunepack_updater_download, lunepack_updater_free, lunepack_updater_open,
+    lunepack_updater_stage, lunepack_updater_staged,
+};
 
 use std::ffi::c_char;
 
@@ -47,47 +58,47 @@ pub extern "C" fn lunepack_library_version() -> *const c_char {
 
 /// The phase of an operation, as a progress event reports it. A number this library does not
 /// know (a phase a later version adds) is `LUNEPACK_PHASE_UNKNOWN`.
-pub type LunepackPhase = i32;
+pub type LunepackPhase = u32;
 /// Fetching and verifying the signed documents.
-pub const LUNEPACK_PHASE_CHECK: LunepackPhase = 0;
+pub const LUNEPACK_PHASE_CHECK: LunepackPhase = 1;
 /// Finding files of the current tree that the new version keeps unchanged.
-pub const LUNEPACK_PHASE_SCAN: LunepackPhase = 1;
+pub const LUNEPACK_PHASE_SCAN: LunepackPhase = 2;
 /// Fetching pack bytes into the cache.
-pub const LUNEPACK_PHASE_DOWNLOAD: LunepackPhase = 2;
+pub const LUNEPACK_PHASE_DOWNLOAD: LunepackPhase = 3;
 /// Building and verifying the new version tree.
-pub const LUNEPACK_PHASE_STAGE: LunepackPhase = 3;
+pub const LUNEPACK_PHASE_STAGE: LunepackPhase = 4;
 /// Installing the first version.
-pub const LUNEPACK_PHASE_INSTALL: LunepackPhase = 4;
+pub const LUNEPACK_PHASE_INSTALL: LunepackPhase = 5;
 /// Waiting for the app to exit before an apply.
-pub const LUNEPACK_PHASE_WAIT: LunepackPhase = 5;
+pub const LUNEPACK_PHASE_WAIT: LunepackPhase = 6;
 /// Committing the staged version and switching `current` to it.
-pub const LUNEPACK_PHASE_APPLY: LunepackPhase = 6;
+pub const LUNEPACK_PHASE_APPLY: LunepackPhase = 7;
 /// Launching the new version.
-pub const LUNEPACK_PHASE_LAUNCH: LunepackPhase = 7;
+pub const LUNEPACK_PHASE_LAUNCH: LunepackPhase = 8;
 /// Waiting for the new version to confirm its health.
-pub const LUNEPACK_PHASE_CONFIRM: LunepackPhase = 8;
+pub const LUNEPACK_PHASE_CONFIRM: LunepackPhase = 9;
 /// Rolling a version that failed its health check back to the previous one.
-pub const LUNEPACK_PHASE_ROLLBACK: LunepackPhase = 9;
+pub const LUNEPACK_PHASE_ROLLBACK: LunepackPhase = 10;
 /// Removing the install.
-pub const LUNEPACK_PHASE_UNINSTALL: LunepackPhase = 10;
+pub const LUNEPACK_PHASE_UNINSTALL: LunepackPhase = 11;
 /// Proving a bundle the user placed equal to its signed release before adopting it.
-pub const LUNEPACK_PHASE_ADOPT: LunepackPhase = 11;
+pub const LUNEPACK_PHASE_ADOPT: LunepackPhase = 12;
 /// A phase this library version does not know.
-pub const LUNEPACK_PHASE_UNKNOWN: LunepackPhase = -1;
+pub const LUNEPACK_PHASE_UNKNOWN: LunepackPhase = 0;
 
 /// Where the bytes of one file come from. A number this library does not know is
 /// `LUNEPACK_SOURCE_UNKNOWN`.
-pub type LunepackSource = i32;
+pub type LunepackSource = u32;
 /// Copied from the current tree, hash-checked against the manifest.
-pub const LUNEPACK_SOURCE_UNCHANGED: LunepackSource = 0;
+pub const LUNEPACK_SOURCE_UNCHANGED: LunepackSource = 1;
 /// A single frame fetched with an HTTP Range request.
-pub const LUNEPACK_SOURCE_RANGE: LunepackSource = 1;
+pub const LUNEPACK_SOURCE_RANGE: LunepackSource = 2;
 /// Taken from the full pack.
-pub const LUNEPACK_SOURCE_FULL_PACK: LunepackSource = 2;
+pub const LUNEPACK_SOURCE_FULL_PACK: LunepackSource = 3;
 /// A delta patch against the current file (reserved).
-pub const LUNEPACK_SOURCE_PATCH: LunepackSource = 3;
-/// A source this library version does not know.
-pub const LUNEPACK_SOURCE_UNKNOWN: LunepackSource = -1;
+pub const LUNEPACK_SOURCE_PATCH: LunepackSource = 4;
+/// No file, or a source this library version does not know.
+pub const LUNEPACK_SOURCE_UNKNOWN: LunepackSource = 0;
 
 /// Every phase and its name, in number order.
 const PHASE_NAMES: &[(LunepackPhase, &std::ffi::CStr)] = &[
@@ -114,7 +125,6 @@ const SOURCE_NAMES: &[(LunepackSource, &std::ffi::CStr)] = &[
 ];
 
 /// The number of a facade phase; a phase a later facade adds is `LUNEPACK_PHASE_UNKNOWN`.
-#[allow(dead_code)] // the progress bridge of the next step is its caller.
 pub(crate) fn phase_number(phase: Phase) -> LunepackPhase {
     match phase {
         Phase::Check => LUNEPACK_PHASE_CHECK,
@@ -134,7 +144,6 @@ pub(crate) fn phase_number(phase: Phase) -> LunepackPhase {
 }
 
 /// The number of a facade source; a source a later facade adds is `LUNEPACK_SOURCE_UNKNOWN`.
-#[allow(dead_code)] // the progress bridge of the next step is its caller.
 pub(crate) fn source_number(source: Source) -> LunepackSource {
     match source {
         Source::Unchanged => LUNEPACK_SOURCE_UNCHANGED,
@@ -145,7 +154,7 @@ pub(crate) fn source_number(source: Source) -> LunepackSource {
     }
 }
 
-fn name_in(table: &[(i32, &'static std::ffi::CStr)], number: i32) -> *const c_char {
+fn name_in(table: &[(u32, &'static std::ffi::CStr)], number: u32) -> *const c_char {
     table
         .iter()
         .find(|(n, _)| *n == number)
@@ -172,6 +181,7 @@ pub extern "C" fn lunepack_source_name(source: LunepackSource) -> *const c_char 
 #[doc(hidden)]
 pub mod unstable_internals {
     pub use crate::status::*;
+    pub use crate::updater::{live_handles, updater_handle};
 }
 
 #[cfg(test)]
@@ -206,6 +216,7 @@ mod tests {
         }
         assert_eq!(text(lunepack_phase_name(LUNEPACK_PHASE_UNKNOWN)), None);
         assert_eq!(text(lunepack_phase_name(99)), None);
+        assert_eq!(text(lunepack_phase_name(0)), None);
         for (source, name) in [
             (Source::Unchanged, "unchanged"),
             (Source::Range, "range"),
@@ -218,5 +229,8 @@ mod tests {
             );
         }
         assert_eq!(text(lunepack_source_name(LUNEPACK_SOURCE_UNKNOWN)), None);
+        assert_eq!(phase_number(Phase::Check), 1);
+        assert_eq!(phase_number(Phase::Adopt), 12);
+        assert_eq!(source_number(Source::Patch), 4);
     }
 }

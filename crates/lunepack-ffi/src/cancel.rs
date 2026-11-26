@@ -6,7 +6,6 @@
 use lunepack::CancelToken;
 
 use crate::guard;
-use crate::status::LunepackStatus;
 
 /// A cancel token: an opaque handle made by `lunepack_cancel_token_new` and released by
 /// `lunepack_cancel_token_free`. Safe to use from several threads at once; cancelling is
@@ -17,7 +16,6 @@ pub struct LunepackCancelToken {
 
 impl LunepackCancelToken {
     /// The facade token operations observe.
-    #[allow(dead_code)] // the updater functions of the next step pass it to their options.
     pub(crate) fn token(&self) -> &CancelToken {
         &self.inner
     }
@@ -29,15 +27,14 @@ const _: () = {
     assert_send_sync::<LunepackCancelToken>();
 };
 
-/// Makes a token that is not cancelled. `out` receives the handle (NULL on failure); release it
-/// with `lunepack_cancel_token_free`.
+/// Makes a token that is not cancelled; release it with `lunepack_cancel_token_free`. NULL only if
+/// the library could not allocate it.
 #[unsafe(no_mangle)]
-pub extern "C" fn lunepack_cancel_token_new(out: *mut *mut LunepackCancelToken) -> LunepackStatus {
-    guard::call_out(out, |slot| {
-        slot.set(LunepackCancelToken {
+pub extern "C" fn lunepack_cancel_token_new() -> *mut LunepackCancelToken {
+    guard::quiet(std::ptr::null_mut(), || {
+        Box::into_raw(Box::new(LunepackCancelToken {
             inner: CancelToken::new(),
-        });
-        Ok(())
+        }))
     })
 }
 
@@ -89,14 +86,12 @@ pub unsafe extern "C" fn lunepack_cancel_token_free(token: *mut LunepackCancelTo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::status::{LUNEPACK_STATUS_OK, LUNEPACK_STATUS_USAGE};
     use std::future::poll_fn;
     use std::ptr;
     use std::task::Poll;
 
     fn new_token() -> *mut LunepackCancelToken {
-        let mut t = ptr::null_mut();
-        assert_eq!(lunepack_cancel_token_new(&mut t), LUNEPACK_STATUS_OK);
+        let t = lunepack_cancel_token_new();
         assert!(!t.is_null());
         t
     }
@@ -123,14 +118,10 @@ mod tests {
             assert!(!lunepack_cancel_token_is_cancelled(ptr::null()));
             lunepack_cancel_token_free(ptr::null_mut());
         }
-        assert_eq!(
-            lunepack_cancel_token_new(ptr::null_mut()),
-            LUNEPACK_STATUS_USAGE
-        );
     }
 
     #[test]
-    fn cancel_and_is_cancelled_work_inside_a_callback_but_new_does_not() {
+    fn the_token_functions_all_work_inside_a_callback() {
         let t = new_token();
         let scope = guard::CallbackScope::enter();
         // SAFETY: `t` is live.
@@ -138,9 +129,9 @@ mod tests {
             lunepack_cancel_token_cancel(t);
             assert!(lunepack_cancel_token_is_cancelled(t));
         }
-        let mut other = 0x10 as *mut LunepackCancelToken;
-        assert_eq!(lunepack_cancel_token_new(&mut other), LUNEPACK_STATUS_USAGE);
-        assert!(other.is_null());
+        let other = new_token();
+        // SAFETY: both handles are live and freed once.
+        unsafe { lunepack_cancel_token_free(other) };
         drop(scope);
         // SAFETY: `t` is live and freed once.
         unsafe { lunepack_cancel_token_free(t) };

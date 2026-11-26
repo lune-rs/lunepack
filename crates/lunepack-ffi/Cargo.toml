@@ -32,3 +32,11 @@ crate-type = ["cdylib", "rlib"]
 # The facade is the only dependency: the binding adds no logic and constructs no adapter
 # (the facade's `Platform::native()` does).
 lunepack.workspace = true
+
+[dev-dependencies]
+# The updaters under test run over the testkit's fakes (M14 step 3): a fake origin and transport,
+# an in-memory filesystem and keys made at test time. No adapter crate by any edge.
+lunepack-testkit.workspace = true
+# The document and state types the fixtures name (`PayloadKind`, `CodecId`, the install record);
+# the facade re-exports only what its API takes. The core is allowed to the binding by role.
+lunepack-core.workspace = true
