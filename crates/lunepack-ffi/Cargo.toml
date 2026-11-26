@@ -40,3 +40,6 @@ lunepack-testkit.workspace = true
 # The document and state types the fixtures name (`PayloadKind`, `CodecId`, the install record);
 # the facade re-exports only what its API takes. The core is allowed to the binding by role.
 lunepack-core.workspace = true
+# Compiles examples/c/example.c for the target the library was built for (tests/c_example.rs); the
+# version already in the lock (the HTTP stack's build scripts use it). Not a workspace crate.
+cc = "1"

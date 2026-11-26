@@ -2219,6 +2219,7 @@ dependencies = [
 name = "lunepack-ffi"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "lunepack",
  "lunepack-core",
  "lunepack-testkit",
@@ -5259,6 +5260,7 @@ dependencies = [
  "anyhow",
  "cargo_metadata",
  "cbindgen",
+ "cc",
  "serde_json",
  "tempfile",
  "toml 1.2.1+spec-1.1.0",

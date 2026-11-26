@@ -16,9 +16,10 @@ fn main() -> ExitCode {
         Some("key-files") => xtask::keyfiles::main(args),
         Some("notices") => xtask::notices::main(args),
         Some("ffi-header") => xtask::ffi_header::main(args),
+        Some("build-example-c") => xtask::example_c::main(args),
         other => {
             eprintln!(
-                "xtask: unknown or missing task {other:?}; tasks: check-boundaries, denylist-scan, key-files, notices, ffi-header"
+                "xtask: unknown or missing task {other:?}; tasks: check-boundaries, denylist-scan, key-files, notices, ffi-header, build-example-c"
             );
             ExitCode::from(2)
         }
