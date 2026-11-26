@@ -58,7 +58,7 @@ runtime's command line.
 
 | | |
 | --- | --- |
-| 🛠️ **`lunepack`** (the `lunepack-cli` crate) | The publisher's command line: `init`, `keys`, `pack`, `feed`, `verify`, `inspect`, `setup` and `prebuilt`. |
+| 🛠️ **`lunepack`** (the `lunepack-cli` crate) | The publisher's command line: `init`, `keys`, `pack`, `feed`, `publish`, `verify`, `inspect`, `setup` and `prebuilt`. |
 | 🦀 **`lunepack`** (the facade crate) | The Rust API: check, download, verify and stage an update, then apply it and restart. |
 | ⚙️ **`lunepack-runtime`** | A small static program beside the app that does the same through a command line with JSON Lines output, so an app in any language can update itself. |
 | 💿 **Installers and an update window** | Per-user and per-machine installs on all three systems, with an install and update UI drawn by [luneui](https://github.com/lune-rs/luneui), and a privileged update service for installs for all users. |
@@ -142,6 +142,7 @@ lunepack feed add --release-dir release --channel stable --version 1.0.0 --sign 
 | --- | --- |
 | 🚀 [Getting started](docs/GETTING-STARTED.md) | From nothing to an installed Rust app that updates itself. |
 | 🌐 [Integration](docs/INTEGRATION.md) | The same for an app in any language, with the .NET and C examples. |
+| 📤 [Publishing](docs/PUBLISHING.md) | Shipping your app's first release and every update to a store, with a CI example and rules for agents. |
 | 🔑 [Key ceremony](docs/KEY-CEREMONY.md) | Making and keeping the signing keys, rotating and revoking them, and what a leak costs. |
 | 🛡️ [Threat model](docs/THREAT-MODEL.md) | What the signing chain defends against, and what it does not. |
 | 📖 Reference | [CLI](docs/CLI.md) · [runtime](docs/RUNTIME.md) · [C API](docs/C-API.md) · [format](docs/FORMAT.md) · [architecture](docs/ARCHITECTURE.md) |

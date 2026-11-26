@@ -1465,6 +1465,72 @@ be, so no attacker class gains anything from it that it had against the runtime:
   assertion or an `expect` in lunepack or a dependency) and is not under the binding's control; the binding
   adds nothing to it, the call returns `internal`, and no panic is expected in normal use.
 
+## The publish path (`lunepack publish`)
+
+`lunepack publish` ([`docs/CLI.md`](CLI.md), [`docs/PUBLISHING.md`](PUBLISHING.md)) adds a publisher-side
+network path: outbound `PUT`, `DELETE` and `GET` to the app's two buckets, signed with the store's own
+credentials. It adds no client-side trust input and changes no format: a client reads the same signed
+documents as before, and what it accepts is decided by the signing chain, never by the bucket.
+
+**Assets.** The release key (already in "Packager and signing keys"); the store credentials (an access
+key and its secret); the state file and the pending-deletes record in the private bucket.
+
+**Store credentials.**
+
+- They come only from the environment variables `[publish]` names; the config holds the names. A missing
+  or empty variable is an error that names the variable and never a value, before any request.
+- They are held in a `Credentials` value whose `Debug` is redacted and whose secret is zeroized on drop;
+  the signer builds each request's headers from them and the request's parts are the only thing sent.
+  A command prints no header, query string, endpoint address or key; the scenario suite scans the
+  output of every run for the made-up key, secret and `-----BEGIN`, with a positive control that proves
+  the scan catches a planted line.
+- The release key and the store credentials are separate secrets for separate jobs: a job that only
+  fetches, packs and builds a setup file needs the release key and no store credential, and a job that
+  only publishes needs both. `fetch` reads no credential at all.
+- Requests are signed (SigV4, HMAC-SHA256 over `sha2`) at the system clock, never at
+  `SOURCE_DATE_EPOCH`; `push`, `refresh` and `init` refuse a set `SOURCE_DATE_EPOCH` before any network
+  access, so a workflow-wide setting cannot back-date a feed.
+
+**A stolen store key.** The holder can read, replace and delete objects in the buckets the key reaches.
+It cannot sign: a feed, manifest or key set it writes does not verify, and a pack or delta it replaces
+no longer matches the SHA-256 in the signed manifest, so a client rejects each (class 1 above). What it
+can do is bounded by that: delete or hide objects (a denial of updates, the worst case), replace a feed
+with an older genuine one (a client that has already seen a newer `seq` refuses it; one that has not,
+a fresh install, takes it, as with any hosting attacker), or plant objects that make the next `push`
+refuse (a published object is never replaced, so a differing object at a new version's path stops the
+push before any write). Replacing the state file or the pending-deletes record weakens the publisher's
+own replay guard (the state file, "Packager and signing keys") but signs nothing, and a forged
+pending-deletes record cannot make a push delete a release a feed lists: every key must lie under the
+prefix and in a version folder, and every feed is re-read and verified just before the deletes, which
+skip any key whose version a current feed lists. Revoking the store key and re-running `publish plan`
+is the recovery; nothing client-side changes.
+
+**Untrusted input on the publish path.** Every document read from a bucket is verified under the key
+set before anything is built on it (`keys.json`, the roots, each feed, each retained release's manifest,
+pack and deltas); a bucket answer is capped; a redirect is never followed; a `NoSuchBucket` answer is an
+error, not "nothing published". The pending-deletes record is parsed strictly (a closed format, sorted and
+unique lists, every key under the prefix and inside a version folder). Purge keys come only from the
+dropped releases' own verified manifests, never from a bucket listing, and each passes the `StoreKey`
+rules (under the prefix, no `..`, `//`, `/./`, whitespace, backslash or control character).
+
+**The race window.** `push` and `refresh` re-read each feed just before writing it and refuse if it
+changed since the run read it. The store API has no conditional write that this path uses, so a
+concurrent publisher that writes between that read and the write is overwritten; the window is two
+requests. The consequences are bounded: no object is deleted that any feed lists (the deletes re-read
+every feed), the other publisher's release is missing from that feed until the next `push` lists it
+again (a rerun is safe, "Rerun and recovery" in `CLI.md`), and no client rejects anything it should
+accept. The defence is not to run two publishes at once: the apps' workflows use a concurrency group
+(`docs/PUBLISHING.md`); the commands take no local lock because each run works in its own temporary
+directory.
+
+**Not covered.** Objects that no manifest names (a hand-placed file, the leftovers of an abandoned
+upload) are never purged by the commands. A single `push` cannot be atomic across the public and
+private buckets; the commit order (`CLI.md`) is what keeps every state a client can see consistent: a feed
+is written only after everything it lists, and an object is deleted only after no feed lists it. The
+first real run against a store is the user's, with `--dry-run` first; no automated test contacts a real
+store, and the loopback S3 the tests use proves our signer against a second implementation of SigV4,
+not against a vendor.
+
 ## Denial-of-service bounds
 
 | Resource | Bound |

@@ -95,6 +95,19 @@ icon = "assets/hello.ico"    # an .ico file, relative to this file
 [macos]                      # optional: inputs of the macOS update window's helper app, not signed
 icon = "assets/hello.icns"   # an .icns file, relative to this file; read only with --ui on a macos-* target
 
+[install.windows]            # optional: `entry` and `icon` only, for the targets of that OS (also
+                             # [install.linux] and [install.macos]); see "`[install.<os>]` and `pack --channel`"
+entry = "bin/hello.exe"
+
+[publish]                    # optional: where and how `lunepack publish` ships releases; see "Publishing"
+prefix = "hello"
+store = "r2"
+account_id_env = "EXAMPLE_R2_ACCOUNT_ID"
+access_key_env = "EXAMPLE_STORE_ACCESS_KEY"
+secret_key_env = "EXAMPLE_STORE_SECRET_KEY"
+public_bucket = "example-updates"
+private_bucket = "example-updates-private"
+
 [codesign.windows]           # optional (M9): how a release is signed with the OS's code signing, as argv
                              # templates with no shell, always timestamped; see "Code signing"
 sign = ["signtool", "sign", "/fd", "sha256", "/tr", "https://timestamp.example.com", "/td", "sha256",
@@ -199,7 +212,8 @@ processes of the same user): pass it to the command through its environment.
 Commands that write documents (`keys set`, `keys rotate-root`, `pack`, `feed add`, `feed refresh`) take
 "now" from `SOURCE_DATE_EPOCH` when it is set: ASCII decimal digits only, at most 2^53-1, otherwise the
 command fails (the message names the variable and does not repeat its value). Without it they use the
-system clock. `verify` and `inspect` use the system clock or `--at <unix>`; they ignore
+system clock. `lunepack publish push`, `refresh` and `init` refuse it ("Publishing"). `verify` and `inspect`
+use the system clock or `--at <unix>`; they ignore
 `SOURCE_DATE_EPOCH`.
 
 ## Commands
@@ -297,8 +311,8 @@ it patches from ("Deltas" below).
 ```
 lunepack pack --input <INPUT> --version <VERSION> --target <TARGET> --release-dir <RELEASE_DIR>
     --sign <SIGN> [--app-id <APP_ID>] [--jobs <JOBS>] [--memory-budget-mib <MEMORY_BUDGET_MIB>]
-    [--deltas <N>] [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>] [--service <SERVICE>]
-    [--require-pinned] [--config <CONFIG>]
+    [--deltas <N>] [--channel <CHANNEL>] [--runtime <RUNTIME>] [--ui <UI>] [--stub <STUB>]
+    [--service <SERVICE>] [--require-pinned] [--config <CONFIG>]
 
 lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runtime <RUNTIME>
     [--ui <UI>] --assemble <DIR> [--require-pinned] [--config <CONFIG>]
@@ -314,6 +328,8 @@ lunepack pack --input <INPUT> --version <VERSION> --target <macos-TARGET> --runt
 - `--deltas <N>`: how many earlier releases to patch from, per feed (default 3, `0` for none, at most
   16); see "Deltas".
 - `--app-id`: when given, it must equal the config's.
+- `--channel <c>`: the channel the packed tree follows, written into the update config instead of
+  `[update] channel`. It needs `[update]`, and `c` must be one of `[publish] channels` ("Publishing").
 - `--runtime`: the static runtime to place beside the entry. Required when the config has `[update]`,
   refused without it (see "Self-updating apps").
 - `--ui`: the `lunepack-ui` binary to place beside the runtime (for a `macos-*` target, inside the update
@@ -1120,6 +1136,231 @@ $ lunepack prebuilt fetch --target linux-x86_64 --out ./downloads
 error: prebuilt fetch needs this CLI in the state pinned, it is in the state no-key: no project key is built in, so nothing is pinned
 ```
 
+## Publishing: `lunepack publish`
+
+`lunepack publish` is the standard way to put a release on a store and keep it there: it fills a
+release directory from what is published, checks the store against it, uploads in the order a client
+needs, trims old releases and keeps the feeds fresh. The recommended flow, with a CI example and the
+rules for an agent, is in [`docs/PUBLISHING.md`](PUBLISHING.md). This section is the reference.
+
+```
+lunepack publish fetch   --release-dir <DIR> --version <VERSION>
+lunepack publish push    --release-dir <DIR>... --version <VERSION> --sign <SIGN>...
+    [--require-targets <T,T,...>] [--dry-run] [--store-dir <DIR>]
+lunepack publish refresh --sign <SIGN>... [--if-expiring-within-days <N>] [--skip-if-unpublished]
+    [--dry-run] [--store-dir <DIR>]
+lunepack publish plan    [--version <VERSION>] [--store-dir <DIR>]
+lunepack publish init    --release-dir <DIR> [--dry-run] [--store-dir <DIR>]
+```
+
+Every command also takes `--config <CONFIG>`. They need `[update]`, `[install]` and `[publish]` in the
+config. Exit codes are the CLI's: 0, 1 (a command failed or refused), 2 (a usage error: a version that
+is not SemVer or not usable as a folder name, a target id that is none, a missing required flag).
+
+### `[publish]`
+
+Names of environment variables, never their values. Unknown keys are errors.
+
+```toml
+[publish]
+prefix = "hello"                         # one path segment: every object lives under <prefix>/
+store = "r2"                             # "r2" or "s3"
+account_id_env = "EXAMPLE_R2_ACCOUNT_ID" # r2 only: the variable that holds the account id
+# endpoint_env = "EXAMPLE_S3_ENDPOINT"   # s3 only: the variable that holds the endpoint URL
+# region = "us-east-1"                   # s3 only
+access_key_env = "EXAMPLE_STORE_ACCESS_KEY"
+secret_key_env = "EXAMPLE_STORE_SECRET_KEY"
+public_bucket = "example-updates"        # what clients read: keys, roots, feeds, releases
+private_bucket = "example-updates-private" # the state file and the pending-deletes record
+keep = 10                                # releases kept per channel, 1..=100 (default 10)
+deltas = 3                               # earlier releases `fetch` brings as delta bases, 0..=16 (default 3)
+feed_days = 90                           # a feed's lifetime when push or refresh signs it, 1..=3650 (default 90)
+channels = ["stable", "beta"]            # default: [update] channel alone
+prerelease_channels = ["beta"]           # where a pre-release goes; a subset of channels; default: all of them
+require_targets = ["linux-x86_64", "windows-x86_64", "macos-universal"]   # default: none
+```
+
+- `public_bucket` and `private_bucket` must differ (both 3 to 63 of `a-z`, `0-9`, `.` and `-`). The
+  public read URL is `[update] feed`; the public bucket is what it serves.
+- `store = "r2"` signs for Cloudflare R2 (region `auto`; the account id is 32 lowercase hex characters); `store = "s3"` for any S3-compatible store,
+  path-style, in the given region. Requests are signed with SigV4 at the system clock, never at
+  `SOURCE_DATE_EPOCH`. Redirects are not followed.
+- A variable that is unset or empty is an error that names the variable and never a value, before any
+  request.
+- `keep` counts releases per channel by version precedence, never by text or file order. The version
+  being published is never dropped, so a pre-release or hotfix older than the newest `keep` leaves one
+  more listed.
+- `require_targets` and `push --require-targets` combine (both must be present in the release).
+
+### `[install.<os>]` and `pack --channel`
+
+`[install.linux]`, `[install.windows]` and `[install.macos]` may set `entry` and `icon` only, and each
+overrides the same key of `[install]` for the targets of that OS. Nothing else (a `name`, a `channel`,
+a `feed`, the root, the app id) can be overridden, and an unknown OS table or key is an error. The
+icon file must already be in the input tree, as for `[install] icon`. This replaces a rendered copy of
+the config per OS.
+
+```toml
+[install]
+entry = "bin/hello"
+name = "Hello"
+
+[install.windows]
+entry = "bin/hello.exe"
+icon = "assets/hello.png"
+```
+
+`pack --channel <c>` writes `c` as the channel of the update config in the packed tree instead of
+`[update] channel`. It needs `[update]`, and `c` must be one of `[publish] channels`.
+
+### `publish fetch`
+
+Reads the public feed (`[update] feed`) over the transport a client uses and fills a new release
+directory: `keys.json`, the `root-<k>.json` files after the config's root, each `[publish]` channel's
+`feed-<channel>.json` that exists, and, per channel and target, the manifests and packs of the `deltas`
+newest earlier releases, so that `pack` writes deltas against exactly those. It reads no credential and
+prints `GET <path> <status>` for every request. `pack` and `setup` then run on that directory unchanged.
+
+- `--release-dir` must be absent or empty; the directory is built beside its place and moved there
+  when complete, so a failed fetch leaves nothing.
+- `keys.json` must answer 200. A root file ends the walk on 404, 410 or 403 (M4-D10); a feed that is
+  absent (404) is skipped; any other status, a TLS failure or a document that does not verify is
+  exit 1. A base whose pack does not match its manifest is skipped with a line; a missing or failing
+  one is exit 1.
+- The documents are read with the time checks skipped, so an expired feed can still be refreshed.
+- A `--version` that a feed already lists is exit 1 ("is already published"): a second `pack` of a
+  published version would build different deltas.
+
+### `publish push`
+
+Publishes the packed release in one or more release directories (one per build job; their
+`<version>/` files merge, and the same path with different bytes is exit 1).
+
+`--sign` is required (the feeds are signed in-process with the same signers `feed add` takes).
+`--dry-run` does every read and check and prints what it would upload, write and delete.
+`--store-dir <dir>` uses `<dir>/public` and `<dir>/private` as the two buckets and reads no
+credential; it is for tests and trials.
+
+What it trusts and checks, before the first write:
+
+1. It reads the state file and the pending-deletes record from the private bucket, and `keys.json`,
+   the roots and each channel's feed from the public bucket through the store API with credentials
+   (not through the CDN). With no state file or no `keys.json` it stops: run `publish init` first.
+2. `keys.json` and every root must equal the copies `fetch` put in each release directory, and each
+   feed must equal the fetched copy or already list `--version` with exactly these manifests (this
+   version's own half-finished push). Anything else is exit 1: "the store changed since fetch".
+3. The release must hold a manifest of `--version` for every `require_targets` target. A file under
+   `<version>/` that no manifest of the release names is refused: only manifests, packs and deltas are
+   published.
+4. Every release a feed lists is downloaded and verified in full (manifest, pack, deltas), and so is
+   the new work directory, as `verify` does. This costs about `keep` times the targets times a pack
+   size of download per publish, and is deliberate: a corrupted retained pack is not left published.
+5. An object that exists in the store with the same bytes is kept and reported; one with other bytes
+   is exit 1, before any upload.
+
+The version goes to `channels`, or to `prerelease_channels` when it has a pre-release part, through the
+same code as `feed add`; retention drops the oldest beyond `keep` per channel through `feed refresh
+--drop` with `feed_days` as the lifetime.
+
+The commit order (every client-visible change comes after what it points to):
+
+1. the pending-deletes record gains the version in `uploading`;
+2. the new version's packs and deltas, then its manifests;
+3. the record gains this run's deletes (the dropped releases' objects, taken from their verified
+   manifests: no bucket listing), before any feed changes;
+4. each changed feed, after re-reading it and refusing if it changed since this run read it (the race
+   check);
+5. the deletes: every feed is re-read first, and a pending key whose version folder any current feed
+   lists is not deleted and leaves the record; a failed delete is not fatal, stays in the record and is
+   printed;
+6. the record as it now is, then 7. the state file, last.
+
+`keys.json` and the roots are never written by `push` (they equal the store's). A purge key is checked
+to lie under `<prefix>/` in the folder of the version it belongs to.
+
+**Rerun and recovery.** A push that stopped part-way is completed by running `publish push` again with
+the same release directories (in CI: re-run the push job; its artifacts are unchanged). Uploaded objects
+are kept when byte-equal (packs are deterministic under `SOURCE_DATE_EPOCH`, so a rerun of `pack` gives
+the same bytes), a feed that already lists the version is not added to again, and the rest completes.
+A fresh `fetch` of a version a feed lists is refused.
+
+### `publish refresh`
+
+Re-signs each channel's feed with a new `seq` and expiry, the releases unchanged, then retries the
+pending deletes under the same filter as `push`. With `--if-expiring-within-days N` only a feed that
+expires within N days (or has expired) is re-signed; with nothing due and nothing pending it writes
+nothing and exits 0. The record's deletes are retried either way, and a record key that a current feed
+lists is dropped from the record undeleted. `--skip-if-unpublished` turns "no `keys.json`, no state
+file or no feed in the store yet" into one `notice:` line and exit 0 (a scheduled job of an app that
+has not published); without it that is exit 1. The re-signed feeds go through the same full check as
+`push`, and the feed race check and the state file apply.
+
+### `publish plan`
+
+Read-only (it needs the store credentials). It prints each channel's feed (`seq`, expiry, releases) and,
+with `--version`, what a push of it would add and drop; the pending deletes; and every version in the
+record's `uploading` list that no feed lists: an abandoned push, whose folder needs a rerun of `push`
+or a clean-up by hand, named with its keys from the store's manifests when they are there and verify. It
+performs no put and no delete.
+
+### `publish init`
+
+The user's own first upload for a new app, from a release directory that `lunepack init` and
+`lunepack keys set` made. It checks the directory's root walk and `keys.json` under the config's root,
+takes the state file's record of this app (and no other app's), refuses when the store already holds
+any document it would write (it names the first), and uploads the roots, then `keys.json`, then the
+state file. An existing prefix of the same layout needs no `init`.
+
+### `SOURCE_DATE_EPOCH` and these commands
+
+`push`, `refresh` and `init` exit 1, naming the variable and before any network access, when
+`SOURCE_DATE_EPOCH` is set: they would issue feeds at that fixed time. Set it only in the job that runs
+`pack` and `setup`, to the tag commit's time. `fetch` and `plan` do not read it.
+
+### The store layout
+
+```
+public bucket:   <prefix>/keys.json
+                 <prefix>/root-<k>.json                       (after a root rotation)
+                 <prefix>/feed-<channel>.json
+                 <prefix>/<version>/<target>.manifest.json
+                 <prefix>/<version>/<target>.pack
+                 <prefix>/<version>/<target>.from-<base>.delta
+private bucket:  <prefix>/lunepack-state.json                 (the publisher state file, one app's record)
+                 <prefix>/lunepack-pending-deletes.json       {"format":1,"keys":[...],"uploading":[...]}
+```
+
+A command writes only keys under its `<prefix>/`; another prefix in the same buckets is never touched.
+The pending-deletes record lists, sorted and without repeats, the full keys a publish dropped from every
+feed and has not deleted yet, and the version folders whose objects a push began to upload before any
+feed listed them.
+
+**Limit.** Deletes come from the dropped releases' own manifests, so an object no manifest names (a file
+placed by hand, the leftovers of an upload that was abandoned and never completed) is never purged
+automatically. `plan` lists an abandoned push only while its version is in `uploading`; removing the
+rest is the user's hand work.
+
+### A CI job split
+
+Generic names; the full workflow is in [`docs/PUBLISHING.md`](PUBLISHING.md).
+
+```sh
+# job "pack", one per target (the release key only; SOURCE_DATE_EPOCH from the tag commit)
+export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+lunepack publish fetch --release-dir release --version "$VERSION"
+lunepack pack --input build --version "$VERSION" --target "$TARGET" --release-dir release \
+    --sign env:EXAMPLE_RELEASE_KEY --runtime lunepack-runtime
+lunepack setup release --version "$VERSION" --target "$TARGET"
+
+# job "push", after every pack job (the release key and the store keys; no SOURCE_DATE_EPOCH)
+lunepack publish push --release-dir release-linux --release-dir release-windows \
+    --version "$VERSION" --sign env:EXAMPLE_RELEASE_KEY
+
+# a scheduled job (the same secrets)
+lunepack publish refresh --sign env:EXAMPLE_RELEASE_KEY --if-expiring-within-days 30 \
+    --skip-if-unpublished
+```
+
 ## The release directory
 
 ```
@@ -1134,7 +1375,8 @@ error: prebuilt fetch needs this CLI in the state pinned, it is in the state no-
     linux-x86_64.pack
 ```
 
-Upload with any tool to any static host (D20; `lunepack publish` comes after v1). Order matters,
+Upload with any tool to any static host, or with `lunepack publish` (above), which uploads in this order and
+checks the store first. Order matters,
 because a client that fetches a document must be able to fetch everything it points to:
 
 1. packs (`<ver>/<target>.pack`);
