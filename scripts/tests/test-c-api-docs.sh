@@ -40,6 +40,7 @@ table_names() {
 
 # prose_names <doc>: every lunepack_ word anywhere in the page, distinct, sorted. `lunepack_ffi`
 # is the library's own name (`lunepack_ffi.dll`, `lunepack_ffi*.lib`), not a function.
+# shellcheck disable=SC2329 # called from compare, which runs through run_cmd
 prose_names() {
   grep -o 'lunepack_[a-z0-9_]*' "$1" | grep -vx 'lunepack_ffi' | sort -u || true
 }
