@@ -75,7 +75,8 @@ enum Command {
     /// Build a Linux setup file: the release's runtime with one version's key set, manifest and
     /// pack, installable offline (`<app_id>-<version>-<target>-setup`).
     Setup(cmd_setup::SetupArgs),
-    /// The standard publish flow: fetch the published state, then push a release.
+    /// The standard publish flow: fetch the published state, then push a release; refresh the
+    /// feeds, plan and init.
     Publish {
         #[command(subcommand)]
         command: cmd_publish::PublishCommand,

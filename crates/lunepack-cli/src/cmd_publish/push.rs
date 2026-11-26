@@ -33,16 +33,16 @@ use lunepack_core::{
     AppId, Channel, Clock, ClockReading, KeysChain, Limits, MAX_ROOT_STEPS, StoreKey, Target,
     VerifiedFeed, Version,
 };
-use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
+use lunepack_crypto::Ed25519Verifier;
 
-use super::pending::{MAX_PENDING_BYTES, PENDING_NAME, Pending, version_of};
-use super::work::{self, LocalFile, Upload, key};
+use super::pending::{PENDING_NAME, Pending, version_of};
+use super::work::{self, LocalFile, StoreRead, Upload, feed_rel, key};
 use super::{Stores, Usage, say, settings};
 use crate::cmd_feed::{self, AddArgs, RefreshArgs, Writer};
 use crate::cmd_verify::check_release_dir;
 use crate::config::{Config, PublishSettings};
 use crate::release_dir::{self, read_capped, verify_feed_of};
-use crate::state::{DEFAULT_STATE, MAX_STATE_BYTES, State, StateArgs};
+use crate::state::{DEFAULT_STATE, State, StateArgs};
 
 /// The state file's name under the prefix (the existing state file format, M3-R2-D1).
 pub const STATE_NAME: &str = DEFAULT_STATE;
@@ -82,7 +82,8 @@ pub(crate) struct Clocks {
     pub check: Arc<dyn Clock>,
 }
 
-struct Shared(Arc<dyn Clock>);
+/// A shared clock handed to a writer, which takes its clock by value.
+pub(crate) struct Shared(pub(crate) Arc<dyn Clock>);
 
 impl Clock for Shared {
     fn now_unix_secs(&self) -> u64 {
@@ -172,6 +173,7 @@ pub(crate) struct Plan {
 
 /// `publish push`.
 pub fn push(config_path: &Path, args: &PushArgs, open: super::OpenStores<'_>) -> Result<()> {
+    super::refuse_source_date_epoch("push")?;
     let config = Config::load(config_path)?;
     let (_, publish) = settings(&config)?;
     Version::parse(&args.version).map_err(|_| Usage("--version is not a SemVer version".into()))?;
@@ -220,25 +222,8 @@ pub(crate) fn run(job: &Job<'_>, stores: &Stores, order: &[Phase]) -> Result<()>
     ))
 }
 
-fn read_doc(
-    store: &dyn lunepack_core::ObjectStore,
-    key: &StoreKey,
-    cap: u64,
-) -> Result<Option<Vec<u8>>> {
-    let got = work::get(store, key, cap)?;
-    say(&format!(
-        "read: {key} {}",
-        if got.is_some() { "found" } else { "absent" }
-    ))?;
-    Ok(got)
-}
-
-fn feed_rel(channel: &Channel) -> String {
-    format!("feed-{}.json", channel.as_str())
-}
-
 /// The `root-<k>.json` files after `from` in `dir`, until the first gap.
-fn local_roots(dir: &Path, from: u64) -> Result<Vec<(u64, Vec<u8>)>> {
+pub(crate) fn local_roots(dir: &Path, from: u64) -> Result<Vec<(u64, Vec<u8>)>> {
     let mut out = Vec::new();
     for k in from + 1..=from + MAX_ROOT_STEPS {
         match read_capped(&release_dir::root_path(dir, k), Limits::V1.root_doc_bytes)? {
@@ -266,75 +251,22 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Plan> {
     let wdir = work_root.join("release");
     fs::create_dir(&wdir).context("cannot create the work directory")?;
     let state_file = work_root.join(STATE_NAME);
-    let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
     let skip = ClockReading::read(job.clocks.check.as_ref(), Some(u64::MAX));
 
-    // The private store: the state file first, then the pending record.
-    let state_key = key(prefix, STATE_NAME)?;
-    let Some(state_read) = read_doc(stores.private.as_ref(), &state_key, MAX_STATE_BYTES)? else {
-        bail!(
-            "the private bucket has no {state_key}: run `lunepack publish init` first (nothing was written)"
-        );
-    };
-    fs::write(&state_file, &state_read).context("cannot write the work directory")?;
-    let pending_key = key(prefix, PENDING_NAME)?;
-    let (pending, pending_existed) =
-        match read_doc(stores.private.as_ref(), &pending_key, MAX_PENDING_BYTES)? {
-            Some(bytes) => (Pending::parse(prefix, &bytes)?, true),
-            None => (Pending::default(), false),
-        };
-
-    // The public store: keys.json, the roots after the config's, every publish channel's feed.
-    let keys_key = key(prefix, "keys.json")?;
-    let Some(keys_bytes) = read_doc(stores.public.as_ref(), &keys_key, Limits::V1.keys_doc_bytes)?
-    else {
-        bail!(
-            "the public bucket has no {keys_key}: run `lunepack publish init` first (nothing was written)"
-        );
-    };
-    let mut roots = Vec::new();
-    for k in config.root_version + 1..=config.root_version + MAX_ROOT_STEPS {
-        let rk = key(prefix, &format!("root-{k}.json"))?;
-        match read_doc(stores.public.as_ref(), &rk, Limits::V1.root_doc_bytes)? {
-            Some(bytes) => roots.push((k, bytes)),
-            None => break,
-        }
-    }
-    let mut feeds_read: BTreeMap<Channel, Option<Vec<u8>>> = BTreeMap::new();
-    let mut feed_keys = Vec::new();
-    for channel in &publish.channels {
-        let fk = key(prefix, &feed_rel(channel))?;
-        let got = read_doc(stores.public.as_ref(), &fk, Limits::V1.feed_doc_bytes)?;
-        feeds_read.insert(channel.clone(), got);
-        feed_keys.push((channel.clone(), fk));
-    }
-
-    // The store's documents into the work directory, verified the way the writers open it.
-    fs::write(release_dir::keys_path(&wdir), &keys_bytes)
-        .context("cannot write the work directory")?;
-    for (k, bytes) in &roots {
-        fs::write(release_dir::root_path(&wdir, *k), bytes)
-            .context("cannot write the work directory")?;
-    }
-    for (channel, bytes) in &feeds_read {
-        if let Some(bytes) = bytes {
-            fs::write(wdir.join(feed_rel(channel)), bytes)
-                .context("cannot write the work directory")?;
-        }
-    }
-    let opened = release_dir::open(&wdir, config, &hasher, &verifier, &skip)
-        .context("the store's key set does not verify")?;
-    let chain = opened
-        .chain
-        .ok_or_else(|| anyhow!("internal error: keys.json vanished"))?;
-    let mut feeds_before: BTreeMap<Channel, VerifiedFeed> = BTreeMap::new();
-    for (channel, bytes) in &feeds_read {
-        if let Some(bytes) = bytes {
-            let feed = verify_feed_of(&chain, &config.app_id, channel, bytes, &skip, &verifier)
-                .with_context(|| format!("the store's {} does not verify", feed_rel(channel)))?;
-            feeds_before.insert(channel.clone(), feed);
-        }
-    }
+    // The two buckets' documents, verified (the state file is the first read).
+    let StoreRead {
+        state_key,
+        state_read,
+        pending,
+        pending_existed,
+        keys_bytes,
+        roots,
+        feeds_read,
+        feed_keys,
+        root_doc_k,
+        chain,
+        feeds: feeds_before,
+    } = work::read_store(stores, config, publish, &wdir, &state_file, &skip)?;
 
     // The release: every release directory's `<version>/` files, merged.
     let mut new_files: BTreeMap<String, LocalFile> = BTreeMap::new();
@@ -431,37 +363,16 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Plan> {
     }
 
     // P-D7: every retained release, downloaded and checked.
-    let mut objects_of: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut fetched: BTreeSet<String> = BTreeSet::new();
-    for feed in feeds_before.values() {
-        for (i, release) in feed.releases().iter().enumerate() {
-            if release.version_text() == v {
-                continue;
-            }
-            for target in release.targets().keys() {
-                let entry = feed
-                    .target_entry(i, *target)
-                    .context("internal error: a release without its target")?;
-                if !fetched.insert(entry.reference().path().to_owned()) {
-                    continue;
-                }
-                let rels = work::download_target(
-                    stores.public.as_ref(),
-                    prefix,
-                    &wdir,
-                    chain.keys(),
-                    &entry,
-                )?;
-                objects_of
-                    .entry(release.version_text().to_owned())
-                    .or_default()
-                    .extend(rels);
-            }
-        }
-    }
+    let (objects_of, fetched) = work::download_retained(
+        stores.public.as_ref(),
+        prefix,
+        &wdir,
+        &chain,
+        &feeds_before,
+        Some(v),
+    )?;
     say(&format!(
-        "retained: {} manifest(s) of {} release(s) downloaded",
-        fetched.len(),
+        "retained: {fetched} manifest(s) of {} release(s) downloaded",
         objects_of.len()
     ))?;
     for (rel, file) in &new_files {
@@ -539,7 +450,7 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Plan> {
             feeds_after.insert(channel.clone(), feed);
         }
     }
-    record.set_keys(opened.root_doc_k, chain.keys());
+    record.set_keys(root_doc_k, chain.keys());
     state.save(&config.app_id, record, StateArgs::default())?;
     let state_bytes = fs::read(&state_file).context("cannot read the work directory")?;
 
@@ -659,7 +570,7 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Plan> {
 }
 
 /// The work directory's feed of `channel`, read with time checks skipped.
-fn work_feed(
+pub(crate) fn work_feed(
     wdir: &Path,
     config: &Config,
     chain: &KeysChain,
@@ -689,18 +600,33 @@ pub(crate) fn retention(
     publish: &PublishSettings,
     version: &str,
 ) -> Vec<String> {
-    let mut ranked: Vec<_> = feed.releases().iter().collect();
-    ranked.sort_by(|a, b| b.version().cmp(a.version()));
+    drops(
+        feed.releases()
+            .iter()
+            .map(|r| (r.version().clone(), r.version_text().to_owned())),
+        publish.keep as usize,
+        version,
+    )
+}
+
+/// [`retention`] over `(precedence, text)` pairs.
+pub(crate) fn drops(
+    releases: impl IntoIterator<Item = (Version, String)>,
+    keep: usize,
+    version: &str,
+) -> Vec<String> {
+    let mut ranked: Vec<_> = releases.into_iter().collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
     ranked
         .into_iter()
-        .skip(publish.keep as usize)
-        .filter(|r| r.version_text() != version)
-        .map(|r| r.version_text().to_owned())
+        .skip(keep)
+        .map(|(_, text)| text)
+        .filter(|text| text != version)
         .collect()
 }
 
 /// Prints the plan: in a dry run, everything a push would write and delete.
-fn show(plan: &Plan, dry_run: bool) -> Result<()> {
+pub(crate) fn show(plan: &Plan, dry_run: bool) -> Result<()> {
     let would = if dry_run { "would " } else { "" };
     for k in &plan.kept {
         say(&format!("kept: {k} (already in the store, the same bytes)"))?;
@@ -733,11 +659,13 @@ fn show(plan: &Plan, dry_run: bool) -> Result<()> {
         }
     }
     after.uploading.retain(|u| !plan.listed_after.contains(u));
-    say(&format!(
-        "{would}write: {}/{PENDING_NAME}: {}",
-        plan.prefix,
-        String::from_utf8_lossy(&after.to_bytes()).trim_end()
-    ))?;
+    if !plan.pending_existed || after != plan.pending {
+        say(&format!(
+            "{would}write: {}/{PENDING_NAME}: {}",
+            plan.prefix,
+            String::from_utf8_lossy(&after.to_bytes()).trim_end()
+        ))?;
+    }
     if plan.state != plan.state_read {
         say(&format!(
             "{would}write: {}: {}",
@@ -878,7 +806,7 @@ pub(crate) fn deletes(plan: &Plan, stores: &Stores, pending: &mut Pending) -> Re
     Ok(())
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! The push logic over in-memory stores: the order of the writes, failures injected at every
     //! write and the rerun that completes the push (P-D13), the race check, retention and purge,
     //! and an invariant checker over the operation log that a reordering of the same plan fails.
@@ -893,6 +821,7 @@ mod tests {
         Floors, Hasher, ObjectStore, RootWalk, StoreError, StoreMethod, encoding::hex_encode,
         verify_manifest,
     };
+    use lunepack_crypto::Sha256Hasher;
     use lunepack_testkit::{MemStore, StoreFault};
 
     use super::*;
@@ -901,26 +830,26 @@ mod tests {
     const P: &str = "hello";
 
     #[derive(Parser)]
-    struct Wrap<A: clap::Args> {
+    pub(crate) struct Wrap<A: clap::Args> {
         #[command(flatten)]
         args: A,
     }
 
-    fn parse<A: clap::Args>(args: &[&str]) -> A {
+    pub(crate) fn parse<A: clap::Args>(args: &[&str]) -> A {
         Wrap::<A>::try_parse_from(std::iter::once("lunepack").chain(args.iter().copied()))
             .expect("arguments parse")
             .args
     }
 
-    fn s(p: &Path) -> &str {
+    pub(crate) fn s(p: &Path) -> &str {
         p.to_str().expect("utf-8 path")
     }
 
-    fn k(rel: &str) -> StoreKey {
+    pub(crate) fn k(rel: &str) -> StoreKey {
         StoreKey::new(P, rel).unwrap()
     }
 
-    fn targets() -> [&'static str; 2] {
+    pub(crate) fn targets() -> [&'static str; 2] {
         if cfg!(windows) {
             ["windows-x86_64", "windows-aarch64"]
         } else {
@@ -931,29 +860,29 @@ mod tests {
     // --- a store that logs every operation with its body ------------------------------------
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    enum Bucket {
+    pub(crate) enum Bucket {
         Public,
         Private,
     }
 
     #[derive(Debug, Clone)]
-    enum Op {
+    pub(crate) enum Op {
         Get,
         Put(StoreKey, Vec<u8>),
         Delete(StoreKey),
     }
 
     /// One logged operation: the bucket, the operation, and whether it took effect.
-    type Log = Arc<Mutex<Vec<(Bucket, Op, bool)>>>;
+    pub(crate) type Log = Arc<Mutex<Vec<(Bucket, Op, bool)>>>;
 
     /// Before the `nth` (from 0) get of `key`, the store's object there becomes `bytes`.
-    struct Hook {
-        key: StoreKey,
-        nth: usize,
-        bytes: Vec<u8>,
+    pub(crate) struct Hook {
+        pub(crate) key: StoreKey,
+        pub(crate) nth: usize,
+        pub(crate) bytes: Vec<u8>,
     }
 
-    struct Rec {
+    pub(crate) struct Rec {
         bucket: Bucket,
         inner: MemStore,
         log: Log,
@@ -1021,22 +950,22 @@ mod tests {
 
     // --- the world: signing material, configs, the two buckets ------------------------------
 
-    struct World {
-        dir: tempfile::TempDir,
+    pub(crate) struct World {
+        pub(crate) dir: tempfile::TempDir,
         /// The config `pack` runs under (no `[update]`), next to the publisher's state file.
-        pack_config: PathBuf,
+        pub(crate) pack_config: PathBuf,
         /// The app's config with `[update]`, `[install]` and `[publish]`.
-        config: PathBuf,
-        release_signer: PathBuf,
-        public: MemStore,
-        private: MemStore,
-        log: Log,
-        hook: Arc<Mutex<Option<Hook>>>,
+        pub(crate) config: PathBuf,
+        pub(crate) release_signer: PathBuf,
+        pub(crate) public: MemStore,
+        pub(crate) private: MemStore,
+        pub(crate) log: Log,
+        pub(crate) hook: Arc<Mutex<Option<Hook>>>,
     }
 
-    type Snapshot = BTreeMap<StoreKey, Vec<u8>>;
+    pub(crate) type Snapshot = BTreeMap<StoreKey, Vec<u8>>;
 
-    fn snapshot_of(store: &MemStore) -> Snapshot {
+    pub(crate) fn snapshot_of(store: &MemStore) -> Snapshot {
         store
             .keys()
             .into_iter()
@@ -1050,7 +979,7 @@ mod tests {
     impl World {
         /// A bootstrapped app: `keys.json` in the public bucket and the state file in the private
         /// one, as `publish init` leaves them. `publish` is appended to `[publish]`.
-        fn new(publish: &str) -> World {
+        pub(crate) fn new(publish: &str) -> World {
             let dir = tempfile::tempdir().unwrap();
             let root = lunepack_crypto::generate_key_file(&dir.path().join("root")).unwrap();
             let release = lunepack_crypto::generate_key_file(&dir.path().join("release")).unwrap();
@@ -1110,7 +1039,7 @@ mod tests {
 
         /// A release directory as `publish fetch` fills it (here: everything the public bucket
         /// holds, so every listed release can be a base).
-        fn fetch(&self, name: &str) -> PathBuf {
+        pub(crate) fn fetch(&self, name: &str) -> PathBuf {
             let rd = self.dir.path().join(name);
             fs::create_dir(&rd).unwrap();
             for (key, bytes) in snapshot_of(&self.public) {
@@ -1122,7 +1051,7 @@ mod tests {
         }
 
         /// Packs `version` for `target` into `rd`.
-        fn pack(&self, rd: &Path, version: &str, target: &str) {
+        pub(crate) fn pack(&self, rd: &Path, version: &str, target: &str) {
             let input = self.dir.path().join(format!("input-{version}-{target}"));
             if !input.exists() {
                 fs::create_dir_all(input.join("bin")).unwrap();
@@ -1153,7 +1082,7 @@ mod tests {
             .unwrap();
         }
 
-        fn stores(&self) -> Stores {
+        pub(crate) fn stores(&self) -> Stores {
             let rec = |bucket, inner: &MemStore| -> Box<dyn ObjectStore> {
                 Box::new(Rec {
                     bucket,
@@ -1168,7 +1097,7 @@ mod tests {
             }
         }
 
-        fn push_in(
+        pub(crate) fn push_in(
             &self,
             rds: &[PathBuf],
             version: &str,
@@ -1197,27 +1126,27 @@ mod tests {
             )
         }
 
-        fn push(&self, rds: &[PathBuf], version: &str) -> Result<()> {
+        pub(crate) fn push(&self, rds: &[PathBuf], version: &str) -> Result<()> {
             self.push_in(rds, version, false, &ORDER)
         }
 
         /// fetch, pack one target, push: one ordinary publish.
-        fn publish(&self, version: &str) {
+        pub(crate) fn publish(&self, version: &str) {
             let rd = self.fetch(&format!("rd-{version}"));
             self.pack(&rd, version, targets()[0]);
             self.push(&[rd], version).unwrap();
         }
 
-        fn log(&self) -> Vec<(Bucket, Op, bool)> {
+        pub(crate) fn log(&self) -> Vec<(Bucket, Op, bool)> {
             self.log.lock().unwrap().clone()
         }
 
-        fn clear_log(&self) {
+        pub(crate) fn clear_log(&self) {
             self.log.lock().unwrap().clear();
         }
 
         /// The writes of the log (puts and deletes), as `(bucket, PUT|DELETE, key)`.
-        fn writes(&self) -> Vec<(Bucket, &'static str, String)> {
+        pub(crate) fn writes(&self) -> Vec<(Bucket, &'static str, String)> {
             self.log()
                 .into_iter()
                 .filter_map(|(b, op, _)| match op {
@@ -1228,7 +1157,7 @@ mod tests {
                 .collect()
         }
 
-        fn chain(&self) -> KeysChain {
+        pub(crate) fn chain(&self) -> KeysChain {
             let config = Config::load(&self.config).unwrap();
             let skip = ClockReading::read(&lunepack::SystemClock, Some(u64::MAX));
             RootWalk::new(
@@ -1247,7 +1176,7 @@ mod tests {
             .unwrap()
         }
 
-        fn feed(&self, channel: &str) -> Option<VerifiedFeed> {
+        pub(crate) fn feed(&self, channel: &str) -> Option<VerifiedFeed> {
             let bytes = self.public.contents(&k(&format!("feed-{channel}.json")))?;
             let skip = ClockReading::read(&lunepack::SystemClock, Some(u64::MAX));
             Some(
@@ -1264,7 +1193,7 @@ mod tests {
         }
 
         /// The versions the public bucket's feed of `channel` lists, sorted as text.
-        fn listed(&self, channel: &str) -> Vec<String> {
+        pub(crate) fn listed(&self, channel: &str) -> Vec<String> {
             let mut out: Vec<String> = self
                 .feed(channel)
                 .map(|f| {
@@ -1278,18 +1207,18 @@ mod tests {
             out
         }
 
-        fn pending(&self) -> Pending {
+        pub(crate) fn pending(&self) -> Pending {
             Pending::parse(P, &self.private.contents(&k(PENDING_NAME)).unwrap()).unwrap()
         }
 
-        fn state_record(&self) -> crate::state::Record {
+        pub(crate) fn state_record(&self) -> crate::state::Record {
             let p = self.dir.path().join("state-check.json");
             fs::write(&p, self.private.contents(&k(STATE_NAME)).unwrap()).unwrap();
             State::load(&p).unwrap().record(&AppId::parse(APP).unwrap())
         }
 
         /// The version folders that hold objects in the public bucket.
-        fn folders(&self) -> BTreeSet<String> {
+        pub(crate) fn folders(&self) -> BTreeSet<String> {
             snapshot_of(&self.public)
                 .into_keys()
                 .filter(|key| key.as_str()[P.len() + 1..].contains('/'))
@@ -1297,12 +1226,12 @@ mod tests {
                 .collect()
         }
 
-        fn snapshot(&self) -> (Snapshot, Snapshot) {
+        pub(crate) fn snapshot(&self) -> (Snapshot, Snapshot) {
             (snapshot_of(&self.public), snapshot_of(&self.private))
         }
 
         /// Puts both buckets back to `snap`, with no fault and an empty log.
-        fn restore(&self, snap: &(Snapshot, Snapshot)) {
+        pub(crate) fn restore(&self, snap: &(Snapshot, Snapshot)) {
             for (store, objects) in [(&self.public, &snap.0), (&self.private, &snap.1)] {
                 for key in snapshot_of(store).into_keys() {
                     store.delete(&key).unwrap();
@@ -1316,7 +1245,7 @@ mod tests {
         }
     }
 
-    fn set(items: &[&str]) -> BTreeSet<String> {
+    pub(crate) fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
     }
 
@@ -1324,7 +1253,7 @@ mod tests {
 
     /// The objects a feed's bytes list, given the objects present: every manifest, and the pack
     /// and deltas of each manifest present. `missing` gets each listed object that is absent.
-    fn listed_objects(
+    pub(crate) fn listed_objects(
         chain: &KeysChain,
         feed_key: &StoreKey,
         feed: &[u8],
@@ -1372,14 +1301,14 @@ mod tests {
         out
     }
 
-    fn is_feed(key: &StoreKey) -> bool {
+    pub(crate) fn is_feed(key: &StoreKey) -> bool {
         let rel = &key.as_str()[P.len() + 1..];
         rel.starts_with("feed-") && !rel.contains('/')
     }
 
     /// Replays the public bucket's log from `initial`: no feed is written before every object it
     /// lists is there, and no object is deleted while a feed in the bucket lists it.
-    fn check_invariants(
+    pub(crate) fn check_invariants(
         chain: &KeysChain,
         initial: &Snapshot,
         log: &[(Bucket, Op, bool)],
@@ -1415,7 +1344,7 @@ mod tests {
     }
 
     /// Every listed object of every feed in the bucket is there.
-    fn assert_consistent(w: &World) {
+    pub(crate) fn assert_consistent(w: &World) {
         let chain = w.chain();
         let present = snapshot_of(&w.public);
         for fk in present.keys().filter(|key| is_feed(key)) {

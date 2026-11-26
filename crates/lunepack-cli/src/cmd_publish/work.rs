@@ -11,12 +11,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use lunepack_core::{
-    CheckedRef, FeedTargetEntry, Hasher, ObjectStore, StoreError, StoreKey, VerifiedKeySet,
-    verify_manifest,
+    Channel, CheckedRef, ClockReading, FeedTargetEntry, Hasher, KeysChain, Limits, MAX_ROOT_STEPS,
+    ObjectStore, StoreError, StoreKey, VerifiedFeed, VerifiedKeySet, verify_manifest,
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 
 use super::fetch::{under, write_file};
+use super::pending::{MAX_PENDING_BYTES, PENDING_NAME, Pending};
+use super::{Stores, say};
+use crate::config::{Config, PublishSettings};
+use crate::release_dir::{self, verify_feed_of};
+use crate::state::{DEFAULT_STATE, MAX_STATE_BYTES};
 
 /// The key `<prefix>/<rel>`; an error names the relative path only.
 pub fn key(prefix: &str, rel: &str) -> Result<StoreKey> {
@@ -218,4 +223,189 @@ pub fn unreferenced<'a>(
         .filter(|f| !referenced.contains(*f))
         .cloned()
         .collect()
+}
+
+/// `<channel>`'s feed, relative to the prefix.
+pub fn feed_rel(channel: &Channel) -> String {
+    format!("feed-{}.json", channel.as_str())
+}
+
+/// Reads `key` and prints one `read:` line for it.
+pub fn read_doc(store: &dyn ObjectStore, key: &StoreKey, cap: u64) -> Result<Option<Vec<u8>>> {
+    let got = get(store, key, cap)?;
+    say(&format!(
+        "read: {key} {}",
+        if got.is_some() { "found" } else { "absent" }
+    ))?;
+    Ok(got)
+}
+
+/// The store has not been published to yet: a document every publish needs is absent.
+#[derive(Debug)]
+pub struct NotPublished {
+    /// What is absent, as a sentence part (`the private bucket has no <key>`).
+    pub what: String,
+}
+
+impl std::fmt::Display for NotPublished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: run `lunepack publish init` first (nothing was written)",
+            self.what
+        )
+    }
+}
+
+impl std::error::Error for NotPublished {}
+
+/// What a command reads from the two buckets before it decides anything (P-D6).
+pub struct StoreRead {
+    /// The state file's key and bytes.
+    pub state_key: StoreKey,
+    pub state_read: Vec<u8>,
+    /// The pending-deletes record as read, and whether the store had one.
+    pub pending: Pending,
+    pub pending_existed: bool,
+    /// `keys.json`'s bytes, and the `root-<k>.json` files after the config's root.
+    pub keys_bytes: Vec<u8>,
+    pub roots: Vec<(u64, Vec<u8>)>,
+    /// The bytes of each `[publish]` channel's feed (`None`: none yet) and its key.
+    pub feeds_read: BTreeMap<Channel, Option<Vec<u8>>>,
+    pub feed_keys: Vec<(Channel, StoreKey)>,
+    /// The version of the root the walk ended at, and the key set under it.
+    pub root_doc_k: u64,
+    pub chain: KeysChain,
+    /// The feeds that exist, verified with the time checks skipped.
+    pub feeds: BTreeMap<Channel, VerifiedFeed>,
+}
+
+/// Reads the state file and the pending record from the private store (the state file first) and
+/// `keys.json`, the roots and every `[publish]` channel's feed from the public store; writes them
+/// into `wdir` (and the state file to `state_file`) the way the feed writers open a release
+/// directory; and verifies the chain. A missing state file or `keys.json` is [`NotPublished`].
+pub fn read_store(
+    stores: &Stores,
+    config: &Config,
+    publish: &PublishSettings,
+    wdir: &Path,
+    state_file: &Path,
+    skip: &ClockReading,
+) -> Result<StoreRead> {
+    let prefix = publish.prefix.as_str();
+    let state_key = key(prefix, DEFAULT_STATE)?;
+    let Some(state_read) = read_doc(stores.private.as_ref(), &state_key, MAX_STATE_BYTES)? else {
+        return Err(NotPublished {
+            what: format!("the private bucket has no {state_key}"),
+        }
+        .into());
+    };
+    fs::write(state_file, &state_read).context("cannot write the work directory")?;
+    let pending_key = key(prefix, PENDING_NAME)?;
+    let (pending, pending_existed) =
+        match read_doc(stores.private.as_ref(), &pending_key, MAX_PENDING_BYTES)? {
+            Some(bytes) => (Pending::parse(prefix, &bytes)?, true),
+            None => (Pending::default(), false),
+        };
+
+    let keys_key = key(prefix, "keys.json")?;
+    let Some(keys_bytes) = read_doc(stores.public.as_ref(), &keys_key, Limits::V1.keys_doc_bytes)?
+    else {
+        return Err(NotPublished {
+            what: format!("the public bucket has no {keys_key}"),
+        }
+        .into());
+    };
+    let mut roots = Vec::new();
+    for k in config.root_version + 1..=config.root_version + MAX_ROOT_STEPS {
+        let rk = key(prefix, &format!("root-{k}.json"))?;
+        match read_doc(stores.public.as_ref(), &rk, Limits::V1.root_doc_bytes)? {
+            Some(bytes) => roots.push((k, bytes)),
+            None => break,
+        }
+    }
+    let mut feeds_read: BTreeMap<Channel, Option<Vec<u8>>> = BTreeMap::new();
+    let mut feed_keys = Vec::new();
+    for channel in &publish.channels {
+        let fk = key(prefix, &feed_rel(channel))?;
+        let got = read_doc(stores.public.as_ref(), &fk, Limits::V1.feed_doc_bytes)?;
+        feeds_read.insert(channel.clone(), got);
+        feed_keys.push((channel.clone(), fk));
+    }
+
+    fs::write(release_dir::keys_path(wdir), &keys_bytes)
+        .context("cannot write the work directory")?;
+    for (k, bytes) in &roots {
+        fs::write(release_dir::root_path(wdir, *k), bytes)
+            .context("cannot write the work directory")?;
+    }
+    for (channel, bytes) in &feeds_read {
+        if let Some(bytes) = bytes {
+            fs::write(wdir.join(feed_rel(channel)), bytes)
+                .context("cannot write the work directory")?;
+        }
+    }
+    let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
+    let opened = release_dir::open(wdir, config, &hasher, &verifier, skip)
+        .context("the store's key set does not verify")?;
+    let chain = opened
+        .chain
+        .ok_or_else(|| anyhow!("internal error: keys.json vanished"))?;
+    let mut feeds: BTreeMap<Channel, VerifiedFeed> = BTreeMap::new();
+    for (channel, bytes) in &feeds_read {
+        if let Some(bytes) = bytes {
+            let feed = verify_feed_of(&chain, &config.app_id, channel, bytes, skip, &verifier)
+                .with_context(|| format!("the store's {} does not verify", feed_rel(channel)))?;
+            feeds.insert(channel.clone(), feed);
+        }
+    }
+    Ok(StoreRead {
+        state_key,
+        state_read,
+        pending,
+        pending_existed,
+        keys_bytes,
+        roots,
+        feeds_read,
+        feed_keys,
+        root_doc_k: opened.root_doc_k,
+        chain,
+        feeds,
+    })
+}
+
+/// P-D7: downloads every release the `feeds` list, except `skip_version`, and checks it against
+/// the document that lists it. Returns the objects of each version (by its text) and how many
+/// manifests were fetched.
+pub fn download_retained(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    wdir: &Path,
+    chain: &KeysChain,
+    feeds: &BTreeMap<Channel, VerifiedFeed>,
+    skip_version: Option<&str>,
+) -> Result<(BTreeMap<String, BTreeSet<String>>, usize)> {
+    let mut objects_of: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut fetched: BTreeSet<String> = BTreeSet::new();
+    for feed in feeds.values() {
+        for (i, release) in feed.releases().iter().enumerate() {
+            if Some(release.version_text()) == skip_version {
+                continue;
+            }
+            for target in release.targets().keys() {
+                let entry = feed
+                    .target_entry(i, *target)
+                    .context("internal error: a release without its target")?;
+                if !fetched.insert(entry.reference().path().to_owned()) {
+                    continue;
+                }
+                let rels = download_target(store, prefix, wdir, chain.keys(), &entry)?;
+                objects_of
+                    .entry(release.version_text().to_owned())
+                    .or_default()
+                    .extend(rels);
+            }
+        }
+    }
+    Ok((objects_of, fetched.len()))
 }

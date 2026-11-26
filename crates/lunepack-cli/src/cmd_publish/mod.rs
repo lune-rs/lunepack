@@ -2,18 +2,23 @@
 //!
 //! `fetch` reads the app's public feed over the transport clients use and fills a release
 //! directory from it; it reads no credential. `push` publishes a packed release to the app's
-//! stores, which the composition root (`main.rs`) builds and hands in as [`Stores`].
+//! stores, which the composition root (`main.rs`) builds and hands in as [`Stores`]; `refresh`
+//! re-signs the feeds and retries the pending deletes, `plan` shows what the stores hold and what
+//! a push would do (it writes nothing), and `init` uploads a fresh app's first documents.
 
 pub mod fetch;
+pub mod init;
 pub mod pending;
+pub mod plan;
 pub mod push;
+pub mod refresh;
 pub mod work;
 
 use std::fmt;
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 use lunepack_core::ObjectStore;
 
@@ -51,6 +56,14 @@ pub enum PublishCommand {
     /// retained release, write the feeds in-process, then upload in the commit order, purge what
     /// retention dropped and write the state file last.
     Push(push::PushArgs),
+    /// Re-sign each channel's feed (all, or those expiring soon) with a new `seq`, and retry the
+    /// pending deletes.
+    Refresh(refresh::RefreshArgs),
+    /// Show the feeds, what a push of a version would add and drop, the pending deletes and any
+    /// abandoned push. Reads the stores; writes nothing.
+    Plan(plan::PlanArgs),
+    /// Upload a new app's `keys.json`, roots and state file from a local release directory.
+    Init(init::InitArgs),
 }
 
 /// The two buckets of an app (P-D4): the public one clients read, the private one with the state
@@ -71,6 +84,9 @@ pub fn run(config: &Path, command: &PublishCommand, open: OpenStores<'_>) -> Res
     match command {
         PublishCommand::Fetch(args) => fetch::fetch(config, args),
         PublishCommand::Push(args) => push::push(config, args, open),
+        PublishCommand::Refresh(args) => refresh::refresh(config, args, open),
+        PublishCommand::Plan(args) => plan::plan(config, args, open),
+        PublishCommand::Init(args) => init::init(config, args, open),
     }
 }
 
@@ -88,5 +104,17 @@ pub(crate) fn settings(config: &Config) -> Result<(&UpdateSettings, &PublishSett
 pub(crate) fn say(line: &str) -> Result<()> {
     let mut out = std::io::stdout().lock();
     writeln!(out, "{line}")?;
+    Ok(())
+}
+
+/// Q6: the commands that issue a feed (`push`, `refresh`) or are part of the publishing job
+/// (`init`) refuse a set `SOURCE_DATE_EPOCH`, before any network access: the writers would issue
+/// the feed at that fixed time. It belongs only in the `pack` and `setup` job.
+pub(crate) fn refuse_source_date_epoch(command: &str) -> Result<()> {
+    if std::env::var_os("SOURCE_DATE_EPOCH").is_some() {
+        bail!(
+            "SOURCE_DATE_EPOCH is set, and `publish {command}` would issue its documents at that fixed time; unset it for this command (set it only in the job that runs `pack` and `setup`)"
+        );
+    }
     Ok(())
 }
