@@ -1,13 +1,14 @@
 //! Command-line packager and release tool; the composition root that wires traits to adapters.
 //!
 //! Exit status: 0 on success, 1 on any failure (`error: <message and causes>` on stderr), 2 on a
-//! usage error (clap). No command prints private-key material, an environment variable's value or
+//! usage error (clap, or an argument `publish` refuses). No command prints private-key material, an environment variable's value or
 //! a config value.
 
 mod cmd_feed;
 mod cmd_keys;
 mod cmd_pack;
 mod cmd_prebuilt;
+mod cmd_publish;
 mod cmd_setup;
 mod cmd_verify;
 mod codesign;
@@ -69,6 +70,11 @@ enum Command {
     /// Build a Linux setup file: the release's runtime with one version's key set, manifest and
     /// pack, installable offline (`<app_id>-<version>-<target>-setup`).
     Setup(cmd_setup::SetupArgs),
+    /// The standard publish flow: fetch the published state, then (later) push a release.
+    Publish {
+        #[command(subcommand)]
+        command: cmd_publish::PublishCommand,
+    },
     /// lunepack's own prebuilt binaries: what this CLI pins, and the project's signed list of them.
     Prebuilt {
         #[command(subcommand)]
@@ -136,6 +142,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Verify(args) => cmd_verify::verify(&cli.config, &args),
         Command::Inspect(args) => cmd_verify::inspect(&cli.config, &args),
         Command::Setup(args) => cmd_setup::setup(&cli.config, &args),
+        Command::Publish { command } => cmd_publish::run(&cli.config, &command),
         Command::Prebuilt { command } => match command {
             PrebuiltCommand::List(args) => cmd_prebuilt::list(&args),
             PrebuiltCommand::Check(args) => cmd_prebuilt::check(&args),
@@ -153,7 +160,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:#}");
-            ExitCode::FAILURE
+            ExitCode::from(cmd_publish::exit_status(&e))
         }
     }
 }
