@@ -4116,3 +4116,291 @@ fn deltas_over_the_budget_are_not_run() {
     );
     assert_eq!(files.len(), 8);
 }
+
+// ---- `--channel` and `[install.<os>]` (P-D4, P-D5) -----------------------------------------------
+
+/// `[publish]` for the tests below: names of variables only, never a value.
+#[cfg(unix)]
+const PUBLISH_TOML: &str = r#"
+[publish]
+prefix = "hello"
+store = "r2"
+account_id_env = "HELLO_R2_ACCOUNT_ID"
+access_key_env = "HELLO_R2_KEY"
+secret_key_env = "HELLO_R2_SECRET"
+public_bucket = "hello-public"
+private_bucket = "hello-private"
+channels = ["stable", "beta"]
+"#;
+
+/// The JSON text without its layout whitespace (the documents hold no string with a space in the
+/// keys looked at here).
+#[cfg(unix)]
+fn compact(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// `pack --channel`: an allowed channel is written into the signed update config; one that is not
+/// listed, one when there is no `[publish]`, and a malformed one are refused naming the allowed
+/// set, and nothing is written; without the flag the pack is byte-identical with or without
+/// `[publish]`.
+#[cfg(unix)]
+#[test]
+fn pack_channel_is_written_and_limited_to_the_publish_channels() {
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    let pack_in = |toml: &str, extra: &[&str]| {
+        let w = World::new(1, 1);
+        w.append_config(toml);
+        let dir = w.release_dir("rel", &[]);
+        let runtime = w.dir.path().join("runtime");
+        fs::write(&runtime, runtime_elf(62, false)).unwrap();
+        let mut args = vec!["--runtime", s(&runtime)];
+        args.extend_from_slice(extra);
+        let out = w.pack(&Pack {
+            input: input.path(),
+            version: "1.2.3",
+            target: "linux-x86_64",
+            release_dir: &dir,
+            signers: w.all_signers(),
+            epoch: T0,
+            extra: args,
+        });
+        (w, dir, out)
+    };
+    let published = format!("{UPDATE_TOML}{PUBLISH_TOML}");
+
+    // beta is written, in the document and in the bytes the manifest hashes.
+    let (w, dir, out) = pack_in(&published, &["--channel", "beta"]);
+    assert_ok(&out, "pack --channel beta");
+    let (_, files) = w.verify(&dir, "1.2.3", Target::LinuxX86_64);
+    let bytes = &files["lunepack-update.json"];
+    let doc = lunepack_core::UpdateConfig::parse(bytes).unwrap();
+    assert_eq!(doc.channel.as_str(), "beta");
+    assert!(
+        compact(bytes).contains("\"channel\":\"beta\""),
+        "{}",
+        String::from_utf8_lossy(bytes)
+    );
+
+    // The listed `stable` is written too, the same as the config's own channel.
+    let (w, dir, out) = pack_in(&published, &["--channel", "stable"]);
+    assert_ok(&out, "pack --channel stable");
+    let (_, files) = w.verify(&dir, "1.2.3", Target::LinuxX86_64);
+    assert!(compact(&files["lunepack-update.json"]).contains("\"channel\":\"stable\""));
+
+    // Refusals: one per case, each before anything is written.
+    for (toml, flag, expect) in [
+        (
+            published.as_str(),
+            "nightly",
+            "--channel nightly is not one of the [publish] channels: stable, beta",
+        ),
+        (
+            UPDATE_TOML,
+            "beta",
+            "--channel needs [publish] in the config",
+        ),
+        (
+            published.as_str(),
+            "Not A Channel",
+            "--channel is not a channel id",
+        ),
+        (published.as_str(), "", "--channel is not a channel id"),
+    ] {
+        let (_, dir, out) = pack_in(toml, &["--channel", flag]);
+        let err = assert_fails(&out, 1, &format!("--channel {flag:?}"));
+        assert!(err.contains(expect), "{flag:?}: {err}");
+        assert!(!dir.join("1.2.3").exists(), "{flag:?}: nothing is written");
+    }
+
+    // Without the flag, a config with `[publish]` packs the same bytes as one without (the same
+    // keys, so the same signed config inside).
+    let w = World::new(1, 1);
+    w.append_config(UPDATE_TOML);
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let plain = w.release_dir("plain", &[]);
+    assert_ok(
+        &pack_update(
+            &w,
+            input.path(),
+            &plain,
+            Some(&runtime),
+            "1.2.3",
+            "linux-x86_64",
+        ),
+        "pack without [publish]",
+    );
+    w.append_config(PUBLISH_TOML);
+    let with = w.release_dir("with", &[]);
+    assert_ok(
+        &pack_update(
+            &w,
+            input.path(),
+            &with,
+            Some(&runtime),
+            "1.2.3",
+            "linux-x86_64",
+        ),
+        "pack with [publish], no --channel",
+    );
+    for name in ["linux-x86_64.pack", "linux-x86_64.manifest.json"] {
+        assert!(
+            fs::read(plain.join("1.2.3").join(name)).unwrap()
+                == fs::read(with.join("1.2.3").join(name)).unwrap(),
+            "{name} differs"
+        );
+    }
+}
+
+/// `[install.<os>]`: the entry of the target's OS is the one written into the signed config, and
+/// `[install]` stays for the others.
+#[cfg(unix)]
+#[test]
+fn install_os_overrides_pick_the_entry_of_the_targets_os() {
+    let toml = r#"
+[update]
+feed = "https://updates.example.com/hello"
+
+[install]
+entry = "bin/app"
+name = "Hello"
+
+[install.windows]
+entry = "bin/app.exe"
+
+[install.macos]
+entry = "Contents/MacOS/Hello"
+"#;
+    let entry_of = |files: &BTreeMap<String, Vec<u8>>, at: &str| {
+        let doc = lunepack_core::UpdateConfig::parse(&files[at]).unwrap();
+        doc.install.entry.as_str().to_owned()
+    };
+
+    // Linux: `[install]`.
+    let w = World::new(1, 1);
+    w.append_config(toml);
+    let dir = w.release_dir("rel", &[]);
+    let input = tempfile::tempdir().unwrap();
+    write(
+        input.path(),
+        "bin/app",
+        &exe_headers::elf(62, false, 20_000),
+    );
+    set_mode(&input.path().join("bin/app"), 0o755);
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    assert_ok(
+        &pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&runtime),
+            "1.0.0",
+            "linux-x86_64",
+        ),
+        "linux",
+    );
+    let (_, files) = w.verify(&dir, "1.0.0", Target::LinuxX86_64);
+    assert_eq!(entry_of(&files, "lunepack-update.json"), "bin/app");
+
+    // Windows: the `.exe` entry (`[install]`'s `bin/app` would be refused for a Windows target).
+    let dir = w.release_dir("rel-win", &[]);
+    let input = tempfile::tempdir().unwrap();
+    write(input.path(), "bin/app.exe", &exe_headers::pe(0x8664, 8_000));
+    let pe = w.dir.path().join("runtime.exe");
+    fs::write(&pe, hardened_pe(0x8664, 2)).unwrap();
+    let stub = w.dir.path().join("stub.exe");
+    fs::write(&stub, hardened_pe(0x8664, 2)).unwrap();
+    assert_ok(
+        &pack_win(
+            &w,
+            input.path(),
+            &dir,
+            Some(&pe),
+            Some(&stub),
+            "1.0.0",
+            "windows-x86_64",
+        ),
+        "windows",
+    );
+    let (_, files) = w.verify(&dir, "1.0.0", Target::WindowsX86_64);
+    assert_eq!(entry_of(&files, "lunepack-update.json"), "bin/app.exe");
+
+    // macOS: the bundle's executable.
+    let dir = w.release_dir("rel-mac", &[]);
+    let input = tempfile::tempdir().unwrap();
+    mac_app(input.path());
+    let macho = w.dir.path().join("runtime.macho");
+    fs::write(&macho, macho_image(ARM64)).unwrap();
+    assert_ok(
+        &pack_update(
+            &w,
+            input.path(),
+            &dir,
+            Some(&macho),
+            "1.0.0",
+            "macos-aarch64",
+        ),
+        "macos",
+    );
+    let (_, files) = w.verify(&dir, "1.0.0", Target::MacosAarch64);
+    assert_eq!(
+        entry_of(&files, "Contents/Resources/lunepack-update.json"),
+        "Contents/MacOS/Hello"
+    );
+
+    // Without the Windows override the shared entry is checked as it always was.
+    let w = World::new(1, 1);
+    w.append_config(&toml.replace("[install.windows]\nentry = \"bin/app.exe\"\n", ""));
+    let dir = w.release_dir("rel", &[]);
+    let input = tempfile::tempdir().unwrap();
+    write(input.path(), "bin/app", &exe_headers::pe(0x8664, 8_000));
+    let pe = w.dir.path().join("runtime.exe");
+    fs::write(&pe, hardened_pe(0x8664, 2)).unwrap();
+    let stub = w.dir.path().join("stub.exe");
+    fs::write(&stub, hardened_pe(0x8664, 2)).unwrap();
+    let out = pack_win(
+        &w,
+        input.path(),
+        &dir,
+        Some(&pe),
+        Some(&stub),
+        "1.0.0",
+        "windows-x86_64",
+    );
+    let err = assert_fails(&out, 1, "a Windows entry without .exe");
+    assert!(err.contains("must be an .exe"), "{err}");
+}
+
+/// A key `[install.<os>]` does not define is refused by `pack`, naming the key.
+#[cfg(unix)]
+#[test]
+fn install_os_table_refuses_other_keys() {
+    let w = World::new(1, 1);
+    let dir = w.release_dir("rel", &[]);
+    w.append_config(&format!(
+        "{UPDATE_TOML}[install.macos]\nchannel = \"beta\"\n"
+    ));
+    let input = tempfile::tempdir().unwrap();
+    app_tree(input.path(), "bin/app");
+    let runtime = w.dir.path().join("runtime");
+    fs::write(&runtime, runtime_elf(62, false)).unwrap();
+    let out = pack_update(
+        &w,
+        input.path(),
+        &dir,
+        Some(&runtime),
+        "1.0.0",
+        "linux-x86_64",
+    );
+    let err = assert_fails(&out, 1, "an unknown key in [install.macos]");
+    assert!(
+        err.contains("unknown field") && err.contains("channel"),
+        "{err}"
+    );
+}
