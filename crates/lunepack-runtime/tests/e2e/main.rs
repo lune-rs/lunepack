@@ -24,7 +24,8 @@
 //! Environment: `LUNEPACK_E2E_RUNTIME` (the static runtime), `LUNEPACK_E2E_CLI` (`lunepack`),
 //! `LUNEPACK_E2E_APP` (the Rust example app), `LUNEPACK_E2E_SHELL_APP` (the shell app),
 //! `LUNEPACK_E2E_FAKE_UI` (the stand-in UI, `tests/e2e/fake-ui`) and `LUNEPACK_E2E_UI` (the real
-//! `lunepack-ui`). On macOS `LUNEPACK_E2E_DOTNET_BUNDLE` names the example's app bundle instead.
+//! `lunepack-ui`). On macOS `LUNEPACK_E2E_DOTNET_BUNDLE` names the example's app bundle instead, and
+//! `LUNEPACK_E2E_C_APP` the folder of the C example (opt-out `LUNEPACK_E2E_C=0`).
 //! `LUNEPACK_E2E_DOTNET_APP` names the published folder of the .NET example (its
 //! entry is `Example`; `scripts/build-example-dotnet.sh` makes it); with `LUNEPACK_E2E_REQUIRE=1`
 //! it must be set, and `LUNEPACK_E2E_DOTNET=0` is the one opt-out (the suite prints `SKIPPED`).
@@ -161,6 +162,37 @@ fn dotnet_bundle() -> Result<Option<PathBuf>, String> {
     Ok(Some(bundle))
 }
 
+/// The C example's folder of the macOS suite (M14 step 7): `LUNEPACK_E2E_C_APP` names the folder
+/// `cargo run -p xtask -- build-example-c` made (`example` and `liblunepack_ffi.dylib`). `Ok(None)`
+/// when its row is skipped: by name (`LUNEPACK_E2E_C=0`) or, without `LUNEPACK_E2E_REQUIRE=1`,
+/// because no folder was given; either way the suite says `SKIPPED` once. An error when the row is
+/// required and the folder is not usable.
+#[cfg(target_os = "macos")]
+fn c_app_folder() -> Result<Option<PathBuf>, String> {
+    const FOLDER_VAR: &str = "LUNEPACK_E2E_C_APP";
+    const C_VAR: &str = "LUNEPACK_E2E_C";
+    if std::env::var(C_VAR).is_ok_and(|v| v == "0") {
+        eprintln!("e2e: SKIPPED: the C row ({C_VAR}=0)");
+        return Ok(None);
+    }
+    let required = std::env::var(REQUIRE_VAR).is_ok_and(|v| v == "1");
+    let Some(folder) = std::env::var_os(FOLDER_VAR).map(PathBuf::from) else {
+        if required {
+            return Err(format!(
+                "{REQUIRE_VAR}=1, but {FOLDER_VAR} is not set ({C_VAR}=0 skips the C row)"
+            ));
+        }
+        eprintln!("e2e: SKIPPED: the C row ({FOLDER_VAR} is not set)");
+        return Ok(None);
+    };
+    if !folder.join("example").is_file() || !folder.join("liblunepack_ffi.dylib").is_file() {
+        return Err(format!(
+            "{FOLDER_VAR} does not name the C example's folder (example, liblunepack_ffi.dylib)"
+        ));
+    }
+    Ok(Some(folder))
+}
+
 /// The macOS suite (M8 step 10): `scripts/e2e-macos.sh` makes the temporary root and sets `HOME`
 /// and `LUNEPACK_E2E_ROOT`; the rows are in [`macos`].
 #[cfg(target_os = "macos")]
@@ -189,6 +221,13 @@ fn run(paths: &Paths<'_>) -> ExitCode {
         fake_ui: paths.fake_ui.clone(),
         dotnet_bundle: match dotnet_bundle() {
             Ok(bundle) => bundle,
+            Err(why) => {
+                eprintln!("e2e: FAIL: {why}");
+                return ExitCode::FAILURE;
+            }
+        },
+        c_app: match c_app_folder() {
+            Ok(folder) => folder,
             Err(why) => {
                 eprintln!("e2e: FAIL: {why}");
                 return ExitCode::FAILURE;
