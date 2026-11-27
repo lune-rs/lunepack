@@ -1487,11 +1487,28 @@ key and its secret); the state file and the pending-deletes record in the privat
 - The release key and the store credentials are separate secrets for separate jobs: a job that only
   fetches, packs and builds a setup file needs the release key and no store credential, and a job that
   only publishes needs both. `fetch` reads no credential at all.
+- There are two store tokens, because the two commands that hold them do different things. The **push
+  token** reads, writes and deletes in both buckets and runs only in the job the owner approves. The
+  **refresh token** (the scheduled job) writes the public bucket and reads the private one, and deletes
+  nothing: `refresh` writes only feeds, never the state file or the pending-deletes record, and runs no
+  delete (the pending deletes wait for the next `push`). The commands read both through the same variables
+  and the app gives each job the token its environment holds; the config has no key for it.
+- In the documented CI example the release key and both tokens are secrets of GitHub environments, never
+  repository secrets: an environment secret reaches only a job that names the environment and only on a
+  ref its rules allow (the tag pattern for `pack` and `push`, the default branch for `refresh`; the owner's
+  approval on `push`). A repository secret would reach every workflow on every branch, so a person or bot
+  with write access but no release rights could send it out, bypassing the approval.
+- No program travels between jobs of that example. The `build` job runs third-party code, and a process it
+  leaves behind can use the run's artifact token to replace an artifact uploaded earlier in the run; a
+  `lunepack` binary downloaded by name into a job that holds the release key or a token would run with
+  them. So `pack`, `push` and `refresh` each install the CLI at a pinned version, and only data passes
+  between jobs (the build output, and the release directories, which `push` verifies completely before
+  uploading).
 - Requests are signed (SigV4, HMAC-SHA256 over `sha2`) at the system clock, never at
   `SOURCE_DATE_EPOCH`; `push`, `refresh` and `init` refuse a set `SOURCE_DATE_EPOCH` before any network
   access, so a workflow-wide setting cannot back-date a feed.
 
-**A stolen store key.** The holder can read, replace and delete objects in the buckets the key reaches.
+**A stolen store key.** (The push token; the refresh token is below.) The holder can read, replace and delete objects in the buckets the key reaches.
 It cannot sign: a feed, manifest or key set it writes does not verify, and a pack or delta it replaces
 no longer matches the SHA-256 in the signed manifest, so a client rejects each (class 1 above). What it
 can do is bounded by that: delete or hide objects (a denial of updates, the worst case), replace a feed
@@ -1505,26 +1522,52 @@ prefix and in a version folder, and every feed is re-read and verified just befo
 skip any key whose version a current feed lists. Revoking the store key and re-running `publish plan`
 is the recovery; nothing client-side changes.
 
+**A stolen refresh token.** The holder can read both buckets (the private one holds the state file and
+the pending-deletes record: version and `seq` numbers and object paths, no secret) and write the public
+bucket; it cannot delete, and it cannot write the private bucket, so it cannot weaken the publisher's
+replay guard or forge a pending-deletes record. It cannot sign either, so what it can write is bounded
+as for the push token: it can plant or replace objects, which clients reject unless they match a signed
+document, and replace a feed with an older genuine one or with garbage, which is a denial of updates
+(and, for a client that never saw a newer `seq`, a replay, as with any hosting attacker). `refresh`
+itself refuses a store that was rolled back: it reads the state file's record and exits before signing or
+writing anything when a feed's `seq`, the key set or the root is below it, so a refresh never re-signs an
+older document as the newest.
+
 **Untrusted input on the publish path.** Every document read from a bucket is verified under the key
 set before anything is built on it (`keys.json`, the roots, each feed, each retained release's manifest,
-pack and deltas); a bucket answer is capped; a redirect is never followed; a `NoSuchBucket` answer is an
+pack and deltas); the feeds of channels the state file records that `[publish]` no longer names are read
+and verified too, only to guard what they list (a guard feed that does not verify stops the command); a bucket answer is capped; a redirect is never followed; a `NoSuchBucket` answer is an
 error, not "nothing published". The pending-deletes record is parsed strictly (a closed format, sorted and
 unique lists, every key under the prefix and inside a version folder). Purge keys come only from the
 dropped releases' own verified manifests, never from a bucket listing, and each passes the `StoreKey`
 rules (under the prefix, no `..`, `//`, `/./`, whitespace, backslash or control character).
 
+**The key-set upload.** `push` and `refresh` never write `keys.json` or a root. The owner's
+`publish keys` does, after checking that the directory's roots continue the store's, that the key set is
+newer, that the state file's record would not be lowered, and that every feed in the store (guard feeds
+too) and every manifest they list still verifies under the new key set, so an upload cannot leave clients
+with documents they reject. It uploads the new roots, then `keys.json` (re-read first to catch another
+writer), then the state file. It runs on the owner's machine with the root signers, never in CI; an
+agent that is asked to revoke a key stops. Between the two moves of a revocation made through it the old
+key is still trusted, so both are done in one sitting.
+
+**What `fetch` proves.** `publish fetch` checks signatures and the chain, not expiry: it reads with the
+time checks skipped so an expired feed can still be refreshed. Nobody should read its exit status as
+"the feeds are fresh"; `plan` shows the expiry, `push` and `refresh` check it at the real time, and clients
+refuse an expired feed.
+
 **The race window.** `push` and `refresh` re-read each feed just before writing it and refuse if it
 changed since the run read it. The store API has no conditional write that this path uses, so a
 concurrent publisher that writes between that read and the write is overwritten; the window is two
-requests. The consequences are bounded: no object is deleted that any feed lists (the deletes re-read
-every feed), the other publisher's release is missing from that feed until the next `push` lists it
+requests. The consequences are bounded: no object is deleted that any feed lists (a push's deletes re-read
+every feed it knows, guard feeds included; a refresh deletes nothing), the other publisher's release is missing from that feed until the next `push` lists it
 again (a rerun is safe, "Rerun and recovery" in `CLI.md`), and no client rejects anything it should
 accept. The defence is not to run two publishes at once: the apps' workflows use a concurrency group
 (`docs/PUBLISHING.md`); the commands take no local lock because each run works in its own temporary
 directory.
 
 **Not covered.** Objects that no manifest names (a hand-placed file, the leftovers of an abandoned
-upload) are never purged by the commands. A single `push` cannot be atomic across the public and
+upload) are never purged by the commands. A feed in the bucket for a channel that is neither in `[publish] channels` nor recorded in the state file (one an old script published) is not known to the commands and does not guard what it lists: keep such a channel in `channels` until its feed has expired. A single `push` cannot be atomic across the public and
 private buckets; the commit order (`CLI.md`) is what keeps every state a client can see consistent: a feed
 is written only after everything it lists, and an object is deleted only after no feed lists it. The
 first real run against a store is the user's, with `--dry-run` first; no automated test contacts a real

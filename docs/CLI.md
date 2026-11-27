@@ -1151,6 +1151,7 @@ lunepack publish refresh --sign <SIGN>... [--if-expiring-within-days <N>] [--ski
     [--dry-run] [--store-dir <DIR>]
 lunepack publish plan    [--version <VERSION>] [--store-dir <DIR>]
 lunepack publish init    --release-dir <DIR> [--dry-run] [--store-dir <DIR>]
+lunepack publish keys    --release-dir <DIR> [--dry-run] [--store-dir <DIR>]
 ```
 
 Every command also takes `--config <CONFIG>`. They need `[update]`, `[install]` and `[publish]` in the
@@ -1184,7 +1185,13 @@ require_targets = ["linux-x86_64", "windows-x86_64", "macos-universal"]   # defa
   public read URL is `[update] feed`; the public bucket is what it serves.
 - `store = "r2"` signs for Cloudflare R2 (region `auto`; the account id is 32 lowercase hex characters); `store = "s3"` for any S3-compatible store,
   path-style, in the given region. Requests are signed with SigV4 at the system clock, never at
-  `SOURCE_DATE_EPOCH`. Redirects are not followed.
+  `SOURCE_DATE_EPOCH`. Redirects are not followed. On AWS S3 the token needs `s3:ListBucket` on both buckets
+  (it can be limited to `<prefix>/*`) as well as object read and write: without it S3 answers 403, not 404,
+  for a key that does not exist, every run fails on its first missing key, and the error says so. A 403 on
+  a read is never taken as "absent".
+- The two buckets may be given two different tokens through the same variables in different jobs: a token
+  for `push` (public: read, write, delete; private: read, write) and one for `refresh` (public: read,
+  write; private: read only), because `refresh` writes only feeds.
 - A variable that is unset or empty is an error that names the variable and never a value, before any
   request.
 - `keep` counts releases per channel by version precedence, never by text or file order. The version
@@ -1227,7 +1234,9 @@ prints `GET <path> <status>` for every request. `pack` and `setup` then run on t
   absent (404) is skipped; any other status, a TLS failure or a document that does not verify is
   exit 1. A base whose pack does not match its manifest is skipped with a line; a missing or failing
   one is exit 1.
-- The documents are read with the time checks skipped, so an expired feed can still be refreshed.
+- The documents are read with the time checks skipped, so an expired feed can still be refreshed. `fetch`
+  therefore proves signatures and the chain, not freshness: an expired feed passes. `plan` shows each
+  feed's expiry; `push` and `refresh` check it at the real time.
 - A `--version` that a feed already lists is exit 1 ("is already published"): a second `pack` of a
   published version would build different deltas.
 
@@ -1245,7 +1254,11 @@ What it trusts and checks, before the first write:
 
 1. It reads the state file and the pending-deletes record from the private bucket, and `keys.json`,
    the roots and each channel's feed from the public bucket through the store API with credentials
-   (not through the CDN). With no state file or no `keys.json` it stops: run `publish init` first.
+   (not through the CDN). "Each channel" is the `[publish]` channels and every other channel the state
+   file records a `seq` for (a channel taken out of `[publish]`): those feeds are read and verified as
+   guards only, never written, and what they list is never deleted. A feed in the bucket for a channel
+   that neither names is not known; keep such a channel in `channels` until its feed has expired. With
+   no state file or no `keys.json` it stops: run `publish init` first.
 2. `keys.json` and every root must equal the copies `fetch` put in each release directory, and each
    feed must equal the fetched copy or already list `--version` with exactly these manifests (this
    version's own half-finished push). Anything else is exit 1: "the store changed since fetch".
@@ -1270,13 +1283,16 @@ The commit order (every client-visible change comes after what it points to):
    manifests: no bucket listing), before any feed changes;
 4. each changed feed, after re-reading it and refusing if it changed since this run read it (the race
    check);
-5. the deletes: every feed is re-read first, and a pending key whose version folder any current feed
-   lists is not deleted and leaves the record; a failed delete is not fatal, stays in the record and is
+5. the deletes: every feed is re-read first (the `[publish]` channels' and the guard feeds'), and a
+   pending key whose version folder any current feed lists is not deleted and leaves the record; a failed delete is not fatal, stays in the record and is
    printed;
 6. the record as it now is, then 7. the state file, last.
 
-`keys.json` and the roots are never written by `push` (they equal the store's). A purge key is checked
-to lie under `<prefix>/` in the folder of the version it belongs to.
+`keys.json` and the roots are never written by `push` or `refresh` (they equal the store's), so a key-set
+change is uploaded only by `publish keys` (below); P-D8's second stage belongs to that command. A purge
+key is checked to lie under `<prefix>/` in the folder of the version it belongs to. The race check's
+message says what to do next: after a refused `push`, run `fetch` and `pack` again, then `push`; after a
+refused `refresh`, run `refresh` again.
 
 **Rerun and recovery.** A push that stopped part-way is completed by running `publish push` again with
 the same release directories (in CI: re-run the push job; its artifacts are unchanged). Uploaded objects
@@ -1286,19 +1302,28 @@ A fresh `fetch` of a version a feed lists is refused.
 
 ### `publish refresh`
 
-Re-signs each channel's feed with a new `seq` and expiry, the releases unchanged, then retries the
-pending deletes under the same filter as `push`. With `--if-expiring-within-days N` only a feed that
-expires within N days (or has expired) is re-signed; with nothing due and nothing pending it writes
-nothing and exits 0. The record's deletes are retried either way, and a record key that a current feed
-lists is dropped from the record undeleted. `--skip-if-unpublished` turns "no `keys.json`, no state
-file or no feed in the store yet" into one `notice:` line and exit 0 (a scheduled job of an app that
-has not published); without it that is exit 1. The re-signed feeds go through the same full check as
-`push`, and the feed race check and the state file apply.
+Re-signs each channel's feed with a new `seq` and expiry, the releases unchanged. With
+`--if-expiring-within-days N` only a feed that expires within N days (or has expired) is re-signed; with
+none due it writes nothing and exits 0. `--skip-if-unpublished` turns "no `keys.json`, no state file or no
+feed in the store yet" into one `notice:` line and exit 0 (a scheduled job of an app that has not
+published); without it that is exit 1. The re-signed feeds go through the same full check as `push`, and
+the feed race check applies.
+
+`refresh` **writes the public bucket only, and only feeds**: it never writes the state file or the
+pending-deletes record and never deletes anything (the pending deletes run at the next `push`; a `notice:`
+line says how many are waiting). Its token therefore needs write access to the public bucket and read access
+to the private one, and no delete. It reads the state file to refuse a rolled-back store: if any feed in the
+store (a guard feed too) has a `seq`, or `keys.json` or the root walk a version, below the state file's
+record, it exits 1 before signing or writing anything, so a replayed older genuine feed is never re-signed.
+The new feeds carry a `seq` above the record, and the next `push` accepts and records them (a newer
+previous document is accepted).
 
 ### `publish plan`
 
-Read-only (it needs the store credentials). It prints each channel's feed (`seq`, expiry, releases) and,
-with `--version`, what a push of it would add and drop; the pending deletes; and every version in the
+Read-only (it needs the store credentials). It prints each channel's feed (`seq`, expiry, releases), the
+guard feeds of channels the state file records that `[publish]` no longer names (marked "not in [publish]
+channels"), and, with `--version`, what a push of it would add and drop; the pending deletes (run at the
+next `push`); and every version in the
 record's `uploading` list that no feed lists: an abandoned push, whose folder needs a rerun of `push`
 or a clean-up by hand, named with its keys from the store's manifests when they are there and verify. It
 performs no put and no delete.
@@ -1311,9 +1336,31 @@ takes the state file's record of this app (and no other app's), refuses when the
 any document it would write (it names the first), and uploads the roots, then `keys.json`, then the
 state file. An existing prefix of the same layout needs no `init`.
 
+### `publish keys`
+
+The owner's command for a key-set change, like `init` (never an agent's, never in CI: the root key signs the
+change and stays offline). `push` and `refresh` never write `keys.json` or a root, so a change made with
+`lunepack keys set` or `keys rotate-root` in a directory `publish fetch` filled reaches the store only
+through this command.
+
+```
+lunepack publish keys --release-dir <DIR> [--dry-run] [--store-dir <DIR>]
+```
+
+It checks the directory's root walk and `keys.json` under the config's root; that the store's roots are
+the start of the directory's (the directory was made from them); that the key set is newer than the
+store's; and that the state file's record would not be lowered. It then checks, in-process, that every
+feed in the store (the `[publish]` channels' and the guard feeds') and every manifest they list verifies
+under the new key set, so an upload cannot leave clients with a feed they reject; if anything would stop
+verifying it exits 1, names it and writes nothing (refresh the feeds with a key you keep first, and drop
+releases only a removed key signed). Then it uploads the new `root-<k>.json` files, then `keys.json`
+(after re-reading it to catch another writer), then the state file with its record of the root and key
+set, last. A rerun after a failure completes the rest; with nothing to change it exits 0. The revocation
+procedure is in [`docs/PUBLISHING.md`](PUBLISHING.md), "Changing the key set or revoking a key".
+
 ### `SOURCE_DATE_EPOCH` and these commands
 
-`push`, `refresh` and `init` exit 1, naming the variable and before any network access, when
+`push`, `refresh`, `init` and `keys` exit 1, naming the variable and before any network access, when
 `SOURCE_DATE_EPOCH` is set: they would issue feeds at that fixed time. Set it only in the job that runs
 `pack` and `setup`, to the tag commit's time. `fetch` and `plan` do not read it.
 
@@ -1356,7 +1403,7 @@ lunepack setup release --version "$VERSION" --target "$TARGET"
 lunepack publish push --release-dir release-linux --release-dir release-windows \
     --version "$VERSION" --sign env:EXAMPLE_RELEASE_KEY
 
-# a scheduled job (the same secrets)
+# a scheduled job (the release key and its own, narrower store token: it writes the public bucket only)
 lunepack publish refresh --sign env:EXAMPLE_RELEASE_KEY --if-expiring-within-days 30 \
     --skip-if-unpublished
 ```
@@ -1398,7 +1445,11 @@ local key set expose nothing.
    `pack` any new release, `feed add` it, and `feed refresh --sign <new>` (the previous feed still
    verifies, since the old key is listed). A release whose manifest only the old key signed cannot be
    carried: re-pack it as a new version, or drop it with `feed refresh --drop <version>`.
-2. `keys set` listing only the new key. Then upload `keys.json` and the feeds (see the upload order).
+2. `keys set` listing only the new key. Then upload `keys.json` and the feeds (see the upload order); with
+   `lunepack publish` that is `publish keys` for each of the two key sets and `publish refresh --sign <new>`
+   between them ([`docs/PUBLISHING.md`](PUBLISHING.md), "Changing the key set or revoking a key").
+   Through `publish` the first key set is uploaded before the second, so the old key stays trusted until
+   the second is published: do both in one sitting.
 
 `keys set` and `keys rotate-root` enforce this. If a feed, or a manifest it lists, would stop verifying
 under the new key set, the command exits 1 and places nothing; stderr names each failing feed and each
