@@ -4,10 +4,11 @@
 //! directory from it; it reads no credential. `push` publishes a packed release to the app's
 //! stores, which the composition root (`main.rs`) builds and hands in as [`Stores`]; `refresh`
 //! re-signs the feeds (it writes the public bucket only), `plan` shows what the stores hold and what
-//! a push would do (it writes nothing), and `init` uploads a fresh app's first documents.
+//! a push would do (it writes nothing), and `init` uploads a fresh app's first documents and `keys` a key-set change.
 
 pub mod fetch;
 pub mod init;
+pub mod keys;
 pub mod pending;
 pub mod plan;
 pub mod push;
@@ -65,6 +66,11 @@ pub enum PublishCommand {
     Plan(plan::PlanArgs),
     /// Upload a new app's `keys.json`, roots and state file from a local release directory.
     Init(init::InitArgs),
+    /// Upload a key-set change (`keys set`, `keys rotate-root`) made in a fetched release
+    /// directory: new roots, then `keys.json`, then the state file's record, after checking every
+    /// feed and manifest in the store still verifies under the new key set. The owner's command;
+    /// never an agent's or CI's.
+    Keys(keys::KeysArgs),
 }
 
 /// The two buckets of an app (P-D4): the public one clients read, the private one with the state
@@ -88,6 +94,7 @@ pub fn run(config: &Path, command: &PublishCommand, open: OpenStores<'_>) -> Res
         PublishCommand::Refresh(args) => refresh::refresh(config, args, open),
         PublishCommand::Plan(args) => plan::plan(config, args, open),
         PublishCommand::Init(args) => init::init(config, args, open),
+        PublishCommand::Keys(args) => keys::keys(config, args, open),
     }
 }
 

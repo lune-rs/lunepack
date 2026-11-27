@@ -284,6 +284,8 @@ pub struct StoreRead {
     /// public bucket still holds, verified with the time checks skipped. They are only read: no
     /// command writes, refreshes or drops from them, but what they list is never purged.
     pub guard_feeds: BTreeMap<Channel, VerifiedFeed>,
+    /// The bytes of the guard feeds.
+    pub guard_read: BTreeMap<Channel, Vec<u8>>,
 }
 
 impl StoreRead {
@@ -363,11 +365,11 @@ pub fn read_store(
         feeds_read.insert(channel.clone(), got);
         feed_keys.push((channel.clone(), fk));
     }
-    let mut guard_read: Vec<(Channel, Vec<u8>)> = Vec::new();
+    let mut guard_read: BTreeMap<Channel, Vec<u8>> = BTreeMap::new();
     for channel in recorded {
         let fk = key(prefix, &feed_rel(&channel))?;
         if let Some(bytes) = read_doc(stores.public.as_ref(), &fk, Limits::V1.feed_doc_bytes)? {
-            guard_read.push((channel.clone(), bytes));
+            guard_read.insert(channel.clone(), bytes);
         }
         feed_keys.push((channel, fk));
     }
@@ -422,6 +424,7 @@ pub fn read_store(
         chain,
         feeds,
         guard_feeds,
+        guard_read,
     })
 }
 

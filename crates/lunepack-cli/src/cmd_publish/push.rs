@@ -279,6 +279,7 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Plan> {
         chain,
         feeds: feeds_before,
         guard_feeds,
+        guard_read: _,
     } = work::read_store(stores, config, publish, &wdir, &state_file, &skip)?;
 
     // The release: every release directory's `<version>/` files, merged.
@@ -834,8 +835,7 @@ pub(crate) mod tests {
 
     use clap::Parser;
     use lunepack_core::{
-        Floors, Hasher, ObjectStore, RootWalk, StoreError, StoreMethod, encoding::hex_encode,
-        verify_manifest,
+        Hasher, ObjectStore, StoreError, StoreMethod, encoding::hex_encode, verify_manifest,
     };
     use lunepack_crypto::Sha256Hasher;
     use lunepack_testkit::{MemStore, StoreFault};
@@ -973,6 +973,8 @@ pub(crate) mod tests {
         /// The app's config with `[update]`, `[install]` and `[publish]`.
         pub(crate) config: PathBuf,
         pub(crate) release_signer: PathBuf,
+        pub(crate) root_signer: PathBuf,
+        pub(crate) release_public: String,
         pub(crate) public: MemStore,
         pub(crate) private: MemStore,
         pub(crate) log: Log,
@@ -1040,6 +1042,8 @@ pub(crate) mod tests {
                 pack_config,
                 config,
                 release_signer: release.path,
+                root_signer: root.path.clone(),
+                release_public: hex_encode(&release.public_key),
                 dir,
             };
             w.public.seed(
@@ -1176,20 +1180,18 @@ pub(crate) mod tests {
         pub(crate) fn chain(&self) -> KeysChain {
             let config = Config::load(&self.config).unwrap();
             let skip = ClockReading::read(&lunepack::SystemClock, Some(u64::MAX));
-            RootWalk::new(
-                config
-                    .trusted_root(&Sha256Hasher, &Ed25519Verifier)
-                    .unwrap(),
-            )
-            .verify_keys(
-                &config.app_id,
-                &Floors::default(),
-                &self.public.contents(&k("keys.json")).unwrap(),
-                &skip,
-                &Sha256Hasher,
-                &Ed25519Verifier,
-            )
-            .unwrap()
+            // The key set under the root walk, as a client reaches it (a rotation adds roots).
+            let docs = tempfile::tempdir().unwrap();
+            for (key, bytes) in snapshot_of(&self.public) {
+                let rel = &key.as_str()[P.len() + 1..];
+                if rel == "keys.json" || (rel.starts_with("root-") && !rel.contains('/')) {
+                    fs::write(docs.path().join(rel), bytes).unwrap();
+                }
+            }
+            release_dir::open(docs.path(), &config, &Sha256Hasher, &Ed25519Verifier, &skip)
+                .unwrap()
+                .chain
+                .unwrap()
         }
 
         pub(crate) fn feed(&self, channel: &str) -> Option<VerifiedFeed> {

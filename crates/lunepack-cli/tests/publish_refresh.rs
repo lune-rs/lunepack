@@ -417,7 +417,7 @@ fn init_uploads_roots_then_keys_then_state_and_refuses_an_existing_document() {
 }
 
 #[test]
-fn source_date_epoch_is_refused_by_refresh_and_init_and_not_by_plan() {
+fn source_date_epoch_is_refused_by_refresh_init_and_keys_and_not_by_plan() {
     let (f, origin) = Fixture::new(now() - 3600);
     let config = f.r2_config();
     let store = f.store_dir(&origin);
@@ -438,6 +438,14 @@ fn source_date_epoch_is_refused_by_refresh_and_init_and_not_by_plan() {
         vec![
             "publish",
             "init",
+            "--release-dir",
+            s(&origin),
+            "--store-dir",
+            &store_arg,
+        ],
+        vec![
+            "publish",
+            "keys",
             "--release-dir",
             s(&origin),
             "--store-dir",
