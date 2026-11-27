@@ -52,7 +52,7 @@ CLI=${CARGO_TARGET_DIR:-$repo/target}/debug/lunepack
 }
 
 # The flags of tools other than lunepack that the documents use.
-OTHER_FLAGS=" --locked --root --format "
+OTHER_FLAGS=" --locked --root --format --force --verify --deep --strict "
 
 # Every subcommand path whose help is read.
 PATHS="|init|keys gen|keys show|keys set|keys rotate-root|pack|feed add|feed refresh|verify|inspect|setup|publish|publish fetch|publish push|publish refresh|publish drop|publish plan|publish init|publish keys|prebuilt list|prebuilt check|prebuilt sign|prebuilt verify|prebuilt fetch"
