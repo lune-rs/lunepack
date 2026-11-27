@@ -17,7 +17,11 @@
 #   drop      `publish refresh` has no `--drop` (S6: a release is taken out by `publish drop`, which
 #             records the new feeds in the state file), so no document pairs the two, and
 #             PUBLISHING.md runs `lunepack publish drop` in a fenced block (the revocation and the
-#             `drop` job).
+#             `drop` job);
+#   tools     every job of a fenced workflow that downloads a `tools-<os>` artifact refuses it,
+#             before its first `tools/lunepack` command, unless the CLI is the artifact's only file
+#             (the set check) and has the SHA-256 its tools job wrote (the hash check), so no file
+#             planted beside the binary (a DLL on Windows) runs with the release key.
 #
 # The checks are the functions below; the seeded negatives call them with fixtures first, so each
 # check is shown to fail on what it claims to catch. bash 3.2 compatible (D30).
@@ -296,6 +300,50 @@ check_runs_drop() {
   return 1
 }
 
+# check_tools_set <md-file>: in the `jobs:` of the fenced blocks, every job that downloads a `tools-`
+# artifact has the set check and the hash check before its first `tools/lunepack` command. Prints one
+# line per missing check, naming the job, then `checked: <jobs>`; fails on a missing check or when no
+# job downloads a `tools-` artifact.
+# shellcheck disable=SC2329 # called through run_cmd and t_check
+check_tools_set() {
+  blocks_of "$1" | awk '
+    function end_job() {
+      if (job == "" || !tools) return
+      checked = checked " " job
+      if (!list) { print "job " job ": no file-set listing (FILES=(tools/*)) before its first lunepack command"; bad = 1 }
+      if (!refuse) { print "job " job ": no file-set refusal before its first lunepack command"; bad = 1 }
+      if (!hash) { print "job " job ": no SHA-256 check before its first lunepack command"; bad = 1 }
+    }
+    /^jobs:[ \t]*$/ { end_job(); on = 1; job = ""; next }
+    on && /^[^ \t#]/ { end_job(); on = 0; job = ""; next }
+    on && /^  [A-Za-z0-9_-]+:[ \t]*$/ {
+      end_job()
+      job = $1
+      sub(/:$/, "", job)
+      tools = 0; list = 0; refuse = 0; hash = 0; ran = 0; dl = 0
+      next
+    }
+    on && job != "" {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (line ~ /^- /) dl = 0
+      if (line ~ /^(- )?uses:/) dl = (index(line, "actions/download-artifact") > 0)
+      if (dl && (index(line, "name: tools-") || index(line, "name: \"tools-"))) tools = 1
+      if (line ~ /^(- run: )?tools\/lunepack[ \t]/) ran = 1
+      if (ran) next
+      if (line == "shopt -s nullglob dotglob; FILES=(tools/*); shopt -u nullglob dotglob") list = 1
+      if (index(line, "\"${#FILES[@]}\" -ne 1") && index(line, "[ -L \"${FILES[0]}\" ]") && index(line, "exit 1")) refuse = 1
+      if (index(line, "[ \"$GOT\" != \"$WANT\" ]")) hash = 1
+    }
+    END {
+      end_job()
+      if (checked == "") { print "no job downloads a tools- artifact"; bad = 1 }
+      print "checked:" checked
+      exit bad
+    }
+  '
+}
+
 # --- seeded negatives and positives --------------------------------------------------------------
 good=$T_TMP/good.md
 cat >"$good" <<'EOF'
@@ -392,6 +440,68 @@ printf '```sh\ntools/lunepack publish drop --version 1.0.0 --sign env:K\n```\n' 
 run_cmd check_runs_drop "$T_TMP/runs-drop.md"
 t_check "drop: a fenced publish drop passes" rc_is 0
 
+# A workflow whose key job checks its tools artifact; the tools job (an upload) and the build job are
+# not checked. The negatives are cut from it.
+tools_good=$T_TMP/tools-good.md
+cat >"$tools_good" <<'EOF'
+```yaml
+jobs:
+  tools-linux:
+    steps:
+      - uses: actions/upload-artifact@v4
+        with: { name: tools-linux, path: tools/bin/lunepack }
+  build:
+    steps:
+      - run: ./build.sh
+  push:
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: tools-linux, path: tools }
+      - name: check the CLI against its tools job
+        run: |
+          shopt -s nullglob dotglob; FILES=(tools/*); shopt -u nullglob dotglob
+          if [ "${#FILES[@]}" -ne 1 ] || [ "${FILES[0]}" != "tools/lunepack" ] || [ ! -f "${FILES[0]}" ] || [ -L "${FILES[0]}" ]; then echo "extra"; exit 1; fi
+          GOT="$(sha256sum tools/lunepack | cut -d' ' -f1)"
+          if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "replaced"; exit 1; fi
+          chmod +x tools/lunepack
+      - run: tools/lunepack publish push --release-dir r --version 1.0.0 --sign env:K
+```
+EOF
+run_cmd check_tools_set "$tools_good"
+t_check "tools: a key job with both checks before its first run passes" rc_is 0
+t_check "and only the job that downloads the tools artifact is checked" grep -qxF "checked: push" "$OUT"
+
+grep -vF 'FILES' "$tools_good" >"$T_TMP/tools-no-set.md"
+run_cmd check_tools_set "$T_TMP/tools-no-set.md"
+t_check "tools: a key job without the set check fails" rc_nonzero
+t_check "and names the job" out_has "job push: no file-set listing"
+t_check "and the missing refusal" out_has "job push: no file-set refusal"
+
+grep -vF 'shopt -s' "$tools_good" >"$T_TMP/tools-no-list.md"
+run_cmd check_tools_set "$T_TMP/tools-no-list.md"
+t_check "tools: a refusal without the listing fails" rc_nonzero
+
+awk '/name: check the CLI/ { print "      - run: tools/lunepack prebuilt list" } { print }' "$tools_good" >"$T_TMP/tools-late.md"
+run_cmd check_tools_set "$T_TMP/tools-late.md"
+t_check "tools: a set check after the first lunepack command fails" rc_nonzero
+t_check "and says before its first command" out_has "job push: no file-set listing (FILES=(tools/*)) before its first lunepack command"
+
+grep -vF '"$GOT" != "$WANT"' "$tools_good" >"$T_TMP/tools-no-hash.md"
+run_cmd check_tools_set "$T_TMP/tools-no-hash.md"
+t_check "tools: a key job without the hash check fails" rc_nonzero
+t_check "and names the job" out_has "job push: no SHA-256 check"
+
+printf '```yaml
+jobs:
+  build:
+    steps:
+      - run: ./build.sh
+```
+' >"$T_TMP/tools-none.md"
+run_cmd check_tools_set "$T_TMP/tools-none.md"
+t_check "tools: a workflow where no job downloads the tools artifact fails" rc_nonzero
+t_check "and says so" out_has "no job downloads a tools- artifact"
+
 # --- the real documents ---------------------------------------------------------------------------
 run_cmd check_commands "$repo/docs/PUBLISHING.md"
 t_check "PUBLISHING.md: every command and flag exists" rc_is 0
@@ -414,6 +524,10 @@ done
 run_cmd check_runs_drop "$repo/docs/PUBLISHING.md"
 t_check "PUBLISHING.md: a fenced block runs publish drop" rc_is 0
 [ "$RC" -eq 0 ] || cat "$OUT" >&2
+run_cmd check_tools_set "$repo/docs/PUBLISHING.md"
+t_check "PUBLISHING.md: every key job checks its tools artifact's file set and hash" rc_is 0
+[ "$RC" -eq 0 ] || cat "$OUT" >&2
+t_check "and the key jobs are pack, push, refresh and drop" grep -qxF "checked: pack push refresh drop" "$OUT"
 
 section="## Publishing: \`lunepack publish\`"
 run_cmd check_commands "$repo/docs/CLI.md" "$section"
