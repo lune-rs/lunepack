@@ -139,7 +139,7 @@ pub fn keys(config_path: &Path, args: &KeysArgs, open: super::OpenStores<'_>) ->
         let broken = unverifiable(&stores, publish.prefix.as_str(), &config, &read, &new_chain)?;
         if !broken.is_empty() {
             bail!(
-                "the new key set would stop these from verifying (nothing was written):\n  {}\nrefresh the feeds with a key you keep (`publish refresh --sign <that key>`) before removing the old key, and drop releases whose manifests only a removed key signed",
+                "the new key set would stop these from verifying (nothing was written):\n  {}\nrefresh the feeds with a key you keep (`publish refresh --sign <that key>`) before removing the old key, and drop the releases whose manifests only a removed key signed (`publish refresh --sign <that key> --drop <version>`); then run this again with the same directory",
                 broken.join("\n  ")
             );
         }
@@ -653,6 +653,84 @@ mod tests {
             w.publish("1.1.0");
             assert_eq!(w.listed("stable"), ["1.0.0", "1.1.0"]);
         }
+    }
+
+    fn refresh_with_key(w: &World, signer: &Path, drop: &[&str]) -> Result<()> {
+        use crate::cmd_publish::refresh;
+        let config = Config::load(&w.config)?;
+        let sign = [format!("file:{}", s(signer))];
+        let drop: Vec<String> = drop.iter().map(|v| (*v).to_owned()).collect();
+        refresh::run(
+            &refresh::Job {
+                config_path: &w.config,
+                config: &config,
+                sign: &sign,
+                within_days: None,
+                skip_if_unpublished: false,
+                drop: &drop,
+                dry_run: false,
+                clock: std::sync::Arc::new(lunepack::SystemClock),
+            },
+            &w.stores(),
+            &refresh::ORDER,
+        )
+    }
+
+    /// F8: the whole revocation of the one release key, as PUBLISHING.md gives it, through
+    /// `publish` alone: move 1 (both keys), the new key in the CI secrets, a release signed by the
+    /// new key, `publish refresh --sign <new> --drop` of every release only the old key signed,
+    /// then move 2 (the new key alone). The old key then signs nothing the store accepts.
+    #[test]
+    fn a_leaked_release_key_is_revoked_end_to_end() {
+        let mut w = World::new("keep = 5\n");
+        w.publish("1.0.0");
+        w.publish("1.1.0");
+        let old_signer = w.release_signer.clone();
+        let new = lunepack_crypto::generate_key_file(&w.dir.path().join("new-release")).unwrap();
+        let new_public = hex_encode(&new.public_key);
+
+        // Move 1: the old and the new key.
+        let rd = w.fetch("rd-move-1");
+        set_release_keys(&w, &rd, &[&release_public(&w), &new_public]).unwrap();
+        keys_in(&w, &rd, false).unwrap();
+        // The CI environments now hold the new key: the next release is signed by it.
+        w.release_signer = new.path.clone();
+        w.publish("1.2.0");
+        assert_eq!(w.listed("stable"), ["1.0.0", "1.1.0", "1.2.0"]);
+
+        // Move 2 too early: the manifests of 1.0.0 and 1.1.0 need the old key. (The owner keeps
+        // this directory: `keys set` recorded its key set in the owner's state file.)
+        let early = w.fetch("rd-move-2-early");
+        // (`keys set` refuses on its own over the directory's copy of the feed; the store's check
+        // is the one under test.)
+        fs::remove_file(early.join("feed-stable.json")).unwrap();
+        set_release_keys(&w, &early, &[&new_public]).unwrap();
+        w.clear_log();
+        let e = format!("{:#}", keys_in(&w, &early, false).unwrap_err());
+        assert!(
+            e.contains("would stop these from verifying")
+                && e.contains("1.0.0/")
+                && e.contains("1.1.0/"),
+            "{e}"
+        );
+        assert!(w.writes().is_empty(), "{:?}", w.writes());
+
+        // Drop what only the old key signed, re-signing the feed with the new key.
+        refresh_with_key(&w, &new.path, &["1.0.0", "1.1.0"]).unwrap();
+        assert_eq!(w.listed("stable"), ["1.2.0"]);
+
+        // Move 2, the refused directory published again as it is: the new key alone.
+        keys_in(&w, &early, false).unwrap();
+        assert_eq!(w.chain().keys().version(), 3);
+        assert_eq!(record_keys_version(&w), Some(3));
+
+        // The old key signs nothing the store takes; the new one refreshes and publishes.
+        assert!(refresh_with_key(&w, &old_signer, &[]).is_err());
+        refresh_with_key(&w, &new.path, &[]).unwrap();
+        w.publish("1.3.0");
+        assert_eq!(w.listed("stable"), ["1.2.0", "1.3.0"]);
+        // The dropped releases' objects are left in the bucket, listed by no feed.
+        assert!(w.folders().contains("1.0.0"));
     }
 
     #[test]
