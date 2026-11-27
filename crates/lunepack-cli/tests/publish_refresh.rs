@@ -14,7 +14,6 @@ use common::*;
 use publish::*;
 
 const PENDING: &str = "lunepack-pending-deletes.json";
-const EMPTY_RECORD: &[u8] = b"{\"format\":1,\"keys\":[],\"uploading\":[]}\n";
 
 impl Fixture {
     fn command(&self, config: &Path, command: &str, args: &[&str], store: &Path) -> Output {
@@ -107,7 +106,8 @@ fn refresh_re_signs_every_feed_and_a_fresh_feed_needs_no_refresh() {
     assert!(text.contains("dry run: nothing was written"), "{text}");
     assert!(tree(&store) == before, "a dry run wrote");
 
-    // Every feed: the releases stay, the seq rises, only the feed and the state change.
+    // Every feed: the releases stay, the seq rises, and only the public feed changes (S1: a refresh
+    // never writes the private bucket).
     let out = f.refresh(&config, &store, &[]);
     assert_ok(&out, "refresh");
     assert!(
@@ -118,10 +118,7 @@ fn refresh_re_signs_every_feed_and_a_fresh_feed_needs_no_refresh() {
     let after = tree(&store);
     assert_eq!(
         changed(&before, &after),
-        [
-            format!("private/{P}/lunepack-state.json"),
-            format!("public/{P}/feed-stable.json")
-        ]
+        [format!("public/{P}/feed-stable.json")]
     );
     let out = f.plan(&config, &store, &[]);
     assert_ok(&out, "plan after");
@@ -179,7 +176,7 @@ fn skip_if_unpublished_is_exit_0_with_one_notice_and_without_it_exit_1() {
 }
 
 #[test]
-fn a_stale_pending_record_deletes_nothing_a_feed_lists_and_leaves_the_record() {
+fn a_refresh_leaves_the_pending_record_and_its_objects_to_the_next_push() {
     let (f, origin) = Fixture::new(now() - 3600);
     let config = f.r2_config();
     let store = f.store_dir(&origin);
@@ -193,33 +190,32 @@ fn a_stale_pending_record_deletes_nothing_a_feed_lists_and_leaves_the_record() {
         "{{\"format\":1,\"keys\":[\"{P}/0.9.0/x.pack\",\"{}\"],\"uploading\":[]}}\n",
         pack_rel()
     );
-    fs::write(store.join("private").join(P).join(PENDING), record).unwrap();
-    let feed = tree(&store.join("public").join(P));
+    fs::write(store.join("private").join(P).join(PENDING), &record).unwrap();
+    let before = tree(&store);
 
+    // Nothing due: nothing is written, and the notice says who runs the deletes.
     let out = f.refresh(&config, &store, &["--if-expiring-within-days", "7"]);
     assert_ok(&out, "refresh");
     let text = stdout(&out);
     assert!(
-        text.contains(&format!("deleted: {P}/0.9.0/x.pack")),
+        text.contains("2 pending delete(s) are left to the next `publish push`"),
         "{text}"
     );
-    assert!(
-        text.contains(&format!(
-            "not deleted: {} (a feed lists 1.0.0 again)",
-            pack_rel()
-        )),
-        "{text}"
-    );
-    assert!(!old.join("x.pack").exists());
+    assert!(!text.contains("deleted:"), "{text}");
+    assert!(tree(&store) == before);
+
+    // Re-signing: the feed changes, the record and the objects do not.
+    assert_ok(&f.refresh(&config, &store, &[]), "refresh, due");
+    assert!(old.join("x.pack").exists());
     assert!(store.join("public").join(pack_rel()).is_file());
     assert_eq!(
         fs::read(store.join("private").join(P).join(PENDING)).unwrap(),
-        EMPTY_RECORD
+        record.as_bytes()
     );
-    // Nothing else moved: the feed was not due.
-    let mut expected = feed;
-    expected.remove("0.9.0/x.pack");
-    assert!(tree(&store.join("public").join(P)) == expected);
+    assert_eq!(
+        changed(&before, &tree(&store)),
+        [format!("public/{P}/feed-stable.json")]
+    );
 }
 
 #[test]

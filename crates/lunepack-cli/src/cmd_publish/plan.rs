@@ -161,7 +161,7 @@ fn report_pending(read: &StoreRead, prefix: &str, stores: &Stores, now: u64) -> 
         say("pending deletes: none")?;
     } else {
         say(&format!(
-            "pending deletes: {} key(s), retried by the next push or refresh",
+            "pending deletes: {} key(s), run by the next `publish push` (a refresh never deletes)",
             read.pending.keys.len()
         ))?;
         for k in &read.pending.keys {
@@ -172,7 +172,7 @@ fn report_pending(read: &StoreRead, prefix: &str, stores: &Stores, now: u64) -> 
     for v in &read.pending.uploading {
         if listed.contains(v) {
             say(&format!(
-                "uploading: {v} (a feed lists it; the next push or refresh clears the mark)"
+                "uploading: {v} (a feed lists it; the next push clears the mark)"
             ))?;
             continue;
         }

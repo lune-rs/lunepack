@@ -1,13 +1,14 @@
 //! `lunepack publish refresh [--if-expiring-within-days N] [--skip-if-unpublished] [--dry-run]`.
 //!
 //! Re-signs each channel's feed (or each that expires within N days) with a new `seq` and
-//! expiry, the releases unchanged, then retries the pending deletes. The work is a push without a
-//! new version: the stores' documents are read and verified into a work directory, every listed
-//! release is downloaded and checked (P-D7), the in-process `feed refresh` re-signs the due
-//! feeds, and the commit is [`ORDER`], the tail of push's order (P-D8): each changed feed after
-//! its race check, the deletes (every feed re-read first; a key whose version folder a current
-//! feed lists is not deleted and leaves the record), the pending record, the state file last.
-//! With nothing due and nothing pending it writes nothing.
+//! expiry, the releases unchanged. The work is a push without a new version: the stores' documents
+//! are read and verified into a work directory, every listed release is downloaded and checked
+//! (P-D7), and the in-process `feed refresh` re-signs the due feeds. The one thing it writes is
+//! each changed feed, after its race check (P-D8): it never writes the private bucket (no state
+//! file, no pending record) and runs no pending delete; a push does those (S1), so a refresh job's
+//! token needs write access to the public bucket and read access to the private one only. Before
+//! it signs anything it refuses a store whose feed, key set or root is older than the state file
+//! records: a rolled-back document is caught, never re-signed. With nothing due it writes nothing.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -66,13 +67,8 @@ pub(crate) struct Job<'a> {
     pub clock: Arc<dyn Clock>,
 }
 
-/// The commit order of a refresh: the tail of push's (P-D8).
-pub(crate) const ORDER: [Phase; 4] = [
-    Phase::Feeds,
-    Phase::Deletes,
-    Phase::FinalRecord,
-    Phase::State,
-];
+/// The commit order of a refresh: the feeds only (S1).
+pub(crate) const ORDER: [Phase; 1] = [Phase::Feeds];
 
 /// `publish refresh`.
 pub fn refresh(config_path: &Path, args: &RefreshArgs, open: super::OpenStores<'_>) -> Result<()> {
@@ -102,7 +98,7 @@ pub(crate) fn run(job: &Job<'_>, stores: &Stores, order: &[Phase]) -> Result<()>
     let Some(plan) = plan(job, stores, work.path())? else {
         return Ok(());
     };
-    show(&plan, job.dry_run)?;
+    show(&plan, job.dry_run, order)?;
     if job.dry_run {
         return say("dry run: nothing was written");
     }
@@ -112,6 +108,50 @@ pub(crate) fn run(job: &Job<'_>, stores: &Stores, order: &[Phase]) -> Result<()>
         plan.feeds.len(),
         plan.prefix
     ))
+}
+
+/// S1: refuses (before anything is signed or written) a store whose root walk, `keys.json` or feed
+/// is older than what the private state file records, which a rolled-back bucket would show. A
+/// document the state file has no record of, or a recorded feed that is absent, is not compared.
+fn refuse_rolled_back(read: &StoreRead, config: &Config, state_file: &Path) -> Result<()> {
+    let record = State::load(state_file)?.record(&config.app_id);
+    let mut older = Vec::new();
+    let mut compare = |what: String, field: &str, recorded: Option<u64>, found: u64| {
+        if let Some(recorded) = recorded
+            && found < recorded
+        {
+            older.push(format!(
+                "{what}: {field} {found} in the store is older than the {recorded} the state file records"
+            ));
+        }
+    };
+    compare(
+        "the root walk".to_owned(),
+        "version",
+        record.root_version,
+        read.root_doc_k,
+    );
+    compare(
+        "keys.json".to_owned(),
+        "version",
+        record.keys_version,
+        read.chain.keys().version(),
+    );
+    for (channel, feed) in read.feeds.iter().chain(&read.guard_feeds) {
+        compare(
+            feed_rel(channel),
+            "seq",
+            record.feeds.get(channel.as_str()).copied(),
+            feed.seq(),
+        );
+    }
+    if older.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "the public bucket holds documents older than the state file records (a rolled-back bucket?); nothing was signed or written:\n  {}",
+        older.join("\n  ")
+    )
 }
 
 /// Reads, checks and decides everything before the first write; `None` when there is nothing to
@@ -143,6 +183,8 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
         bail!("the public bucket has no feed to refresh: publish a release first");
     }
 
+    refuse_rolled_back(&read, config, &state_file)?;
+
     let now = job.clock.now_unix_secs();
     let due: Vec<Channel> = read
         .feeds
@@ -155,13 +197,13 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
         })
         .map(|(channel, _)| channel.clone())
         .collect();
-    let listed_before = read.listed();
-    let stale_uploading = read
-        .pending
-        .uploading
-        .iter()
-        .any(|u| listed_before.contains(u));
-    if due.is_empty() && read.pending.keys.is_empty() && !stale_uploading {
+    if !read.pending.keys.is_empty() {
+        say(&format!(
+            "notice: {} pending delete(s) are left to the next `publish push`; a refresh never writes the private bucket",
+            read.pending.keys.len()
+        ))?;
+    }
+    if due.is_empty() {
         say(&match job.within_days {
             Some(days) => format!("nothing to refresh: no feed expires within {days} day(s)"),
             None => "nothing to refresh".to_owned(),
@@ -169,9 +211,8 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
         return Ok(None);
     }
 
-    let mut state_bytes = read.state_read.clone();
     let mut feeds_after = read.feeds.clone();
-    if !due.is_empty() {
+    {
         // P-D7: every release a feed lists, downloaded and checked, before any feed is re-signed.
         let (objects, fetched) = work::download_retained(
             stores.public.as_ref(),
@@ -204,19 +245,11 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
                 },
             )?;
         }
-        // The state: what the feeds now are, including those a stopped run wrote.
-        let mut state = State::load(&state_file)?;
-        let mut record = state.record(&config.app_id);
         for channel in &publish.channels {
             if let Some(feed) = work_feed(&wdir, config, &read.chain, channel, &skip)? {
-                let seq = record.feeds.entry(channel.as_str().to_owned()).or_insert(0);
-                *seq = (*seq).max(feed.seq());
                 feeds_after.insert(channel.clone(), feed);
             }
         }
-        record.set_keys(read.root_doc_k, read.chain.keys());
-        state.save(&config.app_id, record, StateArgs::default())?;
-        state_bytes = fs::read(&state_file).context("cannot read the work directory")?;
         // P-D7: the whole work directory, as a client checks it, before anything is written.
         let reading = ClockReading::read(job.clock.as_ref(), None);
         check_release_dir(&wdir, config, &reading, &mut |l| {
@@ -265,8 +298,8 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
         feed_keys,
         listed_after: work::listed_versions(feeds_after.values().chain(guard_feeds.values())),
         state_key,
+        state: state_read.clone(),
         state_read,
-        state: state_bytes,
     }))
 }
 
@@ -322,40 +355,67 @@ mod tests {
     }
 
     #[test]
-    fn a_refresh_keeps_the_releases_raises_the_seq_and_writes_in_order() {
+    fn a_refresh_keeps_the_releases_raises_the_seq_and_writes_only_the_public_feed() {
         let w = World::new("keep = 5\n");
         w.publish("1.0.0");
         w.publish("1.1.0");
         let seq = w.feed("stable").unwrap().seq();
         let initial = snapshot_of(&w.public);
+        let private_before = snapshot_of(&w.private);
         w.clear_log();
         refresh_in(&w, None, false, false).unwrap();
         assert_eq!(w.listed("stable"), ["1.0.0", "1.1.0"]);
         let feed = w.feed("stable").unwrap();
         assert!(feed.seq() > seq);
-        assert_eq!(w.state_record().feeds.get("stable"), Some(&feed.seq()));
-        let writes = w.writes();
-        let pos = |what: &str| {
-            writes
-                .iter()
-                .position(|(_, _, key)| key.ends_with(what))
-                .unwrap_or_else(|| panic!("{what} not written: {writes:?}"))
-        };
-        assert!(
-            pos("feed-stable.json") < pos(crate::state::DEFAULT_STATE),
-            "{writes:?}"
-        );
+        // S1: the state file is the private bucket's, and a refresh leaves it where it was.
+        assert_eq!(w.state_record().feeds.get("stable"), Some(&seq));
+        assert!(snapshot_of(&w.private) == private_before);
         assert_eq!(
-            pos(crate::state::DEFAULT_STATE),
-            writes.len() - 1,
-            "{writes:?}"
-        );
-        assert!(
-            !writes.iter().any(|(_, op, _)| *op == "DELETE"),
-            "{writes:?}"
+            w.writes(),
+            [(Bucket::Public, "PUT", k("feed-stable.json").to_string())]
         );
         check_invariants(&w.chain(), &initial, &w.log()).unwrap();
         assert_consistent(&w);
+    }
+
+    #[test]
+    fn a_push_after_several_refreshes_succeeds_and_records_the_newest_seq() {
+        let w = World::new("keep = 5\n");
+        w.publish("1.0.0");
+        for _ in 0..3 {
+            refresh_in(&w, None, false, false).unwrap();
+        }
+        let seq = w.feed("stable").unwrap().seq();
+        assert!(w.state_record().feeds.get("stable").unwrap() < &seq);
+        w.publish("1.1.0");
+        assert_eq!(w.listed("stable"), ["1.0.0", "1.1.0"]);
+        assert!(w.state_record().feeds.get("stable").unwrap() > &seq);
+        // And a refresh after the push still works against the updated record.
+        refresh_in(&w, None, false, false).unwrap();
+        assert_consistent(&w);
+    }
+
+    #[test]
+    fn a_store_whose_feed_was_replaced_by_an_older_genuine_one_is_refused_and_nothing_is_written() {
+        let w = World::new("keep = 5\n");
+        w.publish("1.0.0");
+        let older = w.public.contents(&k("feed-stable.json")).unwrap();
+        w.publish("1.1.0");
+        w.public.seed(&k("feed-stable.json"), &older);
+        w.clear_log();
+        for within in [None, Some(7)] {
+            let e = format!("{:#}", refresh_in(&w, within, false, false).unwrap_err());
+            assert!(
+                e.contains("older than the state file records") && e.contains("feed-stable.json"),
+                "{e}"
+            );
+        }
+        assert!(w.writes().is_empty(), "{:?}", w.writes());
+        assert_eq!(w.public.contents(&k("feed-stable.json")).unwrap(), older);
+        // A push refuses it too (the writer's own check against the state file).
+        let rd = w.fetch("rd-rolled-back");
+        w.pack(&rd, "1.2.0", targets()[0]);
+        assert!(w.push(&[rd], "1.2.0").is_err());
     }
 
     #[test]
@@ -370,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_pending_record_deletes_nothing_a_feed_lists_and_drops_those_keys() {
+    fn a_refresh_leaves_the_pending_record_and_its_deletes_to_the_next_push() {
         let w = World::new("");
         w.publish("1.0.0");
         // The record names the listed 1.0.0's pack and an object of an unlisted 0.9.0.
@@ -381,40 +441,27 @@ mod tests {
         record.keys.insert(pack_key("1.0.0"));
         w.private.seed(&k(PENDING_NAME), &record.to_bytes());
         w.clear_log();
-        // The feed is not due: only the record's deletes run.
+        // Neither a refresh with nothing due nor one that re-signs deletes or rewrites anything
+        // of the record.
         refresh_in(&w, Some(7), false, false).unwrap();
-        assert!(w.public.contents(&pack_key("1.0.0")).is_some());
-        assert!(w.public.contents(&gone).is_none());
-        assert_eq!(w.pending(), Pending::default());
-        let deleted: Vec<_> = w
-            .writes()
-            .into_iter()
-            .filter(|(_, op, _)| *op == "DELETE")
-            .collect();
-        assert_eq!(
-            deleted,
-            [(Bucket::Public, "DELETE", gone.to_string())],
-            "only the unlisted version's object is deleted"
-        );
-    }
-
-    #[test]
-    fn a_stale_pending_record_is_cleaned_even_when_the_feed_is_refreshed() {
-        let w = World::new("");
-        w.publish("1.0.0");
-        let mut record = Pending::default();
-        record.keys.insert(pack_key("1.0.0"));
-        record.uploading.insert("1.0.0".to_owned());
-        w.private.seed(&k(PENDING_NAME), &record.to_bytes());
-        w.clear_log();
+        assert!(w.writes().is_empty(), "{:?}", w.writes());
         refresh_in(&w, None, false, false).unwrap();
+        assert!(w.public.contents(&gone).is_some());
         assert!(w.public.contents(&pack_key("1.0.0")).is_some());
-        assert_eq!(w.pending(), Pending::default());
+        assert_eq!(w.pending(), record);
         assert!(
-            !w.writes().iter().any(|(_, op, _)| *op == "DELETE"),
+            w.writes()
+                .iter()
+                .all(|(b, op, _)| *b == Bucket::Public && *op == "PUT"),
             "{:?}",
             w.writes()
         );
+        // The next push runs them (P-D8 (5)): the unlisted object goes, the listed one stays and
+        // leaves the record.
+        w.publish("1.1.0");
+        assert!(w.public.contents(&gone).is_none());
+        assert!(w.public.contents(&pack_key("1.0.0")).is_some());
+        assert_eq!(w.pending(), Pending::default());
     }
 
     #[test]
@@ -458,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_delete_stays_in_the_record_and_a_refresh_retries_it() {
+    fn a_failed_delete_stays_in_the_record_until_a_push_retries_it() {
         use lunepack_core::StoreMethod;
         use lunepack_testkit::StoreFault;
         let w = World::new("keep = 1\n");
@@ -467,15 +514,17 @@ mod tests {
         w.public
             .inject(StoreMethod::Delete, Some(&pack), StoreFault::Status(503));
         w.publish("1.1.0");
-        assert_eq!(
-            w.pending().keys,
-            std::collections::BTreeSet::from([pack.clone()])
-        );
+        let record = std::collections::BTreeSet::from([pack.clone()]);
+        assert_eq!(w.pending().keys, record);
         w.public.clear_faults();
-        refresh_in(&w, Some(7), false, false).unwrap();
+        // A refresh is no retry: it neither deletes nor touches the record.
+        refresh_in(&w, None, false, false).unwrap();
+        assert!(w.public.contents(&pack).is_some());
+        assert_eq!(w.pending().keys, record);
+        w.publish("1.2.0");
         assert!(w.public.contents(&pack).is_none());
         assert_eq!(w.pending(), Pending::default());
-        assert_eq!(w.listed("stable"), ["1.1.0"]);
+        assert_eq!(w.listed("stable"), ["1.2.0"]);
         let _ = Op::Get;
     }
 }

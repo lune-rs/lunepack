@@ -223,7 +223,7 @@ pub(crate) fn run(job: &Job<'_>, stores: &Stores, order: &[Phase]) -> Result<()>
         .tempdir()
         .context("cannot create a work directory")?;
     let plan = plan(job, stores, work.path())?;
-    show(&plan, job.dry_run)?;
+    show(&plan, job.dry_run, order)?;
     if job.dry_run {
         return say("dry run: nothing was written");
     }
@@ -635,7 +635,7 @@ pub(crate) fn drops(
 }
 
 /// Prints the plan: in a dry run, everything a push would write and delete.
-pub(crate) fn show(plan: &Plan, dry_run: bool) -> Result<()> {
+pub(crate) fn show(plan: &Plan, dry_run: bool, order: &[Phase]) -> Result<()> {
     let would = if dry_run { "would " } else { "" };
     for k in &plan.kept {
         say(&format!("kept: {k} (already in the store, the same bytes)"))?;
@@ -649,8 +649,14 @@ pub(crate) fn show(plan: &Plan, dry_run: bool) -> Result<()> {
             up.key, up.file.len
         ))?;
     }
-    for f in &plan.feeds {
-        say(&format!("{would}write: {}", f.key))?;
+    if order.contains(&Phase::Feeds) {
+        for f in &plan.feeds {
+            say(&format!("{would}write: {}", f.key))?;
+        }
+    }
+    // A command whose order has no delete phase (a refresh) leaves the private bucket alone.
+    if !order.contains(&Phase::Deletes) {
+        return Ok(());
     }
     let mut pending = plan.pending.clone();
     pending.keys.extend(plan.deletes.iter().cloned());

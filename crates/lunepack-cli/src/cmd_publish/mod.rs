@@ -3,7 +3,7 @@
 //! `fetch` reads the app's public feed over the transport clients use and fills a release
 //! directory from it; it reads no credential. `push` publishes a packed release to the app's
 //! stores, which the composition root (`main.rs`) builds and hands in as [`Stores`]; `refresh`
-//! re-signs the feeds and retries the pending deletes, `plan` shows what the stores hold and what
+//! re-signs the feeds (it writes the public bucket only), `plan` shows what the stores hold and what
 //! a push would do (it writes nothing), and `init` uploads a fresh app's first documents.
 
 pub mod fetch;
@@ -56,8 +56,9 @@ pub enum PublishCommand {
     /// retained release, write the feeds in-process, then upload in the commit order, purge what
     /// retention dropped and write the state file last.
     Push(push::PushArgs),
-    /// Re-sign each channel's feed (all, or those expiring soon) with a new `seq`, and retry the
-    /// pending deletes.
+    /// Re-sign each channel's feed (all, or those expiring soon) with a new `seq`. Writes the
+    /// public bucket only: the state file and the pending deletes are a push's, and a feed older
+    /// than the state file records is refused.
     Refresh(refresh::RefreshArgs),
     /// Show the feeds, what a push of a version would add and drop, the pending deletes and any
     /// abandoned push. Reads the stores; writes nothing.
