@@ -441,6 +441,21 @@ Notes on the example:
   they are not part of the publish.
 - Code signing of the app (`[codesign.<os>]`) and notarization run inside `pack`; their secrets belong to the
   `pack` job only.
+- A macOS target's installer `.dmg` needs a macOS host, because `setup` runs `hdiutil`; on any other host
+  `setup --zip` is the only macOS setup file ([`docs/CLI.md`](CLI.md), "`lunepack setup`"). Build the `.dmg`
+  on a macOS runner, or later on a Mac from the published release: `setup` takes no release key.
+- Without `[codesign.macos]` nothing is signed for macOS: the installer app keeps only the linker's
+  signature, and macOS calls a downloaded `.dmg` damaged. With no Developer ID, sign ad-hoc:
+
+  ```toml
+  [codesign.macos]
+  sign = ["/usr/bin/codesign", "--force", "--sign", "-", "{path}"]
+  verify = ["/usr/bin/codesign", "--verify", "--deep", "--strict", "{path}"]
+  ```
+
+  Gatekeeper then shows its ordinary prompt for an unidentified developer (Open Anyway, in System Settings,
+  Privacy & Security). An ad-hoc signature counts as unsigned for the publisher check
+  ([`docs/RUNTIME.md`](RUNTIME.md)).
 - A feed lives `feed_days` (90 by default); the weekly `refresh` with `--if-expiring-within-days 30`
   re-signs a feed in its last 30 days, so a quiet app's clients never see an expired feed.
 - A scheduled job runs on the default branch; keep `lunepack.toml` there.
