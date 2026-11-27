@@ -62,7 +62,7 @@ enum Command {
     },
     /// Package a build-output directory into a signed release: `<version>/<target>.pack` and
     /// `<version>/<target>.manifest.json` in the release directory.
-    Pack(cmd_pack::PackArgs),
+    Pack(Box<cmd_pack::PackArgs>),
     /// Manage the signed feed of a channel.
     Feed {
         #[command(subcommand)]
