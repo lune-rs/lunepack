@@ -78,7 +78,9 @@ touch the keys it makes ("Rules for agents").
 
    `refresh` writes only feeds; it reads the state file to refuse a store that was rolled back
    ([`docs/THREAT-MODEL.md`](THREAT-MODEL.md), "A stolen refresh token"). That guard holds only while the
-   refresh job cannot write the private bucket. **Never give the refresh job one token with Object Read & Write on both buckets**: whoever holds it
+   refresh job cannot write the private bucket. Taking a release out of the feeds (`publish drop`) records
+   the new feeds in that state file, so it writes both buckets and runs with the push token, in the
+   approved `drop` job ("Taking a release out"). **Never give the refresh job one token with Object Read & Write on both buckets**: whoever holds it
    can lower the state file's record and get an older feed re-signed as the newest. The refresh-public
    token can still overwrite any object in the public bucket (and perhaps delete one; R2's documentation
    does not say whether its write permission excludes deletes). An overwritten object fails its signed
@@ -86,8 +88,10 @@ touch the keys it makes ("Rules for agents").
 
    On AWS S3 (`store = "s3"`) make the same three as IAM policies: object read, write and delete
    (`s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`) where the table says Read & Write, `s3:GetObject`
-   where it says Read only. Each also needs `s3:ListBucket` on its buckets (it can be limited to
-   `<prefix>/*`): without it S3 answers 403, not 404, for a key that does not exist, and every run fails
+   where it says Read only. Each also needs `s3:ListBucket`, granted on the bucket itself
+   (`arn:aws:s3:::<bucket>`), not on `<prefix>/*`, an object path that grants no listing (an `s3:prefix`
+   condition narrows the listing; whether S3 still answers 404 under one is not verified here). Without it
+   S3 answers 403, not 404, for a key that does not exist, and every run fails
    on its first missing key (`root-2.json`, a new channel's feed) with "answered status 403". lunepack
    never takes a 403 for "absent". Cloudflare R2 answers 404 and needs nothing extra.
 4. **Add `[publish]`** to `lunepack.toml` (next section) and, if the app is packed per OS,
@@ -111,7 +115,7 @@ touch the keys it makes ("Rules for agents").
    | Environment | Used by | Secrets | Rules |
    | --- | --- | --- | --- |
    | `release-pack` | `pack` | the release key | tags `v*` only |
-   | `release-push` | `push` | the release key, the push token | tags `v*` only; required reviewers: the owner |
+   | `release-push` | `push`, `drop` | the release key, the push token | tags `v*` only; required reviewers: the owner |
    | `release-refresh` | `refresh` | the release key, the refresh-public and refresh-private tokens | the default branch only |
 
    Also restrict who can create `v*` tags (a tag ruleset), protect the default branch, give the workflow
@@ -172,6 +176,7 @@ job needs more than it uses.
 | `pack` | per target | release key | checks the CLI, then `prebuilt fetch`, `publish fetch`, `pack`, `setup`, with `SOURCE_DATE_EPOCH` from the tag commit |
 | `push` | once, after every `pack` | release key and the push token | checks the CLI, then `publish push --dry-run` and `publish push`; no `SOURCE_DATE_EPOCH` |
 | `refresh` | scheduled | release key and the two refresh tokens | checks the CLI, then `publish refresh`; no `SOURCE_DATE_EPOCH` |
+| `drop` | by hand, from a `v*` tag, with the version to take out | release key and the push token | checks the CLI, then `publish drop --dry-run` and `publish drop`; no `SOURCE_DATE_EPOCH` |
 
 Why the CLI is built in its own job and checked by hash: no job that holds a key compiles anything.
 Compiling `lunepack-cli` runs the build scripts of its dependencies, and in a key job they would run beside
@@ -210,7 +215,12 @@ on:
     tags: ["v*"]
   schedule:
     - cron: "17 4 * * 1"     # a weekly refresh
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      drop_version:
+        description: "a release to take out of the feeds (run from a v* tag); empty: refresh"
+        required: false
+        default: ""
 
 concurrency:
   group: publish-example-app
@@ -349,7 +359,7 @@ jobs:
               --sign env:EXAMPLE_RELEASE_KEY
 
   refresh:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.drop_version == '')
     needs: [tools-linux]
     runs-on: ubuntu-latest
     environment: release-refresh   # default branch only; the release key and the two refresh tokens live here
@@ -375,6 +385,35 @@ jobs:
         run: |
           tools/lunepack publish refresh --sign env:EXAMPLE_RELEASE_KEY \
               --if-expiring-within-days 30 --skip-if-unpublished
+
+  drop:
+    if: github.event_name == 'workflow_dispatch' && inputs.drop_version != ''
+    needs: [tools-linux]
+    runs-on: ubuntu-latest
+    environment: release-push      # run from a v* tag; the owner approves, as for push
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: tools-linux, path: tools }
+      - name: check the CLI against its tools job
+        env:
+          WANT: ${{ needs.tools-linux.outputs.cli_sha256 }}
+        run: |
+          GOT="$(sha256sum tools/lunepack | cut -d' ' -f1)"
+          if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "the CLI is not the one tools-linux built"; exit 1; fi
+          chmod +x tools/lunepack
+      - name: drop
+        env:
+          DROP_VERSION: ${{ inputs.drop_version }}   # through the environment, never into the script text
+          EXAMPLE_RELEASE_KEY: ${{ secrets.EXAMPLE_RELEASE_KEY }}
+          EXAMPLE_R2_ACCOUNT_ID: ${{ secrets.EXAMPLE_R2_ACCOUNT_ID }}
+          EXAMPLE_STORE_ACCESS_KEY: ${{ secrets.EXAMPLE_PUSH_ACCESS_KEY }}   # the push token, for both buckets
+          EXAMPLE_STORE_SECRET_KEY: ${{ secrets.EXAMPLE_PUSH_SECRET_KEY }}
+          EXAMPLE_STATE_ACCESS_KEY: ${{ secrets.EXAMPLE_PUSH_ACCESS_KEY }}
+          EXAMPLE_STATE_SECRET_KEY: ${{ secrets.EXAMPLE_PUSH_SECRET_KEY }}
+        run: |
+          tools/lunepack publish drop --version "$DROP_VERSION" --sign env:EXAMPLE_RELEASE_KEY --dry-run
+          tools/lunepack publish drop --version "$DROP_VERSION" --sign env:EXAMPLE_RELEASE_KEY
 ```
 
 Notes on the example:
@@ -391,7 +430,7 @@ Notes on the example:
 - A scheduled job runs on the default branch; keep `lunepack.toml` there.
 - No job reads a repository secret. The release key and the three tokens are secrets of the three
   environments, so a workflow that runs on a branch (or `workflow_dispatch` there) gets none of them, and
-  only `push` waits for the owner. `refresh` holds the two refresh tokens: it can write the public bucket
+  only `push` and `drop` wait for the owner. `refresh` holds the two refresh tokens: it can write the public bucket
   and only read the private one.
 - The `tools-<os>` jobs hold no secret and name no environment. Add `tools-macos` (on a macOS runner, the
   same steps) when you pack a macOS target, and make each key job that runs on that OS check against it.
@@ -421,10 +460,18 @@ byte-equal, a feed that already lists the version is not added to again, and the
 - A `push` that stopped after writing a feed but before its state file (the last write) leaves the
   state file's record one step behind, and the scheduled `refresh` guards against a rolled-back feed by
   that record. Rerun that `push` before the next `refresh` runs.
+- A `drop` that stopped part-way is completed by running the `drop` job again with the same version: while
+  a feed still lists the release it is dropped from it, and once none does the pending-deletes record
+  still names the release's objects, so the rerun deletes them and writes the rest. Only a run whose very
+  last write (the pending record) failed after it was stored leaves a complete store; the rerun then says
+  `nothing to drop`, which is the end state.
 - The owner's `publish init` and `publish keys` are rerun the same way, with the same directory: a
   document already in the store with the same bytes is kept, and the rest is uploaded. When a key-set
   upload fails, `publish keys` removes the roots it had uploaded (it prints `removed:`, or `not removed:`
-  when that fails too). Until the rerun, a store left with a new root but the old `keys.json` makes
+  when that fails too). Removing them leaves, in most cases, a store clients can read. A client that
+  fetched the new root in between, or a store an earlier run left half done (a rerun that fails again
+  removes only the roots it uploaded itself), needs the rerun. Until the rerun, a store left with a new
+  root but the old `keys.json` makes
   `push`, `refresh` and `plan` stop with "the store's key set does not verify"; the rerun of `publish
   keys` finishes it. Do not upload or delete a root or `keys.json` by hand.
 
@@ -448,6 +495,31 @@ was removed) stops every command, naming it: delete that feed object, or restore
 
 Objects that no manifest names (a file placed by hand, the leftovers of an abandoned upload) are not
 purged automatically; the owner removes them by hand.
+
+## Taking a release out (`publish drop`)
+
+To pull a release before retention does (a broken or vulnerable build, or a release only a revoked key
+signed), run the workflow's `drop` job: **Actions → publish → Run workflow**, from a `v*` tag (the
+`release-push` environment admits tags only), with `drop_version` set to the version as the feeds list it;
+the owner approves it like a `push`. It runs, with the push token:
+
+```sh
+lunepack publish drop --version 1.4.0 --sign env:EXAMPLE_RELEASE_KEY --dry-run
+lunepack publish drop --version 1.4.0 --sign env:EXAMPLE_RELEASE_KEY
+```
+
+`drop` reads the stores the way `push` does and checks every listed release, then records the release's
+manifests, packs and deltas in the pending-deletes record, re-signs every `[publish]` channel's feed that
+lists it without it, writes the state file with the new feeds' `seq`, and deletes the release's objects
+after the feeds (a key whose version a feed lists again is kept). Because the state file records the new
+feeds, a copy of an older feed that still lists the release, put back in the public bucket, is refused by
+every later `refresh`, `push` and `drop` instead of being re-signed. One version per run; repeat the job for
+each. It refuses (exit 1, nothing written) a version that no feed lists and the pending record does not
+name, and a version that a feed of a channel no longer in `channels` lists (such a feed is never written:
+put the channel back into `channels` first).
+
+Publish a fixed version too, so that clients that installed the dropped release move on. A `refresh`
+never takes a release out: it has no `--drop`.
 
 ## Changing the key set or revoking a key (owner only)
 
@@ -480,20 +552,19 @@ trusted by clients until the second move is published, so do all five without de
 3. **Publish a new version** the usual way ("Ship a new version"). Its manifests and the feeds it writes
    are signed with the new key. Do this before step 4, so that no feed is left without a release.
 4. **Drop the releases only the old key signed** (when the old key was the only one, that is every
-   earlier release), re-signing every feed with the new key, with the refresh tokens (or the push
-   token) set in the shell:
+   earlier release): run the `drop` job once per release ("Taking a release out"). It signs with the
+   release key of `release-push`, which is the new key since step 2, so every feed it writes is signed
+   by the new key; it runs
 
    ```sh
-   lunepack publish refresh --sign <new signer> --drop 1.3.0 --drop 1.4.0 --dry-run
-   lunepack publish refresh --sign <new signer> --drop 1.3.0 --drop 1.4.0
+   lunepack publish drop --version 1.3.0 --sign env:EXAMPLE_RELEASE_KEY
    ```
 
-   `--drop` takes each named release out of every `[publish]` channel's feed that lists it. It refuses a
-   version that a feed of a channel no longer in `channels` lists (such a feed is never written): put the
-   channel back into `channels` for this step. The dropped releases' manifests, packs and deltas stay in
-   the public bucket, listed by no feed. No client fetches them, and no `push` purges them; the owner may
-   delete them by hand later. A client still on a dropped version updates to the new one as usual (the
-   new version's deltas are its own files).
+   and then the same with `--version 1.4.0`. Each run takes the release out of every `[publish]` channel's
+   feed that lists it, records the new feeds in the state file and deletes the release's manifests, packs
+   and deltas. It refuses a version that a feed of a channel no longer in `channels` lists (such a feed is
+   never written): put the channel back into `channels` for this step. A client still on a dropped version
+   updates to the new one as usual (the new version's deltas are its own files).
 5. **Move 2: remove the old key.** Fetch again, list only the new key, and upload it:
 
    ```sh
@@ -517,8 +588,9 @@ A root rotation (`lunepack keys rotate-root`) is published the same way: `publis
 refuses a directory whose roots do not continue the store's, a `keys.json` that is not newer than the
 store's, and anything that would lower the state file's record. A failed run is repeated as it is, with
 the same directory: the parts already in the store are kept and the rest is uploaded. If the upload of a
-root or of `keys.json` fails, the run first removes the roots it uploaded, so clients keep reading the old
-key set ("Rerun and recovery"). Run it with `--dry-run` first.
+root or of `keys.json` fails, the run first removes the roots it uploaded, which in most cases leaves a
+store clients can read; a client that fetched the new root in the meantime, or a store an earlier run left
+half done, needs the rerun ("Rerun and recovery"). Run it with `--dry-run` first.
 
 ## When something is refused
 
@@ -526,13 +598,14 @@ key set ("Rerun and recovery"). Run it with `--dry-run` first.
 | --- | --- | --- |
 | `run \`lunepack publish init\` first` | the store has no state file or no `keys.json` | the owner runs `publish init` ("One-time setup") |
 | `the environment variable X ... is not set` | a store credential is missing from the job | add the secret and pass it in the job's `env` |
-| `SOURCE_DATE_EPOCH is set` | `push`, `refresh`, `init` or `keys` ran with it | unset it; set it only in the `pack` step |
+| `SOURCE_DATE_EPOCH is set` | `push`, `refresh`, `drop`, `init` or `keys` ran with it | unset it; set it only in the `pack` step |
 | `version X is already published` | `fetch` found the version in a feed | the version is out; publish the next one |
 | `the store changed since fetch` | another publish or refresh wrote between `fetch` and `push` | run the pipeline again from `fetch` |
-| `... changed in the store since this run read it` | the race check: a feed moved during the run (a refresh and a push at once, or two pushes) | on `push`, the message says to run `fetch` and `pack` again, then `push` (the other writer's feed is what `fetch` must see); on `refresh`, run `refresh` again; check for a concurrent run |
+| `... changed in the store since this run read it` | the race check: a feed moved during the run (a refresh and a push at once, or two pushes) | on `push`, the message says to run `fetch` and `pack` again, then `push` (the other writer's feed is what `fetch` must see); on `refresh` or `drop`, run it again; check for a concurrent run |
 | `the store's key set does not verify` | a `publish keys` stopped after uploading a root and before `keys.json`, so the store's last root did not sign its `keys.json` | the owner runs that `publish keys` again with the same directory; never upload or delete a root by hand |
-| `documents older than the state file records` | `refresh` found a feed, key set or root in the store older than the private state file records: a rolled-back bucket | it signed and wrote nothing; the owner restores the newer documents from the state file's history or investigates the bucket; never re-sign over it |
+| `documents older than the state file records` | `refresh` or `drop` found a feed, key set or root in the store older than the private state file records: a rolled-back bucket, or a feed from before a `drop` put back | it signed and wrote nothing; the owner restores the newer documents from the state file's history or investigates the bucket; never re-sign over it |
 | `answered status 403` on a `GET` | the token cannot read the bucket, or (AWS S3) lacks `s3:ListBucket` | give the token the missing access ("One-time setup", step 3); a 403 is never treated as "absent" |
+| `nothing to drop` | `drop` was given a version that no feed lists and the pending record does not name | check the version text against `publish plan`; after a drop that ended with an error, it means the drop is complete |
 | `the store already holds other bytes at` | an object of this version differs from the upload | see "Rerun and recovery"; never delete by hand to get past it |
 | `the release has no X target` | a `require_targets` target is missing | fix the failed `pack` job and re-run |
 | `... is in ... but no manifest of the release names it` | a stray file in `<version>/` | remove it from the release directory |
@@ -555,7 +628,7 @@ real store.
 
 **An agent never**:
 
-- runs `publish push`, `publish refresh` (with or without `--drop`), `publish init` or `publish keys`
+- runs `publish push`, `publish refresh`, `publish drop`, `publish init` or `publish keys`
   against a real store, with or without `--dry-run`, and never starts the publish workflow or approves
   its environment;
 - puts a release key, a root key or a store token in a repository secret, or in an environment whose rules
@@ -566,7 +639,7 @@ real store.
   command line, a commit or an output; a text tool is not to be run on a key or credential file;
 - edits the trust root (the `[root]` table, `keys.json`, a `root-<k>.json`) or generates keys that are
   meant to be real;
-- sets `SOURCE_DATE_EPOCH` for a whole workflow, or for `push`, `refresh` or `init`;
+- sets `SOURCE_DATE_EPOCH` for a whole workflow, or for `push`, `refresh`, `drop` or `init`;
 - deletes, overwrites or hand-uploads an object in the store, or "fixes" a refusal by bypassing it;
 - reuses a published version or moves a published tag.
 

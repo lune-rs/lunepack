@@ -1554,16 +1554,21 @@ never saw a newer `seq`, a replay, as with any hosting attacker). `refresh` itse
 was rolled back. It reads the state file's record and exits before signing or writing anything when a
 feed's `seq`, the key set or the root is below it.
 
-The record that guard compares with is what the last completed `push` wrote, in its last step, after
-its feeds and its deletes. In the window between a push's feed write and its state write (its deletes, or
-a push that stopped there), the record still holds the previous `seq`. A holder of this token can put
-back the pre-push feed then: its `seq` is not below the record, so the next refresh re-signs it under a
-`seq` above every earlier one. That hides the new release and lists the dropped ones again, whose objects
-that push may already have deleted. A rerun of the push then stops at "the store changed since fetch",
-so the owner sees it. So rerun a push that stopped before its state write before the next refresh runs.
-Outside that window, a refresh never re-signs an older document as the newest. If the private bucket's
-token can write (one dashboard token with read and write on both buckets), the holder can lower the
-record itself, and the guard is gone: keep the two tokens apart.
+The record that guard compares with is what the last completed `push` or `publish drop` wrote: a push
+writes it in its last step, after its feeds and its deletes; a drop right after its feeds, before its
+deletes. In the window between such a run's feed write and its state write (a push's deletes, or a run
+that stopped there), the record still holds the previous `seq`. A holder of this token can put back the
+feed the run replaced then: its `seq` is not below the record, so the next refresh re-signs it under a
+`seq` above every earlier one. After a push that hides the new release and lists the dropped ones again,
+whose objects that push may already have deleted; a rerun of the push then stops at "the store changed
+since fetch", so the owner sees it. After a drop it lists the dropped release again (with its objects, if
+the holder put back copies of them). So rerun a push or a drop that stopped before its state write before
+the next refresh runs. Outside those windows, a refresh never re-signs an older document as the newest: a
+feed at least as new as the record is the recorded feed or a refresh of it, with the same releases. A
+refresh never takes a release out of a feed (it has no `--drop`), because a drop it made could not be
+recorded in a state file it cannot write; `publish drop` writes both buckets and runs with the push token.
+If the private bucket's token can write (one dashboard token with read and write on both buckets), the
+holder can lower the record itself, and the guard is gone: keep the two tokens apart.
 
 **Untrusted input on the publish path.** Every document read from a bucket is verified under the key
 set before anything is built on it (`keys.json`, the roots, each feed, each retained release's manifest,
@@ -1574,7 +1579,7 @@ unique lists, every key under the prefix and inside a version folder). Purge key
 dropped releases' own verified manifests, never from a bucket listing, and each passes the `StoreKey`
 rules (under the prefix, no `..`, `//`, `/./`, whitespace, backslash or control character).
 
-**The key-set upload.** `push` and `refresh` never write `keys.json` or a root. The owner's
+**The key-set upload.** `push`, `refresh` and `drop` never write `keys.json` or a root. The owner's
 `publish keys` does, after checking that the directory's roots continue the store's, that the key set is
 newer, that the state file's record would not be lowered, and that every feed in the store (guard feeds
 too) and every manifest they list still verifies under the new key set, so an upload cannot leave clients
@@ -1582,24 +1587,28 @@ with documents they reject. It uploads the new roots, then `keys.json` (re-read 
 writer), then the state file. A rotation stopped after a root upload leaves a store whose last root did
 not sign its `keys.json`; a client walking to that root refuses the key set. So when an upload fails,
 `publish keys` removes the roots this run uploaded, last first and only while `keys.json` still reads as
-the old one, and names any it could not remove. A rerun with the same directory completes it. Only
+the old one, and names any it could not remove. That narrows the harm, not to nothing: a client (or a CDN
+cache) that fetched the new root before its removal still refuses the key set, and a rerun that fails
+again removes only its own roots, not those an earlier run left. A rerun with the same directory that
+completes the change fixes each case. Only
 `publish keys` reads such a store, with the walk ended at the root the state file records, and only when
 every later root in the store is byte-equal to the directory's. `push`, `refresh` and `plan` refuse it.
 It runs on the owner's machine with the root signers, never in CI; an agent that is asked to revoke a key
 stops. Between the two moves of a revocation made through it the old key is still trusted, so the owner
 does them without delay: the new key goes into the CI environments, a release is signed with it, and
-`publish refresh --drop` takes out the releases only the old key signed (`docs/PUBLISHING.md`).
+`publish drop`, in the approved push job, takes out the releases only the old key signed and deletes them
+(`docs/PUBLISHING.md`).
 
 **What `fetch` proves.** `publish fetch` checks signatures and the chain, not expiry: it reads with the
 time checks skipped so an expired feed can still be refreshed. Nobody should read its exit status as
 "the feeds are fresh"; `plan` shows the expiry, `push` and `refresh` check it at the real time, and clients
 refuse an expired feed.
 
-**The race window.** `push` and `refresh` re-read each feed just before writing it and refuse if it
+**The race window.** `push`, `refresh` and `drop` re-read each feed just before writing it and refuse if it
 changed since the run read it. The store API has no conditional write that this path uses, so a
 concurrent publisher that writes between that read and the write is overwritten; the window is two
-requests. The consequences are bounded: no object is deleted that any feed lists (a push's deletes re-read
-every feed it knows, guard feeds included; a refresh deletes nothing), the other publisher's release is missing from that feed until the next `push` lists it
+requests. The consequences are bounded: no object is deleted that any feed lists (the deletes of a push
+or a drop re-read every feed it knows, guard feeds included; a refresh deletes nothing), the other publisher's release is missing from that feed until the next `push` lists it
 again (a rerun is safe, "Rerun and recovery" in `CLI.md`), and no client rejects anything it should
 accept. The defence is not to run two publishes at once: the apps' workflows use a concurrency group
 (`docs/PUBLISHING.md`); the commands take no local lock because each run works in its own temporary

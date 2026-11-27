@@ -13,7 +13,11 @@
 #             (the command `publish plan` reaches its "run `publish init` first" refusal, which is
 #             after the config parsed), so a key that does not exist is a failure;
 #   names     no app, user or host of the maintainer's in the document: only example domains and
-#             the public hosts of the tools it names.
+#             the public hosts of the tools it names;
+#   drop      `publish refresh` has no `--drop` (S6: a release is taken out by `publish drop`, which
+#             records the new feeds in the state file), so no document pairs the two, and
+#             PUBLISHING.md runs `lunepack publish drop` in a fenced block (the revocation and the
+#             `drop` job).
 #
 # The checks are the functions below; the seeded negatives call them with fixtures first, so each
 # check is shown to fail on what it claims to catch. bash 3.2 compatible (D30).
@@ -47,7 +51,7 @@ CLI=${CARGO_TARGET_DIR:-$repo/target}/debug/lunepack
 OTHER_FLAGS=" --locked --root --format "
 
 # Every subcommand path whose help is read.
-PATHS="|init|keys gen|keys show|keys set|keys rotate-root|pack|feed add|feed refresh|verify|inspect|setup|publish|publish fetch|publish push|publish refresh|publish plan|publish init|prebuilt list|prebuilt check|prebuilt sign|prebuilt verify|prebuilt fetch"
+PATHS="|init|keys gen|keys show|keys set|keys rotate-root|pack|feed add|feed refresh|verify|inspect|setup|publish|publish fetch|publish push|publish refresh|publish drop|publish plan|publish init|publish keys|prebuilt list|prebuilt check|prebuilt sign|prebuilt verify|prebuilt fetch"
 HELP_DIR=$T_TMP/help
 mkdir -p "$HELP_DIR"
 
@@ -78,12 +82,14 @@ while IFS= read -r p; do
 done < <(printf '%s\n' "$PATHS" | tr '|' '\n')
 
 # has_flag <help-file> <--flag>
+# shellcheck disable=SC2329 # called by the check_* functions
 has_flag() {
   grep -Eq -- "(^|[^-A-Za-z])$2([^-A-Za-z]|\$)" "$1"
 }
 
 # blocks_of <md-file> [section-heading-prefix]: the content of the fenced blocks (of the section that
 # starts at the heading, when given), the fences themselves removed.
+# shellcheck disable=SC2329 # called by the check_* functions
 blocks_of() {
   awk -v h="${2:-}" '
     h != "" && index($0, h) == 1 { on = 1; next }
@@ -95,6 +101,7 @@ blocks_of() {
 
 # commands_in <text-on-stdin>: one line per lunepack command, "<up to three words>|<flags>".
 # A trailing backslash, or a line that starts with a flag or a "[" after a command, continues it.
+# shellcheck disable=SC2329 # called by the check_* functions
 commands_in() {
   awk '
     function flush(   n, i, t, words, flags, k, stop) {
@@ -268,6 +275,27 @@ check_names() {
   return "$bad"
 }
 
+# check_no_refresh_drop <md-file>: no line names `publish refresh` together with `--drop`.
+# shellcheck disable=SC2329 # called through run_cmd and t_check
+check_no_refresh_drop() {
+  local bad=0 line
+  while IFS= read -r line; do
+    echo "names publish refresh with --drop: $line"
+    bad=1
+  done < <(grep -nE -- 'publish refresh.*--drop' "$1" || true)
+  return "$bad"
+}
+
+# check_runs_drop <md-file>: a fenced block runs `lunepack publish drop`.
+# shellcheck disable=SC2329 # called through run_cmd and t_check
+check_runs_drop() {
+  if blocks_of "$1" | commands_in | grep -q '^ publish drop|'; then
+    return 0
+  fi
+  echo "no fenced block runs lunepack publish drop"
+  return 1
+}
+
 # --- seeded negatives and positives --------------------------------------------------------------
 good=$T_TMP/good.md
 cat >"$good" <<'EOF'
@@ -351,6 +379,19 @@ run_cmd check_names "$bad_name"
 t_check "names: a maintainer's app name and a real host fail" rc_nonzero
 t_check "and names the host" out_has "the document names the host updates.mycompany.test"
 
+old_drop=$T_TMP/old-drop.md
+printf 'Run `lunepack publish refresh --sign K --drop 1.0.0`.\n' >"$old_drop"
+run_cmd check_no_refresh_drop "$old_drop"
+t_check "drop: publish refresh with --drop fails" rc_nonzero
+t_check "and quotes the line" out_has "names publish refresh with --drop"
+run_cmd check_no_refresh_drop "$good"
+t_check "drop: a document without it passes" rc_is 0
+run_cmd check_runs_drop "$old_drop"
+t_check "drop: a document that does not run publish drop fails" rc_nonzero
+printf '```sh\ntools/lunepack publish drop --version 1.0.0 --sign env:K\n```\n' >"$T_TMP/runs-drop.md"
+run_cmd check_runs_drop "$T_TMP/runs-drop.md"
+t_check "drop: a fenced publish drop passes" rc_is 0
+
 # --- the real documents ---------------------------------------------------------------------------
 run_cmd check_commands "$repo/docs/PUBLISHING.md"
 t_check "PUBLISHING.md: every command and flag exists" rc_is 0
@@ -363,6 +404,15 @@ t_check "PUBLISHING.md: the [publish] example is accepted by the CLI" rc_is 0
 [ "$RC" -eq 0 ] || cat "$OUT" >&2
 run_cmd check_names "$repo/docs/PUBLISHING.md"
 t_check "PUBLISHING.md: no maintainer app, user or host" rc_is 0
+[ "$RC" -eq 0 ] || cat "$OUT" >&2
+
+for doc in PUBLISHING.md CLI.md THREAT-MODEL.md; do
+  run_cmd check_no_refresh_drop "$repo/docs/$doc"
+  t_check "$doc: publish refresh has no --drop" rc_is 0
+  [ "$RC" -eq 0 ] || cat "$OUT" >&2
+done
+run_cmd check_runs_drop "$repo/docs/PUBLISHING.md"
+t_check "PUBLISHING.md: a fenced block runs publish drop" rc_is 0
 [ "$RC" -eq 0 ] || cat "$OUT" >&2
 
 section="## Publishing: \`lunepack publish\`"
