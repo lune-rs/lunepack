@@ -1,13 +1,14 @@
 //! Command-line packager and release tool; the composition root that wires traits to adapters.
 //!
 //! Exit status: 0 on success, 1 on any failure (`error: <message and causes>` on stderr), 2 on a
-//! usage error (clap). No command prints private-key material, an environment variable's value or
+//! usage error (clap, or an argument `publish` refuses). No command prints private-key material, an environment variable's value or
 //! a config value.
 
 mod cmd_feed;
 mod cmd_keys;
 mod cmd_pack;
 mod cmd_prebuilt;
+mod cmd_publish;
 mod cmd_setup;
 mod cmd_verify;
 mod codesign;
@@ -25,11 +26,16 @@ mod state;
 mod tool;
 mod zip;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use lunepack_core::{CodeSign, Error, SignItem};
+use lunepack_http::{Credentials, DirStore, S3Store};
+
+use crate::config::{PublishSettings, StoreKind};
 
 #[derive(Parser)]
 #[command(
@@ -69,6 +75,12 @@ enum Command {
     /// Build a Linux setup file: the release's runtime with one version's key set, manifest and
     /// pack, installable offline (`<app_id>-<version>-<target>-setup`).
     Setup(cmd_setup::SetupArgs),
+    /// The standard publish flow: fetch the published state, then push a release; refresh the
+    /// feeds, plan and init.
+    Publish {
+        #[command(subcommand)]
+        command: cmd_publish::PublishCommand,
+    },
     /// lunepack's own prebuilt binaries: what this CLI pins, and the project's signed list of them.
     Prebuilt {
         #[command(subcommand)]
@@ -119,6 +131,81 @@ impl CodeSign for NoCodeSign {
     }
 }
 
+/// The value of the variable `name`, which `[publish] <field>` names. The error names the variable,
+/// never a value.
+fn publish_env(name: &str, field: &str) -> anyhow::Result<String> {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) | Err(std::env::VarError::NotPresent) => {
+            bail!("the environment variable {name} ([publish] {field}) is not set")
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("the environment variable {name} ([publish] {field}) is not valid text")
+        }
+    }
+}
+
+/// The credentials of one bucket, from the variables `[publish]` names: the private bucket's own
+/// pair when `private_access_key_env` and `private_secret_key_env` are set (S4), else the shared
+/// pair. Read once per store, so no copy outlives the `Credentials` that zeroize it.
+fn store_credentials(publish: &PublishSettings, private: bool) -> anyhow::Result<Credentials> {
+    match (&publish.private_keys_env, private) {
+        (Some((access, secret)), true) => Ok(Credentials::new(
+            publish_env(access, "private_access_key_env")?,
+            publish_env(secret, "private_secret_key_env")?,
+        )),
+        _ => Ok(Credentials::new(
+            publish_env(&publish.access_key_env, "access_key_env")?,
+            publish_env(&publish.secret_key_env, "secret_key_env")?,
+        )),
+    }
+}
+
+/// The stores of `publish` (the composition root wires the adapters): `S3Store` for `r2` and `s3`,
+/// signing at the system clock (never `SOURCE_DATE_EPOCH`'s), or two `DirStore`s under
+/// `--store-dir`, which reads no variable.
+fn open_stores(
+    publish: &PublishSettings,
+    store_dir: Option<&Path>,
+) -> anyhow::Result<cmd_publish::Stores> {
+    if let Some(dir) = store_dir {
+        return Ok(cmd_publish::Stores {
+            public: Box::new(DirStore::new(dir.join("public"))),
+            private: Box::new(DirStore::new(dir.join("private"))),
+        });
+    }
+    let clock: Arc<dyn lunepack_core::Clock> = Arc::new(lunepack::SystemClock);
+    let open =
+        |bucket: &str, private: bool| -> anyhow::Result<Box<dyn lunepack_core::ObjectStore>> {
+            let credentials = store_credentials(publish, private)?;
+            let store = match &publish.store {
+                StoreKind::R2 { account_id_env } => S3Store::r2(
+                    &publish_env(account_id_env, "account_id_env")?,
+                    bucket,
+                    credentials,
+                    clock.clone(),
+                ),
+                StoreKind::S3 {
+                    endpoint_env,
+                    region,
+                } => S3Store::new(
+                    &publish_env(endpoint_env, "endpoint_env")?,
+                    bucket,
+                    region,
+                    credentials,
+                    clock.clone(),
+                ),
+            };
+            Ok(Box::new(
+                store.context("[publish] does not describe a usable store")?,
+            ))
+        };
+    Ok(cmd_publish::Stores {
+        public: open(&publish.public_bucket, false)?,
+        private: open(&publish.private_bucket, true)?,
+    })
+}
+
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Init(args) => cmd_keys::init(&cli.config, &args),
@@ -136,6 +223,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Verify(args) => cmd_verify::verify(&cli.config, &args),
         Command::Inspect(args) => cmd_verify::inspect(&cli.config, &args),
         Command::Setup(args) => cmd_setup::setup(&cli.config, &args),
+        Command::Publish { command } => cmd_publish::run(&cli.config, &command, &open_stores),
         Command::Prebuilt { command } => match command {
             PrebuiltCommand::List(args) => cmd_prebuilt::list(&args),
             PrebuiltCommand::Check(args) => cmd_prebuilt::check(&args),
@@ -153,7 +241,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:#}");
-            ExitCode::FAILURE
+            ExitCode::from(cmd_publish::exit_status(&e))
         }
     }
 }

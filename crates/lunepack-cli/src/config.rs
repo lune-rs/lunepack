@@ -17,7 +17,7 @@ use lunepack_core::limits::MAX_JSON_INT;
 use lunepack_core::update_config::{DEFAULT_HEALTH_TIMEOUT_SECS, HEALTH_TIMEOUT_SECS};
 use lunepack_core::{
     AppId, ArgvTemplate, Channel, Clock, FileType, Hasher, InstallMeta, PublisherPolicy, RelPath,
-    Signer, Target, TemplateRole, TrustedRoot, Verifier,
+    Signer, StoreKey, Target, TemplateRole, TrustedRoot, Verifier,
 };
 use lunepack_crypto::{CommandSigner, Ed25519Signer};
 use serde::Deserialize;
@@ -46,6 +46,33 @@ struct RawConfig {
     macos: Option<RawMacos>,
     /// OS code signing, per operating system (M9-D2).
     codesign: Option<RawCodeSign>,
+    /// Where and how a release is published (P-D4); absent for an app that does not use
+    /// `lunepack publish`.
+    publish: Option<RawPublish>,
+}
+
+/// `[publish]`: names of environment variables, never their values (P-D4).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPublish {
+    prefix: String,
+    store: String,
+    account_id_env: Option<String>,
+    endpoint_env: Option<String>,
+    region: Option<String>,
+    access_key_env: String,
+    secret_key_env: String,
+    private_access_key_env: Option<String>,
+    private_secret_key_env: Option<String>,
+    public_bucket: String,
+    private_bucket: String,
+    keep: Option<u64>,
+    deltas: Option<u64>,
+    feed_days: Option<u64>,
+    channels: Option<Vec<String>>,
+    prerelease_channels: Option<Vec<String>>,
+    #[serde(default)]
+    require_targets: Vec<String>,
 }
 
 /// `[codesign]`: one section per operating system that is signed (M9-D2); there is none for Linux.
@@ -120,6 +147,19 @@ struct RawInstall {
     /// Start at sign-in (M7-D3).
     #[serde(default)]
     autostart: bool,
+    /// `[install.linux]`, `[install.windows]`, `[install.macos]` (P-D5).
+    linux: Option<RawInstallOs>,
+    windows: Option<RawInstallOs>,
+    macos: Option<RawInstallOs>,
+}
+
+/// `[install.<os>]` (P-D5): the two install values that differ per operating system, and nothing
+/// else.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInstallOs {
+    entry: Option<String>,
+    icon: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -181,12 +221,108 @@ pub struct UpdateSettings {
     pub channel: Channel,
     /// How long a supervised start may take to confirm its health.
     pub health_timeout_secs: u64,
-    /// The install metadata.
+    /// The install metadata of `[install]`; a target's own values come from
+    /// [`UpdateSettings::install_for`].
     pub install: InstallMeta,
+    /// `[install.<os>]` overrides (P-D5).
+    overrides: InstallOverrides,
     /// `[update] publisher_check` as written (M9-D6); `None` takes the default for the target,
     /// see [`Config::publisher_policy`].
     pub publisher_check: Option<PublisherPolicy>,
 }
+
+/// What `[install.<os>]` overrides, per operating system.
+#[derive(Debug, Clone, Default)]
+struct InstallOverrides {
+    linux: OsInstall,
+    windows: OsInstall,
+    macos: OsInstall,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OsInstall {
+    entry: Option<RelPath>,
+    icon: Option<RelPath>,
+}
+
+impl UpdateSettings {
+    /// The install metadata for `target`: `[install]` with the `entry` and `icon` of the target's
+    /// `[install.<os>]` table laid over it (P-D5).
+    pub fn install_for(&self, target: Target) -> InstallMeta {
+        let os = if target.is_windows() {
+            &self.overrides.windows
+        } else if target.is_macos() {
+            &self.overrides.macos
+        } else {
+            &self.overrides.linux
+        };
+        let mut install = self.install.clone();
+        if let Some(entry) = &os.entry {
+            install.entry = entry.clone();
+        }
+        if let Some(icon) = &os.icon {
+            install.icon = Some(icon.clone());
+        }
+        install
+    }
+}
+
+/// Where `[publish]` says the store is (P-D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreKind {
+    /// Cloudflare R2: the account id is in this environment variable.
+    R2 {
+        /// Name of the variable that holds the account id.
+        account_id_env: String,
+    },
+    /// Any other S3-compatible store.
+    S3 {
+        /// Name of the variable that holds the endpoint URL.
+        endpoint_env: String,
+        /// The region to sign for.
+        region: String,
+    },
+}
+
+/// `[publish]`, parsed and checked (P-D4). It holds the names of the variables that carry the
+/// credentials, never a value.
+#[derive(Debug, Clone)]
+pub struct PublishSettings {
+    /// The app's prefix in both buckets: one key segment.
+    pub prefix: String,
+    /// The kind of store.
+    pub store: StoreKind,
+    /// Name of the variable holding the access key id.
+    pub access_key_env: String,
+    /// Name of the variable holding the secret key.
+    pub secret_key_env: String,
+    /// Names of the variables holding the access key id and the secret key of the private bucket
+    /// (S4): both or neither; without them the private bucket uses the pair above too.
+    pub private_keys_env: Option<(String, String)>,
+    /// The bucket the clients read (feeds, manifests, packs).
+    pub public_bucket: String,
+    /// The bucket that holds the state file and the pending-deletes record.
+    pub private_bucket: String,
+    /// How many versions stay published.
+    pub keep: u32,
+    /// How many earlier versions each release gets a delta from.
+    pub deltas: u8,
+    /// How many days a feed's signature stays valid.
+    pub feed_days: u32,
+    /// The channels a release may go to.
+    pub channels: Vec<Channel>,
+    /// The channels a pre-release goes to.
+    pub prerelease_channels: Vec<Channel>,
+    /// Targets every release must have.
+    pub require_targets: Vec<Target>,
+}
+
+/// Default of `[publish] keep`.
+pub const DEFAULT_PUBLISH_KEEP: u32 = 10;
+/// Default of `[publish] deltas` (the same as `pack --deltas`).
+pub const DEFAULT_PUBLISH_DELTAS: u8 = 3;
+/// Default of `[publish] feed_days`.
+pub const DEFAULT_PUBLISH_FEED_DAYS: u32 = 90;
 
 /// How long one sign or verify call may run when the section names no `timeout_secs` (M9-D2).
 pub const DEFAULT_CODESIGN_TIMEOUT_SECS: u64 = 300;
@@ -245,6 +381,8 @@ pub struct Config {
     pub codesign_windows: Option<CodeSignSection>,
     /// `[codesign.macos]`, when the config has it (M9-D2).
     pub codesign_macos: Option<CodeSignSection>,
+    /// `[publish]`, when the config has it (P-D4).
+    pub publish: Option<PublishSettings>,
     signers: BTreeMap<String, SignerSpec>,
 }
 
@@ -257,6 +395,28 @@ fn update_settings(file: &str, u: RawUpdate, i: RawInstall) -> Result<UpdateSett
     }
     let rel = |value: &str, field: &str| {
         RelPath::parse(value).map_err(|_| anyhow!("{file}: install.{field} is not a tree path"))
+    };
+    let os_install = |os: &str, raw: Option<RawInstallOs>| -> Result<OsInstall> {
+        let Some(raw) = raw else {
+            return Ok(OsInstall::default());
+        };
+        Ok(OsInstall {
+            entry: raw
+                .entry
+                .as_deref()
+                .map(|v| rel(v, &format!("{os}.entry")))
+                .transpose()?,
+            icon: raw
+                .icon
+                .as_deref()
+                .map(|v| rel(v, &format!("{os}.icon")))
+                .transpose()?,
+        })
+    };
+    let overrides = InstallOverrides {
+        linux: os_install("linux", i.linux)?,
+        windows: os_install("windows", i.windows)?,
+        macos: os_install("macos", i.macos)?,
     };
     let publisher_check = u
         .publisher_check
@@ -293,7 +453,187 @@ fn update_settings(file: &str, u: RawUpdate, i: RawInstall) -> Result<UpdateSett
         channel,
         health_timeout_secs,
         install,
+        overrides,
         publisher_check,
+    })
+}
+
+/// An environment variable name, `[A-Z_][A-Z0-9_]*`; the error names the key, never the text.
+fn env_name(file: &str, key: &str, value: &str) -> Result<String> {
+    let mut bytes = value.bytes();
+    let ok = value.len() <= 128
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    if !ok {
+        bail!("{file}: publish.{key} is not an environment variable name ([A-Z_][A-Z0-9_]*)");
+    }
+    Ok(value.to_owned())
+}
+
+/// A bucket name: 3-63 of lowercase letters, digits, `.` and `-`, alphanumeric at both ends.
+fn bucket_name(file: &str, key: &str, value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let ok = (3..=63).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric();
+    if !ok {
+        bail!("{file}: publish.{key} is not a bucket name (3-63 of a-z, 0-9, . and -)");
+    }
+    Ok(value.to_owned())
+}
+
+fn in_range<T: TryFrom<u64>>(
+    file: &str,
+    key: &str,
+    value: Option<u64>,
+    default: T,
+    range: std::ops::RangeInclusive<u64>,
+) -> Result<T> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    match T::try_from(value) {
+        Ok(v) if range.contains(&value) => Ok(v),
+        _ => bail!(
+            "{file}: publish.{key} is outside {}..={}",
+            range.start(),
+            range.end()
+        ),
+    }
+}
+
+fn channel_list(file: &str, key: &str, values: &[String]) -> Result<Vec<Channel>> {
+    if values.is_empty() {
+        bail!("{file}: publish.{key} is empty");
+    }
+    let mut out: Vec<Channel> = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        let channel = Channel::parse(value)
+            .map_err(|_| anyhow!("{file}: publish.{key}[{index}] is not a channel id"))?;
+        if out.contains(&channel) {
+            bail!("{file}: publish.{key}[{index}] repeats a channel");
+        }
+        out.push(channel);
+    }
+    Ok(out)
+}
+
+fn publish_settings(
+    file: &str,
+    raw: RawPublish,
+    update_channel: &Channel,
+) -> Result<PublishSettings> {
+    if raw.prefix.contains('/') {
+        bail!("{file}: publish.prefix must be one path segment (no /)");
+    }
+    StoreKey::new(&raw.prefix, "x").map_err(|e| anyhow!("{file}: publish.prefix: {e}"))?;
+    let store = match raw.store.as_str() {
+        "r2" => {
+            for (key, present) in [
+                ("endpoint_env", raw.endpoint_env.is_some()),
+                ("region", raw.region.is_some()),
+            ] {
+                if present {
+                    bail!("{file}: publish.{key} applies to store = \"s3\" only");
+                }
+            }
+            let var = raw.account_id_env.as_deref().ok_or_else(|| {
+                anyhow!("{file}: publish.account_id_env is required for store = \"r2\"")
+            })?;
+            StoreKind::R2 {
+                account_id_env: env_name(file, "account_id_env", var)?,
+            }
+        }
+        "s3" => {
+            if raw.account_id_env.is_some() {
+                bail!("{file}: publish.account_id_env applies to store = \"r2\" only");
+            }
+            let var = raw.endpoint_env.as_deref().ok_or_else(|| {
+                anyhow!("{file}: publish.endpoint_env is required for store = \"s3\"")
+            })?;
+            let region = raw
+                .region
+                .ok_or_else(|| anyhow!("{file}: publish.region is required for store = \"s3\""))?;
+            if region.is_empty()
+                || region.len() > 32
+                || !region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            {
+                bail!("{file}: publish.region is not a region name (1-32 of a-z, 0-9 and -)");
+            }
+            StoreKind::S3 {
+                endpoint_env: env_name(file, "endpoint_env", var)?,
+                region,
+            }
+        }
+        _ => bail!("{file}: publish.store is not \"r2\" or \"s3\""),
+    };
+    let public_bucket = bucket_name(file, "public_bucket", &raw.public_bucket)?;
+    let private_bucket = bucket_name(file, "private_bucket", &raw.private_bucket)?;
+    if public_bucket == private_bucket {
+        bail!("{file}: publish.public_bucket and publish.private_bucket must differ");
+    }
+    let channels = match &raw.channels {
+        Some(list) => channel_list(file, "channels", list)?,
+        None => vec![update_channel.clone()],
+    };
+    let prerelease_channels = match &raw.prerelease_channels {
+        Some(list) => channel_list(file, "prerelease_channels", list)?,
+        None => channels.clone(),
+    };
+    if prerelease_channels.iter().any(|c| !channels.contains(c)) {
+        bail!(
+            "{file}: publish.prerelease_channels names a channel that is not in publish.channels"
+        );
+    }
+    let mut require_targets: Vec<Target> = Vec::new();
+    for (index, text) in raw.require_targets.iter().enumerate() {
+        let target = Target::parse(text)
+            .map_err(|_| anyhow!("{file}: publish.require_targets[{index}] is not a target id"))?;
+        if require_targets.contains(&target) {
+            bail!("{file}: publish.require_targets[{index}] repeats a target");
+        }
+        require_targets.push(target);
+    }
+    let private_keys_env = match (&raw.private_access_key_env, &raw.private_secret_key_env) {
+        (None, None) => None,
+        (Some(access), Some(secret)) => Some((
+            env_name(file, "private_access_key_env", access)?,
+            env_name(file, "private_secret_key_env", secret)?,
+        )),
+        (Some(_), None) => bail!(
+            "{file}: publish.private_secret_key_env is required with publish.private_access_key_env (both or neither)"
+        ),
+        (None, Some(_)) => bail!(
+            "{file}: publish.private_access_key_env is required with publish.private_secret_key_env (both or neither)"
+        ),
+    };
+    Ok(PublishSettings {
+        prefix: raw.prefix,
+        store,
+        access_key_env: env_name(file, "access_key_env", &raw.access_key_env)?,
+        secret_key_env: env_name(file, "secret_key_env", &raw.secret_key_env)?,
+        private_keys_env,
+        public_bucket,
+        private_bucket,
+        keep: in_range(file, "keep", raw.keep, DEFAULT_PUBLISH_KEEP, 1..=100)?,
+        deltas: in_range(file, "deltas", raw.deltas, DEFAULT_PUBLISH_DELTAS, 0..=16)?,
+        feed_days: in_range(
+            file,
+            "feed_days",
+            raw.feed_days,
+            DEFAULT_PUBLISH_FEED_DAYS,
+            1..=3650,
+        )?,
+        channels,
+        prerelease_channels,
+        require_targets,
     })
 }
 
@@ -506,6 +846,17 @@ impl Config {
             (Some(_), None) => bail!("{}: [update] needs [install]", ctx()),
             (Some(u), Some(i)) => Some(update_settings(&ctx(), u, i)?),
         };
+        let publish = raw
+            .publish
+            .map(|p| {
+                let default_channel = match &update {
+                    Some(u) => u.channel.clone(),
+                    None => Channel::parse(DEFAULT_UPDATE_CHANNEL)
+                        .map_err(|_| anyhow!("the default channel is not a channel id"))?,
+                };
+                publish_settings(&ctx(), p, &default_channel)
+            })
+            .transpose()?;
         Ok(Config {
             app_id,
             root_version: raw.root.version,
@@ -517,6 +868,7 @@ impl Config {
             macos_icon,
             codesign_windows,
             codesign_macos,
+            publish,
             signers,
         })
     }
@@ -531,6 +883,27 @@ impl Config {
         } else {
             None
         }
+    }
+
+    /// The channel `pack --channel <requested>` writes into the update config: `requested` must be
+    /// a channel id listed in `[publish] channels` (P-D5). The error names the allowed set.
+    pub fn pack_channel(&self, requested: &str) -> Result<Channel> {
+        let channel =
+            Channel::parse(requested).map_err(|_| anyhow!("--channel is not a channel id"))?;
+        if self.update.is_none() {
+            bail!("--channel needs [update] and [install] in the config");
+        }
+        let Some(publish) = &self.publish else {
+            bail!("--channel needs [publish] in the config: its channels are the allowed set");
+        };
+        if !publish.channels.contains(&channel) {
+            let allowed: Vec<&str> = publish.channels.iter().map(Channel::as_str).collect();
+            bail!(
+                "--channel {requested} is not one of the [publish] channels: {}",
+                allowed.join(", ")
+            );
+        }
+        Ok(channel)
     }
 
     /// The publisher-continuity policy to write into the config of a tree for `target` (M9-D6): an
@@ -856,6 +1229,486 @@ mod tests {
             parse("").unwrap().publisher_policy(Target::WindowsX86_64),
             PublisherPolicy::Off
         );
+    }
+
+    const UPDATE: &str = "[update]\nfeed = \"https://updates.example.com/app\"\n";
+    const PUBLISH: &str = "[publish]\nprefix = \"app\"\nstore = \"r2\"\n\
+        account_id_env = \"APP_R2_ACCOUNT_ID\"\naccess_key_env = \"APP_R2_KEY\"\n\
+        secret_key_env = \"APP_R2_SECRET\"\npublic_bucket = \"app-public\"\n\
+        private_bucket = \"app-private\"\n";
+
+    fn publish_with(extra: &str) -> String {
+        format!("{PUBLISH}{extra}")
+    }
+
+    fn publish_err(text: &str) -> String {
+        err(&format!("{UPDATE}{INSTALL}{text}"))
+    }
+
+    #[test]
+    fn a_config_without_publish_or_os_installs_is_as_before() {
+        let c = parse(&format!("{UPDATE}{INSTALL}")).unwrap();
+        assert!(c.publish.is_none());
+        let u = c.update.as_ref().unwrap();
+        for target in [
+            Target::LinuxX86_64,
+            Target::WindowsX86_64,
+            Target::MacosUniversal,
+        ] {
+            let install = u.install_for(target);
+            assert_eq!(install.entry, u.install.entry, "{target:?}");
+            assert_eq!(install.icon, u.install.icon);
+        }
+        assert!(parse("").unwrap().publish.is_none());
+    }
+
+    #[test]
+    fn publish_parses_with_its_defaults() {
+        let c = parse(&format!("{UPDATE}{INSTALL}{PUBLISH}")).unwrap();
+        let p = c.publish.unwrap();
+        assert_eq!(p.prefix, "app");
+        assert_eq!(
+            p.store,
+            StoreKind::R2 {
+                account_id_env: "APP_R2_ACCOUNT_ID".to_owned()
+            }
+        );
+        assert_eq!(
+            (p.access_key_env.as_str(), p.secret_key_env.as_str()),
+            ("APP_R2_KEY", "APP_R2_SECRET")
+        );
+        assert_eq!(p.private_keys_env, None);
+        assert_eq!(
+            (p.public_bucket.as_str(), p.private_bucket.as_str()),
+            ("app-public", "app-private")
+        );
+        assert_eq!(
+            (p.keep, p.deltas, p.feed_days),
+            (
+                DEFAULT_PUBLISH_KEEP,
+                DEFAULT_PUBLISH_DELTAS,
+                DEFAULT_PUBLISH_FEED_DAYS
+            )
+        );
+        assert_eq!(
+            (p.keep, p.deltas, p.feed_days),
+            (10, 3, 90),
+            "the documented defaults"
+        );
+        // `channels` defaults to `[update] channel` alone, and pre-releases to all channels.
+        let names = |list: &[Channel]| {
+            list.iter()
+                .map(|c| c.as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&p.channels), ["stable"]);
+        assert_eq!(names(&p.prerelease_channels), ["stable"]);
+        assert!(p.require_targets.is_empty());
+        let c = parse(&format!(
+            "[update]\nfeed = \"https://updates.example.com/app\"\nchannel = \"nightly\"\n{INSTALL}{PUBLISH}"
+        ))
+        .unwrap();
+        assert_eq!(names(&c.publish.unwrap().channels), ["nightly"]);
+    }
+
+    #[test]
+    fn publish_parses_every_key() {
+        let text = format!(
+            "{UPDATE}{INSTALL}[publish]\nprefix = \"my-app_1\"\nstore = \"s3\"\n\
+             endpoint_env = \"S3_ENDPOINT\"\nregion = \"eu-west-1\"\naccess_key_env = \"_K\"\n\
+             secret_key_env = \"S\"\npublic_bucket = \"my.pub-1\"\nprivate_bucket = \"my-priv\"\n\
+             keep = 100\ndeltas = 0\nfeed_days = 3650\nchannels = [\"stable\", \"beta\"]\n\
+             prerelease_channels = [\"beta\"]\nrequire_targets = [\"linux-x86_64\", \"macos-universal\"]\n"
+        );
+        let p = parse(&text).unwrap().publish.unwrap();
+        assert_eq!(
+            p.store,
+            StoreKind::S3 {
+                endpoint_env: "S3_ENDPOINT".to_owned(),
+                region: "eu-west-1".to_owned()
+            }
+        );
+        assert_eq!((p.keep, p.deltas, p.feed_days), (100, 0, 3650));
+        assert_eq!(p.channels.len(), 2);
+        assert_eq!(p.prerelease_channels.len(), 1);
+        assert_eq!(
+            p.require_targets,
+            [Target::LinuxX86_64, Target::MacosUniversal]
+        );
+        // The lowest values of each range.
+        let low = parse(&format!(
+            "{UPDATE}{INSTALL}{}",
+            publish_with("keep = 1\nfeed_days = 1\ndeltas = 16\n")
+        ))
+        .unwrap()
+        .publish
+        .unwrap();
+        assert_eq!((low.keep, low.deltas, low.feed_days), (1, 16, 1));
+    }
+
+    #[test]
+    fn publish_refuses_each_bad_value_naming_the_key() {
+        let cases: &[(&str, &str, &str)] = &[
+            // (what to append or replace, expected key in the message, expected phrase)
+            ("keep = 0\n", "publish.keep", "outside 1..=100"),
+            ("keep = 101\n", "publish.keep", "outside 1..=100"),
+            ("deltas = 17\n", "publish.deltas", "outside 0..=16"),
+            ("feed_days = 0\n", "publish.feed_days", "outside 1..=3650"),
+            (
+                "feed_days = 3651\n",
+                "publish.feed_days",
+                "outside 1..=3650",
+            ),
+            ("channels = []\n", "publish.channels", "empty"),
+            (
+                "channels = [\"Bad Channel\"]\n",
+                "publish.channels[0]",
+                "not a channel id",
+            ),
+            (
+                "channels = [\"a\", \"a\"]\n",
+                "publish.channels[1]",
+                "repeats",
+            ),
+            (
+                "channels = [\"a\"]\nprerelease_channels = [\"b\"]\n",
+                "publish.prerelease_channels",
+                "not in publish.channels",
+            ),
+            (
+                "require_targets = [\"amiga-m68k\"]\n",
+                "publish.require_targets[0]",
+                "not a target id",
+            ),
+            (
+                "require_targets = [\"linux-x86_64\", \"linux-x86_64\"]\n",
+                "publish.require_targets[1]",
+                "repeats",
+            ),
+            (
+                "endpoint_env = \"X\"\n",
+                "publish.endpoint_env",
+                "applies to store = \"s3\"",
+            ),
+            (
+                "region = \"auto\"\n",
+                "publish.region",
+                "applies to store = \"s3\"",
+            ),
+            ("surprise = 1\n", "surprise", "unknown field"),
+        ];
+        for (extra, key, phrase) in cases {
+            let e = publish_err(&publish_with(extra));
+            assert!(e.contains(key) && e.contains(phrase), "{extra:?}: {e}");
+        }
+        // Replaced values.
+        let replaced: &[(&str, &str, &str, &str)] = &[
+            (
+                "prefix = \"app\"",
+                "prefix = \"a/b\"",
+                "publish.prefix",
+                "one path segment",
+            ),
+            (
+                "prefix = \"app\"",
+                "prefix = \"\"",
+                "publish.prefix",
+                "empty",
+            ),
+            (
+                "prefix = \"app\"",
+                "prefix = \"..\"",
+                "publish.prefix",
+                ". or .. segment",
+            ),
+            (
+                "prefix = \"app\"",
+                "prefix = \"a b\"",
+                "publish.prefix",
+                "whitespace",
+            ),
+            (
+                "prefix = \"app\"",
+                "prefix = \"a\\\\b\"",
+                "publish.prefix",
+                "backslash",
+            ),
+            (
+                "prefix = \"app\"",
+                "prefix = \"\\u00e9\"",
+                "publish.prefix",
+                "non-ASCII",
+            ),
+            (
+                "store = \"r2\"",
+                "store = \"gcs\"",
+                "publish.store",
+                "not \"r2\" or \"s3\"",
+            ),
+            (
+                "APP_R2_ACCOUNT_ID",
+                "lower_case",
+                "publish.account_id_env",
+                "environment variable name",
+            ),
+            (
+                "APP_R2_KEY",
+                "1STARTS_WITH_DIGIT",
+                "publish.access_key_env",
+                "environment variable name",
+            ),
+            (
+                "APP_R2_SECRET",
+                "HAS-DASH",
+                "publish.secret_key_env",
+                "environment variable name",
+            ),
+            (
+                "APP_R2_SECRET",
+                "",
+                "publish.secret_key_env",
+                "environment variable name",
+            ),
+            (
+                "app-public",
+                "Upper",
+                "publish.public_bucket",
+                "not a bucket name",
+            ),
+            (
+                "app-private",
+                "ab",
+                "publish.private_bucket",
+                "not a bucket name",
+            ),
+            (
+                "app-private",
+                "app-public",
+                "publish.public_bucket",
+                "must differ",
+            ),
+        ];
+        for (from, to, key, phrase) in replaced {
+            let e = publish_err(&PUBLISH.replace(from, to));
+            assert!(e.contains(key) && e.contains(phrase), "{from} -> {to}: {e}");
+        }
+        // Missing keys.
+        for missing in [
+            "prefix",
+            "store",
+            "access_key_env",
+            "secret_key_env",
+            "public_bucket",
+            "private_bucket",
+        ] {
+            let text: String = PUBLISH
+                .lines()
+                .filter(|l| !l.starts_with(missing))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let e = publish_err(&format!("{text}\n"));
+            assert!(
+                e.contains("missing field") && e.contains(missing),
+                "{missing}: {e}"
+            );
+        }
+        let e = publish_err(&PUBLISH.replace("account_id_env = \"APP_R2_ACCOUNT_ID\"\n", ""));
+        assert!(e.contains("publish.account_id_env is required"), "{e}");
+        // S4: the private bucket's own pair, both or neither, each a variable name.
+        let both = "private_access_key_env = \"APP_R2_STATE_KEY\"\nprivate_secret_key_env = \"APP_R2_STATE_SECRET\"\n";
+        let c = parse(&format!("{UPDATE}{INSTALL}{}", publish_with(both))).unwrap();
+        assert_eq!(
+            c.publish.unwrap().private_keys_env,
+            Some((
+                "APP_R2_STATE_KEY".to_owned(),
+                "APP_R2_STATE_SECRET".to_owned()
+            ))
+        );
+        for (half, named) in [
+            (
+                "private_access_key_env = \"APP_R2_STATE_KEY\"\n",
+                "publish.private_secret_key_env is required",
+            ),
+            (
+                "private_secret_key_env = \"APP_R2_STATE_SECRET\"\n",
+                "publish.private_access_key_env is required",
+            ),
+        ] {
+            let e = publish_err(&publish_with(half));
+            assert!(e.contains(named) && e.contains("both or neither"), "{e}");
+        }
+        let e = publish_err(&publish_with(
+            &both.replace("APP_R2_STATE_SECRET", "bad-name"),
+        ));
+        assert!(
+            e.contains("publish.private_secret_key_env is not an environment variable name"),
+            "{e}"
+        );
+        // s3 needs its own keys and refuses r2's.
+        let s3 = PUBLISH.replace("store = \"r2\"", "store = \"s3\"");
+        let e = publish_err(&s3);
+        assert!(
+            e.contains("publish.account_id_env applies to store = \"r2\""),
+            "{e}"
+        );
+        let s3 = s3.replace("account_id_env = \"APP_R2_ACCOUNT_ID\"\n", "");
+        let e = publish_err(&s3);
+        assert!(e.contains("publish.endpoint_env is required"), "{e}");
+        let e = publish_err(&format!("{s3}endpoint_env = \"EP\"\n"));
+        assert!(e.contains("publish.region is required"), "{e}");
+        for region in ["", "US-EAST", "a b", &"a".repeat(33)] {
+            let e = publish_err(&format!(
+                "{s3}endpoint_env = \"EP\"\nregion = \"{region}\"\n"
+            ));
+            assert!(
+                e.contains("publish.region is not a region name"),
+                "{region:?}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_errors_never_echo_a_value() {
+        let secretish = "hunter2-VALUE";
+        for (from, to) in [
+            ("APP_R2_KEY", secretish),
+            ("app-public", secretish),
+            ("store = \"r2\"", "store = \"hunter2-VALUE\""),
+            ("prefix = \"app\"", "prefix = \"hunter2 VALUE\""),
+        ] {
+            let e = publish_err(&PUBLISH.replace(from, to));
+            assert!(
+                !e.contains(secretish) && !e.contains("hunter2"),
+                "{from}: {e}"
+            );
+        }
+        let e = publish_err(&publish_with("channels = [\"hunter2 VALUE\"]\n"));
+        assert!(!e.contains("hunter2"), "{e}");
+    }
+
+    #[test]
+    fn publish_works_without_update_and_defaults_its_channel() {
+        let c = parse(PUBLISH).unwrap();
+        let p = c.publish.unwrap();
+        assert_eq!(p.channels.len(), 1);
+        assert_eq!(p.channels[0].as_str(), DEFAULT_UPDATE_CHANNEL);
+    }
+
+    #[test]
+    fn os_install_overrides_pick_the_targets_entry_and_icon() {
+        let text = format!(
+            "{UPDATE}[install]\nentry = \"bin/app\"\nname = \"App\"\nicon = \"assets/icon.svg\"\n\
+             [install.windows]\nentry = \"bin/app.exe\"\nicon = \"assets/icon.png\"\n\
+             [install.macos]\nentry = \"Contents/MacOS/App\"\n"
+        );
+        let c = parse(&text).unwrap();
+        let u = c.update.unwrap();
+        let entry = |t: Target| u.install_for(t).entry.as_str().to_owned();
+        let icon = |t: Target| u.install_for(t).icon.map(|i| i.as_str().to_owned());
+        for t in [Target::LinuxX86_64, Target::LinuxAarch64] {
+            assert_eq!(entry(t), "bin/app");
+            assert_eq!(icon(t).as_deref(), Some("assets/icon.svg"));
+        }
+        for t in [Target::WindowsX86_64, Target::WindowsAarch64] {
+            assert_eq!(entry(t), "bin/app.exe");
+            assert_eq!(icon(t).as_deref(), Some("assets/icon.png"));
+        }
+        for t in [
+            Target::MacosUniversal,
+            Target::MacosAarch64,
+            Target::MacosX86_64,
+        ] {
+            assert_eq!(entry(t), "Contents/MacOS/App");
+            assert_eq!(
+                icon(t).as_deref(),
+                Some("assets/icon.svg"),
+                "icon not overridden"
+            );
+        }
+        // Everything else in `[install]` is shared, and `[install]` itself is not changed.
+        assert_eq!(u.install.entry.as_str(), "bin/app");
+        assert_eq!(u.install_for(Target::WindowsX86_64).name, "App");
+        // The `[windows] icon` and `[macos] icon` stamping inputs stay beside them.
+        let c = parse(&format!(
+            "{text}[windows]\nicon = \"art/app.ico\"\n[macos]\nicon = \"art/app.icns\"\n"
+        ))
+        .unwrap();
+        assert_eq!(c.windows_icon, Some(PathBuf::from("/cfg/art/app.ico")));
+        assert_eq!(c.macos_icon, Some(PathBuf::from("/cfg/art/app.icns")));
+    }
+
+    #[test]
+    fn os_install_refuses_other_keys_and_bad_paths() {
+        let with = |table: &str| format!("{UPDATE}{INSTALL}{table}");
+        for key in [
+            "channel",
+            "name",
+            "terminal",
+            "autostart",
+            "feed",
+            "app_id",
+            "bin",
+        ] {
+            for os in ["linux", "windows", "macos"] {
+                let e = err(&with(&format!("[install.{os}]\n{key} = \"x\"\n")));
+                assert!(
+                    e.contains("unknown field") && e.contains(key),
+                    "{os} {key}: {e}"
+                );
+            }
+        }
+        let e = err(&with("[install.freebsd]\nentry = \"x\"\n"));
+        assert!(e.contains("unknown field") && e.contains("freebsd"), "{e}");
+        for (os, key, value) in [
+            ("linux", "entry", "/abs"),
+            ("windows", "entry", "../up"),
+            ("macos", "icon", ""),
+            ("windows", "icon", "a//b"),
+        ] {
+            let e = err(&with(&format!("[install.{os}]\n{key} = \"{value}\"\n")));
+            assert!(
+                e.contains(&format!("install.{os}.{key} is not a tree path")),
+                "{os} {key}: {e}"
+            );
+        }
+        // An override table needs `[install]`, which needs `[update]`.
+        let e = err("[install.macos]\nentry = \"x\"\n");
+        assert!(
+            e.contains("missing field") || e.contains("[install]"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn pack_channel_is_limited_to_the_publish_channels() {
+        let base = format!("{UPDATE}{INSTALL}");
+        let c = parse(&format!(
+            "{base}{}",
+            publish_with("channels = [\"stable\", \"beta\"]\n")
+        ))
+        .unwrap();
+        assert_eq!(c.pack_channel("beta").unwrap().as_str(), "beta");
+        assert_eq!(c.pack_channel("stable").unwrap().as_str(), "stable");
+        let e = c.pack_channel("nightly").unwrap_err().to_string();
+        assert!(
+            e.contains("--channel nightly") && e.contains("stable, beta"),
+            "{e}"
+        );
+        let e = c.pack_channel("Not A Channel").unwrap_err().to_string();
+        assert!(
+            e.contains("not a channel id") && !e.contains("Not A"),
+            "{e}"
+        );
+        // No [publish], or no [update].
+        let none = parse(&base).unwrap();
+        let e = none.pack_channel("beta").unwrap_err().to_string();
+        assert!(e.contains("--channel needs [publish]"), "{e}");
+        let e = parse(PUBLISH)
+            .unwrap()
+            .pack_channel("stable")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--channel needs [update]"), "{e}");
     }
 
     #[test]

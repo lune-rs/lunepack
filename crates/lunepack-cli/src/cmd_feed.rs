@@ -25,7 +25,7 @@ use crate::place;
 use crate::release_dir::{self, read_capped};
 use crate::state::{Compared, Record, State, StateArgs};
 
-const SECS_PER_DAY: u64 = 86_400;
+pub(crate) const SECS_PER_DAY: u64 = 86_400;
 /// About a century; a bound so the day count cannot overflow the second count.
 const MAX_EXPIRES_DAYS: u64 = 36_500;
 const MANIFEST_SUFFIX: &str = ".manifest.json";
@@ -35,30 +35,30 @@ const MANIFEST_SUFFIX: &str = ".manifest.json";
 pub struct AddArgs {
     /// The release directory.
     #[arg(long = "release-dir")]
-    release_dir: PathBuf,
+    pub(crate) release_dir: PathBuf,
     /// The channel, such as `stable`; the feed is `feed-<channel>.json`.
     #[arg(long)]
-    channel: String,
+    pub(crate) channel: String,
     /// The release version, as written in its directory name.
     #[arg(long)]
-    version: String,
+    pub(crate) version: String,
     /// Limit the release to this many basis points of installs (0..=10000). Without it, an
     /// existing release keeps its rollout.
     #[arg(long, value_parser = clap::value_parser!(u16).range(0..=10_000))]
-    rollout: Option<u16>,
+    pub(crate) rollout: Option<u16>,
     /// The rollout seed, 64 lowercase hex characters (default: the release's existing seed, else
     /// a deterministic one).
     #[arg(long = "rollout-seed", requires = "rollout")]
-    rollout_seed: Option<String>,
+    pub(crate) rollout_seed: Option<String>,
     /// Feed lifetime in days (default 90).
     #[arg(long = "expires-after-days", value_parser = clap::value_parser!(u64).range(1..=MAX_EXPIRES_DAYS))]
-    expires_after_days: Option<u64>,
+    pub(crate) expires_after_days: Option<u64>,
     /// A release signer: a name from the config, `file:<path>` or `env:<VAR>`; repeat to reach the
     /// key set's threshold.
     #[arg(long = "sign", required = true)]
-    sign: Vec<String>,
+    pub(crate) sign: Vec<String>,
     #[command(flatten)]
-    state: StateArgs,
+    pub(crate) state: StateArgs,
 }
 
 /// Arguments of `feed refresh`.
@@ -66,22 +66,22 @@ pub struct AddArgs {
 pub struct RefreshArgs {
     /// The release directory.
     #[arg(long = "release-dir")]
-    release_dir: PathBuf,
+    pub(crate) release_dir: PathBuf,
     /// The channel to re-sign.
     #[arg(long)]
-    channel: String,
+    pub(crate) channel: String,
     /// Feed lifetime in days (default 90).
     #[arg(long = "expires-after-days", value_parser = clap::value_parser!(u64).range(1..=MAX_EXPIRES_DAYS))]
-    expires_after_days: Option<u64>,
+    pub(crate) expires_after_days: Option<u64>,
     /// Remove this release (its version text, as listed in the feed) from the feed; repeat for
     /// several. The release's files stay in the release directory.
     #[arg(long = "drop")]
-    drop: Vec<String>,
+    pub(crate) drop: Vec<String>,
     /// A release signer: a name from the config, `file:<path>` or `env:<VAR>`.
     #[arg(long = "sign", required = true)]
-    sign: Vec<String>,
+    pub(crate) sign: Vec<String>,
     #[command(flatten)]
-    state: StateArgs,
+    pub(crate) state: StateArgs,
 }
 
 fn say(line: &str) -> Result<()> {
@@ -109,17 +109,42 @@ fn feed_file_name(channel: &Channel) -> String {
     format!("feed-{}.json", channel.as_str())
 }
 
+/// What a writer runs under: the config, the file `--sign` names resolve against, and the clock.
+/// The commands load the config and take the writer clock (M3-D5); `publish push` hands its own
+/// (a config whose `state_path` is in its work directory).
+pub(crate) struct Writer<'a> {
+    /// The config file, for `--sign` names.
+    pub config_path: &'a Path,
+    /// The config; its `state_path` is the state file the writer checks and updates.
+    pub config: Config,
+    /// The clock the feed is issued and checked at.
+    pub clock: Box<dyn Clock>,
+}
+
+impl Writer<'_> {
+    fn of(config_path: &Path) -> Result<Writer<'_>> {
+        Ok(Writer {
+            config_path,
+            config: Config::load(config_path)?,
+            clock: writer_clock()?,
+        })
+    }
+}
+
 fn prepare(
-    config_path: &Path,
+    writer: Writer<'_>,
     dir: &Path,
     channel: &str,
     sign: &[String],
     require_prev: bool,
     over: StateArgs,
 ) -> Result<Prepared> {
-    let config = Config::load(config_path)?;
+    let Writer {
+        config_path,
+        config,
+        clock,
+    } = writer;
     let channel = Channel::parse(channel).context("--channel is not a valid channel name")?;
-    let clock = writer_clock()?;
     let now = clock.now_unix_secs();
     // Time checks are skipped on everything read (M3-D9); the signers' windows are checked at
     // `now` below, and the new feed is verified at `now`.
@@ -351,6 +376,11 @@ fn manifests_of(dir: &Path, version: &str) -> Result<BTreeMap<Target, ArtifactRe
 
 /// `feed add`: adds release `--version` to the channel's feed, or adds targets to it.
 pub fn add(config_path: &Path, args: &AddArgs) -> Result<()> {
+    add_with(Writer::of(config_path)?, args)
+}
+
+/// `feed add` in-process, under `writer`.
+pub(crate) fn add_with(writer: Writer<'_>, args: &AddArgs) -> Result<()> {
     let version = Version::parse(&args.version).context("--version is not a SemVer version")?;
     let seed = args
         .rollout_seed
@@ -358,7 +388,7 @@ pub fn add(config_path: &Path, args: &AddArgs) -> Result<()> {
         .map(|t| hex32(t, "--rollout-seed"))
         .transpose()?;
     let p = prepare(
-        config_path,
+        writer,
         &args.release_dir,
         &args.channel,
         &args.sign,
@@ -426,8 +456,13 @@ pub fn add(config_path: &Path, args: &AddArgs) -> Result<()> {
 
 /// `feed refresh`: the same releases under a new `seq`, `issued` and `expires`.
 pub fn refresh(config_path: &Path, args: &RefreshArgs) -> Result<()> {
+    refresh_with(Writer::of(config_path)?, args)
+}
+
+/// `feed refresh` in-process, under `writer`.
+pub(crate) fn refresh_with(writer: Writer<'_>, args: &RefreshArgs) -> Result<()> {
     let p = prepare(
-        config_path,
+        writer,
         &args.release_dir,
         &args.channel,
         &args.sign,

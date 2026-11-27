@@ -10,6 +10,7 @@ mod codec;
 mod docs;
 pub mod exe_headers;
 pub mod exec;
+mod fake_s3;
 mod hasher;
 mod http_server;
 mod integration;
@@ -21,6 +22,7 @@ pub mod replay;
 mod rng;
 mod seeds;
 mod signer;
+mod store;
 mod suites;
 mod transport;
 mod verifier;
@@ -33,6 +35,7 @@ pub use docs::{
     ChainFixture, PackBuilder, SUITE_APP_ID, SUITE_CHANNEL, SUITE_T0, TRUST_CHAIN_CASES, fake_sign,
     run_trust_chain_suite,
 };
+pub use fake_s3::{FakeS3Config, FakeS3Server, S3Fault, S3Request};
 pub use hasher::FakeHasher;
 pub use http_server::LoopbackServer;
 pub use integration::{
@@ -54,6 +57,7 @@ pub use publisher::{
 pub use rng::FakeRng;
 pub use seeds::{Seed, fuzz_seeds, sample_update_config};
 pub use signer::FakeSigner;
+pub use store::{MemStore, StoreFault, run_store_suite};
 pub use suites::{
     HashKat, SHA256_KATS, SignFixture, TransportCaps, VerifyKat, run_blocking_transport_suite,
     run_blocking_transport_suite_with, run_clock_suite, run_codec_suite, run_fs_suite,

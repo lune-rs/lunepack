@@ -1465,6 +1465,163 @@ be, so no attacker class gains anything from it that it had against the runtime:
   assertion or an `expect` in lunepack or a dependency) and is not under the binding's control; the binding
   adds nothing to it, the call returns `internal`, and no panic is expected in normal use.
 
+## The publish path (`lunepack publish`)
+
+`lunepack publish` ([`docs/CLI.md`](CLI.md), [`docs/PUBLISHING.md`](PUBLISHING.md)) adds a publisher-side
+network path: outbound `PUT`, `DELETE` and `GET` to the app's two buckets, signed with the store's own
+credentials. It adds no client-side trust input and changes no format: a client reads the same signed
+documents as before, and what it accepts is decided by the signing chain, never by the bucket.
+
+**Assets.** The release key (already in "Packager and signing keys"); the store credentials (an access
+key and its secret); the state file and the pending-deletes record in the private bucket.
+
+**Store credentials.**
+
+- They come only from the environment variables `[publish]` names; the config holds the names. A missing
+  or empty variable is an error that names the variable and never a value, before any request.
+- They are held in a `Credentials` value whose `Debug` is redacted and whose secret is zeroized on drop;
+  the signer builds each request's headers from them and the request's parts are the only thing sent.
+  A command prints no header, query string, endpoint address or key; the scenario suite scans the
+  output of every run for the made-up key, secret and `-----BEGIN`, with a positive control that proves
+  the scan catches a planted line.
+- The release key and the store credentials are separate secrets for separate jobs: a job that only
+  fetches, packs and builds a setup file needs the release key and no store credential, and a job that
+  only publishes needs both. `fetch` reads no credential at all.
+- The two commands that hold store tokens do different things. The **push token** reads, writes and
+  deletes in both buckets and runs only in the job the owner approves. The scheduled **refresh** job holds
+  two tokens: one that reads and writes the public bucket, and one that only reads the private bucket.
+  `refresh` writes only feeds, never the state file or the pending-deletes record, and runs no delete (the
+  pending deletes wait for the next `push`). The private bucket's token is read through its own variables,
+  `[publish] private_access_key_env` and `private_secret_key_env` (both or neither; without them the
+  private bucket uses the main pair). This is needed because the refresh job must write one bucket and
+  only read the other, and a token made in Cloudflare R2's dashboard carries one permission for all the
+  buckets it names. A single dashboard token with read and write on both buckets would let its holder
+  lower the state file's record, which is the refresh guard below, and bring back the rollback it stops.
+  With two variables set, the push job gives both pairs the push token.
+- In the documented CI example the release key and both tokens are secrets of GitHub environments, never
+  repository secrets: an environment secret reaches only a job that names the environment and only on a
+  ref its rules allow (the tag pattern for `pack` and `push`, the default branch for `refresh`; the owner's
+  approval on `push`). A repository secret would reach every workflow on every branch, so a person or bot
+  with write access but no release rights could send it out, bypassing the approval.
+- No job that holds a key compiles anything, and none runs a program it has not checked. Compiling the CLI
+  runs the build scripts of its dependencies, which would run beside the secrets. So one `tools-<os>` job
+  per operating system builds the CLI at a pinned version with no secret and publishes the binary's
+  SHA-256 as a job output. Each job that holds a key downloads that binary and refuses to run it unless
+  its SHA-256 equals `needs.tools-<os>.outputs.cli_sha256`. The `build` job runs third-party code, and a
+  process it leaves behind can use the run's artifact token to replace an artifact uploaded earlier in the
+  run. It cannot write another job's outputs, so a replaced binary fails the check. Only data passes
+  between jobs besides that: the build output, and the release directories, which `push` verifies
+  completely before uploading.
+- Requests are signed (SigV4, HMAC-SHA256 over `sha2`) at the system clock, never at
+  `SOURCE_DATE_EPOCH`; `push`, `refresh` and `init` refuse a set `SOURCE_DATE_EPOCH` before any network
+  access, so a workflow-wide setting cannot back-date a feed.
+
+**A stolen store key.** (The push token: a leaked token or a compromised store account; the refresh
+tokens are below.) The holder can read, replace and delete objects in both buckets. It cannot sign: a
+feed, manifest or key set it writes does not verify, and a pack or delta it replaces no longer matches
+the SHA-256 in the signed manifest, so a client rejects each (class 1 above). It can delete or hide
+objects (a denial of updates), replace a feed with an older genuine one (a client that has already seen
+a newer `seq` refuses it; one that has not, a fresh install, takes it, as with any hosting attacker), or
+plant objects that make the next `push` refuse (a published object is never replaced, so a differing
+object at a new version's path stops the push before any write).
+
+It can also **roll back the release set through the owner's next push**, which is worse than denial. It
+puts back an older genuine `feed-<channel>.json` (restoring any purged objects it lists from public
+copies) and lowers `feeds.<channel>` in the state file to that feed's `seq`. The next approved `push`
+then finds the store consistent with its `fetch` and the state file's record. Its `feed add` signs the
+older feed's releases plus the new version under a fresh `seq`. A release the owner had dropped is
+listed again, or a halted rollout resumes, now carrying the publisher's own signature, and every client
+accepts it. It never forges code: every release listed was genuinely published once. That is why the
+push token is the only token that writes the private bucket, and why the push job runs only with the
+owner's approval. A forged pending-deletes record still cannot make a push delete a release a feed
+lists: every key must lie under the prefix and in a version folder, and every feed is re-read and
+verified just before the deletes, which skip any key whose version a current feed lists.
+
+Recovery after a suspected leak: revoke the token first. Then, before the next push, compare each feed's
+releases and `seq` and the state file's record with a copy kept outside the store (the last `push` job's
+log, or the owner's own copy) and restore them. Nothing client-side changes.
+
+**A stolen refresh token.** The holder of the refresh job's two tokens can read both buckets (the
+private one holds the state file and the pending-deletes record: version and `seq` numbers and object
+paths, no secret) and write the public bucket. Write access to the public bucket covers every object in
+it, so it can overwrite any object there, and perhaps delete one (R2's documentation does not say whether
+its object-write permission excludes deletes). An overwritten object fails its signed hash, so that is
+denial only. While the private bucket's token is read-only, the holder cannot write the state file or the
+pending-deletes record. It cannot sign either, so what it can write is bounded as for the push token: it
+can plant or replace objects, which clients reject unless they match a signed document, and replace a
+feed with an older genuine one or with garbage, which is a denial of updates (and, for a client that
+never saw a newer `seq`, a replay, as with any hosting attacker). `refresh` itself refuses a store that
+was rolled back. It reads the state file's record and exits before signing or writing anything when a
+feed's `seq`, the key set or the root is below it.
+
+The record that guard compares with is what the last completed `push` or `publish drop` wrote: a push
+writes it in its last step, after its feeds and its deletes; a drop right after its feeds, before its
+deletes. In the window between such a run's feed write and its state write (a push's deletes, or a run
+that stopped there), the record still holds the previous `seq`. A holder of this token can put back the
+feed the run replaced then: its `seq` is not below the record, so the next refresh re-signs it under a
+`seq` above every earlier one. After a push that hides the new release and lists the dropped ones again,
+whose objects that push may already have deleted; a rerun of the push then stops at "the store changed
+since fetch", so the owner sees it. After a drop it lists the dropped release again (with its objects, if
+the holder put back copies of them). So rerun a push or a drop that stopped before its state write before
+the next refresh runs. Outside those windows, a refresh never re-signs an older document as the newest: a
+feed at least as new as the record is the recorded feed or a refresh of it, with the same releases. A
+refresh never takes a release out of a feed (it has no `--drop`), because a drop it made could not be
+recorded in a state file it cannot write; `publish drop` writes both buckets and runs with the push token.
+If the private bucket's token can write (one dashboard token with read and write on both buckets), the
+holder can lower the record itself, and the guard is gone: keep the two tokens apart.
+
+**Untrusted input on the publish path.** Every document read from a bucket is verified under the key
+set before anything is built on it (`keys.json`, the roots, each feed, each retained release's manifest,
+pack and deltas); the feeds of channels the state file records that `[publish]` no longer names are read
+and verified too, only to guard what they list (a guard feed that does not verify stops the command); a bucket answer is capped; a redirect is never followed; a `NoSuchBucket` answer is an
+error, not "nothing published". The pending-deletes record is parsed strictly (a closed format, sorted and
+unique lists, every key under the prefix and inside a version folder). Purge keys come only from the
+dropped releases' own verified manifests, never from a bucket listing, and each passes the `StoreKey`
+rules (under the prefix, no `..`, `//`, `/./`, whitespace, backslash or control character).
+
+**The key-set upload.** `push`, `refresh` and `drop` never write `keys.json` or a root. The owner's
+`publish keys` does, after checking that the directory's roots continue the store's, that the key set is
+newer, that the state file's record would not be lowered, and that every feed in the store (guard feeds
+too) and every manifest they list still verifies under the new key set, so an upload cannot leave clients
+with documents they reject. It uploads the new roots, then `keys.json` (re-read first to catch another
+writer), then the state file. A rotation stopped after a root upload leaves a store whose last root did
+not sign its `keys.json`; a client walking to that root refuses the key set. So when an upload fails,
+`publish keys` removes the roots this run uploaded, last first and only while `keys.json` still reads as
+the old one, and names any it could not remove. That narrows the harm, not to nothing: a client (or a CDN
+cache) that fetched the new root before its removal still refuses the key set, and a rerun that fails
+again removes only its own roots, not those an earlier run left. A rerun with the same directory that
+completes the change fixes each case. Only
+`publish keys` reads such a store, with the walk ended at the root the state file records, and only when
+every later root in the store is byte-equal to the directory's. `push`, `refresh` and `plan` refuse it.
+It runs on the owner's machine with the root signers, never in CI; an agent that is asked to revoke a key
+stops. Between the two moves of a revocation made through it the old key is still trusted, so the owner
+does them without delay: the new key goes into the CI environments, a release is signed with it, and
+`publish drop`, in the approved push job, takes out the releases only the old key signed and deletes them
+(`docs/PUBLISHING.md`).
+
+**What `fetch` proves.** `publish fetch` checks signatures and the chain, not expiry: it reads with the
+time checks skipped so an expired feed can still be refreshed. Nobody should read its exit status as
+"the feeds are fresh"; `plan` shows the expiry, `push` and `refresh` check it at the real time, and clients
+refuse an expired feed.
+
+**The race window.** `push`, `refresh` and `drop` re-read each feed just before writing it and refuse if it
+changed since the run read it. The store API has no conditional write that this path uses, so a
+concurrent publisher that writes between that read and the write is overwritten; the window is two
+requests. The consequences are bounded: no object is deleted that any feed lists (the deletes of a push
+or a drop re-read every feed it knows, guard feeds included; a refresh deletes nothing), the other publisher's release is missing from that feed until the next `push` lists it
+again (a rerun is safe, "Rerun and recovery" in `CLI.md`), and no client rejects anything it should
+accept. The defence is not to run two publishes at once: the apps' workflows use a concurrency group
+(`docs/PUBLISHING.md`); the commands take no local lock because each run works in its own temporary
+directory.
+
+**Not covered.** Objects that no manifest names (a hand-placed file, the leftovers of an abandoned
+upload) are never purged by the commands. A feed in the bucket for a channel that is neither in `[publish] channels` nor recorded in the state file (one an old script published) is not known to the commands and does not guard what it lists: keep such a channel in `channels` until its feed has expired. A single `push` cannot be atomic across the public and
+private buckets; the commit order (`CLI.md`) is what keeps every state a client can see consistent: a feed
+is written only after everything it lists, and an object is deleted only after no feed lists it. The
+first real run against a store is the user's, with `--dry-run` first; no automated test contacts a real
+store, and the loopback S3 the tests use proves our signer against a second implementation of SigV4,
+not against a vendor.
+
 ## Denial-of-service bounds
 
 | Resource | Bound |

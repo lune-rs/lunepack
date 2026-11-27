@@ -189,6 +189,36 @@ Example.dll
 194
 ```
 
+### Publishing the release and every later update
+
+The feed above is a directory you can serve from anywhere. To put each new version on an S3-compatible
+store (R2 first) and keep the feeds fresh, `lunepack publish` does the upload in the order a client
+needs and trims old releases; the walkthrough, with a CI workflow and the rules for an agent, is
+[`PUBLISHING.md`](PUBLISHING.md). In short, for the app above:
+
+```toml
+[publish]
+prefix = "dotnet"
+store = "r2"
+account_id_env = "EXAMPLE_R2_ACCOUNT_ID"
+access_key_env = "EXAMPLE_STORE_ACCESS_KEY"
+secret_key_env = "EXAMPLE_STORE_SECRET_KEY"
+public_bucket = "example-updates"
+private_bucket = "example-updates-private"
+```
+
+```sh
+lunepack publish init  --release-dir keys-dir            # once, by the owner of the keys
+lunepack publish fetch --release-dir release --version 1.1.0
+lunepack pack --input publish --version 1.1.0 --target linux-aarch64 \
+    --release-dir release --sign release --runtime lunepack-runtime
+lunepack publish push  --release-dir release --version 1.1.0 --sign release --dry-run
+```
+
+`fetch` brings the published feeds and the newest earlier releases into `release` so that `pack` builds
+deltas against them; `push` checks the store against that directory, verifies every retained release,
+uploads and trims. Nothing about the app, the runtime or the client changes.
+
 ## 5. Locating the runtime and the tree
 
 The runtime is `lunepack-runtime` (`lunepack-runtime.exe` on Windows) in the same directory as the app's

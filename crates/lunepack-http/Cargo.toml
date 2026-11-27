@@ -1,6 +1,6 @@
 [package]
 name = "lunepack-http"
-description = "HTTP release-source adapter for lunepack: HTTP and HTTPS through ureq with rustls and the platform certificate verifier, and a local-directory source."
+description = "HTTP release-source adapter for lunepack: HTTP and HTTPS through ureq with rustls and the platform certificate verifier, a local-directory source, and the S3-compatible and local-directory object stores a publisher uploads to."
 readme = "README.md"
 # The tests (their fixtures, goldens and the fuzz replay) are a checkout's, not a package's.
 exclude = ["/tests"]
@@ -20,6 +20,11 @@ lunepack-core.workspace = true
 # No gzip, no brotli, no aws-lc: the transport never negotiates or decodes a content coding.
 ureq = { workspace = true }
 url = { workspace = true }
+thiserror = { workspace = true }
+# The store adapters (P-D2): SigV4 is HMAC-SHA256 written here over `sha2`, and the credentials
+# wipe themselves on drop. Both are already in the lock (the crypto adapter uses them).
+sha2 = { workspace = true }
+zeroize = { workspace = true }
 # Only to recognise a TLS failure in an error chain (ureq reports a failed handshake as an I/O
 # error around the rustls one); the same crate and features ureq already links.
 rustls = { version = "0.23", default-features = false, features = ["std"] }

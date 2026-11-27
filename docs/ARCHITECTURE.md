@@ -133,6 +133,20 @@ suite its adapter runs):
   removes a path from new launches (M10-D20); the Windows adapter adds the file-system probe, and the Linux
   and macOS adapters scan every process of every user and count one they cannot read as in use (M11-D13).
 
+- `ObjectStore` (publishing, P-D1: `get(key, max_len) -> Option<bytes>`, `put(key, reader, len, sha256,
+  content_type)` and `delete(key)` over a validated `StoreKey`, which is always `<prefix>/<relative path>`:
+  under its prefix, no `..`, `//`, `/./`, whitespace, backslash or control character; `StoreError` has
+  `Status`, `Transport` (a closed set of kinds), `TooLarge`, `Io` and `Mismatch`; a body whose length or
+  SHA-256 differs from the declared is refused, so a failed upload stores nothing). The core opens no
+  file: the caller passes a reader. Implemented by `lunepack-http`'s `S3Store` (SigV4 over ureq, path-style,
+  for R2 and any S3-compatible store; no redirect is followed; its signer is our own, HMAC-SHA256 over `sha2`,
+  held to the RFC 4231 vectors and AWS's published SigV4 examples) and `DirStore` (a local directory for tests
+  and dry runs: `<dir>/<key>`, written through a temporary file and a rename, symlinks refused). The testkit has
+  `MemStore` (with fault injection and a call log) and `run_store_suite`, which both adapters run; its
+  `FakeS3Server` is a loopback S3 that verifies every request's signature with a second implementation of
+  SigV4, with one credential for every bucket or one per bucket (the CLI signs the private bucket with its
+  own pair when `[publish]` names one);
+
 `Clock` is implemented by `lunepack::SystemClock` and by the testkit's fake; the CLI adds a fixed
 clock for `SOURCE_DATE_EPOCH`. Each trait has a contract suite in the testkit that the real
 implementation's `tests/` runs, and a fake in the testkit. `LinuxProcess` and `XdgIntegration`

@@ -119,6 +119,10 @@ pub struct PackArgs {
     /// directory and no signer, and writes nothing to a release.
     #[arg(long)]
     assemble: Option<PathBuf>,
+    /// The channel the packed tree follows (P-D5): one of the config's `[publish] channels`;
+    /// without it the tree follows `[update] channel`.
+    #[arg(long)]
+    channel: Option<String>,
     /// Refuse a `--runtime`, `--ui`, `--stub` or `--service` that is not a binary this CLI pins
     /// (the project's signed list for this CLI's version; `lunepack prebuilt list`).
     #[arg(long = "require-pinned")]
@@ -364,6 +368,8 @@ struct UpdateInputs<'a> {
     ui: Option<&'a Path>,
     stub: Option<&'a Path>,
     service: Option<&'a Path>,
+    /// `--channel`, already checked against `[publish] channels`.
+    channel: Option<&'a Channel>,
     /// The `--input` directory, where a PNG `install.icon` is read from.
     input: &'a Path,
     /// The `--version` text, written into a stamped stub's version info.
@@ -571,14 +577,16 @@ fn prepare_update(
     if inputs.stub.is_some() && !target.is_windows() {
         bail!("--stub is only for windows-* targets");
     }
+    // `[install]` with the target's `[install.<os>]` laid over it (P-D5).
+    let install = settings.install_for(target);
     if target.is_windows() {
         if inputs.stub.is_none() {
             bail!("--stub is required for a windows-* target when the config has [update]");
         }
-        check_windows_install(&settings.install, version)?;
+        check_windows_install(&install, version)?;
     }
     if target.is_macos() {
-        check_macos_install(&settings.install)?;
+        check_macos_install(&install)?;
     }
     let root = config.trusted_root(&Sha256Hasher, &Ed25519Verifier)?;
     let mut document = UpdateConfig::new(
@@ -586,9 +594,12 @@ fn prepare_update(
         version.clone(),
         target,
         &settings.feed,
-        settings.channel.clone(),
+        inputs
+            .channel
+            .cloned()
+            .unwrap_or_else(|| settings.channel.clone()),
         settings.health_timeout_secs,
-        settings.install.clone(),
+        install,
     )
     .map_err(config_error)?;
     // M9-D6: what the installed tree enforces about the next update's publisher; `Off` is not
@@ -714,6 +725,11 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
     }
     let version = Version::parse(&args.version).context("--version is not a SemVer version")?;
     let target = Target::parse(&args.target)?;
+    let channel = args
+        .channel
+        .as_deref()
+        .map(|requested| config.pack_channel(requested))
+        .transpose()?;
     // M3-D10: a Windows host cannot know the exec bits of a Unix target.
     if cfg!(windows) && !target.is_windows() {
         bail!(
@@ -743,6 +759,7 @@ pub fn pack(config_path: &Path, args: &PackArgs, code_sign: &dyn CodeSign) -> Re
             ui: args.ui.as_deref(),
             stub: args.stub.as_deref(),
             service: args.service.as_deref(),
+            channel: channel.as_ref(),
             input: &args.input,
             version_text: &args.version,
             pins: &pins,

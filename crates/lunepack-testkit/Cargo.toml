@@ -14,6 +14,9 @@ workspace = true
 lunepack-core.workspace = true
 # Serialises frame descriptors for the fuzz seeds.
 serde_json = { workspace = true }
+# The fake S3 server (`fake_s3`) checks request signatures with a SigV4 of its own, which needs the
+# real SHA-256 (the testkit's own hasher deliberately is not one).
+sha2 = { workspace = true }
 # The replay generators (`replay`): random and mutated inputs for the fuzz harnesses. No
 # persistence, no fork.
 proptest = { version = "1", default-features = false, features = ["std"] }

@@ -2246,10 +2246,13 @@ dependencies = [
  "lunepack-testkit",
  "rcgen",
  "rustls",
+ "sha2",
  "tempfile",
+ "thiserror 2.0.21",
  "time",
  "ureq",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -2335,6 +2338,7 @@ dependencies = [
  "lunepack-core",
  "proptest",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

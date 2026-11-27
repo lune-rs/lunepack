@@ -25,7 +25,7 @@ use crate::release_dir::read_capped;
 
 /// The default state file name, in the config's directory.
 pub const DEFAULT_STATE: &str = "lunepack-state.json";
-const MAX_STATE_BYTES: u64 = 1024 * 1024;
+pub const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const FORMAT: u64 = 1;
 
 /// The state-check overrides every writer that builds on a previous document takes.

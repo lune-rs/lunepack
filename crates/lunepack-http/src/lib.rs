@@ -6,7 +6,10 @@
 //! - [`DirSource`]: `file:` URLs under one directory, for local mirrors and tests; it answers
 //!   `Range` like a server would and offers no validator.
 //!
-//! Both hand the core the response as it came: every header lowercased with duplicates kept, 4xx
+//! - [`S3Store`] and [`DirStore`]: the adapters of the core's `ObjectStore` (P-D1), an
+//!   S3-compatible HTTP store signed with SigV4 of our own (P-D2) and a local directory.
+//!
+//! The first two hand the core the response as it came: every header lowercased with duplicates kept, 4xx
 //! and 5xx as a [`Head`], the body as a plain `Read`. The core's response rules (`classify`) judge
 //! the answer; this crate never does.
 //!
@@ -18,8 +21,12 @@
 
 mod dir;
 mod proxy;
+mod sigv4;
+mod store;
 mod ureq_transport;
 
 pub use dir::DirSource;
 pub use proxy::proxy_for_url;
+pub use sigv4::Credentials;
+pub use store::{DirStore, S3ConfigError, S3Store};
 pub use ureq_transport::{UreqOptions, UreqTransport};
