@@ -859,7 +859,7 @@ try {
         Same 'Setup OriginalFilename' $v.OriginalFilename 'Setup.exe'
     }
     Row '9 (planted DLLs, garbage-file form)' {
-        $out = & (Join-Path $PSScriptRoot 'ci\plant-dll-test.ps1') -Case "setup=$setup=--no-such-option", "runtime=$runtime=--no-such-option", "console-stub=$stubConsole="
+        $out = & (Join-Path $PSScriptRoot 'ci\plant-dll-test.ps1') -Case "setup=$setup=--no-such-option", "runtime=$runtime=--no-such-option", "console-stub=$stubConsole=", "cli=$cli=--no-such-option"
         $out | ForEach-Object { Write-Output "     $_" }
         Require ($LASTEXITCODE -eq 0) 'no planted DLL breaks a start'
     }

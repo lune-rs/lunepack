@@ -554,8 +554,8 @@ paths it derived itself or read from a signed tree, and fails toward keeping fil
   `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)` as the first statement of `main`. Step 0 measured
   that `DependentLoadFlags` covers the static imports only and that a later `LoadLibrary` still searches the
   application's folder unless that call has been made, so both are needed. The end-to-end suite
-  (`scripts/e2e-windows.ps1`, row 9; `scripts/ci/plant-dll-test.ps1`) copies the setup file, the runtime
-  and the console stub into a fresh folder that also holds files named after DLLs none of them imports
+  (`scripts/e2e-windows.ps1`, row 9; `scripts/ci/plant-dll-test.ps1`) copies the setup file, the runtime,
+  the console stub and the `lunepack` CLI into a fresh folder that also holds files named after DLLs none of them imports
   statically; the files hold garbage, so a binary that loaded one fails to start with a loader error, and the
   test requires that each starts and ends with its own exit code. This is the garbage-file form: the
   module-sampling instrument of step 0 (it saw which DLLs a process loaded, and had a working control, an
