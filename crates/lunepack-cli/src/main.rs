@@ -145,13 +145,20 @@ fn publish_env(name: &str, field: &str) -> anyhow::Result<String> {
     }
 }
 
-/// The store credentials, from the variables `[publish]` names; read once per store, so no copy
-/// outlives the `Credentials` that zeroize it.
-fn store_credentials(publish: &PublishSettings) -> anyhow::Result<Credentials> {
-    Ok(Credentials::new(
-        publish_env(&publish.access_key_env, "access_key_env")?,
-        publish_env(&publish.secret_key_env, "secret_key_env")?,
-    ))
+/// The credentials of one bucket, from the variables `[publish]` names: the private bucket's own
+/// pair when `private_access_key_env` and `private_secret_key_env` are set (S4), else the shared
+/// pair. Read once per store, so no copy outlives the `Credentials` that zeroize it.
+fn store_credentials(publish: &PublishSettings, private: bool) -> anyhow::Result<Credentials> {
+    match (&publish.private_keys_env, private) {
+        (Some((access, secret)), true) => Ok(Credentials::new(
+            publish_env(access, "private_access_key_env")?,
+            publish_env(secret, "private_secret_key_env")?,
+        )),
+        _ => Ok(Credentials::new(
+            publish_env(&publish.access_key_env, "access_key_env")?,
+            publish_env(&publish.secret_key_env, "secret_key_env")?,
+        )),
+    }
 }
 
 /// The stores of `publish` (the composition root wires the adapters): `S3Store` for `r2` and `s3`,
@@ -168,33 +175,34 @@ fn open_stores(
         });
     }
     let clock: Arc<dyn lunepack_core::Clock> = Arc::new(lunepack::SystemClock);
-    let open = |bucket: &str| -> anyhow::Result<Box<dyn lunepack_core::ObjectStore>> {
-        let credentials = store_credentials(publish)?;
-        let store = match &publish.store {
-            StoreKind::R2 { account_id_env } => S3Store::r2(
-                &publish_env(account_id_env, "account_id_env")?,
-                bucket,
-                credentials,
-                clock.clone(),
-            ),
-            StoreKind::S3 {
-                endpoint_env,
-                region,
-            } => S3Store::new(
-                &publish_env(endpoint_env, "endpoint_env")?,
-                bucket,
-                region,
-                credentials,
-                clock.clone(),
-            ),
+    let open =
+        |bucket: &str, private: bool| -> anyhow::Result<Box<dyn lunepack_core::ObjectStore>> {
+            let credentials = store_credentials(publish, private)?;
+            let store = match &publish.store {
+                StoreKind::R2 { account_id_env } => S3Store::r2(
+                    &publish_env(account_id_env, "account_id_env")?,
+                    bucket,
+                    credentials,
+                    clock.clone(),
+                ),
+                StoreKind::S3 {
+                    endpoint_env,
+                    region,
+                } => S3Store::new(
+                    &publish_env(endpoint_env, "endpoint_env")?,
+                    bucket,
+                    region,
+                    credentials,
+                    clock.clone(),
+                ),
+            };
+            Ok(Box::new(
+                store.context("[publish] does not describe a usable store")?,
+            ))
         };
-        Ok(Box::new(
-            store.context("[publish] does not describe a usable store")?,
-        ))
-    };
     Ok(cmd_publish::Stores {
-        public: open(&publish.public_bucket)?,
-        private: open(&publish.private_bucket)?,
+        public: open(&publish.public_bucket, false)?,
+        private: open(&publish.private_bucket, true)?,
     })
 }
 

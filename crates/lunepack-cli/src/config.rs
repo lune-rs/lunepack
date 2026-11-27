@@ -62,6 +62,8 @@ struct RawPublish {
     region: Option<String>,
     access_key_env: String,
     secret_key_env: String,
+    private_access_key_env: Option<String>,
+    private_secret_key_env: Option<String>,
     public_bucket: String,
     private_bucket: String,
     keep: Option<u64>,
@@ -294,6 +296,9 @@ pub struct PublishSettings {
     pub access_key_env: String,
     /// Name of the variable holding the secret key.
     pub secret_key_env: String,
+    /// Names of the variables holding the access key id and the secret key of the private bucket
+    /// (S4): both or neither; without them the private bucket uses the pair above too.
+    pub private_keys_env: Option<(String, String)>,
     /// The bucket the clients read (feeds, manifests, packs).
     pub public_bucket: String,
     /// The bucket that holds the state file and the pending-deletes record.
@@ -596,11 +601,25 @@ fn publish_settings(
         }
         require_targets.push(target);
     }
+    let private_keys_env = match (&raw.private_access_key_env, &raw.private_secret_key_env) {
+        (None, None) => None,
+        (Some(access), Some(secret)) => Some((
+            env_name(file, "private_access_key_env", access)?,
+            env_name(file, "private_secret_key_env", secret)?,
+        )),
+        (Some(_), None) => bail!(
+            "{file}: publish.private_secret_key_env is required with publish.private_access_key_env (both or neither)"
+        ),
+        (None, Some(_)) => bail!(
+            "{file}: publish.private_access_key_env is required with publish.private_secret_key_env (both or neither)"
+        ),
+    };
     Ok(PublishSettings {
         prefix: raw.prefix,
         store,
         access_key_env: env_name(file, "access_key_env", &raw.access_key_env)?,
         secret_key_env: env_name(file, "secret_key_env", &raw.secret_key_env)?,
+        private_keys_env,
         public_bucket,
         private_bucket,
         keep: in_range(file, "keep", raw.keep, DEFAULT_PUBLISH_KEEP, 1..=100)?,
@@ -1258,6 +1277,7 @@ mod tests {
             (p.access_key_env.as_str(), p.secret_key_env.as_str()),
             ("APP_R2_KEY", "APP_R2_SECRET")
         );
+        assert_eq!(p.private_keys_env, None);
         assert_eq!(
             (p.public_bucket.as_str(), p.private_bucket.as_str()),
             ("app-public", "app-private")
@@ -1494,6 +1514,36 @@ mod tests {
         }
         let e = publish_err(&PUBLISH.replace("account_id_env = \"APP_R2_ACCOUNT_ID\"\n", ""));
         assert!(e.contains("publish.account_id_env is required"), "{e}");
+        // S4: the private bucket's own pair, both or neither, each a variable name.
+        let both = "private_access_key_env = \"APP_R2_STATE_KEY\"\nprivate_secret_key_env = \"APP_R2_STATE_SECRET\"\n";
+        let c = parse(&format!("{UPDATE}{INSTALL}{}", publish_with(both))).unwrap();
+        assert_eq!(
+            c.publish.unwrap().private_keys_env,
+            Some((
+                "APP_R2_STATE_KEY".to_owned(),
+                "APP_R2_STATE_SECRET".to_owned()
+            ))
+        );
+        for (half, named) in [
+            (
+                "private_access_key_env = \"APP_R2_STATE_KEY\"\n",
+                "publish.private_secret_key_env is required",
+            ),
+            (
+                "private_secret_key_env = \"APP_R2_STATE_SECRET\"\n",
+                "publish.private_access_key_env is required",
+            ),
+        ] {
+            let e = publish_err(&publish_with(half));
+            assert!(e.contains(named) && e.contains("both or neither"), "{e}");
+        }
+        let e = publish_err(&publish_with(
+            &both.replace("APP_R2_STATE_SECRET", "bad-name"),
+        ));
+        assert!(
+            e.contains("publish.private_secret_key_env is not an environment variable name"),
+            "{e}"
+        );
         // s3 needs its own keys and refuses r2's.
         let s3 = PUBLISH.replace("store = \"r2\"", "store = \"s3\"");
         let e = publish_err(&s3);

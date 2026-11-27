@@ -46,6 +46,9 @@ pub struct FakeS3Config {
     region: String,
     access_key: String,
     secret_key: String,
+    /// Buckets that accept only their own credential (access key, secret) instead of the one
+    /// above.
+    bucket_credentials: BTreeMap<String, (String, String)>,
     clock: Arc<dyn Clock>,
 }
 
@@ -63,7 +66,32 @@ impl FakeS3Config {
             region: region.to_owned(),
             access_key: access_key.to_owned(),
             secret_key: secret_key.to_owned(),
+            bucket_credentials: BTreeMap::new(),
             clock,
+        }
+    }
+
+    /// `bucket` accepts only this credential, and no other bucket accepts it (two tokens, each
+    /// scoped to its bucket).
+    #[must_use]
+    pub fn with_bucket_credential(
+        mut self,
+        bucket: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> FakeS3Config {
+        self.bucket_credentials.insert(
+            bucket.to_owned(),
+            (access_key.to_owned(), secret_key.to_owned()),
+        );
+        self
+    }
+
+    /// The credential `bucket` accepts.
+    fn credential_of(&self, bucket: &str) -> (&str, &str) {
+        match self.bucket_credentials.get(bucket) {
+            Some((access, secret)) => (access, secret),
+            None => (&self.access_key, &self.secret_key),
         }
     }
 }
@@ -725,7 +753,16 @@ fn verify(config: &FakeS3Config, request: &Received) -> Result<(String, String),
     let [access_key, day, region, service, terminator] = scope[..] else {
         return Err((400, "AuthorizationHeaderMalformed"));
     };
-    if access_key != config.access_key {
+    // The credential the request's bucket accepts (the path is checked in full below).
+    let bucket_of_path = decode_path(&request.target)
+        .and_then(|d| String::from_utf8(d).ok())
+        .and_then(|p| {
+            p.strip_prefix('/')
+                .map(|rest| rest.split_once('/').map_or(rest, |(b, _)| b).to_owned())
+        })
+        .unwrap_or_default();
+    let (accepted_key, accepted_secret) = config.credential_of(&bucket_of_path);
+    if access_key != accepted_key {
         return Err((403, "InvalidAccessKeyId"));
     }
     if region != config.region || service != "s3" || terminator != "aws4_request" {
@@ -778,7 +815,7 @@ fn verify(config: &FakeS3Config, request: &Received) -> Result<(String, String),
     }
 
     let wanted = expected_signature(
-        &config.secret_key,
+        accepted_secret,
         &request.method,
         raw_path,
         &signed_headers,

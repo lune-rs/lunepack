@@ -235,6 +235,97 @@ fn usage_errors_exit_2_and_refusals_exit_1() {
 }
 
 #[test]
+fn the_private_bucket_is_signed_with_its_own_pair_when_publish_names_one() {
+    // S4: two tokens, each scoped to its bucket, as R2's dashboard makes them.
+    let (mut f, origin) = Fixture::new(now() - 3600);
+    let (access, secret) = (made_up("AKID", 20), made_up("S", 40));
+    let (state_access, state_secret) = (made_up("BKID", 20), made_up("T", 40));
+    for v in [&access, &secret, &state_access, &state_secret] {
+        f.secrets.push(v.clone().into_bytes());
+    }
+    let server = FakeS3Server::start(
+        FakeS3Config::new(
+            &["hello-public", "hello-private"],
+            "us-east-1",
+            &access,
+            &secret,
+            Arc::new(lunepack::SystemClock),
+        )
+        .with_bucket_credential("hello-private", &state_access, &state_secret),
+    )
+    .unwrap();
+    server.seed(
+        "hello-public",
+        "hello/keys.json",
+        &fs::read(origin.join("keys.json")).unwrap(),
+    );
+    server.seed("hello-private", "hello/lunepack-state.json", &f.state());
+    let s3 = "store = \"s3\"\nendpoint_env = \"HELLO_S3_ENDPOINT\"\nregion = \"us-east-1\"";
+    let two = f.config(&format!(
+        "{s3}\nprivate_access_key_env = \"HELLO_STATE_KEY\"\nprivate_secret_key_env = \"HELLO_STATE_SECRET\""
+    ));
+    let one = f.config(s3);
+    let public: BTreeMap<String, Vec<u8>> = [(
+        "keys.json".to_owned(),
+        fs::read(origin.join("keys.json")).unwrap(),
+    )]
+    .into();
+    let rd = f.release_dir("rd", &public, "1.0.0");
+    let endpoint = server.endpoint();
+    let shared = [
+        ("HELLO_S3_ENDPOINT", endpoint.as_str()),
+        ("HELLO_STORE_KEY", access.as_str()),
+        ("HELLO_STORE_SECRET", secret.as_str()),
+    ];
+    // The shared pair alone reaches only the public bucket: the state file's read is refused.
+    let out = f.push(&one, &rd, "1.0.0", &["--dry-run"], &shared);
+    let err = assert_fails(&out, 1, "the shared pair on the private bucket");
+    assert!(
+        err.contains("hello/lunepack-state.json answered status 403"),
+        "{err}"
+    );
+    // With the private pair named but not set, the variable is named before any request.
+    server.clear_requests();
+    let out = f.push(&two, &rd, "1.0.0", &[], &shared);
+    let err = assert_fails(&out, 1, "the private pair unset");
+    assert!(
+        err.contains("HELLO_STATE_KEY ([publish] private_access_key_env) is not set"),
+        "{err}"
+    );
+    assert!(server.requests().is_empty(), "a request was made");
+    // Both pairs: each bucket is signed with its own, and the push completes.
+    let mut both = shared.to_vec();
+    both.push(("HELLO_STATE_KEY", state_access.as_str()));
+    both.push(("HELLO_STATE_SECRET", state_secret.as_str()));
+    let out = f.push(&two, &rd, "1.0.0", &[], &both);
+    assert_ok(&out, "push with two pairs");
+    let requests = server.requests();
+    assert!(
+        requests.iter().all(|r| r.status != 403),
+        "a request was refused"
+    );
+    for bucket in ["hello-public", "hello-private"] {
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.bucket == bucket && r.method == "PUT"),
+            "no write to {bucket}"
+        );
+    }
+    assert!(
+        server
+            .object("hello-private", "hello/lunepack-state.json")
+            .unwrap()
+            != f.state()
+    );
+    assert!(
+        server
+            .object("hello-public", "hello/feed-stable.json")
+            .is_some()
+    );
+}
+
+#[test]
 fn a_push_to_s3_runs_without_source_date_epoch_and_refuses_it() {
     // Every document was issued two hours ago (the pack job's SOURCE_DATE_EPOCH); the fake refuses
     // a request time more than 15 minutes from its own (system) clock.
