@@ -252,12 +252,23 @@ impl StoreTransportKind {
     }
 }
 
+/// What a refused read usually means, appended to the message of a `GET` that answered 403: AWS S3
+/// answers 403, not 404, for a missing key to a caller without `s3:ListBucket`, so a read of an
+/// absent object fails here (it is never taken as "absent").
+fn status_hint(method: StoreMethod, status: u16) -> &'static str {
+    if method == StoreMethod::Get && status == 403 {
+        " (the token may lack read access to this bucket; on AWS S3 it also needs s3:ListBucket on the bucket, or a missing object answers 403 instead of 404)"
+    } else {
+        ""
+    }
+}
+
 /// An [`ObjectStore`] operation failed. The key is always there; a credential never is.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StoreError {
     /// The store answered with a status that is not success (a `get` of a missing key is not one).
-    #[error("store: {method} {key} answered status {status}")]
+    #[error("store: {method} {key} answered status {status}{}", status_hint(*method, *status))]
     Status {
         /// The operation.
         method: StoreMethod,
@@ -618,6 +629,26 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "store: PUT apps/demo/keys.json answered status 403"
+        );
+        let e = StoreError::Status {
+            method: StoreMethod::Get,
+            key: key.clone(),
+            status: 403,
+        };
+        let text = e.to_string();
+        assert!(
+            text.starts_with("store: GET apps/demo/keys.json answered status 403 (")
+                && text.contains("s3:ListBucket"),
+            "{text}"
+        );
+        let e = StoreError::Status {
+            method: StoreMethod::Get,
+            key: key.clone(),
+            status: 500,
+        };
+        assert_eq!(
+            e.to_string(),
+            "store: GET apps/demo/keys.json answered status 500"
         );
         let e = StoreError::Transport {
             method: StoreMethod::Get,

@@ -612,6 +612,31 @@ fn the_fake_is_not_an_accept_everything_server() {
     );
 }
 
+#[test]
+fn a_403_on_a_get_is_an_error_with_the_listbucket_hint_never_an_absent_key() {
+    let f = Fixture::new();
+    let wrong = f.store_with(BUCKET, REGION, "not-the-secret", &f.clock);
+    let k = key("1.0.0/missing.bin");
+    let e = wrong.get(&k, 1).expect_err("403 is not absent");
+    assert!(matches!(
+        e,
+        StoreError::Status {
+            status: 403,
+            method: StoreMethod::Get,
+            ..
+        }
+    ));
+    let text = e.to_string();
+    assert!(
+        text.contains("GET")
+            && text.contains("1.0.0/missing.bin")
+            && text.contains("403")
+            && text.contains("s3:ListBucket"),
+        "{text}"
+    );
+    assert!(!f.leaks(&text));
+}
+
 // --- secrets never reach a message ---------------------------------------------------------------
 
 #[test]
