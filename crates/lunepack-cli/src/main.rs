@@ -235,6 +235,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn main() -> ExitCode {
+    // First, before any library load: only System32 from here on (M7-D10).
+    #[cfg(windows)]
+    lunepack_os_windows::harden_dll_search();
     // Usage errors and --help are handled (and exit) here; 2 is clap's status for a usage error.
     let cli = Cli::parse();
     match run(cli) {

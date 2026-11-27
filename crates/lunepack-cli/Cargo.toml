@@ -42,6 +42,10 @@ flate2 = { workspace = true }
 # here (boundary check CONFINED) and pinned exactly (M7-D22, D17).
 editpe = { version = "=0.2.4", default-features = false, features = ["std"] }
 
+# The DLL search hardening, first in `main` (M7-D10); the build script's link flags are the other half.
+[target.'cfg(windows)'.dependencies]
+lunepack-os-windows.workspace = true
+
 [dev-dependencies]
 lunepack-testkit.workspace = true
 base64 = { workspace = true }
