@@ -16,18 +16,16 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use lunepack_core::{Channel, Clock, ClockReading, Limits, VerifiedFeed};
+use lunepack_core::{Channel, Clock, ClockReading, Limits};
 
 use super::push::{FeedWrite, Phase, Plan, Shared, commit, show, work_feed};
 use super::work::{self, NotPublished, StoreRead, feed_rel};
 use super::{Stores, say, settings};
-use crate::cmd_feed::{self, RefreshArgs as FeedRefreshArgs, Writer};
+use crate::cmd_feed::{self, RefreshArgs as FeedRefreshArgs, SECS_PER_DAY, Writer};
 use crate::cmd_verify::check_release_dir;
 use crate::config::Config;
 use crate::release_dir::read_capped;
 use crate::state::{DEFAULT_STATE, State, StateArgs};
-
-const SECS_PER_DAY: u64 = 86_400;
 
 /// Arguments of `publish refresh`.
 #[derive(Args)]
@@ -116,13 +114,6 @@ pub(crate) fn run(job: &Job<'_>, stores: &Stores, order: &[Phase]) -> Result<()>
     ))
 }
 
-fn listed_versions<'a>(feeds: impl IntoIterator<Item = &'a VerifiedFeed>) -> BTreeSet<String> {
-    feeds
-        .into_iter()
-        .flat_map(|f| f.releases().iter().map(|r| r.version_text().to_owned()))
-        .collect()
-}
-
 /// Reads, checks and decides everything before the first write; `None` when there is nothing to
 /// do (a line saying so was printed).
 fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>> {
@@ -164,7 +155,7 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
         })
         .map(|(channel, _)| channel.clone())
         .collect();
-    let listed_before = listed_versions(read.feeds.values());
+    let listed_before = read.listed();
     let stale_uploading = read
         .pending
         .uploading
@@ -256,6 +247,7 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
         pending_existed,
         feed_keys,
         chain,
+        guard_feeds,
         ..
     } = read;
     Ok(Some(Plan {
@@ -271,7 +263,7 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
         deletes: BTreeSet::new(),
         feeds,
         feed_keys,
-        listed_after: listed_versions(feeds_after.values()),
+        listed_after: work::listed_versions(feeds_after.values().chain(guard_feeds.values())),
         state_key,
         state_read,
         state: state_bytes,

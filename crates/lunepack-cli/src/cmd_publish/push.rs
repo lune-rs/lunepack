@@ -162,13 +162,25 @@ pub(crate) struct Plan {
     /// The objects of the releases this run drops from every feed.
     pub deletes: BTreeSet<StoreKey>,
     pub feeds: Vec<FeedWrite>,
-    /// Every publish channel's feed key, for the delete filter.
+    /// Every feed key the delete filter reads: the `[publish]` channels' and the guard feeds'.
     pub feed_keys: Vec<(Channel, StoreKey)>,
     /// The version folders the new feeds list, for the dry run's view of the filter.
     pub listed_after: BTreeSet<String>,
     pub state_key: StoreKey,
     pub state_read: Vec<u8>,
     pub state: Vec<u8>,
+}
+
+impl Plan {
+    /// What to do after the race check refused: a push has release directories built against the
+    /// feed that moved, a refresh has nothing to rebuild.
+    fn rerun_hint(&self) -> &'static str {
+        if self.version.is_empty() {
+            "Run `publish refresh` again"
+        } else {
+            "Run `publish fetch` and `pack` again, then `publish push`"
+        }
+    }
 }
 
 /// `publish push`.
@@ -266,6 +278,7 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Plan> {
         root_doc_k,
         chain,
         feeds: feeds_before,
+        guard_feeds,
     } = work::read_store(stores, config, publish, &wdir, &state_file, &skip)?;
 
     // The release: every release directory's `<version>/` files, merged.
@@ -485,15 +498,11 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Plan> {
     }
 
     // What is dropped from every feed, and the objects that go with it (P-D10).
-    let listed = |feeds: &BTreeMap<Channel, VerifiedFeed>| -> BTreeSet<String> {
-        feeds
-            .values()
-            .flat_map(|f| f.releases().iter().map(|r| r.version_text().to_owned()))
-            .collect()
-    };
-    let listed_after = listed(&feeds_after);
+    // The feeds of channels outside `[publish]` stay as they are and keep what they list.
+    let listed_before = work::listed_versions(feeds_before.values().chain(guard_feeds.values()));
+    let listed_after = work::listed_versions(feeds_after.values().chain(guard_feeds.values()));
     let mut deletes = BTreeSet::new();
-    for dropped in listed(&feeds_before).difference(&listed_after) {
+    for dropped in listed_before.difference(&listed_after) {
         for rel in objects_of.get(dropped).into_iter().flatten() {
             let k = key(prefix, rel)?;
             if version_of(prefix, &k) != Some(dropped.as_str())
@@ -724,8 +733,9 @@ pub(crate) fn commit(plan: &Plan, stores: &Stores, order: &[Phase]) -> Result<()
                     let now = work::get(stores.public.as_ref(), &f.key, Limits::V1.feed_doc_bytes)?;
                     if now != f.read {
                         bail!(
-                            "{} changed in the store since this run read it (another publish?); it was not written. Run `publish fetch` again",
-                            f.key
+                            "{} changed in the store since this run read it (another publish?); it was not written. {}",
+                            f.key,
+                            plan.rerun_hint()
                         );
                     }
                     work::put_bytes(stores.public.as_ref(), &f.key, f.key.as_str(), &f.bytes)?;
@@ -1485,6 +1495,38 @@ pub(crate) mod tests {
         assert_eq!(w.listed("stable"), ["2.0.0"]);
         assert_eq!(w.listed("beta"), ["2.0.0"]);
         assert_eq!(w.folders(), set(&["2.0.0"]));
+        assert_consistent(&w);
+    }
+
+    #[test]
+    fn a_feed_of_a_channel_taken_out_of_the_config_still_protects_what_it_lists() {
+        let w = World::new(
+            "channels = [\"stable\", \"beta\"]\nprerelease_channels = [\"beta\"]\nkeep = 1\n",
+        );
+        w.publish("1.0.0");
+        // beta is taken out of `[publish]`; its feed stays in the bucket and the state records it.
+        let text = fs::read_to_string(&w.config).unwrap();
+        fs::write(
+            &w.config,
+            text.replace(
+                "channels = [\"stable\", \"beta\"]\nprerelease_channels = [\"beta\"]\n",
+                "channels = [\"stable\"]\n",
+            ),
+        )
+        .unwrap();
+        assert!(
+            fs::read_to_string(&w.config)
+                .unwrap()
+                .contains("channels = [\"stable\"]")
+        );
+        w.publish("1.1.0");
+        assert_eq!(w.listed("stable"), ["1.1.0"]);
+        assert_eq!(w.listed("beta"), ["1.0.0"], "the beta feed is not written");
+        assert_eq!(w.folders(), set(&["1.0.0", "1.1.0"]));
+        assert_eq!(w.pending(), Pending::default());
+        // The guard feed is read with the others, so the delete filter sees it too.
+        w.publish("1.2.0");
+        assert_eq!(w.folders(), set(&["1.0.0", "1.2.0"]));
         assert_consistent(&w);
     }
 

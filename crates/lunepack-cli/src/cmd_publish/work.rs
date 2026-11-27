@@ -21,7 +21,7 @@ use super::pending::{MAX_PENDING_BYTES, PENDING_NAME, Pending};
 use super::{Stores, say};
 use crate::config::{Config, PublishSettings};
 use crate::release_dir::{self, verify_feed_of};
-use crate::state::{DEFAULT_STATE, MAX_STATE_BYTES};
+use crate::state::{DEFAULT_STATE, MAX_STATE_BYTES, State};
 
 /// The key `<prefix>/<rel>`; an error names the relative path only.
 pub fn key(prefix: &str, rel: &str) -> Result<StoreKey> {
@@ -270,18 +270,41 @@ pub struct StoreRead {
     /// `keys.json`'s bytes, and the `root-<k>.json` files after the config's root.
     pub keys_bytes: Vec<u8>,
     pub roots: Vec<(u64, Vec<u8>)>,
-    /// The bytes of each `[publish]` channel's feed (`None`: none yet) and its key.
+    /// The bytes of each `[publish]` channel's feed (`None`: none yet).
     pub feeds_read: BTreeMap<Channel, Option<Vec<u8>>>,
+    /// The keys of every feed the commands must see: the `[publish]` channels' and those of the
+    /// channels the state file records that are no longer in `[publish]` (see `guard_feeds`).
     pub feed_keys: Vec<(Channel, StoreKey)>,
     /// The version of the root the walk ended at, and the key set under it.
     pub root_doc_k: u64,
     pub chain: KeysChain,
-    /// The feeds that exist, verified with the time checks skipped.
+    /// The `[publish]` channels' feeds that exist, verified with the time checks skipped.
     pub feeds: BTreeMap<Channel, VerifiedFeed>,
+    /// The feeds of channels outside `[publish] channels` that the state file records and the
+    /// public bucket still holds, verified with the time checks skipped. They are only read: no
+    /// command writes, refreshes or drops from them, but what they list is never purged.
+    pub guard_feeds: BTreeMap<Channel, VerifiedFeed>,
+}
+
+impl StoreRead {
+    /// The versions any feed in the store lists, a guard feed's included.
+    pub fn listed(&self) -> BTreeSet<String> {
+        listed_versions(self.feeds.values().chain(self.guard_feeds.values()))
+    }
+}
+
+/// The versions the `feeds` list, by their text.
+pub fn listed_versions<'a>(feeds: impl IntoIterator<Item = &'a VerifiedFeed>) -> BTreeSet<String> {
+    feeds
+        .into_iter()
+        .flat_map(|f| f.releases().iter().map(|r| r.version_text().to_owned()))
+        .collect()
 }
 
 /// Reads the state file and the pending record from the private store (the state file first) and
-/// `keys.json`, the roots and every `[publish]` channel's feed from the public store; writes them
+/// `keys.json`, the roots and every `[publish]` channel's feed from the public store, and the feeds
+/// of the channels the state file records that `[publish]` no longer names (they guard what they
+/// list, F1); writes them
 /// into `wdir` (and the state file to `state_file`) the way the feed writers open a release
 /// directory; and verifies the chain. A missing state file or `keys.json` is [`NotPublished`].
 pub fn read_store(
@@ -316,6 +339,14 @@ pub fn read_store(
         }
         .into());
     };
+    // Channels the state file records but `[publish]` does not name: their feeds are still read.
+    let recorded: Vec<Channel> = State::load(state_file)?
+        .record(&config.app_id)
+        .feeds
+        .keys()
+        .filter_map(|c| Channel::parse(c).ok())
+        .filter(|c| !publish.channels.contains(c))
+        .collect();
     let mut roots = Vec::new();
     for k in config.root_version + 1..=config.root_version + MAX_ROOT_STEPS {
         let rk = key(prefix, &format!("root-{k}.json"))?;
@@ -331,6 +362,14 @@ pub fn read_store(
         let got = read_doc(stores.public.as_ref(), &fk, Limits::V1.feed_doc_bytes)?;
         feeds_read.insert(channel.clone(), got);
         feed_keys.push((channel.clone(), fk));
+    }
+    let mut guard_read: Vec<(Channel, Vec<u8>)> = Vec::new();
+    for channel in recorded {
+        let fk = key(prefix, &feed_rel(&channel))?;
+        if let Some(bytes) = read_doc(stores.public.as_ref(), &fk, Limits::V1.feed_doc_bytes)? {
+            guard_read.push((channel.clone(), bytes));
+        }
+        feed_keys.push((channel, fk));
     }
 
     fs::write(release_dir::keys_path(wdir), &keys_bytes)
@@ -359,6 +398,17 @@ pub fn read_store(
             feeds.insert(channel.clone(), feed);
         }
     }
+    let mut guard_feeds: BTreeMap<Channel, VerifiedFeed> = BTreeMap::new();
+    for (channel, bytes) in &guard_read {
+        let feed = verify_feed_of(&chain, &config.app_id, channel, bytes, skip, &verifier)
+            .with_context(|| {
+                format!(
+                    "the store's {} (a channel the state file records, not in [publish] channels) does not verify; it must be read so that what it lists is never purged: delete that feed object yourself if the channel is gone",
+                    feed_rel(channel)
+                )
+            })?;
+        guard_feeds.insert(channel.clone(), feed);
+    }
     Ok(StoreRead {
         state_key,
         state_read,
@@ -371,6 +421,7 @@ pub fn read_store(
         root_doc_k: opened.root_doc_k,
         chain,
         feeds,
+        guard_feeds,
     })
 }
 

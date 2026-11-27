@@ -25,7 +25,7 @@ use crate::place;
 use crate::release_dir::{self, read_capped};
 use crate::state::{Compared, Record, State, StateArgs};
 
-const SECS_PER_DAY: u64 = 86_400;
+pub(crate) const SECS_PER_DAY: u64 = 86_400;
 /// About a century; a bound so the day count cannot overflow the second count.
 const MAX_EXPIRES_DAYS: u64 = 36_500;
 const MANIFEST_SUFFIX: &str = ".manifest.json";

@@ -7,7 +7,6 @@
 //! `publish push` with its release directories or a clean-up by hand. Its objects are named from
 //! the store's manifests of it, verified under the key set, when any are there.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -20,10 +19,9 @@ use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
 use super::push::drops;
 use super::work::{self, StoreRead, feed_rel, key};
 use super::{Stores, Usage, say, settings};
+use crate::cmd_feed::SECS_PER_DAY;
 use crate::config::Config;
 use crate::state::DEFAULT_STATE;
-
-const SECS_PER_DAY: u64 = 86_400;
 
 /// Arguments of `publish plan`.
 #[derive(Args)]
@@ -81,23 +79,30 @@ pub fn plan(config_path: &Path, args: &PlanArgs, open: super::OpenStores<'_>) ->
     )?;
 
     // The feeds as they are.
+    let describe = |channel: &Channel, feed: &VerifiedFeed| {
+        let mut releases: Vec<_> = feed.releases().iter().collect();
+        releases.sort_by(|a, b| b.version().cmp(a.version()));
+        let names: Vec<&str> = releases.iter().map(|r| r.version_text()).collect();
+        format!(
+            "{}: seq {}, {}, {} release(s): {}",
+            feed_rel(channel),
+            feed.seq(),
+            expiry(feed, now),
+            names.len(),
+            names.join(", ")
+        )
+    };
     for channel in &publish.channels {
         match read.feeds.get(channel) {
             None => say(&format!("{}: absent", feed_rel(channel)))?,
-            Some(feed) => {
-                let mut releases: Vec<_> = feed.releases().iter().collect();
-                releases.sort_by(|a, b| b.version().cmp(a.version()));
-                let names: Vec<&str> = releases.iter().map(|r| r.version_text()).collect();
-                say(&format!(
-                    "{}: seq {}, {}, {} release(s): {}",
-                    feed_rel(channel),
-                    feed.seq(),
-                    expiry(feed, now),
-                    names.len(),
-                    names.join(", ")
-                ))?;
-            }
+            Some(feed) => say(&describe(channel, feed))?,
         }
+    }
+    for (channel, feed) in &read.guard_feeds {
+        say(&format!(
+            "{} (not in [publish] channels; never written, and what it lists is never purged)",
+            describe(channel, feed)
+        ))?;
     }
 
     // What a push of the version would do to each feed.
@@ -163,11 +168,7 @@ fn report_pending(read: &StoreRead, prefix: &str, stores: &Stores, now: u64) -> 
             say(&format!("  {k}"))?;
         }
     }
-    let listed: BTreeSet<String> = read
-        .feeds
-        .values()
-        .flat_map(|f| f.releases().iter().map(|r| r.version_text().to_owned()))
-        .collect();
+    let listed = read.listed();
     for v in &read.pending.uploading {
         if listed.contains(v) {
             say(&format!(
