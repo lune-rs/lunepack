@@ -375,12 +375,27 @@ fn init_uploads_roots_then_keys_then_state_and_refuses_an_existing_document() {
         f.state()
     );
 
-    // The store now holds them: a second init names the first.
+    // The store now holds exactly them: a second init has nothing to upload (F7: a rerun after a
+    // failed upload keeps what is there).
     let before = tree(&fresh);
     let out = f.command(&config, "init", &["--release-dir", &origin_arg], &fresh);
-    let err = assert_fails(&out, 1, "second init");
+    assert_ok(&out, "second init");
     assert!(
-        err.contains(&format!("already holds {P}/root-2.json")),
+        stdout(&out).contains(&format!("nothing to upload: {P}/ already holds")),
+        "{}",
+        stdout(&out)
+    );
+    assert!(tree(&fresh) == before);
+    // Other bytes at one of them: refused, naming it.
+    let state_at = fresh.join("private").join(P).join("lunepack-state.json");
+    let mut other = fs::read(&state_at).unwrap();
+    other.push(b'\n');
+    fs::write(&state_at, &other).unwrap();
+    let before = tree(&fresh);
+    let out = f.command(&config, "init", &["--release-dir", &origin_arg], &fresh);
+    let err = assert_fails(&out, 1, "second init, other state");
+    assert!(
+        err.contains(&format!("already holds {P}/lunepack-state.json")),
         "{err}"
     );
     assert!(tree(&fresh) == before);

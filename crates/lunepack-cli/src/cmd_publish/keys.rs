@@ -16,8 +16,14 @@
 //! 4. uploads the new `root-<k>.json` files, then `keys.json`, then the state file (its record of
 //!    the root and key set), after re-reading `keys.json` to catch another writer.
 //!
-//! A rerun after any failure completes the rest: a `keys.json` already equal to the store's is
-//! kept, and only a state record that is behind is written.
+//! A rerun after any failure completes the rest (F7): a `keys.json` already equal to the store's
+//! is kept, and only a state record that is behind is written. A rotation that stopped after a
+//! `root-<k>.json` upload leaves a store whose last root did not sign its `keys.json`, which no
+//! other command reads; this command alone reads such a store with the walk ended at the root the
+//! state file records, when every root after it is byte-equal to the directory's, and uploads the
+//! rest. When an upload of this run fails, the roots this run uploaded are removed again (last
+//! first, and only while the store's `keys.json` is still the old one), so clients keep a store
+//! they can read; a root that cannot be removed is named and left to the rerun.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -83,7 +89,13 @@ pub fn keys(config_path: &Path, args: &KeysArgs, open: super::OpenStores<'_>) ->
     fs::create_dir(&wdir).context("cannot create the work directory")?;
     let state_file = work.path().join(DEFAULT_STATE);
     let skip = ClockReading::read(&lunepack::SystemClock, Some(u64::MAX));
-    let read = work::read_store(&stores, &config, publish, &wdir, &state_file, &skip)?;
+    let read = match work::read_store(&stores, &config, publish, &wdir, &state_file, &skip) {
+        Ok(read) => read,
+        Err(e) => match half_done(&stores, &config, publish, work.path(), &new_roots, &skip)? {
+            Some(read) => read,
+            None => return Err(e),
+        },
+    };
 
     // The store's roots must be the start of the directory's: the directory was made from them.
     if new_roots.len() < read.roots.len() || new_roots[..read.roots.len()] != read.roots[..] {
@@ -180,8 +192,16 @@ pub fn keys(config_path: &Path, args: &KeysArgs, open: super::OpenStores<'_>) ->
             );
         }
     }
+    let mut sent_roots: Vec<&StoreKey> = Vec::new();
     for (at, rel, bytes) in &uploads {
-        work::put_bytes(stores.public.as_ref(), at, rel, bytes)?;
+        if rel.starts_with("root-") {
+            // Noted before the request: a lost answer may have stored it.
+            sent_roots.push(at);
+        }
+        if let Err(e) = work::put_bytes(stores.public.as_ref(), at, rel, bytes) {
+            take_back(&stores, prefix, &sent_roots, &read.keys_bytes)?;
+            return Err(e);
+        }
         say(&format!("uploaded: {at}"))?;
     }
     if state_changed {
@@ -197,6 +217,106 @@ pub fn keys(config_path: &Path, args: &KeysArgs, open: super::OpenStores<'_>) ->
         "published: key set version {} under {prefix}/",
         new_chain.keys().version()
     ))
+}
+
+/// F7: the store as a rotation that stopped part-way left it, or `None`. It is read with the root
+/// walk ended at the root the state file records (the config's root when it records none), and is
+/// taken only when that read verifies and every store root after that one is byte-equal to the
+/// directory's root of the same number: this run then uploads the rest.
+fn half_done(
+    stores: &Stores,
+    config: &Config,
+    publish: &crate::config::PublishSettings,
+    work_root: &Path,
+    dir_roots: &[(u64, Vec<u8>)],
+    skip: &ClockReading,
+) -> Result<Option<StoreRead>> {
+    let state_file = work_root.join("half-done-state.json");
+    let state_key = key(publish.prefix.as_str(), DEFAULT_STATE)?;
+    // Any failure here reports the first read's error instead.
+    let Ok(Some(state_bytes)) = work::get(
+        stores.private.as_ref(),
+        &state_key,
+        crate::state::MAX_STATE_BYTES,
+    ) else {
+        return Ok(None);
+    };
+    fs::write(&state_file, &state_bytes).context("cannot write the work directory")?;
+    let Ok(state) = State::load(&state_file) else {
+        return Ok(None);
+    };
+    let walk_to = state
+        .record(&config.app_id)
+        .root_version
+        .unwrap_or(config.root_version);
+    let wdir = work_root.join("half-done");
+    fs::create_dir(&wdir).context("cannot create the work directory")?;
+    let Ok(read) = work::read_store_walk(
+        stores,
+        config,
+        publish,
+        &wdir,
+        &state_file,
+        skip,
+        Some(walk_to),
+    ) else {
+        return Ok(None);
+    };
+    let after: Vec<&(u64, Vec<u8>)> = read.roots.iter().filter(|(k, _)| *k > walk_to).collect();
+    if after.is_empty() || after.iter().any(|root| !dir_roots.contains(root)) {
+        return Ok(None);
+    }
+    // The state file the rest of the run reads is this one.
+    fs::copy(&state_file, work_root.join(DEFAULT_STATE))
+        .context("cannot write the work directory")?;
+    say(&format!(
+        "notice: the store holds {} of this directory but the keys.json root-{walk_to} signed: a `publish keys` stopped part-way; this run uploads the rest",
+        after
+            .iter()
+            .map(|(k, _)| format!("root-{k}.json"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))?;
+    Ok(Some(read))
+}
+
+/// F7: after a failed upload, removes the roots this run sent (`sent`, last first), while the
+/// store's `keys.json` is still `old_keys`; a root walk past the root that signed `keys.json` would
+/// stop every client. Each outcome is printed; nothing here fails the run (the upload's error is
+/// the one reported, and a rerun finishes what is left).
+fn take_back(stores: &Stores, prefix: &str, sent: &[&StoreKey], old_keys: &[u8]) -> Result<()> {
+    if sent.is_empty() {
+        return Ok(());
+    }
+    let keys_key = key(prefix, "keys.json")?;
+    match work::get(stores.public.as_ref(), &keys_key, Limits::V1.keys_doc_bytes) {
+        Ok(Some(now)) if now == old_keys => {}
+        _ => {
+            // keys.json may be the new one (an answer lost after the write): the roots stay.
+            return say(&format!(
+                "not removed: {} ({keys_key} could not be read back as the old one); run `publish keys` again to finish",
+                sent.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    for at in sent.iter().rev() {
+        match stores.public.delete(at) {
+            Ok(()) => say(&format!(
+                "removed: {at} (uploaded by this run; the store's keys.json is still the old one)"
+            ))?,
+            Err(e) => {
+                say(&format!(
+                    "not removed: {at}: {e}; run `publish keys` again to finish"
+                ))?;
+                // An earlier root stays too: the walk must not skip a number.
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The feeds in the store and the manifests they list that do not verify under `chain`'s key set,
@@ -266,7 +386,7 @@ mod tests {
     use lunepack_testkit::StoreFault;
 
     use super::*;
-    use crate::cmd_publish::push::tests::{Bucket, World, parse, s};
+    use crate::cmd_publish::push::tests::{Bucket, World, parse, s, snapshot_of};
     use crate::state::DEFAULT_STATE;
 
     fn keys_in(w: &World, rd: &Path, dry_run: bool) -> Result<()> {
@@ -440,6 +560,99 @@ mod tests {
         // The next push reads the walk through the new root.
         w.publish("1.1.0");
         assert_eq!(w.listed("stable"), ["1.0.0", "1.1.0"]);
+    }
+
+    /// A fetched directory with a root rotation of `steps` steps, ready for `publish keys`.
+    fn rotated(w: &World, name: &str, steps: usize) -> PathBuf {
+        let rd = w.fetch(name);
+        let mut signer = w.root_signer.clone();
+        for i in 0..steps {
+            signer = w.rotate_root(&rd, &signer, &format!("{name}-root{}", i + 2));
+        }
+        rd
+    }
+
+    /// What push, refresh and plan read first: `read_store`, which walks every root.
+    fn others_read(w: &World) -> Result<()> {
+        let config = Config::load(&w.config)?;
+        let (_, publish) = settings(&config)?;
+        let work = tempfile::tempdir()?;
+        let wdir = work.path().join("release");
+        fs::create_dir(&wdir)?;
+        let skip = ClockReading::read(&lunepack::SystemClock, Some(u64::MAX));
+        work::read_store(
+            &w.stores(),
+            &config,
+            publish,
+            &wdir,
+            &work.path().join(DEFAULT_STATE),
+            &skip,
+        )
+        .map(|_| ())
+    }
+
+    /// F7: a rotation (one step, then two) stopped at each of its writes, by a refused request or
+    /// by an answer lost after the write, with the take-back of the roots working or failing: the
+    /// rerun with the same directory completes it, the store is then the clean run's, and a push
+    /// follows. While the take-back works, the store stays one a client reads; a store left half
+    /// done is refused by the reader every other command uses.
+    #[test]
+    fn a_rotation_stopped_at_any_write_is_completed_by_a_rerun() {
+        for steps in [1, 2] {
+            let w = World::new("");
+            w.publish("1.0.0");
+            let rd = rotated(&w, &format!("rd-rotate-{steps}"), steps);
+            let snap = w.snapshot();
+            w.clear_log();
+            keys_in(&w, &rd, false).unwrap();
+            let done = snapshot_of(&w.public);
+            let record = w.state_record();
+            let points = w.writes();
+            assert_eq!(points.len(), steps + 2, "{points:?}");
+            let mut half_done = 0;
+            for take_back_fails in [false, true] {
+                for fault in [StoreFault::Status(500), StoreFault::LostAnswer] {
+                    for (bucket, _, at) in &points {
+                        let what = format!(
+                            "{steps} step(s), {fault:?} at {at}, take-back fails: {take_back_fails}"
+                        );
+                        w.restore(&snap);
+                        let store = match bucket {
+                            Bucket::Public => &w.public,
+                            Bucket::Private => &w.private,
+                        };
+                        let at = StoreKey::parse(crate::cmd_publish::push::tests::P, at).unwrap();
+                        store.inject(StoreMethod::Put, Some(&at), fault);
+                        if take_back_fails {
+                            w.public
+                                .inject(StoreMethod::Delete, None, StoreFault::Status(503));
+                        }
+                        assert!(keys_in(&w, &rd, false).is_err(), "{what}");
+                        w.public.clear_faults();
+                        w.private.clear_faults();
+                        if w.readable() {
+                            others_read(&w).unwrap_or_else(|e| panic!("{what}: {e:#}"));
+                        } else {
+                            assert!(take_back_fails, "{what}: the take-back left it unreadable");
+                            half_done += 1;
+                            let e = format!("{:#}", others_read(&w).unwrap_err());
+                            assert!(
+                                e.contains("does not verify") && e.contains("publish keys"),
+                                "{what}: {e}"
+                            );
+                        }
+                        keys_in(&w, &rd, false)
+                            .unwrap_or_else(|e| panic!("{what}: the rerun failed: {e:#}"));
+                        assert!(snapshot_of(&w.public) == done, "{what}");
+                        assert_eq!(w.state_record(), record, "{what}");
+                    }
+                }
+            }
+            // With a failed take-back, a root stored before the fault (or by it) is left: half done.
+            assert_eq!(half_done, 2 * steps, "{steps} step(s)");
+            w.publish("1.1.0");
+            assert_eq!(w.listed("stable"), ["1.0.0", "1.1.0"]);
+        }
     }
 
     #[test]

@@ -2,9 +2,11 @@
 //! a new app, from a release directory `lunepack init` and `lunepack keys set` made.
 //!
 //! It checks the directory's root walk and `keys.json` under the config's root, takes the state
-//! file's record of this app (and no other app's), refuses when the store already holds any
-//! document it would write (naming the first), and then uploads the roots, `keys.json` and the
-//! state file, in that order. An existing prefix needs no init: its documents are already there.
+//! file's record of this app (and no other app's), refuses when the store already holds other
+//! bytes at any document it would write (naming the first), and then uploads the roots,
+//! `keys.json` and the state file, in that order. A document already there with exactly these
+//! bytes is kept, so a rerun after a failed upload completes the rest (F7). An existing prefix
+//! needs no init: its documents are already there.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,16 +49,32 @@ struct Item {
     private: bool,
 }
 
-/// Whether the store has an object at `at`: an object over `cap` exists too.
-fn exists(store: &dyn ObjectStore, at: &StoreKey, cap: u64) -> Result<bool> {
-    let found = match store.get(at, cap) {
-        Ok(got) => got.is_some(),
-        Err(StoreError::TooLarge { .. }) => true,
+/// What the store has at an item's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Found {
+    Absent,
+    /// Exactly the item's bytes (an earlier run's upload).
+    Same,
+    /// Other bytes, or an object over the item's cap.
+    Other,
+}
+
+/// What the store has at `item.at`.
+fn found(store: &dyn ObjectStore, item: &Item) -> Result<Found> {
+    let found = match store.get(&item.at, item.cap) {
+        Ok(None) => Found::Absent,
+        Ok(Some(bytes)) if bytes == item.bytes => Found::Same,
+        Ok(Some(_)) | Err(StoreError::TooLarge { .. }) => Found::Other,
         Err(e) => return Err(e.into()),
     };
     say(&format!(
-        "read: {at} {}",
-        if found { "found" } else { "absent" }
+        "read: {} {}",
+        item.at,
+        match found {
+            Found::Absent => "absent",
+            Found::Same => "found, the same bytes",
+            Found::Other => "found",
+        }
     ))?;
     Ok(found)
 }
@@ -131,16 +149,24 @@ pub fn init(config_path: &Path, args: &InitArgs, open: super::OpenStores<'_>) ->
             stores.public.as_ref()
         }
     };
+    let mut todo = Vec::new();
     for item in &items {
-        if exists(store_of(item), &item.at, item.cap)? {
-            bail!(
+        match found(store_of(item), item)? {
+            Found::Absent => todo.push(item),
+            Found::Same => {}
+            Found::Other => bail!(
                 "the store already holds {} (nothing was written): `publish init` writes only into an empty prefix",
                 item.at
-            );
+            ),
         }
     }
+    if todo.is_empty() {
+        return say(&format!(
+            "nothing to upload: {prefix}/ already holds these documents"
+        ));
+    }
     if args.dry_run {
-        for item in &items {
+        for item in &todo {
             say(&format!(
                 "would upload: {} ({} bytes)",
                 item.at,
@@ -149,9 +175,73 @@ pub fn init(config_path: &Path, args: &InitArgs, open: super::OpenStores<'_>) ->
         }
         return say("dry run: nothing was written");
     }
-    for item in &items {
+    for item in &todo {
         work::put_bytes(store_of(item), &item.at, &item.rel, &item.bytes)?;
         say(&format!("uploaded: {}", item.at))?;
     }
     say(&format!("initialized: {prefix}/"))
+}
+
+#[cfg(test)]
+mod tests {
+    //! `publish init` over in-memory stores: a run stopped at any write is completed by a rerun.
+
+    use lunepack_core::StoreMethod;
+    use lunepack_testkit::StoreFault;
+
+    use super::*;
+    use crate::cmd_publish::push::tests::{Bucket, P, Snapshot, World, parse, s};
+
+    fn init_in(w: &World, rd: &Path) -> Result<()> {
+        let open = |_: &crate::config::PublishSettings, _: Option<&Path>| Ok(w.stores());
+        init(
+            &w.config,
+            &parse::<InitArgs>(&["--release-dir", s(rd)]),
+            &open,
+        )
+    }
+
+    /// F7: an init (with a root rotation, so it writes a root, `keys.json` and the state file)
+    /// stopped at each write, by a refused request or an answer lost after the write: the rerun
+    /// completes it to the clean run's store, and a push follows.
+    #[test]
+    fn a_rerun_completes_an_init_stopped_at_any_write() {
+        let w = World::new("");
+        let origin = w.dir.path().join("origin");
+        w.rotate_root(&origin, &w.root_signer, "init-root2");
+        let empty = (Snapshot::new(), Snapshot::new());
+        w.restore(&empty);
+        init_in(&w, &origin).unwrap();
+        let done = w.snapshot();
+        let points = w.writes();
+        assert_eq!(
+            points
+                .iter()
+                .map(|(_, _, k)| k.rsplit('/').next().unwrap())
+                .collect::<Vec<_>>(),
+            ["root-2.json", "keys.json", DEFAULT_STATE]
+        );
+        for fault in [StoreFault::Status(500), StoreFault::LostAnswer] {
+            for (bucket, _, at) in &points {
+                w.restore(&empty);
+                let store = match bucket {
+                    Bucket::Public => &w.public,
+                    Bucket::Private => &w.private,
+                };
+                let at = StoreKey::parse(P, at).unwrap();
+                store.inject(StoreMethod::Put, Some(&at), fault);
+                assert!(init_in(&w, &origin).is_err(), "{fault:?} at {at}");
+                w.public.clear_faults();
+                w.private.clear_faults();
+                init_in(&w, &origin)
+                    .unwrap_or_else(|e| panic!("{fault:?} at {at}: the rerun failed: {e:#}"));
+                assert!(w.snapshot() == done, "{fault:?} at {at}");
+            }
+        }
+        // A finished init has nothing to upload, and a push reads what it wrote.
+        w.clear_log();
+        init_in(&w, &origin).unwrap();
+        assert!(w.writes().is_empty(), "{:?}", w.writes());
+        w.publish("1.0.0");
+    }
 }

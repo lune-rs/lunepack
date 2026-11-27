@@ -317,6 +317,22 @@ pub fn read_store(
     state_file: &Path,
     skip: &ClockReading,
 ) -> Result<StoreRead> {
+    read_store_walk(stores, config, publish, wdir, state_file, skip, None)
+}
+
+/// [`read_store`], with the root walk ended at `root-<walk_to>.json` when `walk_to` is given: the
+/// roots after it are read into [`StoreRead::roots`] but not walked, and `keys.json` and the feeds
+/// are verified under the root the walk ends at. Only `publish keys` passes `Some`, to read a store
+/// whose rotation it left half done (F7); every other command walks every root.
+pub fn read_store_walk(
+    stores: &Stores,
+    config: &Config,
+    publish: &PublishSettings,
+    wdir: &Path,
+    state_file: &Path,
+    skip: &ClockReading,
+    walk_to: Option<u64>,
+) -> Result<StoreRead> {
     let prefix = publish.prefix.as_str();
     let state_key = key(prefix, DEFAULT_STATE)?;
     let Some(state_read) = read_doc(stores.private.as_ref(), &state_key, MAX_STATE_BYTES)? else {
@@ -376,7 +392,10 @@ pub fn read_store(
 
     fs::write(release_dir::keys_path(wdir), &keys_bytes)
         .context("cannot write the work directory")?;
-    for (k, bytes) in &roots {
+    for (k, bytes) in roots
+        .iter()
+        .filter(|(k, _)| walk_to.is_none_or(|to| *k <= to))
+    {
         fs::write(release_dir::root_path(wdir, *k), bytes)
             .context("cannot write the work directory")?;
     }
@@ -388,7 +407,7 @@ pub fn read_store(
     }
     let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
     let opened = release_dir::open(wdir, config, &hasher, &verifier, skip)
-        .context("the store's key set does not verify")?;
+        .context("the store's key set does not verify (if a `publish keys` stopped after uploading a root-<k>.json, run that `publish keys` again to finish it)")?;
     let chain = opened
         .chain
         .ok_or_else(|| anyhow!("internal error: keys.json vanished"))?;

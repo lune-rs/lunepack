@@ -843,7 +843,7 @@ pub(crate) mod tests {
     use super::*;
 
     const APP: &str = "org.example.hello";
-    const P: &str = "hello";
+    pub(crate) const P: &str = "hello";
 
     #[derive(Parser)]
     pub(crate) struct Wrap<A: clap::Args> {
@@ -1246,6 +1246,49 @@ pub(crate) mod tests {
 
         pub(crate) fn snapshot(&self) -> (Snapshot, Snapshot) {
             (snapshot_of(&self.public), snapshot_of(&self.private))
+        }
+
+        /// `keys rotate-root` in `rd`: a new root key (generated as `<name>` in the world's
+        /// directory), signed by the root key file `old` and the new one. Returns the new key
+        /// file.
+        pub(crate) fn rotate_root(&self, rd: &Path, old: &Path, name: &str) -> PathBuf {
+            let new_root = lunepack_crypto::generate_key_file(&self.dir.path().join(name)).unwrap();
+            let old = format!("file:{}", s(old));
+            let new = format!("file:{}", s(&new_root.path));
+            crate::cmd_keys::rotate_root_cmd(
+                &self.pack_config,
+                &parse(&[
+                    "--release-dir",
+                    s(rd),
+                    "--new-root-key",
+                    &hex_encode(&new_root.public_key),
+                    "--new-threshold",
+                    "1",
+                    "--sign",
+                    &old,
+                    "--sign-new",
+                    &new,
+                    "--trust-release-dir",
+                ]),
+            )
+            .unwrap();
+            new_root.path
+        }
+
+        /// Whether a client (and a push) can read the store's key set: `keys.json` verifies under
+        /// the walk through every root the bucket holds.
+        pub(crate) fn readable(&self) -> bool {
+            let config = Config::load(&self.config).unwrap();
+            let skip = ClockReading::read(&lunepack::SystemClock, Some(u64::MAX));
+            let docs = tempfile::tempdir().unwrap();
+            for (key, bytes) in snapshot_of(&self.public) {
+                let rel = &key.as_str()[P.len() + 1..];
+                if rel == "keys.json" || (rel.starts_with("root-") && !rel.contains('/')) {
+                    fs::write(docs.path().join(rel), bytes).unwrap();
+                }
+            }
+            release_dir::open(docs.path(), &config, &Sha256Hasher, &Ed25519Verifier, &skip)
+                .is_ok_and(|o| o.chain.is_some())
         }
 
         /// Puts both buckets back to `snap`, with no fault and an empty log.
