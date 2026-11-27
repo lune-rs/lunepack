@@ -186,6 +186,9 @@ refuses to run it unless its SHA-256 equals `needs.tools-<os>.outputs.cli_sha256
 because the `build` job runs your build, which includes third-party code (dependencies, build scripts,
 package hooks), and a process it leaves running can use the run's artifact token to replace an artifact
 the run uploaded earlier. It cannot write another job's outputs, so a replaced binary fails the check.
+A replaced artifact could also add a file beside the binary, such as a DLL that Windows loads from the
+binary's directory before `main` runs, in the step that holds the release key, so each key job also refuses
+the artifact unless the binary is the only file in it.
 Besides the CLI only data artifacts pass: the build output, which `pack` packages and signs by design,
 and the release directories, which `push` verifies completely, signatures and hashes, before it uploads
 anything. The prebuilt runtime and stub are fetched inside `pack` and held to lunepack's pins by
@@ -294,6 +297,8 @@ jobs:
         env:
           WANT: ${{ matrix.tool == 'linux' && needs.tools-linux.outputs.cli_sha256 || needs.tools-windows.outputs.cli_sha256 }}
         run: |
+          shopt -s nullglob dotglob; FILES=(tools/*); shopt -u nullglob dotglob
+          if [ "${#FILES[@]}" -ne 1 ] || [ "${FILES[0]}" != "tools/${{ matrix.exe }}" ] || [ ! -f "${FILES[0]}" ] || [ -L "${FILES[0]}" ]; then echo "tools-${{ matrix.tool }} holds more than the CLI"; exit 1; fi
           GOT="$(sha256sum "tools/${{ matrix.exe }}" | cut -d' ' -f1)"
           if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "the CLI is not the one tools-${{ matrix.tool }} built"; exit 1; fi
           chmod +x "tools/${{ matrix.exe }}"
@@ -334,6 +339,8 @@ jobs:
         env:
           WANT: ${{ needs.tools-linux.outputs.cli_sha256 }}
         run: |
+          shopt -s nullglob dotglob; FILES=(tools/*); shopt -u nullglob dotglob
+          if [ "${#FILES[@]}" -ne 1 ] || [ "${FILES[0]}" != "tools/lunepack" ] || [ ! -f "${FILES[0]}" ] || [ -L "${FILES[0]}" ]; then echo "tools-linux holds more than the CLI"; exit 1; fi
           GOT="$(sha256sum tools/lunepack | cut -d' ' -f1)"
           if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "the CLI is not the one tools-linux built"; exit 1; fi
           chmod +x tools/lunepack
@@ -371,6 +378,8 @@ jobs:
         env:
           WANT: ${{ needs.tools-linux.outputs.cli_sha256 }}
         run: |
+          shopt -s nullglob dotglob; FILES=(tools/*); shopt -u nullglob dotglob
+          if [ "${#FILES[@]}" -ne 1 ] || [ "${FILES[0]}" != "tools/lunepack" ] || [ ! -f "${FILES[0]}" ] || [ -L "${FILES[0]}" ]; then echo "tools-linux holds more than the CLI"; exit 1; fi
           GOT="$(sha256sum tools/lunepack | cut -d' ' -f1)"
           if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "the CLI is not the one tools-linux built"; exit 1; fi
           chmod +x tools/lunepack
@@ -399,6 +408,8 @@ jobs:
         env:
           WANT: ${{ needs.tools-linux.outputs.cli_sha256 }}
         run: |
+          shopt -s nullglob dotglob; FILES=(tools/*); shopt -u nullglob dotglob
+          if [ "${#FILES[@]}" -ne 1 ] || [ "${FILES[0]}" != "tools/lunepack" ] || [ ! -f "${FILES[0]}" ] || [ -L "${FILES[0]}" ]; then echo "tools-linux holds more than the CLI"; exit 1; fi
           GOT="$(sha256sum tools/lunepack | cut -d' ' -f1)"
           if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "the CLI is not the one tools-linux built"; exit 1; fi
           chmod +x tools/lunepack
@@ -634,7 +645,8 @@ real store.
 - puts a release key, a root key or a store token in a repository secret, or in an environment whose rules
   allow a branch, or adds a job that holds one without an environment;
 - compiles anything in a job that holds a key or a store token, or runs a `lunepack` program there without
-  first checking its SHA-256 against the output of the `tools-<os>` job that built it;
+  first checking its SHA-256 against the output of the `tools-<os>` job that built it and that it is the only
+  file of its artifact;
 - reads, prints, copies, logs or stores a release key, a root key or a store credential, in a file, a
   command line, a commit or an output; a text tool is not to be run on a key or credential file;
 - edits the trust root (the `[root]` table, `keys.json`, a `root-<k>.json`) or generates keys that are
