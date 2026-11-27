@@ -62,7 +62,7 @@ enum Command {
     },
     /// Package a build-output directory into a signed release: `<version>/<target>.pack` and
     /// `<version>/<target>.manifest.json` in the release directory.
-    Pack(cmd_pack::PackArgs),
+    Pack(Box<cmd_pack::PackArgs>),
     /// Manage the signed feed of a channel.
     Feed {
         #[command(subcommand)]
@@ -235,6 +235,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn main() -> ExitCode {
+    // First, before any library load: only System32 from here on (M7-D10).
+    #[cfg(windows)]
+    lunepack_os_windows::harden_dll_search();
     // Usage errors and --help are handled (and exit) here; 2 is clap's status for a usage error.
     let cli = Cli::parse();
     match run(cli) {

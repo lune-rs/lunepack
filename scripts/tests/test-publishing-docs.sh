@@ -352,6 +352,40 @@ check_tools_set() {
   '
 }
 
+# check_tools_crt <md-file>: in the `jobs:` of the fenced blocks, every job that runs on Windows and
+# runs `cargo install` has `RUSTFLAGS: "-C target-feature=+crt-static"` in that same step (a `cargo
+# install` outside a checkout does not read `.cargo/config.toml`, so the C runtime would be linked
+# dynamically). Prints one line per install step without it, then `checked: <jobs>`; fails on a
+# missing flag or when no Windows job runs `cargo install`. A step is the lines from one `- ` at six
+# spaces of indent to the next; the flag must be exactly that value.
+# shellcheck disable=SC2329 # called through run_cmd and t_check
+check_tools_crt() {
+  blocks_of "$1" | awk '
+    function end_step() {
+      if (job != "" && win && inst) {
+        if (!crt) { print "job " job ": the cargo install step has no RUSTFLAGS \"-C target-feature=+crt-static\": " first; bad = 1 }
+        if (index(checked " ", " " job " ") == 0) checked = checked " " job
+      }
+      inst = 0; crt = 0; first = ""
+    }
+    /^jobs:[ \t]*$/ { end_step(); on = 1; job = ""; win = 0; next }
+    on && /^[^ \t#]/ { end_step(); on = 0; job = ""; next }
+    on && /^  [A-Za-z0-9_-]+:[ \t]*$/ { end_step(); job = $1; sub(/:$/, "", job); win = 0; next }
+    on && job != "" {
+      if ($0 ~ /^    runs-on:/ && tolower($0) ~ /windows/) win = 1
+      if ($0 ~ /^      - /) end_step()
+      if ($0 ~ /cargo[ \t]+install/) { inst = 1; line = $0; sub(/^[ \t]+(- )?/, "", line); first = line }
+      if ($0 ~ /RUSTFLAGS:[ \t]*"-C target-feature=\+crt-static"/) crt = 1
+    }
+    END {
+      end_step()
+      if (checked == "") { print "no Windows job runs cargo install"; bad = 1 }
+      print "checked:" checked
+      exit bad
+    }
+  '
+}
+
 # --- seeded negatives and positives --------------------------------------------------------------
 good=$T_TMP/good.md
 cat >"$good" <<'EOF'
@@ -535,6 +569,42 @@ run_cmd check_tools_set "$T_TMP/tools-none.md"
 t_check "tools: a workflow where no job downloads the tools artifact fails" rc_nonzero
 t_check "and says so" out_has "no job downloads a tools- artifact"
 
+# The Windows tools job builds the CLI with a static C runtime (M7-D10): the install step carries
+# RUSTFLAGS, because a `cargo install` outside a checkout does not read `.cargo/config.toml`.
+crt_good=$T_TMP/crt-good.md
+cat >"$crt_good" <<'EOF'
+```yaml
+jobs:
+  tools-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo install lunepack-cli --locked --root tools
+  tools-windows:
+    runs-on: windows-latest
+    steps:
+      - run: cargo install lunepack-cli --locked --root tools
+        env: { RUSTFLAGS: "-C target-feature=+crt-static" }
+      - run: echo hash
+```
+EOF
+run_cmd check_tools_crt "$crt_good"
+t_check "crt: a Windows install step with the static C runtime flag passes" rc_is 0
+t_check "and only the Windows job is checked" grep -qxF "checked: tools-windows" "$OUT"
+grep -vF 'RUSTFLAGS' "$crt_good" >"$T_TMP/crt-none.md"
+run_cmd check_tools_crt "$T_TMP/crt-none.md"
+t_check "crt: a Windows install step without RUSTFLAGS fails" rc_nonzero
+t_check "and names the job" out_has "job tools-windows: the cargo install step has no RUSTFLAGS"
+sed 's/+crt-static/-crt-static/' "$crt_good" >"$T_TMP/crt-minus.md"
+run_cmd check_tools_crt "$T_TMP/crt-minus.md"
+t_check "crt: a flag that turns the static runtime off fails" rc_nonzero
+awk '/^      - run: echo hash/ { print; print "        env: { RUSTFLAGS: \"-C target-feature=+crt-static\" }"; next } /RUSTFLAGS/ { next } { print }' "$crt_good" >"$T_TMP/crt-other-step.md"
+run_cmd check_tools_crt "$T_TMP/crt-other-step.md"
+t_check "crt: the flag on another step does not count" rc_nonzero
+printf '```yaml\njobs:\n  tools-linux:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo install lunepack-cli\n```\n' >"$T_TMP/crt-nowin.md"
+run_cmd check_tools_crt "$T_TMP/crt-nowin.md"
+t_check "crt: a workflow with no Windows install job fails" rc_nonzero
+t_check "and says so" out_has "no Windows job runs cargo install"
+
 # --- the real documents ---------------------------------------------------------------------------
 run_cmd check_commands "$repo/docs/PUBLISHING.md"
 t_check "PUBLISHING.md: every command and flag exists" rc_is 0
@@ -561,6 +631,10 @@ run_cmd check_tools_set "$repo/docs/PUBLISHING.md"
 t_check "PUBLISHING.md: every key job checks its tools artifact's file set and hash" rc_is 0
 [ "$RC" -eq 0 ] || cat "$OUT" >&2
 t_check "and the key jobs are pack, push, refresh and drop" grep -qxF "checked: pack push refresh drop" "$OUT"
+run_cmd check_tools_crt "$repo/docs/PUBLISHING.md"
+t_check "PUBLISHING.md: the Windows tools job builds the CLI with a static C runtime" rc_is 0
+[ "$RC" -eq 0 ] || cat "$OUT" >&2
+t_check "and the job is tools-windows" grep -qxF "checked: tools-windows" "$OUT"
 
 section="## Publishing: \`lunepack publish\`"
 run_cmd check_commands "$repo/docs/CLI.md" "$section"

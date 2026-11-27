@@ -188,7 +188,11 @@ package hooks), and a process it leaves running can use the run's artifact token
 the run uploaded earlier. It cannot write another job's outputs, so a replaced binary fails the check.
 A replaced artifact could also add a file beside the binary, such as a DLL that Windows loads from the
 binary's directory before `main` runs, in the step that holds the release key, so each key job also refuses
-the artifact unless the binary is the only file in it.
+the artifact unless the binary is the only file in it. The `tools-windows` job builds with a static C
+runtime (`RUSTFLAGS` on its install step), because a `cargo install` outside a checkout does not read
+the repository's `.cargo/config.toml`; with no `vcruntime140.dll` to import there is none to plant beside
+the binary or to be missing on the runner, and the binary itself carries the same DLL search hardening
+as the other shipped Windows binaries (M7-D10).
 Besides the CLI only data artifacts pass: the build output, which `pack` packages and signs by design,
 and the release directories, which `push` verifies completely, signatures and hashes, before it uploads
 anything. The prebuilt runtime and stub are fetched inside `pack` and held to lunepack's pins by
@@ -259,6 +263,7 @@ jobs:
       cli_sha256: ${{ steps.hash.outputs.cli_sha256 }}
     steps:
       - run: cargo install lunepack-cli --locked --version "$LUNEPACK_VERSION" --root tools
+        env: { RUSTFLAGS: "-C target-feature=+crt-static" }
       - id: hash
         run: echo "cli_sha256=$(sha256sum tools/bin/lunepack.exe | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
