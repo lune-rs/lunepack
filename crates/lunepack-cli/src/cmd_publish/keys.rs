@@ -139,7 +139,7 @@ pub fn keys(config_path: &Path, args: &KeysArgs, open: super::OpenStores<'_>) ->
         let broken = unverifiable(&stores, publish.prefix.as_str(), &config, &read, &new_chain)?;
         if !broken.is_empty() {
             bail!(
-                "the new key set would stop these from verifying (nothing was written):\n  {}\nrefresh the feeds with a key you keep (`publish refresh --sign <that key>`) before removing the old key, and drop the releases whose manifests only a removed key signed (`publish refresh --sign <that key> --drop <version>`); then run this again with the same directory",
+                "the new key set would stop these from verifying (nothing was written):\n  {}\nrefresh the feeds with a key you keep (`publish refresh --sign <that key>`) before removing the old key, and drop the releases whose manifests only a removed key signed (`publish drop --version <version> --sign <that key>`, in the push job); then run this again with the same directory",
                 broken.join("\n  ")
             );
         }
@@ -655,11 +655,10 @@ mod tests {
         }
     }
 
-    fn refresh_with_key(w: &World, signer: &Path, drop: &[&str]) -> Result<()> {
+    fn refresh_with_key(w: &World, signer: &Path) -> Result<()> {
         use crate::cmd_publish::refresh;
         let config = Config::load(&w.config)?;
         let sign = [format!("file:{}", s(signer))];
-        let drop: Vec<String> = drop.iter().map(|v| (*v).to_owned()).collect();
         refresh::run(
             &refresh::Job {
                 config_path: &w.config,
@@ -667,7 +666,6 @@ mod tests {
                 sign: &sign,
                 within_days: None,
                 skip_if_unpublished: false,
-                drop: &drop,
                 dry_run: false,
                 clock: std::sync::Arc::new(lunepack::SystemClock),
             },
@@ -678,8 +676,9 @@ mod tests {
 
     /// F8: the whole revocation of the one release key, as PUBLISHING.md gives it, through
     /// `publish` alone: move 1 (both keys), the new key in the CI secrets, a release signed by the
-    /// new key, `publish refresh --sign <new> --drop` of every release only the old key signed,
-    /// then move 2 (the new key alone). The old key then signs nothing the store accepts.
+    /// new key, `publish drop --version <v> --sign <new>` of every release only the old key signed
+    /// (which deletes their objects too), then move 2 (the new key alone). The old key then signs
+    /// nothing the store accepts.
     #[test]
     fn a_leaked_release_key_is_revoked_end_to_end() {
         let mut w = World::new("keep = 5\n");
@@ -716,8 +715,18 @@ mod tests {
         assert!(w.writes().is_empty(), "{:?}", w.writes());
 
         // Drop what only the old key signed, re-signing the feed with the new key.
-        refresh_with_key(&w, &new.path, &["1.0.0", "1.1.0"]).unwrap();
+        for version in ["1.0.0", "1.1.0"] {
+            crate::cmd_publish::drop::tests::drop_in(
+                &w,
+                &new.path,
+                version,
+                false,
+                &crate::cmd_publish::drop::ORDER,
+            )
+            .unwrap();
+        }
         assert_eq!(w.listed("stable"), ["1.2.0"]);
+        assert_eq!(w.folders(), BTreeSet::from(["1.2.0".to_owned()]));
 
         // Move 2, the refused directory published again as it is: the new key alone.
         keys_in(&w, &early, false).unwrap();
@@ -725,12 +734,15 @@ mod tests {
         assert_eq!(record_keys_version(&w), Some(3));
 
         // The old key signs nothing the store takes; the new one refreshes and publishes.
-        assert!(refresh_with_key(&w, &old_signer, &[]).is_err());
-        refresh_with_key(&w, &new.path, &[]).unwrap();
+        assert!(refresh_with_key(&w, &old_signer).is_err());
+        refresh_with_key(&w, &new.path).unwrap();
         w.publish("1.3.0");
         assert_eq!(w.listed("stable"), ["1.2.0", "1.3.0"]);
-        // The dropped releases' objects are left in the bucket, listed by no feed.
-        assert!(w.folders().contains("1.0.0"));
+        // The dropped releases' objects went with them.
+        assert_eq!(
+            w.folders(),
+            BTreeSet::from(["1.2.0".to_owned(), "1.3.0".to_owned()])
+        );
     }
 
     #[test]

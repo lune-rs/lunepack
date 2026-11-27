@@ -3,9 +3,11 @@
 //! `fetch` reads the app's public feed over the transport clients use and fills a release
 //! directory from it; it reads no credential. `push` publishes a packed release to the app's
 //! stores, which the composition root (`main.rs`) builds and hands in as [`Stores`]; `refresh`
-//! re-signs the feeds (it writes the public bucket only), `plan` shows what the stores hold and what
-//! a push would do (it writes nothing), and `init` uploads a fresh app's first documents and `keys` a key-set change.
+//! re-signs the feeds (it writes the public bucket only), `drop` takes a release out of the feeds
+//! and deletes it, `plan` shows what the stores hold and what a push would do (it writes nothing),
+//! and `init` uploads a fresh app's first documents and `keys` a key-set change.
 
+pub mod drop;
 pub mod fetch;
 pub mod init;
 pub mod keys;
@@ -61,6 +63,10 @@ pub enum PublishCommand {
     /// public bucket only: the state file and the pending deletes are a push's, and a feed older
     /// than the state file records is refused.
     Refresh(refresh::RefreshArgs),
+    /// Take a release out of every `[publish]` channel's feed that lists it and delete its
+    /// objects: the pending record, the feeds, the state file (which then records the new feeds),
+    /// the deletes. Writes both buckets: the push job's command, never a scheduled one.
+    Drop(drop::DropArgs),
     /// Show the feeds, what a push of a version would add and drop, the pending deletes and any
     /// abandoned push. Reads the stores; writes nothing.
     Plan(plan::PlanArgs),
@@ -92,6 +98,7 @@ pub fn run(config: &Path, command: &PublishCommand, open: OpenStores<'_>) -> Res
         PublishCommand::Fetch(args) => fetch::fetch(config, args),
         PublishCommand::Push(args) => push::push(config, args, open),
         PublishCommand::Refresh(args) => refresh::refresh(config, args, open),
+        PublishCommand::Drop(args) => drop::drop_release(config, args, open),
         PublishCommand::Plan(args) => plan::plan(config, args, open),
         PublishCommand::Init(args) => init::init(config, args, open),
         PublishCommand::Keys(args) => keys::keys(config, args, open),
@@ -115,7 +122,7 @@ pub(crate) fn say(line: &str) -> Result<()> {
     Ok(())
 }
 
-/// Q6: the commands that issue a feed (`push`, `refresh`) or are part of the publishing job
+/// Q6: the commands that issue a feed (`push`, `refresh`, `drop`) or are part of the publishing job
 /// (`init`) refuse a set `SOURCE_DATE_EPOCH`, before any network access: the writers would issue
 /// the feed at that fixed time. It belongs only in the `pack` and `setup` job.
 pub(crate) fn refuse_source_date_epoch(command: &str) -> Result<()> {

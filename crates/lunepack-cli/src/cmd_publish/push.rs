@@ -169,18 +169,9 @@ pub(crate) struct Plan {
     pub state_key: StoreKey,
     pub state_read: Vec<u8>,
     pub state: Vec<u8>,
-}
-
-impl Plan {
     /// What to do after the race check refused: a push has release directories built against the
-    /// feed that moved, a refresh has nothing to rebuild.
-    fn rerun_hint(&self) -> &'static str {
-        if self.version.is_empty() {
-            "Run `publish refresh` again"
-        } else {
-            "Run `publish fetch` and `pack` again, then `publish push`"
-        }
-    }
+    /// feed that moved, a refresh or a drop has nothing to rebuild.
+    pub rerun_hint: &'static str,
 }
 
 /// `publish push`.
@@ -576,6 +567,7 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Plan> {
         state_key,
         state_read,
         state: state_bytes,
+        rerun_hint: "Run `publish fetch` and `pack` again, then `publish push`",
     })
 }
 
@@ -742,7 +734,7 @@ pub(crate) fn commit(plan: &Plan, stores: &Stores, order: &[Phase]) -> Result<()
                         bail!(
                             "{} changed in the store since this run read it (another publish?); it was not written. {}",
                             f.key,
-                            plan.rerun_hint()
+                            plan.rerun_hint
                         );
                     }
                     work::put_bytes(stores.public.as_ref(), &f.key, f.key.as_str(), &f.bytes)?;

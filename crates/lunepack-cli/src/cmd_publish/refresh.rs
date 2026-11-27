@@ -10,10 +10,8 @@
 //! it signs anything it refuses a store whose feed, key set or root is older than the state file
 //! records: a rolled-back document is caught, never re-signed. With nothing due it writes nothing.
 //!
-//! `--drop <version>` (the owner's, for a revocation, F8) also takes a release out of every
-//! `[publish]` channel's feed that lists it, re-signing those feeds whatever their expiry. It only
-//! unlists: the release's objects stay in the public bucket, listed by no feed, and no later push
-//! purges them (a push deletes only what its own retention drops); the owner removes them by hand.
+//! A refresh never takes a release out of a feed: that is `publish drop` (S6), which records the
+//! feeds it writes in the state file, so a pre-drop feed put back is refused here.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -26,7 +24,7 @@ use lunepack_core::{Channel, Clock, ClockReading, Limits};
 
 use super::push::{FeedWrite, Phase, Plan, Shared, commit, show, work_feed};
 use super::work::{self, NotPublished, StoreRead, feed_rel};
-use super::{Stores, Usage, say, settings};
+use super::{Stores, say, settings};
 use crate::cmd_feed::{self, RefreshArgs as FeedRefreshArgs, SECS_PER_DAY, Writer};
 use crate::cmd_verify::check_release_dir;
 use crate::config::Config;
@@ -51,11 +49,6 @@ pub struct RefreshArgs {
     /// repeat to reach the key set's threshold.
     #[arg(long = "sign", required = true)]
     sign: Vec<String>,
-    /// Take this release (its version text, as listed) out of every `[publish]` channel's feed
-    /// that lists it, re-signing those feeds; repeat for several. Its objects stay in the public
-    /// bucket, listed by no feed. For a key revocation (the owner's), not for a scheduled job.
-    #[arg(long = "drop")]
-    drop: Vec<String>,
     /// Do every read and check, print what would be written and deleted, and write nothing.
     #[arg(long = "dry-run")]
     dry_run: bool,
@@ -72,8 +65,6 @@ pub(crate) struct Job<'a> {
     pub sign: &'a [String],
     pub within_days: Option<u64>,
     pub skip_if_unpublished: bool,
-    /// The releases to take out of the feeds (`--drop`).
-    pub drop: &'a [String],
     pub dry_run: bool,
     /// The time feeds are issued, checked and compared with their expiry at.
     pub clock: Arc<dyn Clock>,
@@ -95,7 +86,6 @@ pub fn refresh(config_path: &Path, args: &RefreshArgs, open: super::OpenStores<'
         sign: &args.sign,
         within_days: args.within_days,
         skip_if_unpublished: args.skip_if_unpublished,
-        drop: &args.drop,
         dry_run: args.dry_run,
         clock: Arc::new(lunepack::SystemClock),
     };
@@ -126,7 +116,12 @@ pub(crate) fn run(job: &Job<'_>, stores: &Stores, order: &[Phase]) -> Result<()>
 /// S1: refuses (before anything is signed or written) a store whose root walk, `keys.json` or feed
 /// is older than what the private state file records, which a rolled-back bucket would show. A
 /// document the state file has no record of, or a recorded feed that is absent, is not compared.
-fn refuse_rolled_back(read: &StoreRead, config: &Config, state_file: &Path) -> Result<()> {
+/// `publish drop` runs it too.
+pub(crate) fn refuse_rolled_back(
+    read: &StoreRead,
+    config: &Config,
+    state_file: &Path,
+) -> Result<()> {
     let record = State::load(state_file)?.record(&config.app_id);
     let mut older = Vec::new();
     let mut compare = |what: String, field: &str, recorded: Option<u64>, found: u64| {
@@ -198,39 +193,15 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
 
     refuse_rolled_back(&read, config, &state_file)?;
 
-    // `--drop`: each version must be listed by a `[publish]` channel's feed and by no guard feed
-    // (a guard feed is never written, so it would go on listing it).
-    let lists = |feed: &lunepack_core::VerifiedFeed, v: &str| {
-        feed.releases().iter().any(|r| r.version_text() == v)
-    };
-    for v in job.drop {
-        if let Some((channel, _)) = read.guard_feeds.iter().find(|(_, f)| lists(f, v)) {
-            return Err(Usage(format!(
-                "--drop {v}: {} lists it, a channel not in [publish] channels, which no command writes; add the channel back to channels to drop from its feed (nothing was written)",
-                feed_rel(channel)
-            ))
-            .into());
-        }
-        if !read.feeds.values().any(|f| lists(f, v)) {
-            return Err(Usage(format!(
-                "--drop {v}: no feed of a [publish] channel lists it (nothing was written)"
-            ))
-            .into());
-        }
-    }
-
     let now = job.clock.now_unix_secs();
     let due: Vec<Channel> = read
         .feeds
         .iter()
-        .filter(|(_, feed)| {
-            job.drop.iter().any(|v| lists(feed, v))
-                || match job.within_days {
-                    None => true,
-                    Some(days) => feed.expires().is_some_and(|e| {
-                        e <= now.saturating_add(days.saturating_mul(SECS_PER_DAY))
-                    }),
-                }
+        .filter(|(_, feed)| match job.within_days {
+            None => true,
+            Some(days) => feed
+                .expires()
+                .is_some_and(|e| e <= now.saturating_add(days.saturating_mul(SECS_PER_DAY))),
         })
         .map(|(channel, _)| channel.clone())
         .collect();
@@ -266,19 +237,6 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
         let mut wconfig = config.clone();
         wconfig.state_path = state_file.clone();
         for channel in &due {
-            let drop: Vec<String> = job
-                .drop
-                .iter()
-                .filter(|v| read.feeds.get(channel).is_some_and(|f| lists(f, v)))
-                .cloned()
-                .collect();
-            if !drop.is_empty() {
-                say(&format!(
-                    "{}: drops {}; their objects stay in the bucket, listed by no feed (no push purges them)",
-                    feed_rel(channel),
-                    drop.join(", ")
-                ))?;
-            }
             cmd_feed::refresh_with(
                 Writer {
                     config_path: job.config_path,
@@ -289,7 +247,7 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
                     release_dir: wdir.clone(),
                     channel: channel.as_str().to_owned(),
                     expires_after_days: Some(u64::from(publish.feed_days)),
-                    drop,
+                    drop: Vec::new(),
                     sign: job.sign.to_vec(),
                     state: StateArgs::default(),
                 },
@@ -350,6 +308,7 @@ fn plan(job: &Job<'_>, stores: &Stores, work_root: &Path) -> Result<Option<Plan>
         state_key,
         state: state_read.clone(),
         state_read,
+        rerun_hint: "Run `publish refresh` again",
     }))
 }
 
@@ -381,90 +340,12 @@ mod tests {
                 sign: &sign,
                 within_days,
                 skip_if_unpublished,
-                drop: &[],
                 dry_run,
                 clock: Arc::new(lunepack::SystemClock),
             },
             &w.stores(),
             &ORDER,
         )
-    }
-
-    fn refresh_dropping(w: &World, within_days: Option<u64>, drop: &[&str]) -> Result<()> {
-        let config = Config::load(&w.config)?;
-        let sign = [format!("file:{}", s(&w.release_signer))];
-        let drop: Vec<String> = drop.iter().map(|v| (*v).to_owned()).collect();
-        run(
-            &Job {
-                config_path: &w.config,
-                config: &config,
-                sign: &sign,
-                within_days,
-                skip_if_unpublished: false,
-                drop: &drop,
-                dry_run: false,
-                clock: Arc::new(lunepack::SystemClock),
-            },
-            &w.stores(),
-            &ORDER,
-        )
-    }
-
-    /// F8: `--drop` unlists a release from every `[publish]` feed that lists it, even a feed that
-    /// is not due, writes only those feeds, and leaves the release's objects where they are; a
-    /// version no feed lists, or one a guard feed lists, is refused before anything is written.
-    #[test]
-    fn drop_unlists_a_release_from_every_feed_and_leaves_its_objects() {
-        let w = World::new("channels = [\"stable\", \"beta\"]\nkeep = 5\n");
-        w.publish("1.0.0");
-        w.publish("1.1.0");
-        let private_before = snapshot_of(&w.private);
-        w.clear_log();
-        for (version, phrase) in [
-            ("0.9.0", "no feed of a [publish] channel lists it"),
-            ("1.1", "no feed of a [publish] channel lists it"),
-        ] {
-            let e = refresh_dropping(&w, Some(7), &["1.0.0", version]).unwrap_err();
-            assert_eq!(crate::cmd_publish::exit_status(&e), 2, "{e:#}");
-            assert!(format!("{e:#}").contains(phrase), "{e:#}");
-        }
-        assert!(w.writes().is_empty(), "{:?}", w.writes());
-        // Nothing expires within 7 days, but the feeds that list 1.0.0 are written anyway.
-        refresh_dropping(&w, Some(7), &["1.0.0"]).unwrap();
-        assert_eq!(w.listed("stable"), ["1.1.0"]);
-        assert_eq!(w.listed("beta"), ["1.1.0"]);
-        let mut written: Vec<String> = w.writes().into_iter().map(|(_, _, k)| k).collect();
-        written.sort();
-        assert_eq!(
-            written,
-            [
-                k("feed-beta.json").to_string(),
-                k("feed-stable.json").to_string()
-            ]
-        );
-        assert!(w.public.contents(&pack_key("1.0.0")).is_some());
-        assert!(snapshot_of(&w.private) == private_before);
-        assert_consistent(&w);
-        // A push after it publishes over the shorter feeds.
-        w.publish("1.2.0");
-        assert_eq!(w.listed("stable"), ["1.1.0", "1.2.0"]);
-
-        // A guard feed (beta, out of [publish] channels) that lists the version is not written:
-        // refused, naming it.
-        let config = fs::read_to_string(&w.config).unwrap().replace(
-            "channels = [\"stable\", \"beta\"]",
-            "channels = [\"stable\"]",
-        );
-        fs::write(&w.config, config).unwrap();
-        w.clear_log();
-        let e = refresh_dropping(&w, None, &["1.1.0"]).unwrap_err();
-        assert_eq!(crate::cmd_publish::exit_status(&e), 2, "{e:#}");
-        assert!(
-            format!("{e:#}")
-                .contains("feed-beta.json lists it, a channel not in [publish] channels"),
-            "{e:#}"
-        );
-        assert!(w.writes().is_empty(), "{:?}", w.writes());
     }
 
     fn pack_key(version: &str) -> StoreKey {
