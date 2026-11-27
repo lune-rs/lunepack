@@ -144,7 +144,8 @@ suite its adapter runs):
   and dry runs: `<dir>/<key>`, written through a temporary file and a rename, symlinks refused). The testkit has
   `MemStore` (with fault injection and a call log) and `run_store_suite`, which both adapters run; its
   `FakeS3Server` is a loopback S3 that verifies every request's signature with a second implementation of
-  SigV4;
+  SigV4, with one credential for every bucket or one per bucket (the CLI signs the private bucket with its
+  own pair when `[publish]` names one);
 
 `Clock` is implemented by `lunepack::SystemClock` and by the testkit's fake; the CLI adds a fixed
 clock for `SOURCE_DATE_EPOCH`. Each trait has a contract suite in the testkit that the real

@@ -1148,7 +1148,7 @@ lunepack publish fetch   --release-dir <DIR> --version <VERSION>
 lunepack publish push    --release-dir <DIR>... --version <VERSION> --sign <SIGN>...
     [--require-targets <T,T,...>] [--dry-run] [--store-dir <DIR>]
 lunepack publish refresh --sign <SIGN>... [--if-expiring-within-days <N>] [--skip-if-unpublished]
-    [--dry-run] [--store-dir <DIR>]
+    [--drop <VERSION>]... [--dry-run] [--store-dir <DIR>]
 lunepack publish plan    [--version <VERSION>] [--store-dir <DIR>]
 lunepack publish init    --release-dir <DIR> [--dry-run] [--store-dir <DIR>]
 lunepack publish keys    --release-dir <DIR> [--dry-run] [--store-dir <DIR>]
@@ -1171,6 +1171,8 @@ account_id_env = "EXAMPLE_R2_ACCOUNT_ID" # r2 only: the variable that holds the 
 # region = "us-east-1"                   # s3 only
 access_key_env = "EXAMPLE_STORE_ACCESS_KEY"
 secret_key_env = "EXAMPLE_STORE_SECRET_KEY"
+private_access_key_env = "EXAMPLE_STATE_ACCESS_KEY" # optional, with the next: the private bucket's own pair
+private_secret_key_env = "EXAMPLE_STATE_SECRET_KEY" # (default: the pair above, for both buckets)
 public_bucket = "example-updates"        # what clients read: keys, roots, feeds, releases
 private_bucket = "example-updates-private" # the state file and the pending-deletes record
 keep = 10                                # releases kept per channel, 1..=100 (default 10)
@@ -1189,9 +1191,14 @@ require_targets = ["linux-x86_64", "windows-x86_64", "macos-universal"]   # defa
   (it can be limited to `<prefix>/*`) as well as object read and write: without it S3 answers 403, not 404,
   for a key that does not exist, every run fails on its first missing key, and the error says so. A 403 on
   a read is never taken as "absent".
-- The two buckets may be given two different tokens through the same variables in different jobs: a token
-  for `push` (public: read, write, delete; private: read, write) and one for `refresh` (public: read,
-  write; private: read only), because `refresh` writes only feeds.
+- `private_access_key_env` and `private_secret_key_env` name the private bucket's own key pair: both or
+  neither (one alone is an error naming the other). With them the private bucket's requests are signed
+  with that pair and the public bucket's with `access_key_env` and `secret_key_env`; without them the one
+  pair signs for both. They let the scheduled `refresh` job hold two tokens that Cloudflare R2's dashboard
+  can make: read and write on the public bucket, read only on the private one (a dashboard token has one
+  permission for every bucket it names). The `push` job gives both pairs its one token (public: read,
+  write, delete; private: read, write). A refresh token with write access to the private bucket could
+  lower the state file's record and defeat `refresh`'s rollback guard (below).
 - A variable that is unset or empty is an error that names the variable and never a value, before any
   request.
 - `keep` counts releases per channel by version precedence, never by text or file order. The version
@@ -1311,12 +1318,23 @@ the feed race check applies.
 
 `refresh` **writes the public bucket only, and only feeds**: it never writes the state file or the
 pending-deletes record and never deletes anything (the pending deletes run at the next `push`; a `notice:`
-line says how many are waiting). Its token therefore needs write access to the public bucket and read access
-to the private one, and no delete. It reads the state file to refuse a rolled-back store: if any feed in the
-store (a guard feed too) has a `seq`, or `keys.json` or the root walk a version, below the state file's
-record, it exits 1 before signing or writing anything, so a replayed older genuine feed is never re-signed.
-The new feeds carry a `seq` above the record, and the next `push` accepts and records them (a newer
-previous document is accepted).
+line says how many are waiting). Its job therefore needs write access to the public bucket and read access
+to the private one (two tokens, through `private_access_key_env` and `private_secret_key_env`, above). It
+reads the state file to refuse a rolled-back store: if any feed in the store (a guard feed too) has a
+`seq`, or `keys.json` or the root walk a version, below the state file's record, it exits 1 before
+signing or writing anything. That record is what the last completed `push` wrote, in its last step, so a
+replayed older genuine feed is never re-signed unless it is at least as new as that record: the feed a
+push replaced, put back before that push wrote the state file. A push that stopped before its state
+write is therefore rerun before the next refresh (`docs/THREAT-MODEL.md`, "A stolen refresh token"). The
+new feeds carry a `seq` above the record, and the next `push` accepts and records them (a newer previous
+document is accepted).
+
+`--drop <VERSION>` (repeatable; the owner's, for a key revocation, not a scheduled job's) also takes
+that release out of every `[publish]` channel's feed that lists it, and re-signs those feeds whatever
+their expiry. A version that no `[publish]` feed lists, or that a guard feed lists (a guard feed is never
+written), is exit 2 before anything is written. It only unlists. The release's manifests, packs and
+deltas stay in the public bucket, listed by no feed, and no later `push` purges them (a push deletes only
+what its own retention drops), so the owner removes them by hand if the space matters.
 
 ### `publish plan`
 
@@ -1333,8 +1351,10 @@ performs no put and no delete.
 The user's own first upload for a new app, from a release directory that `lunepack init` and
 `lunepack keys set` made. It checks the directory's root walk and `keys.json` under the config's root,
 takes the state file's record of this app (and no other app's), refuses when the store already holds
-any document it would write (it names the first), and uploads the roots, then `keys.json`, then the
-state file. An existing prefix of the same layout needs no `init`.
+other bytes at any document it would write (it names the first), and uploads the roots, then
+`keys.json`, then the state file. A document already there with exactly the bytes it would write is
+kept, so a rerun after a failed upload completes the rest, and a rerun after a complete one has nothing
+to upload (exit 0). An existing prefix of the same layout needs no `init`.
 
 ### `publish keys`
 
@@ -1353,9 +1373,18 @@ store's; and that the state file's record would not be lowered. It then checks, 
 feed in the store (the `[publish]` channels' and the guard feeds') and every manifest they list verifies
 under the new key set, so an upload cannot leave clients with a feed they reject; if anything would stop
 verifying it exits 1, names it and writes nothing (refresh the feeds with a key you keep first, and drop
-releases only a removed key signed). Then it uploads the new `root-<k>.json` files, then `keys.json`
-(after re-reading it to catch another writer), then the state file with its record of the root and key
-set, last. A rerun after a failure completes the rest; with nothing to change it exits 0. The revocation
+releases only a removed key signed with `publish refresh --drop`). Then it uploads the new
+`root-<k>.json` files, then `keys.json` (after re-reading it to catch another writer), then the state
+file with its record of the root and key set, last. With nothing to change it exits 0.
+
+**Rerun and recovery.** A rerun with the same directory after any failure completes the rest. When an
+upload of `root-<k>.json` or `keys.json` fails, the roots this run uploaded are removed again, last
+first and only while the store's `keys.json` still reads as the old one, so a client never walks to a
+root that did not sign the store's `keys.json`; each is named (`removed:`, or `not removed:` when the
+delete fails too). A store left with such a root (the run was killed, or the removal failed) is refused
+by `push`, `refresh` and `plan` ("the store's key set does not verify"). `publish keys` alone reads it,
+with the walk ended at the root the state file records, when every later root in the store is byte-equal
+to the directory's root of the same number, prints a `notice:` and uploads the rest. The revocation
 procedure is in [`docs/PUBLISHING.md`](PUBLISHING.md), "Changing the key set or revoking a key".
 
 ### `SOURCE_DATE_EPOCH` and these commands
@@ -1403,7 +1432,7 @@ lunepack setup release --version "$VERSION" --target "$TARGET"
 lunepack publish push --release-dir release-linux --release-dir release-windows \
     --version "$VERSION" --sign env:EXAMPLE_RELEASE_KEY
 
-# a scheduled job (the release key and its own, narrower store token: it writes the public bucket only)
+# a scheduled job (the release key and two narrower tokens: public read and write, private read only)
 lunepack publish refresh --sign env:EXAMPLE_RELEASE_KEY --if-expiring-within-days 30 \
     --skip-if-unpublished
 ```
@@ -1445,11 +1474,12 @@ local key set expose nothing.
    `pack` any new release, `feed add` it, and `feed refresh --sign <new>` (the previous feed still
    verifies, since the old key is listed). A release whose manifest only the old key signed cannot be
    carried: re-pack it as a new version, or drop it with `feed refresh --drop <version>`.
-2. `keys set` listing only the new key. Then upload `keys.json` and the feeds (see the upload order); with
-   `lunepack publish` that is `publish keys` for each of the two key sets and `publish refresh --sign <new>`
-   between them ([`docs/PUBLISHING.md`](PUBLISHING.md), "Changing the key set or revoking a key").
-   Through `publish` the first key set is uploaded before the second, so the old key stays trusted until
-   the second is published: do both in one sitting.
+2. `keys set` listing only the new key. Then upload `keys.json` and the feeds (see the upload order).
+   With `lunepack publish` that is `publish keys` for each of the two key sets, and between them a
+   release signed with the new key and `publish refresh --sign <new> --drop <version>` for each release
+   only the old key signed ([`docs/PUBLISHING.md`](PUBLISHING.md), "Changing the key set or revoking a
+   key"). Through `publish` the first key set is uploaded before the second, so the old key stays trusted
+   until the second is published: do the steps between them without delay.
 
 `keys set` and `keys rotate-root` enforce this. If a feed, or a manifest it lists, would stop verifying
 under the new key set, the command exits 1 and places nothing; stderr names each failing feed and each

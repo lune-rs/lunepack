@@ -637,7 +637,7 @@ fn every_refusal_is_checked_by_its_message_and_leaves_the_store_as_it_was() {
     assert!(!site.store.join("public").join(P).exists());
     assert!(!site.store.join("private").join(P).exists());
 
-    // init: a dry run writes nothing; a second init names the first document.
+    // init: a dry run writes nothing; a second init finds the same documents and uploads nothing.
     let out = site.cmd("init", &["--release-dir", s(&site.origin), "--dry-run"]);
     assert_ok(&out, "init dry run");
     assert!(!site.store.join("public").join(P).exists());
@@ -645,10 +645,11 @@ fn every_refusal_is_checked_by_its_message_and_leaves_the_store_as_it_was() {
     assert_ok(&out, "init");
     let before = tree(&site.store);
     let out = site.cmd("init", &["--release-dir", s(&site.origin)]);
-    let err = assert_fails(&out, 1, "second init");
+    assert_ok(&out, "second init");
     assert!(
-        err.contains(&format!("already holds {P}/keys.json")),
-        "{err}"
+        stdout(&out).contains("nothing to upload"),
+        "{}",
+        stdout(&out)
     );
     assert!(tree(&site.store) == before);
 
